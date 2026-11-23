@@ -466,9 +466,8 @@ function addEphemeralCacheControl(body: AnthropicRequestBody): void {
 }
 
 /**
- * Paid API-key requests get the cache markers Pi's own Anthropic provider would
- * place (system, last tool, last message), and none of the plugin's own
- * subscription layout such as the bridge to an earlier cache boundary.
+ * Paid API-key requests get exactly the cache markers Pi's own Anthropic
+ * provider would place: the system prompt, the last tool and the last message.
  */
 function applyPiApiKeyCache(
   body: AnthropicRequestBody,

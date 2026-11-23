@@ -49,7 +49,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - OpenCode 1 no longer waits for abandoned responses to cancel or for cache diagnostics before sending, and editing killswitch thresholds no longer turns the killswitch on.
 - Keep-warm follows the process where you actually work: a session restored by another OpenCode or Pi process at startup is handed over on your next turn, and a session deleted in one process no longer comes back from another's saved state.
 - Keep-warm recovers from temporary lock contention when claiming or releasing a session, and OpenCode 2 keeps the newest cache body in memory if its final save fails.
-- Pi: a pasted lane-start marker is left intact, the marker never reaches Anthropic or the session file, a lane start no longer joins the conversation's request chain, and a lane start that would go to a paid API key is skipped with a short message.
+- Pi: `/claude` lane start (a one-token turn that warms the session's cache) tags its queued message with a one-time marker. A user who pastes that marker keeps their text, the marker never reaches Anthropic or the session file, a lane start no longer joins the conversation's request chain, and a lane start that would go to a paid API key is skipped with a short message.
 - Pi: when the session's cache is off, earlier messages are no longer reshaped for a cache marker.
 
 ## 2.16.6
