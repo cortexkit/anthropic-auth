@@ -103,44 +103,56 @@ test('paid requests do not inherit session cache policy', async () => {
   expect(sent.cacheTtlMs).toBe(300_000)
 })
 
+const hybridHistory: Context = {
+  ...context,
+  messages: [
+    ...context.messages,
+    {
+      role: 'assistant',
+      content: [{ type: 'text', text: 'reply' }],
+    } as Message,
+    { role: 'user', content: 'Earlier boundary', timestamp: 1 },
+    {
+      role: 'assistant',
+      content: Array.from({ length: 19 }, (_, index) => ({
+        type: 'text',
+        text: `Reply block ${index}`,
+      })),
+    } as Message,
+    { role: 'user', content: 'Latest boundary', timestamp: 2 },
+  ],
+}
+
+function buildHybridHistory(ttl?: 'short' | 'none') {
+  globals[key] = () => ({ cache: () => (ttl ? { ttl } : null) })
+  return buildAnthropicRequest(
+    'claude-sonnet-5',
+    hybridHistory,
+    { sessionId: 'ses_pi_hybrid_layout' },
+    { enabled: false, mode: 'hybrid' },
+    false,
+    identity,
+    { deferSigning: true },
+  )
+}
+
 test('five-minute hybrid sessions keep the bridge with or without a policy override', async () => {
-  const history: Context = {
-    ...context,
-    messages: [
-      ...context.messages,
-      {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'reply' }],
-      } as Message,
-      { role: 'user', content: 'Earlier boundary', timestamp: 1 },
-      {
-        role: 'assistant',
-        content: Array.from({ length: 19 }, (_, index) => ({
-          type: 'text',
-          text: `Reply block ${index}`,
-        })),
-      } as Message,
-      { role: 'user', content: 'Latest boundary', timestamp: 2 },
-    ],
-  }
-  const build = async (ttl?: 'short') => {
-    globals[key] = () => ({ cache: () => (ttl ? { ttl } : null) })
-    return buildAnthropicRequest(
-      'claude-sonnet-5',
-      history,
-      { sessionId: 'ses_pi_hybrid_layout' },
-      { enabled: false, mode: 'hybrid' },
-      false,
-      identity,
-      { deferSigning: true },
-    )
-  }
-  const { body, cacheTtlMs } = await build()
+  const { body, cacheTtlMs } = await buildHybridHistory()
   expect(piThreadCacheSlot(body)).toEqual({
     type: 'text',
     text: 'Earlier boundary',
     cache_control: { type: 'ephemeral' },
   })
   expect(cacheTtlMs).toBe(300_000)
-  expect((await build('short')).body).toEqual(body)
+  expect((await buildHybridHistory('short')).body).toEqual(body)
+})
+
+test('OAuth hybrid policy none leaves the earlier user message scalar', async () => {
+  const { body, bodyText, cacheTtlMs } = await buildHybridHistory('none')
+  expect(body.messages[2]).toEqual({
+    role: 'user',
+    content: 'Earlier boundary',
+  })
+  expect(bodyText).not.toContain('cache_control')
+  expect(cacheTtlMs).toBe(0)
 })

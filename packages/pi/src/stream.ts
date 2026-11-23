@@ -292,7 +292,9 @@ function piPrimarySession(
   )
     return undefined
   const session = primarySessions.get(options.sessionId)
-  return session?.storagePath === storagePath && session.turn
+  return session?.storagePath === storagePath &&
+    session.turn &&
+    !session.turn.synthetic
     ? session
     : undefined
 }
@@ -2019,6 +2021,10 @@ export async function firstStreamingError(
   return { response: inspected, preflight: inspected }
 }
 
+// A local completion, not a provider response. Keep routing's quota-wait path
+// able to hand it back without treating a skipped lane start as a refusal.
+const skippedPaidLaneStart = new Response(null, { status: 204 })
+
 async function executeWithFallback(options: {
   model: Model<Api>
   context: Context
@@ -2362,6 +2368,7 @@ async function executeWithFallback(options: {
           !isValidApiBaseURL(account.baseURL)
         )
           continue
+        if (options.laneStart) return skippedPaidLaneStart
         response = await sendAnthropicRequest({
           ...options,
           apiAccount: account,
@@ -3148,6 +3155,17 @@ export function streamCortexKitAnthropic(
         }),
       )
 
+      if (response === skippedPaidLaneStart) {
+        options?.signal?.throwIfAborted()
+        output.content.push({
+          type: 'text',
+          text: 'Lane start skipped on a paid route.',
+        })
+        output.stopReason = 'stop'
+        stream.push({ type: 'done', reason: 'stop', message: output })
+        stream.end()
+        return
+      }
       if (!response.ok) {
         throw new Error(
           `Anthropic request failed: HTTP ${response.status} ${await response.text()}`,

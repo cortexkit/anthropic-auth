@@ -7,7 +7,6 @@ import {
   __setLogTestSink,
   type AccountStorage,
   getLogLevel,
-  LANE_START_TEXT,
   PROMPT_CACHE_DEFAULT_TTL_MS,
   PrimeManager,
   primeAccountMarkerDir,
@@ -256,7 +255,12 @@ test('Pi Prime enabled with a due account fires once through the signed model tr
   expect([...timeouts.values()].map((timer) => timer.ms)).toEqual([90_000])
 })
 
-test('Pi /claude queues lane start as a visible turn that warms the session cache', async () => {
+test.each(['single', 'multipart'])(
+  'Pi /claude queues lane start as a visible turn that warms the session cache (%s)',
+  runLaneStart,
+)
+
+async function runLaneStart(shape: string) {
   const native = await fixture(false, {
     routing: { mode: 'sticky-balanced' },
     accounts: [
@@ -355,7 +359,7 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
     maxTokens: 64_000,
   }
   const notice = await invoke(model)
-  const marker = LANE_START_TEXT
+  const marker = '[lane start] — automated cache warm; no response needed.'
   expect(queued).toEqual([
     [
       expect.stringMatching(
@@ -372,9 +376,13 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
     content: 'Earlier session prompt',
     timestamp: now,
   } as const
+  const extra =
+    shape === 'multipart'
+      ? [{ type: 'text' as const, text: 'Other content' }]
+      : []
   const lane = {
     role: 'user',
-    content: [{ type: 'text', text: queued[0]![0] as string }],
+    content: [...extra, { type: 'text', text: queued[0]![0] as string }],
     timestamp: now + 2,
   } satisfies Parameters<typeof streamCortexKitAnthropic>[1]['messages'][number]
   const typed = { role: 'user', content: marker, timestamp: now + 1 } as const
@@ -386,6 +394,7 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
   async function runTurn(
     messages: Parameters<typeof streamCortexKitAnthropic>[1]['messages'],
     newUser = messages.at(-1),
+    canThread = false,
   ) {
     if (newUser?.role === 'user') {
       await handlers.get('message_start')?.(
@@ -397,7 +406,15 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
     const result = await streamCortexKitAnthropic(
       model,
       { messages: structuredClone(messages) },
-      { sessionId, maxTokens: 123 },
+      {
+        sessionId,
+        maxTokens: 123,
+        ...(canThread && {
+          onPayload: () => {},
+          onResponse: () => {},
+          onProviderStreamEvent: () => {},
+        }),
+      },
       undefined,
       undefined,
       'agent-loop',
@@ -416,7 +433,7 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
     expect(human.thinking).toBeDefined()
     expect(human.system[0].text).toContain('cc_prompt_index=2;')
 
-    await runTurn([first, typed, lane])
+    await runTurn([first, typed, lane], lane, true)
     expect(sends).toHaveLength(2)
     const sent = sends[1]!
     expect(sent.headers.get('authorization')).toBe(
@@ -424,6 +441,7 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
     )
     const body = JSON.parse(sent.text)
     expect(body).toMatchObject({ model: modelId, max_tokens: 1 })
+    expect(body.thread).toBeUndefined()
     expect(body.messages).toHaveLength(3)
     expect(body.messages[0]).toMatchObject({
       role: 'user',
@@ -436,6 +454,7 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
     expect(body.messages[2]).toMatchObject({
       role: 'user',
       content: [
+        ...extra,
         { type: 'text', text: marker, cache_control: { type: 'ephemeral' } },
       ],
     })
@@ -444,7 +463,7 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
     expect(persisted).not.toContain('cortexkit lane start:')
     expect(
       JSON.parse(persisted.trimEnd().split('\n').at(-1)!).message.content,
-    ).toEqual([{ type: 'text', text: marker }])
+    ).toEqual([...extra, { type: 'text', text: marker }])
     expect(sent.text).not.toContain('cortexkit lane start:')
     expect(body.system[0].text).not.toMatch(/cc_(?:prompt_id|prev_req)=/)
     expect(body.thinking).toBeUndefined()
@@ -473,6 +492,7 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
       },
     ])
     const toolStep = JSON.parse(sends[2]!.text)
+    expect(toolStep.diagnostics.previous_message_id).toBe('msg_pi_lane_1')
     expect(toolStep.max_tokens).toBe(123)
     expect(toolStep.thinking).toBeDefined()
     expect(toolStep.system[0].text).not.toMatch(/cc_(?:prompt_id|prev_req)=/)
@@ -480,12 +500,15 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
     await runTurn([first, typed, lane, next])
     expect(sends).toHaveLength(4)
     const following = JSON.parse(sends[3]!.text)
+    expect(following.diagnostics.previous_message_id).toBe('msg_pi_lane_1')
     expect(following.max_tokens).toBe(123)
     expect(following.thinking).toBeDefined()
     expect(following.messages[0]).toEqual(body.messages[0])
     expect(following.messages[2]).toMatchObject({
       role: 'user',
-      content: marker,
+      content: extra.length
+        ? [...extra, { type: 'text', text: marker }]
+        : marker,
     })
     expect(following.system[0].text).toContain('cc_prev_req=req_lane_test_1;')
     expect(following.system[0].text).toContain('cc_prompt_index=3;')
@@ -502,7 +525,7 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
     sessionCacheActivity.forget(sessionId)
   }
   expect((await native.view()).policyStorage.prime?.enabled).toBe(false)
-})
+}
 
 test('Pi Prime disabled never polls or sends, and the menu enables it live', async () => {
   const native = await fixture(false)

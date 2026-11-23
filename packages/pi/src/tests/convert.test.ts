@@ -10,12 +10,22 @@ import {
   signRequestBody,
   TrailingAssistantHistoryError,
 } from '@cortexkit/anthropic-auth-core'
-import type { Context, Message } from '@earendil-works/pi-ai'
+import type {
+  Context,
+  Message,
+  Model,
+  SimpleStreamOptions,
+} from '@earendil-works/pi-ai'
 import { buildAnthropicRequest, piThreadCacheSlot } from '../convert'
 import { collectPiEffortHistory } from '../effort-history.ts'
 import { PiForkEffortSnapshots } from '../forks.ts'
-import { forgetPiLaneStarts, queuePiLaneStart } from '../lane-start.ts'
+import {
+  forgetPiLaneStarts,
+  queuePiLaneStart,
+  stripPiLaneStartNonce,
+} from '../lane-start.ts'
 import { normalizeContext } from '../transcript.ts'
+import { captureNativeAnthropicCacheRequest } from './native-anthropic-cache.ts'
 
 function userMsg(text: string): Message {
   return { role: 'user', content: text, timestamp: 0 }
@@ -79,86 +89,151 @@ test('conversion strips a lane delivery nonce when the host hook did not run', a
   }
 })
 
-test('paid Pi requests keep the native Anthropic cache markers and lifetimes', async () => {
-  const tools = ['read', 'write'].map((name) => ({
-    name,
-    description: name,
-    parameters: {},
-  }))
-  for (const retention of [
-    'default',
-    'short',
-    'long',
-    'none',
-    'env long',
-    'compat short',
-  ] as const) {
-    const compatible = retention !== 'compat short'
-    const control =
-      retention === 'none'
-        ? undefined
-        : {
-            type: 'ephemeral',
-            ...((retention === 'long' || retention === 'env long') && {
-              ttl: '1h',
-            }),
-          }
-    const { body, bodyText, cacheTtlMs } = await buildAnthropicRequest(
-      'claude-sonnet-5',
-      {
-        systemPrompt: PI_PROMPT,
-        tools,
-        messages: [userMsg('First'), assistantMsg('Reply'), userMsg('Latest')],
-      },
-      {
-        env: {
-          PI_CACHE_RETENTION: retention === 'env long' ? 'long' : 'short',
+test('lane nonce stripping preserves pasted markers not pending in this session', async () => {
+  const sessionId = 'lane-issued-here'
+  const raw = queuePiLaneStart(sessionId)
+  const invented = `${LANE_START_TEXT}\n[cortexkit lane start: 12345678-1234-1234-1234-123456789abc]`
+  try {
+    for (const [content, id] of [
+      [invented, sessionId],
+      [raw, 'lane-other-session'],
+    ] as const) {
+      const user = userMsg(content)
+      stripPiLaneStartNonce(user, id)
+      expect(user).toEqual(userMsg(content))
+      const { body } = await buildAnthropicRequest(
+        TEST_MODEL_ID,
+        { messages: [user] },
+        { sessionId: id },
+        defaultCache,
+      )
+      expect(JSON.stringify(body.messages)).toContain(JSON.stringify(content))
+    }
+    const delivered = userMsg(raw)
+    stripPiLaneStartNonce(delivered, sessionId)
+    expect(delivered).toMatchObject({ content: LANE_START_TEXT })
+    const replay = userMsg(raw)
+    stripPiLaneStartNonce(replay, sessionId)
+    expect(replay).toEqual(userMsg(raw))
+  } finally {
+    forgetPiLaneStarts(sessionId)
+  }
+})
+
+test('conversion strips an issued delivery nonce from a later text block', async () => {
+  const sessionId = 'lane-converter-multipart'
+  const raw = queuePiLaneStart(sessionId)
+  const content = [
+    { type: 'text', text: 'Other content' },
+    { type: 'text', text: raw },
+  ] as const
+  try {
+    const { bodyText } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      { messages: [{ role: 'user', timestamp: 0, content: [...content] }] },
+      { sessionId },
+      defaultCache,
+    )
+    expect(bodyText).not.toContain('cortexkit lane start:')
+    expect(bodyText).toContain('Other content')
+    expect(bodyText).toContain(LANE_START_TEXT)
+  } finally {
+    forgetPiLaneStarts(sessionId)
+  }
+})
+
+test.each([
+  'default',
+  'short',
+  'long',
+  'none',
+  'env long',
+  'env none',
+  'compat short',
+] as const)(
+  'paid Pi cache markers match the native request (%s)',
+  async (retention) => {
+    const tools = ['read', 'write'].map((name) => ({
+      name,
+      description: name,
+      parameters: { type: 'object', properties: {} },
+    }))
+    const context = {
+      systemPrompt: PI_PROMPT,
+      tools,
+      messages: [userMsg('First'), assistantMsg('Reply'), userMsg('Latest')],
+    }
+    const model: Model<'anthropic-messages'> = {
+      id: 'claude-sonnet-5',
+      name: 'Sonnet',
+      api: 'anthropic-messages',
+      provider: 'anthropic',
+      baseUrl: 'https://api.anthropic.com',
+      reasoning: false,
+      input: ['text'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200_000,
+      maxTokens: 4096,
+      ...(retention === 'compat short' && {
+        compat: {
+          supportsLongCacheRetention: false,
+          supportsCacheControlOnTools: false,
         },
-        ...(retention === 'compat short'
-          ? { cacheRetention: 'long' }
-          : retention !== 'default' && retention !== 'env long'
-            ? { cacheRetention: retention }
-            : {}),
+      }),
+    }
+    const options: SimpleStreamOptions = {
+      env: {
+        PI_CACHE_RETENTION:
+          retention === 'env long'
+            ? 'long'
+            : retention === 'env none'
+              ? 'none'
+              : 'short',
       },
+      ...(retention === 'compat short'
+        ? { cacheRetention: 'long' }
+        : retention === 'short' || retention === 'long' || retention === 'none'
+          ? { cacheRetention: retention }
+          : {}),
+    }
+    const { body: native } = await captureNativeAnthropicCacheRequest(
+      model,
+      context,
+      // Pi's resolveCacheRetention only reads "long" from the environment.
+      // Compare our environment opt-out to Pi's explicit no-cache request.
+      retention === 'env none'
+        ? { ...options, cacheRetention: 'none' }
+        : options,
+    )
+    const { body, bodyText, cacheTtlMs } = await buildAnthropicRequest(
+      model.id,
+      context,
+      options,
       { enabled: true, mode: 'automatic' },
       false,
       undefined,
-      {
-        apiKey: true,
-        ...(compatible
-          ? {}
-          : {
-              apiKeyModelCompat: {
-                supportsLongCacheRetention: false,
-                supportsCacheControlOnTools: false,
-              },
-            }),
-      },
+      { apiKey: true, apiKeyModelCompat: model.compat },
     )
-    expect(body.system).toEqual([
-      {
-        type: 'text',
-        text: PI_PROMPT,
-        ...(control && { cache_control: control }),
-      },
-    ])
-    expect(
-      body.tools?.map(({ name, cache_control }) => [name, cache_control]),
-    ).toEqual([
-      ['read', undefined],
-      ['write', compatible ? control : undefined],
-    ])
+    const toolMarkers = (request: typeof body) =>
+      request.tools?.map(({ name, cache_control }) => [name, cache_control])
+    expect(body.system).toEqual(native.system)
+    expect(toolMarkers(body)).toEqual(toolMarkers(native))
     expect(body.messages[0]?.content).toBe('First')
     expect(body.messages.at(-1)?.content).toEqual(
-      control
-        ? [{ type: 'text', text: 'Latest', cache_control: control }]
-        : 'Latest',
+      native.messages.at(-1)?.content,
     )
     expect(body.cache_control).toBeUndefined()
     expect(bodyText).not.toContain('x-anthropic-billing-header')
-    expect(cacheTtlMs).toBe(control ? (control.ttl ? 3_600_000 : 300_000) : 0)
-  }
-})
+    const control = native.system?.at(-1)?.cache_control
+    expect(cacheTtlMs).toBe(
+      control && typeof control === 'object'
+        ? 'ttl' in control && control.ttl === '1h'
+          ? 3_600_000
+          : 300_000
+        : 0,
+    )
+  },
+)
 
 test('Pi full-after-thread trades only its system slot for the accepted full tail', async () => {
   const messages = [

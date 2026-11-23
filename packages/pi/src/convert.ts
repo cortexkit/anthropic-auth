@@ -471,11 +471,12 @@ function applyPiApiKeyCache(
   options: SimpleStreamOptions | undefined,
   compat: Model<'anthropic-messages'>['compat'],
 ): void {
+  const envRetention =
+    options?.env?.PI_CACHE_RETENTION || process.env.PI_CACHE_RETENTION
   const retention =
     options?.cacheRetention ??
-    ((options?.env?.PI_CACHE_RETENTION || process.env.PI_CACHE_RETENTION) ===
-    'long'
-      ? 'long'
+    (envRetention === 'long' || envRetention === 'none'
+      ? envRetention
       : 'short')
   if (retention === 'none') return
   const control = {
@@ -829,7 +830,8 @@ export async function buildAnthropicRequest(
   forkEffortApplied?: PiForkEffortHint
 }> {
   const apiKey = controls.apiKey === true
-  for (const message of context.messages) stripPiLaneStartNonce(message)
+  for (const message of context.messages)
+    stripPiLaneStartNonce(message, options?.sessionId)
   const mapToolName = apiKey ? (name: string) => name : toClaudeCodeToolName
   const forkBase =
     controls.forkBaseMessageCount === undefined
@@ -1070,7 +1072,12 @@ export async function buildAnthropicRequest(
         (cachePolicy?.ttl === undefined && cache.enabled),
       cache.mode,
     )
-    if (cache.mode === 'hybrid' && !forkHead && !forkBase)
+    if (
+      cache.mode === 'hybrid' &&
+      cachePolicy?.ttl !== 'none' &&
+      !forkHead &&
+      !forkBase
+    )
       applyHybridCacheBridge(body)
   }
   if (identity) {

@@ -26,31 +26,34 @@ export function forgetPiLaneStarts(sessionId: string): void {
   sessions.delete(sessionId)
 }
 
-/** Pi rebuilds queued user messages from text; strip its delivery token before display or persistence. */
+/** Pi rebuilds queued user messages from text; remove the token before the delivered message is saved. */
 export function stripPiLaneStartNonce(
   message: Message,
   sessionId?: string,
 ): void {
   if (message.role !== 'user') return
-  const content = message.content
-  const block =
-    Array.isArray(content) && content.length === 1 ? content[0] : undefined
-  const text =
-    typeof content === 'string'
-      ? content
-      : block?.type === 'text'
-        ? block.text
-        : undefined
-  if (!text?.startsWith(marker) || !text.endsWith(']')) return
-  const nonce = text.slice(marker.length, -1)
-  if (!/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/.test(nonce)) return
-  if (block?.type === 'text') block.text = LANE_START_TEXT
-  else message.content = LANE_START_TEXT
   const state = sessionId ? sessions.get(sessionId) : undefined
-  if (state?.pending.delete(nonce)) {
-    ;(message as LaneUserMessage).cortexkitLaneStart = true
-    state.ready = message.timestamp
+  if (!state?.pending.size) return
+  const pending = state.pending
+  const delivered = new Set<string>()
+  const clean = (text: string) => {
+    if (!text.startsWith(marker) || !text.endsWith(']')) return text
+    const nonce = text.slice(marker.length, -1)
+    if (!pending.has(nonce)) return text
+    delivered.add(nonce)
+    return LANE_START_TEXT
   }
+  if (typeof message.content === 'string') {
+    message.content = clean(message.content)
+  } else {
+    for (const block of message.content)
+      if (block.type === 'text') block.text = clean(block.text)
+  }
+  if (!delivered.size) return
+  // Consume after scanning so a repeated block in this delivery is also clean.
+  for (const nonce of delivered) pending.delete(nonce)
+  ;(message as LaneUserMessage).cortexkitLaneStart = true
+  state.ready = message.timestamp
 }
 
 export function isPiLaneStartMessage(message: Message): boolean {

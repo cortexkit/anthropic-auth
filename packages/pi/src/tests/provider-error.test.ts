@@ -22,6 +22,7 @@ import type { Api, Context, Model } from '@earendil-works/pi-ai'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import type { TestGate } from '../../../core/src/tests/test-lifetime.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
+import { forgetPiLaneStarts, queuePiLaneStart } from '../lane-start.ts'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import {
   __setPiQuotaCallPauseForTest,
@@ -566,6 +567,41 @@ for (const customEndpoint of [false, true]) {
     ])
   })
 }
+
+test('Pi skips the lane start when general exhaustion selects a paid route', async () => {
+  await paidFixture()
+  const requests: Array<string | null> = []
+  useFetch(async (url, init) => {
+    if (url.includes('/api/oauth/usage'))
+      return Response.json({
+        five_hour: { utilization: 100 },
+        seven_day: { utilization: 100 },
+      })
+    if (!url.includes('/messages')) return new Response('{}', { status: 503 })
+    const authorization = authorizationOf(init)
+    requests.push(authorization)
+    return authorization === `Bearer ${PAID_KEY}`
+      ? eventStream(healthy('paid reply'))
+      : jsonError(429, 'rate_limit_error', MAIN_ACCESS)
+  })
+
+  const sessionId = 'pi-paid-lane-start'
+  const lane = queuePiLaneStart(sessionId)
+  deferCleanup(() => forgetPiLaneStarts(sessionId))
+  const result = await streamCortexKitAnthropic(
+    model,
+    { messages: [{ role: 'user', content: lane, timestamp: 1 }] },
+    { sessionId, maxTokens: 123 },
+    undefined,
+    undefined,
+    'agent-loop',
+  ).result()
+  expect(requests).toEqual([`Bearer ${MAIN_ACCESS}`])
+  expect(result.stopReason).toBe('stop')
+  expect(result.content).toEqual([
+    { type: 'text', text: 'Lane start skipped on a paid route.' },
+  ])
+})
 
 test('Pi usage-limit echo still reaches the paid route, whose error omits the paid key', async () => {
   const { quotaPauses } = await paidFixture()
