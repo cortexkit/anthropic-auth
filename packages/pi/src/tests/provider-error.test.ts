@@ -603,6 +603,72 @@ test('Pi skips the lane start when general exhaustion selects a paid route', asy
   ])
 })
 
+test('Pi lane start tries an eligible OAuth fallback listed after a paid route', async () => {
+  recordQuotaPauses()
+  const { storagePath } = await ownDirectory('pi-lane-oauth-after-paid-')
+  const fallbackAccess = 'sk-ant-oat01-synthetic-pi-lane-fallback'
+  await saveNativePiFixture(
+    {
+      version: 1,
+      accounts: [
+        {
+          id: 'paid',
+          type: 'api',
+          apiKey: PAID_KEY,
+          baseURL: 'https://paid.invalid',
+        },
+        {
+          id: 'fallback',
+          type: 'oauth',
+          access: fallbackAccess,
+          refresh: 'synthetic-pi-lane-fallback-refresh',
+          expires: Date.now() + 3_600_000,
+        },
+      ],
+    },
+    storagePath,
+    { mainAccess: MAIN_ACCESS },
+  )
+  const requests: Array<{ authorization: string; maxTokens: number }> = []
+  useFetch(async (url, init) => {
+    if (url.includes('/api/oauth/usage')) {
+      const utilization =
+        authorizationOf(init) === `Bearer ${MAIN_ACCESS}` ? 100 : 0
+      return Response.json({
+        five_hour: { utilization },
+        seven_day: { utilization },
+      })
+    }
+    if (!url.includes('/messages')) return new Response('{}', { status: 503 })
+    const authorization = authorizationOf(init)
+    const body = JSON.parse(String(init?.body)) as { max_tokens: number }
+    requests.push({ authorization, maxTokens: body.max_tokens })
+    return authorization === `Bearer ${MAIN_ACCESS}`
+      ? jsonError(429, 'rate_limit_error', MAIN_ACCESS)
+      : eventStream(healthy('OAuth fallback reply'))
+  })
+
+  const sessionId = 'pi-lane-oauth-after-paid'
+  const lane = queuePiLaneStart(sessionId)
+  deferCleanup(() => forgetPiLaneStarts(sessionId))
+  const result = await streamCortexKitAnthropic(
+    model,
+    { messages: [{ role: 'user', content: lane, timestamp: 1 }] },
+    { sessionId, maxTokens: 123 },
+    undefined,
+    undefined,
+    'agent-loop',
+  ).result()
+  expect(requests).toEqual([
+    { authorization: `Bearer ${MAIN_ACCESS}`, maxTokens: 1 },
+    { authorization: `Bearer ${fallbackAccess}`, maxTokens: 1 },
+  ])
+  expect(result.stopReason).toBe('stop')
+  expect(result.content).toEqual([
+    { type: 'text', text: 'OAuth fallback reply' },
+  ])
+})
+
 test('Pi usage-limit echo still reaches the paid route, whose error omits the paid key', async () => {
   const { quotaPauses } = await paidFixture()
   const modelRequests: string[] = []

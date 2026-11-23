@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
@@ -137,6 +137,86 @@ test('conversion strips an issued delivery nonce from a later text block', async
     expect(bodyText).not.toContain('cortexkit lane start:')
     expect(bodyText).toContain('Other content')
     expect(bodyText).toContain(LANE_START_TEXT)
+  } finally {
+    forgetPiLaneStarts(sessionId)
+  }
+})
+
+test('a lane delivery survives queuing more than 128 sessions', async () => {
+  const sessionId = 'lane-oldest-pending'
+  const user = userMsg(queuePiLaneStart(sessionId))
+  const others = Array.from({ length: 128 }, (_, i) => `lane-pending-${i}`)
+  try {
+    for (const id of others) queuePiLaneStart(id)
+    const { body } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      { messages: [user] },
+      { sessionId },
+      defaultCache,
+    )
+    expect(user.content).toBe(LANE_START_TEXT)
+    expect(body.messages).toEqual([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: LANE_START_TEXT,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      },
+    ])
+  } finally {
+    for (const id of [sessionId, ...others]) forgetPiLaneStarts(id)
+  }
+})
+
+test('queuing a lane start expires old nonces without dropping newer ones in the same session', () => {
+  const sessionId = 'lane-expiring-nonces'
+  const other = 'lane-queue-after-expiry'
+  const day = 24 * 60 * 60 * 1000
+  const clock = spyOn(Date, 'now').mockReturnValue(day)
+  try {
+    const old = queuePiLaneStart(sessionId)
+    clock.mockReturnValue(day + 1000)
+    const fresh = queuePiLaneStart(sessionId)
+    clock.mockReturnValue(2 * day + 1)
+    queuePiLaneStart(other)
+
+    const user = userMsg(`${old}\n${fresh}`)
+    stripPiLaneStartNonce(user, sessionId)
+    expect(user.content).toBe(`${old}\n${LANE_START_TEXT}`)
+  } finally {
+    clock.mockRestore()
+    forgetPiLaneStarts(sessionId)
+    forgetPiLaneStarts(other)
+  }
+})
+
+test('a lane delivery scrubs embedded envelopes without changing surrounding text', async () => {
+  const sessionId = 'lane-embedded-envelope'
+  const raw = queuePiLaneStart(sessionId)
+  const raw2 = queuePiLaneStart(sessionId)
+  const pasted = `${LANE_START_TEXT}\n[cortexkit lane start: 12345678-1234-1234-1234-123456789abc]`
+  const user = userMsg(`prefix\n${raw}\n${pasted}\n${raw2}\n${raw}\nsuffix`)
+  const clean = `prefix\n${LANE_START_TEXT}\n${pasted}\n${LANE_START_TEXT}\n${LANE_START_TEXT}\nsuffix`
+  try {
+    const { body } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      { messages: [user] },
+      { sessionId },
+      defaultCache,
+    )
+    expect(user.content).toBe(clean)
+    expect(body.messages).toEqual([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: clean, cache_control: { type: 'ephemeral' } },
+        ],
+      },
+    ])
   } finally {
     forgetPiLaneStarts(sessionId)
   }

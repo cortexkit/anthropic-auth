@@ -1417,8 +1417,9 @@ async function sendAnthropicRequestAttempt(
     relayConfig = null
   }
   let threadRequest: MessageThreadRequest | undefined
-  // A real conversation request in the turn this process still owns.
+  // A human prompt can replace the session's turn while a lane start is routing.
   const primaryThread =
+    !options.laneStart &&
     primary !== undefined &&
     primary ===
       piPrimarySession(
@@ -2338,6 +2339,7 @@ async function executeWithFallback(options: {
     const usableOAuthById = new Map(
       usableOAuth.map((account) => [account.id, account]),
     )
+    let sawPaidLaneRoute = false
     for (const configured of storage.accounts) {
       if (!nativeAccountCanServe(configured)) continue
       let response: Response | undefined
@@ -2368,7 +2370,11 @@ async function executeWithFallback(options: {
           !isValidApiBaseURL(account.baseURL)
         )
           continue
-        if (options.laneStart) return skippedPaidLaneStart
+        if (options.laneStart) {
+          // A paid route can end a lane start only if no OAuth route serves it.
+          sawPaidLaneRoute = true
+          continue
+        }
         response = await sendAnthropicRequest({
           ...options,
           apiAccount: account,
@@ -2385,7 +2391,7 @@ async function executeWithFallback(options: {
         return preflight
       await inspected.response.body?.cancel().catch(() => {})
     }
-    return null
+    return sawPaidLaneRoute ? skippedPaidLaneStart : null
   }
 
   const routingMode = getRoutingMode(storage)

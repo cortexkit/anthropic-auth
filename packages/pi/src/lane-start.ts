@@ -7,17 +7,32 @@ type LaneUserMessage = Extract<Message, { role: 'user' }> & {
 }
 
 const marker = `${LANE_START_TEXT}\n[cortexkit lane start: `
-const sessions = new Map<string, { pending: Set<string>; ready?: number }>()
+const uuidLength = 36
+const pendingMaxAgeMs = 24 * 60 * 60 * 1000
+const sessions = new Map<
+  string,
+  { pending: Map<string, number>; ready?: number }
+>()
 
 export function queuePiLaneStart(sessionId: string): string {
-  const state = sessions.get(sessionId) ?? { pending: new Set<string>() }
+  const state = sessions.get(sessionId) ?? {
+    pending: new Map<string, number>(),
+  }
   const nonce = randomUUID()
-  state.pending.add(nonce)
+  const now = Date.now()
+  state.pending.set(nonce, now)
   sessions.delete(sessionId)
   sessions.set(sessionId, state)
-  if (sessions.size > 128) {
-    const oldest = sessions.keys().next().value
-    if (oldest !== undefined) sessions.delete(oldest)
+  // The host may still deliver a queued nonce; only age out abandoned ones.
+  for (const [id, entry] of sessions) {
+    for (const [pending, issuedAt] of entry.pending) {
+      if (now - issuedAt >= pendingMaxAgeMs) entry.pending.delete(pending)
+    }
+    if (
+      !entry.pending.size &&
+      (entry.ready === undefined || sessions.size > 128)
+    )
+      sessions.delete(id)
   }
   return `${marker}${nonce}]`
 }
@@ -37,11 +52,23 @@ export function stripPiLaneStartNonce(
   const pending = state.pending
   const delivered = new Set<string>()
   const clean = (text: string) => {
-    if (!text.startsWith(marker) || !text.endsWith(']')) return text
-    const nonce = text.slice(marker.length, -1)
-    if (!pending.has(nonce)) return text
-    delivered.add(nonce)
-    return LANE_START_TEXT
+    let from = 0
+    let result = ''
+    let start = text.indexOf(marker)
+    while (start !== -1) {
+      const nonceStart = start + marker.length
+      const end = nonceStart + uuidLength
+      if (text[end] === ']') {
+        const nonce = text.slice(nonceStart, end)
+        if (pending.has(nonce)) {
+          delivered.add(nonce)
+          result += text.slice(from, start) + LANE_START_TEXT
+          from = end + 1
+        }
+      }
+      start = text.indexOf(marker, nonceStart)
+    }
+    return result + text.slice(from)
   }
   if (typeof message.content === 'string') {
     message.content = clean(message.content)

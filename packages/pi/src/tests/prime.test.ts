@@ -257,10 +257,13 @@ test('Pi Prime enabled with a due account fires once through the signed model tr
 
 test.each(['single', 'multipart'])(
   'Pi /claude queues lane start as a visible turn that warms the session cache (%s)',
-  runLaneStart,
+  (shape) => runLaneStart(shape),
 )
 
-async function runLaneStart(shape: string) {
+test('Pi lane stays out of the thread and predecessor when a human prompt arrives during routing', () =>
+  runLaneStart('single', true))
+
+async function runLaneStart(shape: string, interleaveHumanPrompt = false) {
   const native = await fixture(false, {
     routing: { mode: 'sticky-balanced' },
     accounts: [
@@ -393,7 +396,7 @@ async function runLaneStart(shape: string) {
   } as const
   async function runTurn(
     messages: Parameters<typeof streamCortexKitAnthropic>[1]['messages'],
-    newUser = messages.at(-1),
+    newUser = messages.at(-1) ?? null,
     canThread = false,
   ) {
     if (newUser?.role === 'user') {
@@ -433,7 +436,30 @@ async function runLaneStart(shape: string) {
     expect(human.thinking).toBeDefined()
     expect(human.system[0].text).toContain('cc_prompt_index=2;')
 
-    await runTurn([first, typed, lane], lane, true)
+    if (interleaveHumanPrompt) {
+      const routingKey = Symbol.for('cortexkit.routing')
+      const globals = globalThis as Record<symbol, unknown>
+      const previousRouting = globals[routingKey]
+      let prompts = 0
+      globals[routingKey] = () => ({
+        accountFor: async () => {
+          prompts++
+          await handlers.get('message_start')?.(
+            { message: next },
+            { sessionManager: transcript },
+          )
+        },
+      })
+      try {
+        await runTurn([first, typed, lane], lane, true)
+        expect(prompts).toBe(1)
+      } finally {
+        if (previousRouting === undefined) delete globals[routingKey]
+        else globals[routingKey] = previousRouting
+      }
+    } else {
+      await runTurn([first, typed, lane], lane, true)
+    }
     expect(sends).toHaveLength(2)
     const sent = sends[1]!
     expect(sent.headers.get('authorization')).toBe(
@@ -471,6 +497,16 @@ async function runLaneStart(shape: string) {
     expect(sessionCacheActivity.ttlMs(sessionId)).toBe(
       PROMPT_CACHE_DEFAULT_TTL_MS,
     )
+
+    if (interleaveHumanPrompt) {
+      // The routing callback already delivered this prompt's message_start.
+      await runTurn([first, typed, lane, next], null)
+      expect(sends).toHaveLength(3)
+      const following = JSON.parse(sends[2]!.text)
+      expect(following.diagnostics.previous_message_id).toBe('msg_pi_lane_1')
+      expect(following.system[0].text).toContain('cc_prev_req=req_lane_test_1;')
+      return
+    }
 
     await runTurn([
       first,
