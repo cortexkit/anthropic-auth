@@ -900,8 +900,8 @@ export class StickySessionRouter {
         // Malformed bytes are invalid state, unlike a failed disk read.
       }
       if (normalized) return normalized
-      // Request reads never take the lease. Only a publisher can move the
-      // invalid file it just read under the lease.
+      // Request reads never take the routing lock. Only a publisher holding
+      // it can move the invalid file it just read under that lock.
       if (lock) await this.setAsideInvalidState(raw, lock)
     }
     return {
