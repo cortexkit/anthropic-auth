@@ -56,7 +56,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Keep-warm requests are sent only by the process that owns the session, and a real turn can resume keep-warm after another process took over a restored session and then let it go.
 - Pi: a queued lane start keeps its marker hidden even with many sessions open or text after it, stays out of the conversation's request chain if you type while it routes, and can still use a subscription listed after a paid key.
 - Keep-warm retries after a temporary lock failure instead of forgetting the session, keeps a saved session when it can't check whether it was deleted, and after an OpenCode 2 plugin reload sends a warm only when it can confirm it owns the session.
-- OpenCode 1 never falls back to a paid API key when the shared routing check disappears mid-request, in any routing mode, and retries with a refreshed login without waiting for the rejected response to close.
+- OpenCode 1 never falls back to a paid API key when Thalamus's shared routing becomes unavailable mid-request, in any routing mode, and retries with a refreshed login without waiting for the rejected response to close.
 - Pi answers a message that carries a `/claude` lane start together with other content as a normal turn.
 
 ## 2.16.6

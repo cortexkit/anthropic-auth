@@ -10472,7 +10472,7 @@ const anthropicAuthPlugin = async (
                       throw error
                     }
                     const { advice, account, snapshot, routing, probed } = pick
-                    // A missing hook is not a probe that returned no advice.
+                    // A missing shared-routing hook is not a routing probe that returned no advice.
                     allowPaidFallback = probed && !advice
                     if (!advice) return
                     if (account?.id === 'main' && providerRestriction) {
