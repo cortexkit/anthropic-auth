@@ -782,8 +782,8 @@ describe('OpenCode 1 settings service reads', () => {
           ] as const) {
             settingsReaderOutputs(storage)
             const observed = await observeSettings(storage, 1)
-            // Per-warm timings are tested separately and were absent in 2.11.2;
-            // keep every older diagnostic and request byte in the release oracle.
+            // Per-warm timings were absent in 2.11.2. Compare the fixed warm
+            // body bytes, and check the intentional diagnostics difference separately.
             const compatible = {
               ...observed,
               warms: observed.warms.map((warm) =>

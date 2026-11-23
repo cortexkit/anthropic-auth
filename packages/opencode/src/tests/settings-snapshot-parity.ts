@@ -9,6 +9,7 @@ export function cacheKeepWarmSnapshot<T extends { body: string }>(
   const body = JSON.parse(warm.body)
   // Older OpenCode warms sent the previous-message ID; current warms must not.
   if (source === 'current') expect(body).not.toHaveProperty('diagnostics')
+  else expect(body.diagnostics).toEqual({ previous_message_id: null })
   return { ...warm, body: promptCacheSnapshot(body) }
 }
 

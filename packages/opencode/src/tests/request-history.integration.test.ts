@@ -221,7 +221,7 @@ describe('OpenCode 1 OAuth and paid request shaping', () => {
     },
   )
 
-  test('OpenCode 1 verifies TLS for paid sends to a custom address even with the old opt-out set', async () => {
+  test('OpenCode 1 verifies TLS for sign-in and paid sends even with the old opt-out set', async () => {
     const baseURL = process.env.ANTHROPIC_BASE_URL
     const insecure = process.env.ANTHROPIC_INSECURE
     try {
@@ -230,6 +230,10 @@ describe('OpenCode 1 OAuth and paid request shaping', () => {
       process.env.ANTHROPIC_BASE_URL = 'https://api.anthropic.com'
       process.env.ANTHROPIC_INSECURE = '1'
       const { sent } = await capture('api fallback')
+      expect(sent[0]?.headers.get('authorization')).toBe(
+        'Bearer sk-ant-oat01-main-access',
+      )
+      expect(sent[0]!.tls?.rejectUnauthorized ?? true).toBe(true)
       const paid = sent[1]!
       expect(new URL(paid.url).origin).toBe('https://paid.invalid')
       expect(paid.headers.get('x-api-key')).toBe('synthetic-service-tier-key')

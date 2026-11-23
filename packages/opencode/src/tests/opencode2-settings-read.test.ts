@@ -426,6 +426,19 @@ test('OpenCode 2 shows zero prices only for active OAuth unless opted out', asyn
   await Bun.sleep(0)
   expect(price()).toEqual(zeroPrice)
 
+  const failedRead = Promise.withResolvers<Connection>()
+  active = failedRead.promise
+  const failure = new Error('temporary connection lookup failure')
+  const ignoredRejection = active.catch(() => {})
+  publish!({
+    type: 'credential.updated',
+    data: { integrationID: 'anthropic' },
+  })
+  failedRead.reject(failure)
+  await ignoredRejection
+  await Bun.sleep(0)
+  expect(price()).toEqual(zeroPrice)
+
   await select(connection('api-key', 'key'))
   expect(price()).toEqual(listPrice)
   await select(

@@ -106,9 +106,14 @@ export function createNativeClaudeModelRules(
     const refresh = async () => {
       const generation = ++read
       // Only the connection kind is needed. Never resolve its secret.
-      const active = await connection.active('anthropic').catch(() => undefined)
-      if (abort.signal.aborted || generation !== read) return
-      oauth = active?.type === 'credential' && active.method === 'oauth'
+      try {
+        const active = await connection.active('anthropic')
+        if (abort.signal.aborted || generation !== read) return
+        oauth = active?.type === 'credential' && active.method === 'oauth'
+      } catch {
+        // Keep the last confirmed pricing until a credential event prompts another read.
+        return
+      }
       reloadIfChanged()
     }
     const unwatch = settings?.watch(reloadIfChanged)

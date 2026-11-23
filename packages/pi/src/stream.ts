@@ -12,7 +12,6 @@ import {
   buildBillingHeaderValue,
   buildCacheDiagnosticsRecord,
   buildPrimeRequestBody,
-  CACHE_DIAGNOSTICS_BETA,
   CACHE_DIAGNOSTICS_SESSION_LIMIT,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheDiagnosticsBetaTracker,
@@ -24,6 +23,7 @@ import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
   type ClaudeCodeIdentity,
+  cacheDiagnosticsMessageId,
   claudeGatewayHeaderValues,
   claudeGatewayModelUrl,
   copyStreamResponseTiming,
@@ -57,6 +57,7 @@ import {
   getScopedQuotaWindowForModel,
   getThinkingPrefixMismatchBehavior,
   getWaitForReset,
+  hasCacheDiagnosticsBeta,
   hostRetryHeaders,
   hostRetryResponse,
   isCache1hPersistentlyEnabled,
@@ -883,7 +884,7 @@ export async function* parseSse(
         if (event.type === 'message_start' && cacheDiagnosticsObserver) {
           const observe = cacheDiagnosticsObserver
           cacheDiagnosticsObserver = undefined
-          await observe(event.message).catch(() => {})
+          void observe(event.message).catch(() => {})
         }
         yield event
       }
@@ -1065,7 +1066,11 @@ async function sendAnthropicRequestAttempt(
     primary.previousRequestId = id
   }
   const diagnosticsSession =
-    realSession && !options.apiAccount && !options.prime && !forkHead
+    realSession &&
+    !options.apiAccount &&
+    !options.prime &&
+    !forkHead &&
+    options.streamOptions?.maxTokens !== 1
       ? {
           id: realSession,
           token: cacheDiagnosticsSession(realSession),
@@ -1802,22 +1807,28 @@ async function sendAnthropicRequestAttempt(
     }
     // Thread recovery can replace the prepared body. Attribute the result only
     // if the actual send carried this diagnostic predecessor and beta.
-    if (payload.diagnostics?.previous_message_id === previousMessageId) {
+    if (
+      payload.diagnostics?.previous_message_id === previousMessageId &&
+      hasCacheDiagnosticsBeta(headers)
+    ) {
       const betas = getCacheDiagnosticsBetas(headers).catch(() => undefined)
       const ttlSent = summarizeCacheTtl(payload)
       const requestedModel =
         typeof payload.model === 'string' ? payload.model : undefined
+      const current = () =>
+        !init.signal?.aborted &&
+        cacheDiagnosticsSessions.get(diagnosticsSession.id) ===
+          diagnosticsSession.token
       cacheDiagnosticsObservers.set(response, async (message) => {
+        if (!current()) return
         const receivedAt = Date.now()
+        const messageId = cacheDiagnosticsMessageId(message)
+        // Record the predecessor before yielding, even if debug logging is delayed or skipped.
+        if (primaryThread && messageId)
+          cacheDiagnostics.capture(diagnosticsSession.id, messageId, receivedAt)
         const sent = await betas
-        if (
-          !sent?.betas.includes(CACHE_DIAGNOSTICS_BETA) ||
-          init.signal?.aborted ||
-          cacheDiagnosticsSessions.get(diagnosticsSession.id) !==
-            diagnosticsSession.token
-        )
-          return
-        const { record, messageId, canary } = buildCacheDiagnosticsRecord({
+        if (!sent || !current()) return
+        const { record, canary } = buildCacheDiagnosticsRecord({
           request: {
             sessionId: diagnosticsSession.id,
             previousMessageId,
@@ -1833,7 +1844,7 @@ async function sendAnthropicRequestAttempt(
           message,
           receivedAt,
         })
-        if (!record || !messageId) return
+        if (!record) return
         logger.debug('cache-diagnostics', formatCacheDiagnosticsLogLine(record))
         const betaLine = cacheDiagnosticBetas.capture(
           sent.betasHash,
@@ -1849,8 +1860,6 @@ async function sendAnthropicRequestAttempt(
               previous_message_id: canary.previousMessageId,
             },
           )
-        if (primaryThread)
-          cacheDiagnostics.capture(diagnosticsSession.id, messageId, receivedAt)
       })
     }
   }

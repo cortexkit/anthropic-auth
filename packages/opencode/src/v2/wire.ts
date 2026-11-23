@@ -2,6 +2,7 @@ import {
   buildCacheDiagnosticsRecord,
   CacheDiagnosticsBetaTracker,
   CacheDiagnosticsTracker,
+  cacheDiagnosticsMessageId,
   formatCacheDiagnosticsLogLine,
   logger,
   type NativeAccountSnapshot,
@@ -212,48 +213,67 @@ export function createNativeWirePolicy(
         if (!sent || attemptSessions.get(input.attemptId) !== input.sessionID)
           return
         const receivedAt = Date.now()
-        const { record, messageId, canary } = buildCacheDiagnosticsRecord({
-          request: {
-            ...sent,
-            sessionId: input.sessionID,
-            isSubagent: options.isSubagent?.(input.sessionID) ?? false,
-          },
-          source: laneStart ? 'start' : 'turn',
-          accountId: input.accountId,
-          synthetic: laneStart,
-          betasHash: sent.betasHash,
-          requestedModel: sent.requestedModel,
-          message,
-          receivedAt,
-        })
-        if (!record || !messageId) {
-          logger.debug(
-            'cache-diagnostics',
-            'skipped invalid response envelope',
-            {
-              status: input.status,
-            },
-          )
-          return
-        }
-        logger.debug('cache-diagnostics', formatCacheDiagnosticsLogLine(record))
-        const betaLine = cacheDiagnosticBetas.capture(
-          sent.betasHash,
-          sent.betas,
-        )
-        if (betaLine) logger.debug('cache-diagnostics', betaLine)
-        if (canary)
-          logger.warn(
-            'cache-diagnostics',
-            'short-gap previous_message_not_found',
-            {
-              message_id: canary.messageId,
-              previous_message_id: canary.previousMessageId,
-            },
-          )
-        if (input.kind === 'primary') {
+        const messageId = cacheDiagnosticsMessageId(message)
+        // The next request needs the ID even when the reply has no detailed usage.
+        if (
+          messageId &&
+          input.kind === 'primary' &&
+          input.status >= 200 &&
+          input.status < 300
+        ) {
           cacheDiagnostics.capture(input.sessionID, messageId, receivedAt)
         }
+        const request = {
+          previousMessageId: sent.previousMessageId,
+          previousMessageReceivedAt: sent.previousMessageReceivedAt,
+          ttlSent: sent.ttlSent,
+          sessionId: input.sessionID,
+          isSubagent: options.isSubagent?.(input.sessionID) ?? false,
+        }
+        // Only the optional log needs the hash; the host can consume the reply now.
+        void sent.betaInfo
+          .then((betaInfo) => {
+            if (!betaInfo) return
+            const { record, canary } = buildCacheDiagnosticsRecord({
+              request,
+              source: laneStart ? 'start' : 'turn',
+              accountId: input.accountId,
+              synthetic: laneStart,
+              betasHash: betaInfo.betasHash,
+              requestedModel: sent.requestedModel,
+              message,
+              receivedAt,
+            })
+            if (!record) {
+              logger.debug(
+                'cache-diagnostics',
+                'skipped invalid response envelope',
+                {
+                  status: input.status,
+                },
+              )
+              return
+            }
+            logger.debug(
+              'cache-diagnostics',
+              formatCacheDiagnosticsLogLine(record),
+            )
+            const betaLine = cacheDiagnosticBetas.capture(
+              betaInfo.betasHash,
+              betaInfo.betas,
+            )
+            if (betaLine) logger.debug('cache-diagnostics', betaLine)
+            if (canary)
+              logger.warn(
+                'cache-diagnostics',
+                'short-gap previous_message_not_found',
+                {
+                  message_id: canary.messageId,
+                  previous_message_id: canary.previousMessageId,
+                },
+              )
+          })
+          .catch(() => {})
       }
       return {
         serverSideFallbackModel: model,

@@ -14,7 +14,6 @@ import {
   applyCustomHeaders,
   assertHostAuthorityStable,
   assertNotCustodyTombstone,
-  CACHE_DIAGNOSTICS_BETA,
   type CacheDiagnosticsRequestContext,
   type CacheKeepRealTurn,
   type ClaudeCodeIdentity,
@@ -36,6 +35,7 @@ import {
   getRequestGzipLatch,
   getRequestGzipLatchPath,
   guardAnthropicStreamResponse,
+  hasCacheDiagnosticsBeta,
   type IncompleteStreamDiagnostics,
   isDumpEnabled as isDumpEnabledCore,
   isNativeTransientAccountError,
@@ -326,10 +326,12 @@ export interface NativeAnthropicResponseContext<P>
 type CacheDiagnosticsSend = Omit<
   CacheDiagnosticsRequestContext,
   'sessionId' | 'isSubagent'
-> &
-  Awaited<ReturnType<typeof getCacheDiagnosticsBetas>> & {
-    requestedModel?: string
-  }
+> & {
+  betaInfo: Promise<
+    Awaited<ReturnType<typeof getCacheDiagnosticsBetas>> | undefined
+  >
+  requestedModel?: string
+}
 
 /** An `error` event inside a streamed response. */
 export interface NativeAnthropicStreamErrorContext<P>
@@ -857,10 +859,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     Data,
     NonNullable<StrippedStreamOptions['toolNameMap']>
   >()
-  const cacheDiagnosticsSends = new WeakMap<
-    Data,
-    Promise<CacheDiagnosticsSend | undefined>
-  >()
+  const cacheDiagnosticsSends = new WeakMap<Data, CacheDiagnosticsSend>()
   // Each sent request privately holds its own credentials, so errors about
   // it can be scrubbed after rewriteSend has dropped the pending credential:
   // a response scope for the one response the request gets, and a redactor
@@ -1838,30 +1837,22 @@ export function createNativeAnthropicAdapter<Q, P>(
       if (diagnosticsOptIn) {
         cacheDiagnosticsSends.delete(data)
         const payload = parseJson(bodyText)
+        // For a relay, these are the upstream headers inside the envelope,
+        // not the headers on the outer Request to the relay itself.
         if (
+          hasCacheDiagnosticsBeta(headers) &&
           isRecord(payload) &&
           isRecord(payload.diagnostics) &&
           payload.diagnostics.previous_message_id ===
             diagnosticsOptIn.previousMessageId
         ) {
-          const sent = {
+          cacheDiagnosticsSends.set(data, {
             ...diagnosticsOptIn,
             requestedModel:
               typeof payload.model === 'string' ? payload.model : undefined,
             ttlSent: summarizeCacheTtl(payload),
-          }
-          // For a relay, these are the upstream headers inside the envelope,
-          // not the headers on the outer Request to the relay itself.
-          cacheDiagnosticsSends.set(
-            data,
-            getCacheDiagnosticsBetas(headers)
-              .then((betas) =>
-                betas.betas.includes(CACHE_DIAGNOSTICS_BETA)
-                  ? { ...sent, ...betas }
-                  : undefined,
-              )
-              .catch(() => undefined),
-          )
+            betaInfo: getCacheDiagnosticsBetas(headers).catch(() => undefined),
+          })
         }
       }
       try {
@@ -2108,7 +2099,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       const context = {
         ...contextOf(attempt, data),
         status: response.status,
-        ...(diagnostics ? { cacheDiagnostics: await diagnostics } : {}),
+        ...(diagnostics ? { cacheDiagnostics: diagnostics } : {}),
       }
       const options = source.responseOptions?.(context) ?? {}
       const json = data

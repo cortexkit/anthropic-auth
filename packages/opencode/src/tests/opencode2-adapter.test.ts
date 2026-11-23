@@ -93,6 +93,7 @@ type Data = NativeAnthropicAttemptData<Provenance>
 const ENV_KEYS = [
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_CUSTOM_HEADERS',
+  'ANTHROPIC_INSECURE',
   'ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
@@ -524,6 +525,92 @@ const diagnosticsMessage = (id: string) => ({
     },
   },
   diagnostics: null,
+})
+
+test('OpenCode 2 delivers the reply and captures its ID even while the diagnostics hash is pending', async () => {
+  const { native, host } = cacheDiagnosticsHost()
+  const hash = core.getCacheDiagnosticsBetas
+  const pending = Promise.withResolvers<void>()
+  const hashSpy = spyOn(core, 'getCacheDiagnosticsBetas').mockImplementation(
+    async (headers) => {
+      await pending.promise
+      return hash(headers)
+    },
+  )
+  const debug = spyOn(core.logger, 'debug').mockImplementation(() => {})
+  const send = () =>
+    host.run(scopeOf(), hostRequest({ ...sonnetPayload(), stream: false }))
+  let reading: Promise<unknown> | undefined
+  try {
+    const { attempt, final } = await send()
+    expect(hashSpy).toHaveBeenCalledTimes(1)
+    let delivered: unknown
+    reading = Promise.resolve(
+      native.adapter.rewriteResponse?.({
+        ...attempt,
+        attempt,
+        request: final,
+        response: Response.json(diagnosticsMessage('msg_pending_hash')),
+      }),
+    )
+      .then((response) => response?.json())
+      .then((message) => (delivered = message))
+    await until(() => delivered !== undefined)
+    expect(delivered).toHaveProperty('id', 'msg_pending_hash')
+    expect((await bodyOf((await send()).final)).diagnostics).toEqual({
+      previous_message_id: 'msg_pending_hash',
+    })
+    const logged = () =>
+      debug.mock.calls.some(
+        ([channel, line]) =>
+          channel === 'cache-diagnostics' &&
+          line.startsWith('MC-CACHE-DIAG ') &&
+          line.includes('"message_id":"msg_pending_hash"'),
+      )
+    expect(logged()).toBe(false)
+    pending.resolve()
+    await until(logged)
+  } finally {
+    pending.resolve()
+    await reading
+    hashSpy.mockRestore()
+    debug.mockRestore()
+    native.dispose()
+  }
+})
+
+test('OpenCode 2 links the next request to a reply without detailed cache usage', async () => {
+  const { native, host } = cacheDiagnosticsHost()
+  const send = () =>
+    host.run(scopeOf(), hostRequest({ ...sonnetPayload(), stream: true }))
+  const debug = spyOn(core.logger, 'debug').mockImplementation(() => {})
+  try {
+    const { attempt, final } = await send()
+    const message = diagnosticsMessage('msg_without_breakdown')
+    const { cache_creation: _omitted, ...usage } = message.usage
+    await (
+      await native.adapter.rewriteResponse?.({
+        ...attempt,
+        attempt,
+        request: final,
+        response: new Response(
+          sse('message_start', {
+            type: 'message_start',
+            message: { ...message, usage },
+          }) + sse('message_stop', { type: 'message_stop' }),
+        ),
+      })
+    )?.text()
+    expect((await bodyOf((await send()).final)).diagnostics).toEqual({
+      previous_message_id: 'msg_without_breakdown',
+    })
+    expect(
+      debug.mock.calls.some(([, line]) => line.startsWith('MC-CACHE-DIAG ')),
+    ).toBe(false)
+  } finally {
+    debug.mockRestore()
+    native.dispose()
+  }
 })
 
 test('OpenCode 2 sends null first, then the previous Claude response ID in cache diagnostics', async () => {
@@ -3554,12 +3641,15 @@ describe.each(['direct', 'http'] as const)(
     ])(
       '%s recovery sends at most one full create with the same request id',
       async (code) => {
+        process.env.ANTHROPIC_INSECURE = '1'
         const { source } = makeSource({ authorize })
         const resent: Request[] = []
+        const tls: (Bun.TLSOptions | undefined)[] = []
         const native = createNativeAnthropicAdapter({
           source,
           fetch: Object.assign(
             async (url: string | URL | Request, init?: RequestInit) => {
+              tls.push((init as RequestInit & { tls?: Bun.TLSOptions })?.tls)
               resent.push(
                 url instanceof Request
                   ? new Request(url, init)
@@ -3641,6 +3731,12 @@ describe.each(['direct', 'http'] as const)(
         await response?.text()
         expect(resent).toHaveLength(code === 'unrelated' ? 0 : 1)
         if (resent[0]) {
+          if (transport === 'direct') {
+            expect(resent[0].headers.get('authorization')).toBe(
+              'Bearer stable-thread-token',
+            )
+            expect(tls[0]?.rejectUnauthorized ?? true).toBe(true)
+          }
           const text = await resent[0].text()
           const secondText = await second.final.clone().text()
           expect(

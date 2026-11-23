@@ -102,6 +102,15 @@ export async function getCacheDiagnosticsBetas(headers: Headers) {
   }
 }
 
+export function hasCacheDiagnosticsBeta(headers: Headers): boolean {
+  return (
+    headers
+      .get('anthropic-beta')
+      ?.split(',')
+      .some((beta) => beta.trim() === CACHE_DIAGNOSTICS_BETA) ?? false
+  )
+}
+
 export function applyCacheDiagnosticsOptIn(
   body: Record<string, unknown>,
   previousMessageId: string | null,
@@ -111,6 +120,13 @@ export function applyCacheDiagnosticsOptIn(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value)
+}
+
+export function cacheDiagnosticsMessageId(
+  message: unknown,
+): string | undefined {
+  const id = isRecord(message) ? message.id : undefined
+  return typeof id === 'string' && id.length > 0 ? id : undefined
 }
 
 function isBreakpoint(value: unknown): value is Record<string, unknown> {
@@ -217,10 +233,10 @@ export function buildCacheDiagnosticsRecord(input: {
   if (!Number.isFinite(input.receivedAt) || receivedAt !== input.receivedAt)
     return {}
   if (!isRecord(input.message)) return {}
-  const messageId = input.message.id
+  const messageId = cacheDiagnosticsMessageId(input.message)
   const model = input.message.model
   const usage = input.message.usage
-  if (typeof messageId !== 'string' || messageId.length === 0) return {}
+  if (!messageId) return {}
   if (typeof model !== 'string' || model.length === 0 || !isRecord(usage))
     return {}
   const inputTokens = numericUsage(usage, 'input_tokens')
