@@ -13,6 +13,7 @@ import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import {
   CacheKeepManager,
+  logger,
   MessageThreadTracker,
   signRequestBody,
 } from '@cortexkit/anthropic-auth-core'
@@ -24,7 +25,7 @@ import {
   type SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
-import { buildAnthropicRequest } from '../convert.ts'
+import { type AnthropicRequestBody, buildAnthropicRequest } from '../convert.ts'
 import cortexKitPiAnthropicAuth from '../index'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import { getPiAccountStoragePath } from '../paths.ts'
@@ -575,7 +576,11 @@ describe('cortexKitPiAnthropicAuth turn_start effort history', () => {
     const branch = [
       { id: 't0', type: 'thinking_level_change', thinkingLevel: 'minimal' },
       { id: 'u1', type: 'message', message: { role: 'user' } },
-      { id: 'a1', type: 'message', message: { role: 'assistant' } },
+      {
+        id: 'a1',
+        type: 'message',
+        message: { role: 'assistant', timestamp: 0 },
+      },
       { id: 't1', type: 'thinking_level_change', thinkingLevel: 'xhigh' },
       { id: 'u2', type: 'message', message: { role: 'user' } },
     ]
@@ -675,7 +680,10 @@ describe('cortexKitPiAnthropicAuth turn_start effort history', () => {
   })
 })
 
-async function auditPiPrimaryHarness(suffix: string) {
+async function auditPiPrimaryHarness(
+  suffix: string,
+  { modelId = fableModel.id, getBranch = (): unknown[] => [] } = {},
+) {
   const runtime = await getPiNativeRuntime(getPiAccountStoragePath()).service()
   await runtime.updateSettings((settings) => ({
     ...settings,
@@ -687,6 +695,8 @@ async function auditPiPrimaryHarness(suffix: string) {
   await cortexKitPiAnthropicAuth(pi)
   const provider = providers.get('anthropic')
   if (!provider?.streamSimple) throw new Error('Missing registered Pi provider')
+  const model = provider.models?.find((candidate) => candidate.id === modelId)
+  if (!model) throw new Error(`Missing Pi model ${modelId}`)
   const sessionId = `audit-pi-${suffix}`
   const context: Context = {
     systemPrompt: 'test',
@@ -712,7 +722,7 @@ async function auditPiPrimaryHarness(suffix: string) {
     hasUI: false,
     sessionManager: {
       getSessionId: () => sessionId,
-      getBranch: () => [],
+      getBranch,
       getEntries: () => [],
     },
   }
@@ -748,7 +758,7 @@ async function auditPiPrimaryHarness(suffix: string) {
         type: 'message_start',
         message: {
           id: `msg_gate_${sent.length}`,
-          model: fableModel.id,
+          model: model.id,
           content: [],
           usage: { input_tokens: 1, output_tokens: 0 },
         },
@@ -823,7 +833,7 @@ async function auditPiPrimaryHarness(suffix: string) {
   ) => {
     const call = raw ? provider.stream : provider.streamSimple
     if (!call) throw new Error('Missing Pi stream entry point')
-    const stream = call(fableModel, history, overrides) as {
+    const stream = call(model, history, overrides) as {
       result(): Promise<AssistantMessage>
     }
     const result = await stream.result()
@@ -847,6 +857,275 @@ async function auditPiPrimaryHarness(suffix: string) {
     },
   }
 }
+
+type EffortBranchEntry = {
+  id: string
+  type: string
+  message?: Context['messages'][number]
+  thinkingLevel?: string
+  firstKeptEntryId?: string
+}
+
+async function piEffortHarness(suffix: string) {
+  const branch: EffortBranchEntry[] = []
+  const reply = (text: string, timestamp: number): AssistantMessage => ({
+    role: 'assistant',
+    content: [{ type: 'text', text }],
+    api: 'cortexkit-anthropic-messages',
+    provider: 'anthropic',
+    model: 'claude-opus-5-5',
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: 'stop',
+    timestamp,
+  })
+  const user = (
+    content: string,
+    timestamp: number,
+  ): Context['messages'][number] => ({ role: 'user', content, timestamp })
+  const append = (message: Context['messages'][number]) =>
+    branch.push({ id: String(branch.length), type: 'message', message })
+  const changeLevel = (thinkingLevel: string) =>
+    branch.push({
+      id: String(branch.length),
+      type: 'thinking_level_change',
+      thinkingLevel,
+    })
+  const h = await auditPiPrimaryHarness(suffix, {
+    modelId: 'claude-opus-5-5',
+    getBranch: () => branch,
+  })
+  const send = async (
+    messages: Context['messages'],
+    reasoning: 'high' | 'xhigh' = 'xhigh',
+    onPayload?: SimpleStreamOptions['onPayload'],
+  ) => {
+    // The full request (not a thread delta) exposes the marker's absolute index.
+    const answer = await h.send(
+      { ...h.context, messages },
+      { sessionId: h.options.sessionId, reasoning, onPayload },
+    )
+    const body = h.sent.at(-1)?.body
+    if (!body) throw new Error('Pi did not send a request')
+    return { body, answer }
+  }
+  changeLevel('high')
+  return { ...h, branch, append, changeLevel, send, reply, user }
+}
+
+const xhighMarker = {
+  role: 'system',
+  content: [],
+  output_config: { effort: 'xhigh' },
+}
+
+test('Pi Opus 5.5 pins a mid-turn effort change at the same boundary after turn_start', async () => {
+  const h = await piEffortHarness('effort-tool-loop')
+  const first = h.user('Please read a file', 1)
+  h.append(first)
+  await h.start()
+  h.setReply('call_1')
+  const opening = await h.send([first], 'high')
+  expect(opening.body.output_config).toEqual({ effort: 'high' })
+  expect(opening.answer.stopReason).toBe('toolUse')
+  h.append(opening.answer)
+  const result: Context['messages'][number] = {
+    role: 'toolResult',
+    toolCallId: 'call_1',
+    toolName: 'read',
+    content: [{ type: 'text', text: 'file contents' }],
+    isError: false,
+    timestamp: 2,
+  }
+  h.append(result)
+  h.changeLevel('xhigh')
+  h.setReply('answer')
+  const history = [first, opening.answer, result]
+  const midTurn = await h.send(history)
+  h.append(midTurn.answer)
+  await h.settle()
+  const next = h.user('next user turn', 3)
+  h.append(next)
+  await h.start()
+  const afterTurnStart = await h.send([...history, midTurn.answer, next])
+
+  expect(midTurn.body.output_config).toEqual({ effort: 'high' })
+  expect(afterTurnStart.body.output_config).toEqual(midTurn.body.output_config)
+  for (const body of [midTurn.body, afterTurnStart.body]) {
+    expect(body.messages[2]).toEqual(xhighMarker)
+    expect(
+      body.messages.filter((m: { role: string }) => m.role === 'system'),
+    ).toEqual([xhighMarker])
+  }
+})
+
+test('Pi Opus 5.5 puts the effort marker after the surviving reply in a summarized context', async () => {
+  const h = await piEffortHarness('effort-summary')
+  const retained = h.reply('last high answer', 4)
+  for (const message of [
+    h.user('earlier user message', 1),
+    h.reply('summarized away', 2),
+    h.user('user message summarized into message zero', 3),
+    retained,
+  ]) {
+    h.append(message)
+  }
+  h.changeLevel('xhigh')
+  const changedTurn = h.user('first xhigh question', 5)
+  h.append(changedTurn)
+  const xhighAnswer = h.reply('answer at xhigh', 6)
+  h.append(xhighAnswer)
+  const next = h.user('newest question', 7)
+  h.append(next)
+  await h.start()
+  const { body } = await h.send([
+    h.user('summary of the older messages', 3),
+    { ...retained },
+    changedTurn,
+    xhighAnswer,
+    next,
+  ])
+
+  expect(body.output_config).toEqual({ effort: 'high' })
+  expect(body.messages[1]).toMatchObject({
+    role: 'assistant',
+    content: [{ text: 'last high answer' }],
+  })
+  expect(body.messages[2]).toEqual(xhighMarker)
+  expect(body.messages[3]).toEqual({
+    role: 'user',
+    content: 'first xhigh question',
+  })
+})
+
+test('Pi Opus 5.5 can rebase top-level effort after compaction', async () => {
+  const h = await piEffortHarness('effort-compaction')
+  const first = h.user('first question', 1)
+  const firstAnswer = h.reply('answer at high', 2)
+  h.append(first)
+  h.append(firstAnswer)
+  h.changeLevel('xhigh')
+  const second = h.user('second question', 3)
+  h.append(second)
+  await h.start()
+  const before = await h.send([first, firstAnswer, second])
+  expect(before.body.output_config).toEqual({ effort: 'high' })
+  expect(before.body.messages[2]).toEqual(xhighMarker)
+
+  h.append(before.answer)
+  h.branch.push({
+    id: 'compaction',
+    type: 'compaction',
+    firstKeptEntryId: h.branch.find((entry) => entry.message === second)?.id,
+  })
+  const third = h.user('question after compaction', 4)
+  h.append(third)
+  await h.start()
+  const compacted = await h.send([
+    h.user('compaction summary', 3),
+    second,
+    before.answer,
+    third,
+  ])
+  expect(compacted.body.output_config).toEqual({ effort: 'xhigh' })
+  expect(compacted.body.messages[0]).toMatchObject({ role: 'user' })
+  expect(
+    compacted.body.messages.some((m: { role: string }) => m.role === 'system'),
+  ).toBe(false)
+})
+
+test('Pi sends the marker when onPayload removes an older assistant', async () => {
+  const h = await piEffortHarness('effort-on-payload')
+  const beforeChange = [
+    h.user('first question', 1),
+    h.reply('older answer', 2),
+    h.user('second question', 3),
+    h.reply('last high answer', 4),
+  ]
+  for (const message of beforeChange) h.append(message)
+  h.changeLevel('xhigh')
+  const newest = h.user('newest question', 5)
+  h.append(newest)
+  await h.start()
+  const { body } = await h.send(
+    [...beforeChange, newest],
+    'xhigh',
+    (payload) => {
+      const body = payload as AnthropicRequestBody
+      return {
+        ...body,
+        messages: body.messages.filter((_, index) => index !== 1),
+      }
+    },
+  )
+  expect(h.sent).toHaveLength(1)
+  expect(body.output_config).toEqual({ effort: 'high' })
+  expect(body.messages.map((m: { role: string }) => m.role)).toEqual([
+    'user',
+    'user',
+    'assistant',
+    'system',
+    'user',
+  ])
+  expect(body.messages[3]).toEqual(xhighMarker)
+})
+
+test.each(['unknown', 'reordered'] as const)(
+  'Pi Opus 5.5 pins effort and marks the newest user message when an assistant is %s',
+  async (kind) => {
+    const h = await piEffortHarness(`effort-fallback-${kind}`)
+    const first = h.user('first question', 1)
+    const firstAnswer = h.reply('first answer', 2)
+    const second = h.user('second question', 3)
+    const secondAnswer = h.reply('second answer', 4)
+    for (const message of [first, firstAnswer, second, secondAnswer])
+      h.append(message)
+    h.changeLevel('xhigh')
+    const queued = h.user('an earlier queued user message', 5)
+    const newest = h.user('newest user message', 6)
+    h.append(queued)
+    h.append(newest)
+    const history = [
+      first,
+      kind === 'unknown' ? { ...firstAnswer, timestamp: 9 } : secondAnswer,
+      second,
+      kind === 'unknown' ? secondAnswer : firstAnswer,
+      queued,
+      newest,
+    ]
+    const debug = spyOn(logger, 'debug')
+    try {
+      for (let request = 0; request < 2; request++) {
+        await h.start()
+        const { body } = await h.send(history)
+        expect(body.output_config).toEqual({ effort: 'high' })
+        expect(body.messages.at(-3)).toEqual({
+          role: 'user',
+          content: 'an earlier queued user message',
+        })
+        expect(body.messages.at(-2)).toEqual(xhighMarker)
+        expect(body.messages.at(-1)).toMatchObject({ role: 'user' })
+      }
+      expect(
+        debug.mock.calls.filter(([channel]) => channel === 'pi-effort'),
+      ).toEqual([
+        [
+          'pi-effort',
+          'Could not align Pi effort history',
+          { sessionId: h.options.sessionId },
+        ],
+      ])
+    } finally {
+      debug.mockRestore()
+    }
+  },
+)
 
 test('audit primary gates: stock Pi three-step tool loop reuses the whole-turn lease', async () => {
   const h = await auditPiPrimaryHarness('tool-loop')

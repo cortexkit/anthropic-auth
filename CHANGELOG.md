@@ -2,6 +2,10 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+- Pi: changing thinking effort during a conversation now preserves the prompt cache on models that support per-message effort, including in conversations shortened by Magic Context.
+
 ## 2.16.5
 
 - OpenCode 2: the serving account's model-scoped weekly windows and credits now refresh from Insula (vault) or the regular poll (local) while response headers keep arriving, so the sidebar no longer shows a growing 'checked … ago' for it.
