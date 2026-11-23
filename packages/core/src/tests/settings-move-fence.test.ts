@@ -40,6 +40,11 @@ const liveness: HolderLiveness = {
     pid === self.pid ? self.incarnation : 'peer-start',
   now: () => NOW,
   uptime: () => 3_600,
+  // The fake pids (200 and others) may be real processes on the test machine.
+  // Without this, the reused-pid check asks the OS when such a pid started, and
+  // a real process started after the fixture's timestamps would make a live
+  // fake writer look like a reused pid.
+  processStartedAtMs: async () => null,
 }
 
 function holder(overrides: Partial<HolderEntry> = {}): HolderEntry {
