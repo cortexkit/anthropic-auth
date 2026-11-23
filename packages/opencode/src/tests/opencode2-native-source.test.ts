@@ -5846,6 +5846,52 @@ describe('OC2 confirmed exhaustion is never sent again', () => {
     expect((stopped as Error).message).not.toMatch(/Retrying|Retry in /)
   })
 
+  test('OC2 sends the next turn after a newer poll clears an unknown reset', async () => {
+    const { fixture, host } = await localSticky()
+    const credential = await fixture.runtime.authorizeLocal('main')
+    if (credential.status !== 'usable')
+      throw new Error('Missing local credential')
+    const available = (checkedAt: number, fiveHourCheckedAt = checkedAt) => {
+      const window = { usedPercent: 10, remainingPercent: 90 }
+      return fixture.runtime.publishLocal(credential.subject, {
+        quota: {
+          accountIdentity: identity,
+          source: 'poll',
+          checkedAt,
+          five_hour: { ...window, checkedAt: fiveHourCheckedAt },
+          seven_day: { ...window, checkedAt },
+        },
+      })
+    }
+    const now = Date.now()
+    await atTime(now, async () => {
+      await available(now)
+      const first = await host.send()
+      expect(first.headers.get('authorization')).toBe(localBearer)
+      await host.response(first, 429, scope, {
+        'anthropic-ratelimit-unified-5h-status': 'rejected',
+      })
+      host.idle()
+      await new Promise((resolve) => setImmediate(resolve))
+      await expect(host.send()).rejects.toThrow('Reset time is unknown.')
+    })
+    await atTime(now + 1000, async () => {
+      await available(now + 1000, now)
+      expect((await fixture.runtime.read()).accounts[0]?.quota).toMatchObject({
+        five_hour: { checkedAt: now, remainingPercent: 90 },
+        seven_day: { checkedAt: now + 1000, remainingPercent: 90 },
+      })
+      await expect(host.send()).rejects.toThrow('Reset time is unknown.')
+    })
+    await atTime(now + 2000, async () => {
+      await available(now + 2000)
+      expect((await fixture.runtime.read()).accounts[0]?.quota).toMatchObject({
+        five_hour: { checkedAt: now + 2000, remainingPercent: 90 },
+      })
+      expect((await host.send()).headers.get('authorization')).toBe(localBearer)
+    })
+  })
+
   test.each([
     ['remaining retries cannot reach the reset', 9, 38 * 60_000, true],
     ['the host retry schedule is exhausted', 11, 60_000, true],
