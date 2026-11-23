@@ -3,7 +3,6 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { getScopedQuotaWindowForModel } from '../accounts.ts'
 import {
-  CLAUDE_CODE_DEFAULT_BETAS,
   CLAUDE_MODEL_CAPABILITIES,
   getClaudeModelCapabilities,
   resolveClaudeModelCapabilities,
@@ -23,7 +22,11 @@ const snapshot = JSON.parse(
 ) as { models: Record<string, unknown> }
 
 describe('model capability table', () => {
-  test('Mythos 5.2 has its own catalogue with conservative Mythos request defaults', () => {
+  test('Mythos 5.2 has its own catalogue, conservative Mythos request defaults and per-message effort', () => {
+    // Mythos 5.2 accepts per-message effort, so it uses the same per-turn
+    // control beta list as Fable 5.2.
+    const perTurnControlBetas =
+      resolveClaudeModelCapabilities('claude-fable-5-2')?.claudeCodeBetas
     for (const id of ['claude-mythos-5-2', 'claude-mythos-5-2-20261109[1m]']) {
       expect(resolveClaudeModelCapabilities(id)).toMatchObject({
         id: 'claude-mythos-5-2',
@@ -36,10 +39,10 @@ describe('model capability table', () => {
           variants: ['low', 'medium', 'high', 'xhigh', 'max'],
           default: 'high',
         },
-        effortMarkers: 'none',
+        effortMarkers: 'always',
         turnEndNote: false,
         thinkingBindingControls: true,
-        claudeCodeBetas: CLAUDE_CODE_DEFAULT_BETAS,
+        claudeCodeBetas: perTurnControlBetas,
         serverSideFallback: false,
         scopedQuota: 'mythos',
         fastMode: false,

@@ -521,31 +521,57 @@
       },
       "effortMarkers": {
         "single": {
-          "plan": null,
+          "plan": {
+            "baseline": "low",
+            "markerCount": 0
+          },
           "result": {
             "found": 0,
             "inserted": 0
           },
-          "output_config": null,
+          "output_config": {
+            "effort": "low"
+          },
           "messages": ["user"]
         },
         "single_default": {
-          "plan": null,
+          "plan": {
+            "baseline": "high",
+            "markerCount": 0
+          },
           "result": {
             "found": 0,
             "inserted": 0
           },
-          "output_config": null,
+          "output_config": {
+            "effort": "high"
+          },
           "messages": ["user"]
         },
         "change": {
-          "plan": null,
-          "result": {
-            "found": 0,
-            "inserted": 0
+          "plan": {
+            "baseline": "low",
+            "markerCount": 1
           },
-          "output_config": null,
-          "messages": ["user", "assistant", "user"]
+          "result": {
+            "found": 1,
+            "inserted": 1
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages": [
+            "user",
+            "assistant",
+            {
+              "role": "system",
+              "clear_at": null,
+              "output_config": {
+                "effort": "max"
+              }
+            },
+            "user"
+          ]
         }
       }
     },
@@ -1049,31 +1075,57 @@
       },
       "effortMarkers": {
         "single": {
-          "plan": null,
+          "plan": {
+            "baseline": "low",
+            "markerCount": 0
+          },
           "result": {
             "found": 0,
             "inserted": 0
           },
-          "output_config": null,
+          "output_config": {
+            "effort": "low"
+          },
           "messages": ["user"]
         },
         "single_default": {
-          "plan": null,
+          "plan": {
+            "baseline": "high",
+            "markerCount": 0
+          },
           "result": {
             "found": 0,
             "inserted": 0
           },
-          "output_config": null,
+          "output_config": {
+            "effort": "high"
+          },
           "messages": ["user"]
         },
         "change": {
-          "plan": null,
-          "result": {
-            "found": 0,
-            "inserted": 0
+          "plan": {
+            "baseline": "low",
+            "markerCount": 1
           },
-          "output_config": null,
-          "messages": ["user", "assistant", "user"]
+          "result": {
+            "found": 1,
+            "inserted": 1
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages": [
+            "user",
+            "assistant",
+            {
+              "role": "system",
+              "clear_at": null,
+              "output_config": {
+                "effort": "max"
+              }
+            },
+            "user"
+          ]
         }
       }
     },
@@ -1171,31 +1223,57 @@
       },
       "effortMarkers": {
         "single": {
-          "plan": null,
+          "plan": {
+            "baseline": "low",
+            "markerCount": 0
+          },
           "result": {
             "found": 0,
             "inserted": 0
           },
-          "output_config": null,
+          "output_config": {
+            "effort": "low"
+          },
           "messages": ["user"]
         },
         "single_default": {
-          "plan": null,
+          "plan": {
+            "baseline": "high",
+            "markerCount": 0
+          },
           "result": {
             "found": 0,
             "inserted": 0
           },
-          "output_config": null,
+          "output_config": {
+            "effort": "high"
+          },
           "messages": ["user"]
         },
         "change": {
-          "plan": null,
-          "result": {
-            "found": 0,
-            "inserted": 0
+          "plan": {
+            "baseline": "low",
+            "markerCount": 1
           },
-          "output_config": null,
-          "messages": ["user", "assistant", "user"]
+          "result": {
+            "found": 1,
+            "inserted": 1
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages": [
+            "user",
+            "assistant",
+            {
+              "role": "system",
+              "clear_at": null,
+              "output_config": {
+                "effort": "max"
+              }
+            },
+            "user"
+          ]
         }
       }
     },
@@ -1282,7 +1360,10 @@
       },
       "effortMarkers": {
         "single": {
-          "plan": null,
+          "plan": {
+            "baseline": "low",
+            "markerCount": 0
+          },
           "result": {
             "found": 0,
             "inserted": 0
@@ -1291,7 +1372,10 @@
           "messages": ["user"]
         },
         "single_default": {
-          "plan": null,
+          "plan": {
+            "baseline": "high",
+            "markerCount": 0
+          },
           "result": {
             "found": 0,
             "inserted": 0
@@ -1300,13 +1384,29 @@
           "messages": ["user"]
         },
         "change": {
-          "plan": null,
-          "result": {
-            "found": 0,
-            "inserted": 0
+          "plan": {
+            "baseline": "low",
+            "markerCount": 1
           },
-          "output_config": null,
-          "messages": ["user", "assistant", "user"]
+          "result": {
+            "found": 1,
+            "inserted": 1
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages": [
+            "user",
+            "assistant",
+            {
+              "role": "system",
+              "clear_at": null,
+              "output_config": {
+                "effort": "max"
+              }
+            },
+            "user"
+          ]
         }
       }
     },
@@ -1961,7 +2061,10 @@
       },
       "effortMarkers": {
         "single": {
-          "plan": null,
+          "plan": {
+            "baseline": "low",
+            "markerCount": 0
+          },
           "result": {
             "found": 0,
             "inserted": 0
@@ -1970,7 +2073,10 @@
           "messages": ["user"]
         },
         "single_default": {
-          "plan": null,
+          "plan": {
+            "baseline": "medium",
+            "markerCount": 0
+          },
           "result": {
             "found": 0,
             "inserted": 0
@@ -1979,13 +2085,29 @@
           "messages": ["user"]
         },
         "change": {
-          "plan": null,
-          "result": {
-            "found": 0,
-            "inserted": 0
+          "plan": {
+            "baseline": "low",
+            "markerCount": 1
           },
-          "output_config": null,
-          "messages": ["user", "assistant", "user"]
+          "result": {
+            "found": 1,
+            "inserted": 1
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages": [
+            "user",
+            "assistant",
+            {
+              "role": "system",
+              "clear_at": null,
+              "output_config": {
+                "effort": "max"
+              }
+            },
+            "user"
+          ]
         }
       }
     },
@@ -2590,7 +2712,10 @@
       },
       "effortMarkers": {
         "single": {
-          "plan": null,
+          "plan": {
+            "baseline": "low",
+            "markerCount": 0
+          },
           "result": {
             "found": 0,
             "inserted": 0
@@ -2599,7 +2724,10 @@
           "messages": ["user"]
         },
         "single_default": {
-          "plan": null,
+          "plan": {
+            "baseline": "high",
+            "markerCount": 0
+          },
           "result": {
             "found": 0,
             "inserted": 0
@@ -2608,13 +2736,29 @@
           "messages": ["user"]
         },
         "change": {
-          "plan": null,
-          "result": {
-            "found": 0,
-            "inserted": 0
+          "plan": {
+            "baseline": "low",
+            "markerCount": 1
           },
-          "output_config": null,
-          "messages": ["user", "assistant", "user"]
+          "result": {
+            "found": 1,
+            "inserted": 1
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages": [
+            "user",
+            "assistant",
+            {
+              "role": "system",
+              "clear_at": null,
+              "output_config": {
+                "effort": "max"
+              }
+            },
+            "user"
+          ]
         }
       }
     },
@@ -3158,7 +3302,10 @@
       },
       "effortMarkers": {
         "single": {
-          "plan": null,
+          "plan": {
+            "baseline": "low",
+            "markerCount": 0
+          },
           "result": {
             "found": 0,
             "inserted": 0
@@ -3167,7 +3314,10 @@
           "messages": ["user"]
         },
         "single_default": {
-          "plan": null,
+          "plan": {
+            "baseline": "medium",
+            "markerCount": 0
+          },
           "result": {
             "found": 0,
             "inserted": 0
@@ -3176,13 +3326,29 @@
           "messages": ["user"]
         },
         "change": {
-          "plan": null,
-          "result": {
-            "found": 0,
-            "inserted": 0
+          "plan": {
+            "baseline": "low",
+            "markerCount": 1
           },
-          "output_config": null,
-          "messages": ["user", "assistant", "user"]
+          "result": {
+            "found": 1,
+            "inserted": 1
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages": [
+            "user",
+            "assistant",
+            {
+              "role": "system",
+              "clear_at": null,
+              "output_config": {
+                "effort": "max"
+              }
+            },
+            "user"
+          ]
         }
       }
     },

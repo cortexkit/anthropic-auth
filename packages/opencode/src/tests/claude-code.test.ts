@@ -173,8 +173,20 @@ describe('Claude Code fingerprint helpers', () => {
     expect(base[base.indexOf('prompt-caching-scope-2026-01-05') + 1]).toBe(
       'per-turn-control-2026-07-01',
     )
+    // Opus 5, Mythos 5.1 and Mythos 5.2 take per-message effort too. Opus 5
+    // and Mythos 5.1 follow Anthropic's per-message effort page, which lists
+    // them, although Claude Code doesn't send the beta for them.
+    for (const model of [
+      'claude-opus-5',
+      'claude-mythos-5-1',
+      'claude-mythos-5-2',
+    ])
+      expect(selectClaudeCodeBetas({ model, messages: [] })).toContain(
+        'per-turn-control-2026-07-01',
+      )
+    // A model without per-message effort keeps its list unchanged.
     expect(
-      selectClaudeCodeBetas({ model: 'claude-opus-5', messages: [] }),
+      selectClaudeCodeBetas({ model: 'claude-sonnet-5', messages: [] }),
     ).not.toContain('per-turn-control-2026-07-01')
   })
 

@@ -9,15 +9,15 @@ import {
 import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback'
 import { rewriteRequestBody } from '../transform'
 
-// Captured before adding Fable 5.2. Preserve older request bodies and betas;
-// Mythos 5.1 deliberately gains effort variants and thinking binding controls.
+// Captured before adding Fable 5.2. Keep the recorded request bodies and apply
+// only the explicit capability and header changes below to the expected data.
 const snapshotPath = join(
   import.meta.dir,
   'fixtures',
   'pre-fable-5-2-models.json',
 )
 
-test('existing model capabilities, request bodies and betas stay byte-identical', async () => {
+test('existing model request bodies stay byte-identical with only the expected capability and beta updates', async () => {
   const rendered: Record<string, unknown> = {}
   for (const row of CLAUDE_MODEL_CAPABILITIES) {
     if (row.id === 'claude-fable-5-2' || row.id === 'claude-mythos-5-2')
@@ -60,6 +60,29 @@ test('existing model capabilities, request bodies and betas stay byte-identical'
     default: 'high',
   }
   recorded['claude-mythos-5-1'].capabilities.thinkingBindingControls = true
+  const addPerTurnControl = (betas: string) =>
+    betas.replace(
+      'prompt-caching-scope-2026-01-05',
+      'prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01',
+    )
+  for (const [id, effortMarkers] of [
+    ['claude-opus-5', 'with-adaptive-thinking'],
+    ['claude-mythos-5-1', 'always'],
+  ] as const) {
+    const model = recorded[id]
+    model.capabilities.effortMarkers = effortMarkers
+    for (const kind of ['main', 'title', 'quota']) {
+      const betas = model.capabilities.claudeCodeBetas
+      betas[kind] = addPerTurnControl(betas[kind].join(',')).split(',')
+    }
+    for (const thinking of ['absent', 'adaptive', 'disabled']) {
+      const request = model.requests[thinking]
+      request.betas = addPerTurnControl(request.betas)
+      request.auxiliaryBetas = addPerTurnControl(request.auxiliaryBetas)
+    }
+  }
+  recorded['claude-haiku-5-5'].capabilities.effortMarkers =
+    'with-adaptive-thinking'
   const serialized = `${JSON.stringify(rendered, null, 2)}\n`
   expect(serialized).toBe(`${JSON.stringify(recorded, null, 2)}\n`)
 })

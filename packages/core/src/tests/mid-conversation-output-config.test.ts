@@ -98,8 +98,8 @@ describe('Fable 5.1 mid-conversation output configuration', () => {
   test('does not add Fable 5.1 controls to other models', () => {
     for (const model of [
       'claude-fable-5',
-      'claude-mythos-5-1',
-      'claude-opus-5',
+      'claude-mythos-5',
+      'claude-opus-4-8',
     ]) {
       const request = body(model)
       const before = structuredClone(request)
@@ -148,11 +148,14 @@ describe('Fable 5.1 mid-conversation output configuration', () => {
 })
 
 const PER_TURN_CONTROL_MODELS = [
+  'claude-opus-5',
   'claude-opus-5-5',
   'claude-opus-5-5[1m]',
   'claude-opus-5-5-20260918',
   'claude-sonnet-5-5',
   'claude-sonnet-5-5[1m]',
+  'claude-haiku-5-5',
+  'claude-haiku-5-5-20261007[1m]',
 ] as const
 
 function adaptiveBody(model: string) {
@@ -219,10 +222,13 @@ describe('per-message effort beyond Fable 5.1', () => {
     })
   }
 
-  test('requires adaptive thinking on Opus 5.5 and Sonnet 5.5', () => {
+  test('uses no markers on models that require adaptive thinking when it is off', () => {
     for (const [model, thinking] of [
       ['claude-sonnet-5-5', { type: 'between_tools' }],
       ['claude-opus-5-5', undefined],
+      ['claude-opus-5', { type: 'disabled' }],
+      ['claude-haiku-5-5', { type: 'disabled' }],
+      ['claude-haiku-5-5', undefined],
     ] as const) {
       const request = body(model)
       if (thinking) request.thinking = { ...thinking }
@@ -252,16 +258,38 @@ describe('per-message effort beyond Fable 5.1', () => {
     )
   })
 
-  test('leaves Opus 5, Haiku 5.5 and Mythos 5.1 requests unchanged, headers included', () => {
-    for (const model of [
-      'claude-opus-5',
-      'claude-haiku-5-5',
-      'claude-mythos-5-1',
-    ]) {
+  test.each(['claude-mythos-5-1', 'claude-mythos-5-2'])(
+    '%s pins the baseline and inserts changes without inspecting thinking',
+    (model) => {
+      const request = body(model)
+      expect(
+        applyMidConversationOutputConfig(request, [
+          { afterAssistantMessages: 0, effort: 'low' },
+        ]),
+      ).toEqual({ applied: true, inserted: 0 })
+      expect(request.output_config).toMatchObject({ effort: 'low' })
+      expect(
+        applyMidConversationOutputConfig(request, [
+          { afterAssistantMessages: 0, effort: 'low' },
+          { afterAssistantMessages: 1, effort: 'high' },
+        ]),
+      ).toEqual({ applied: true, inserted: 1 })
+      expect(request.output_config).toMatchObject({ effort: 'low' })
+      expect(request.messages).toEqual([
+        { role: 'user', content: 'first' },
+        { role: 'assistant', content: 'one' },
+        { role: 'system', content: [], output_config: { effort: 'high' } },
+        { role: 'user', content: 'second' },
+        { role: 'assistant', content: 'two' },
+        { role: 'user', content: 'third' },
+      ])
+    },
+  )
+
+  test('leaves Fable 5 and Mythos 5 requests unchanged, headers included', () => {
+    for (const model of ['claude-fable-5', 'claude-mythos-5']) {
       const request = adaptiveBody(model)
       const before = JSON.stringify(request)
-      // Apart from the per-turn control beta, the selected list does not
-      // depend on the model id, so Opus 4.8 gives the list these keep.
       const betasBefore = selectClaudeCodeBetas({
         ...structuredClone(request),
         model: 'claude-opus-4-8',
@@ -274,22 +302,7 @@ describe('per-message effort beyond Fable 5.1', () => {
         ]),
       ).toEqual({ applied: false, inserted: 0 })
       expect(JSON.stringify(request)).toBe(before)
-      const betas = selectClaudeCodeBetas(request)
-      // Claude Code 2.1.302 sends per-turn control on Haiku 5.5 requests (and
-      // moves claude-code-20250219 next to it); that is the only header
-      // difference, and the body above stays unchanged.
-      expect(
-        betas
-          .split(',')
-          .filter((beta) => beta !== PER_TURN_CONTROL_BETA)
-          .sort(),
-      ).toEqual(betasBefore.split(',').sort())
-      expect(betas.split(',').includes(PER_TURN_CONTROL_BETA)).toBe(
-        model === 'claude-haiku-5-5',
-      )
-      expect(betas.split(',')).not.toContain(
-        'mid-conversation-output-config-2026-07-01',
-      )
+      expect(selectClaudeCodeBetas(request)).toBe(betasBefore)
     }
   })
 
@@ -297,9 +310,6 @@ describe('per-message effort beyond Fable 5.1', () => {
     for (const model of [
       'claude-fable-5-1',
       'claude-mythos-5-1',
-      'claude-opus-5',
-      'claude-opus-5-20260601',
-      'claude-haiku-5-5',
       'claude-fable-5',
       'claude-mythos-5',
       'claude-sonnet-5',

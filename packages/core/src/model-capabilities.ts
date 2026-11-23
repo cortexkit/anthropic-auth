@@ -14,7 +14,7 @@ import type { AdaptiveEffort } from './mid-conversation-output-config.ts'
  * each field.
  */
 
-/** Per-turn control beta Claude Code sends on the models whose rows list it. */
+/** OAuth beta for per-message effort markers. */
 export const PER_TURN_CONTROL_BETA = 'per-turn-control-2026-07-01'
 
 /** Beta that allows turn-scoped system messages (`clear_at`). */
@@ -326,12 +326,13 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     thinkingModes: ['adaptive'],
     rejectsForcedToolChoice: true,
     efforts: { variants: ALL_ADAPTIVE_EFFORTS, default: 'high' },
-    effortMarkers: 'none',
+    // By user choice, follow Anthropic's documented per-message effort support, not Claude Code.
+    effortMarkers: 'always',
     turnEndNote: false,
     // The preserved-thinking docs list Mythos 5.1 as prefix-checked on all accounts.
     // https://platform.claude.com/docs/en/build-with-claude/preserved-thinking#enforcement
     thinkingBindingControls: true,
-    claudeCodeBetas: CLAUDE_CODE_DEFAULT_BETAS,
+    claudeCodeBetas: claudeCodeBetaLists({ perTurnControl: true }),
     serverSideFallback: false,
     scopedQuota: 'mythos',
     fastMode: false,
@@ -368,12 +369,13 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     // The overview's Capabilities table lists default effort as high:
     // https://platform.claude.com/docs/en/models/mythos-5-2/overview
     efforts: { variants: ALL_ADAPTIVE_EFFORTS, default: 'high' },
-    // Request-shape flags follow Mythos 5.1: no evidence shows Mythos 5.2
-    // accepts Fable 5.2's extra controls or betas.
-    effortMarkers: 'none',
+    // Per-message effort follows Claude Code's catalog, which marks Mythos 5.2
+    // `per_turn_effort`. The other request-shape flags follow Mythos 5.1: no
+    // evidence shows Mythos 5.2 accepts Fable 5.2's extra controls.
+    effortMarkers: 'always',
     turnEndNote: false,
     thinkingBindingControls: true,
-    claudeCodeBetas: CLAUDE_CODE_DEFAULT_BETAS,
+    claudeCodeBetas: claudeCodeBetaLists({ perTurnControl: true }),
     serverSideFallback: false,
     scopedQuota: 'mythos',
     fastMode: false,
@@ -387,10 +389,11 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     thinkingModes: ['adaptive', 'disabled'],
     rejectsForcedToolChoice: false,
     efforts: { variants: ALL_ADAPTIVE_EFFORTS, default: 'high' },
-    effortMarkers: 'none',
+    // By user choice, follow Anthropic's documented per-message effort support, not Claude Code.
+    effortMarkers: 'with-adaptive-thinking',
     turnEndNote: false,
     thinkingBindingControls: false,
-    claudeCodeBetas: CLAUDE_CODE_DEFAULT_BETAS,
+    claudeCodeBetas: claudeCodeBetaLists({ perTurnControl: true }),
     serverSideFallback: true,
     refusalRecoveryFamily: 'opus-5',
     fastMode: true,
@@ -498,7 +501,8 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     thinkingModes: ['adaptive', 'disabled'],
     rejectsForcedToolChoice: false,
     efforts: { variants: ALL_ADAPTIVE_EFFORTS, default: 'medium' },
-    effortMarkers: 'none',
+    // Unlike adaptive thinking, disabled thinking rejects a per-message effort change.
+    effortMarkers: 'with-adaptive-thinking',
     turnEndNote: true,
     thinkingBindingControls: true,
     claudeCodeBetas: claudeCodeBetaLists({

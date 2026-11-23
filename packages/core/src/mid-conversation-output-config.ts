@@ -5,9 +5,7 @@ import {
 } from './model-capabilities.ts'
 
 /**
- * Per-turn control beta that Claude Code sends on the models whose
- * capability rows list it. It enables effort changes carried by empty
- * `role: "system"` messages on the eligible models below.
+ * The beta for sending effort changes in empty `role: "system"` messages.
  */
 export { PER_TURN_CONTROL_BETA }
 
@@ -40,10 +38,8 @@ export function normalizeAdaptiveEffort(
 }
 
 /**
- * Models that require adaptive thinking for per-message effort (capability
- * `effortMarkers: "with-adaptive-thinking"`: Opus 5.5 and Sonnet 5.5),
- * including dated and `[1m]` context-window ids. Header eligibility is
- * separate; `sendsPerTurnControlBeta` follows Claude Code.
+ * Whether the model requires adaptive thinking for per-message effort.
+ * The per-turn control beta header can be sent even when thinking is off.
  */
 export function usesPerTurnControl(model: unknown): boolean {
   return (
@@ -53,10 +49,8 @@ export function usesPerTurnControl(model: unknown): boolean {
 }
 
 /**
- * Models whose OAuth requests carry `PER_TURN_CONTROL_BETA`: those whose
- * Claude Code main beta list includes it (Opus 5.5, Sonnet 5.5, Fable 5.1/5.2 and
- * Haiku 5.5 in Claude Code 2.1.302). Sending the beta does not by itself make
- * a model eligible for effort markers; `supportsPerMessageEffort` decides that.
+ * Whether the model's Claude Code main beta list includes `PER_TURN_CONTROL_BETA`.
+ * Sending the beta does not by itself make a request eligible for effort markers.
  */
 export function sendsPerTurnControlBeta(model: unknown): boolean {
   return (
@@ -69,11 +63,9 @@ export function sendsPerTurnControlBeta(model: unknown): boolean {
 /**
  * Whether a request may move effort changes into empty system messages.
  *
- * Models with `effortMarkers: "always"` (Fable 5.1/5.2) are always eligible,
- * whatever the thinking field says. Models with `"with-adaptive-thinking"`
- * (Opus 5.5, Sonnet 5.5) qualify only with adaptive thinking: Anthropic
- * rejects a differing per-message effort with HTTP 400 on Sonnet 5.5
- * `between_tools`, and asks callers to use adaptive thinking to vary effort.
+ * Check thinking only when the model requires adaptive thinking for markers.
+ * Anthropic rejects a differing per-message effort on Sonnet 5.5 without
+ * up-front thinking (`between_tools`) and on Haiku 5.5 with disabled thinking.
  */
 export function supportsPerMessageEffort(
   body: Record<string, unknown>,
@@ -135,9 +127,7 @@ export function applyMidConversationOutputConfig(
   }
 
   const compacted = compactTransitions(transitions)
-  // Models with `effortMarkers: "always"` (Fable 5.1/5.2) always pin top-level
-  // effort. The other models leave a request without an effort change exactly
-  // as the host built it.
+  // Only `always` rows pin top-level effort on requests without an effort change.
   const pinsEveryRequest = pinsEffortOnEveryRequest(body.model)
   if (!pinsEveryRequest && compacted.length < 2) {
     return { applied: false, inserted: 0 }

@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Changing effort mid-conversation now preserves the prompt cache in OpenCode v1, OpenCode v2, and Pi for Claude Mythos 5.1 and 5.2, and for Claude Opus 5 and Haiku 5.5 when adaptive thinking is on.
 - Pi: changing thinking effort during a conversation now preserves the prompt cache on models that support per-message effort, including in conversations shortened by Magic Context.
 
 ## 2.16.5

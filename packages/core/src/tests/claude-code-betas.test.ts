@@ -43,6 +43,13 @@ for (const [model, expected] of [
   })
 }
 
+test.each(['claude-mythos-5-2', 'claude-mythos-5-1', 'claude-opus-5'])(
+  '%s main betas add only per-turn control',
+  (model) => {
+    expect(selectClaudeCodeBetas({ model })).toBe(MAIN)
+  },
+)
+
 test('Haiku 5.5 auxiliary structured title betas match the capture', () => {
   const body = {
     model: 'claude-haiku-5-5',

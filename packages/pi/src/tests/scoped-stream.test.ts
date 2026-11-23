@@ -575,6 +575,10 @@ for (const modelId of [
   'claude-fable-5-2',
   'claude-opus-5-5',
   'claude-sonnet-5-5',
+  'claude-haiku-5-5',
+  'claude-mythos-5-2',
+  'claude-opus-5',
+  'claude-mythos-5-1',
 ]) {
   test(`Pi fork answers its question at a lower effort hint: ${modelId}`, async () => {
     const [plain, lowered] = await runForkEffortHints({
@@ -603,7 +607,7 @@ for (const modelId of ['claude-fable-5-1', 'claude-opus-5-5']) {
   })
 }
 
-for (const modelId of ['claude-opus-5', 'claude-haiku-5-5']) {
+for (const modelId of ['claude-fable-5', 'claude-mythos-5']) {
   test(`Pi fork ignores the effort hint on a model without per-message effort: ${modelId}`, async () => {
     const [plain, hinted] = await runForkEffortHints({
       modelId,

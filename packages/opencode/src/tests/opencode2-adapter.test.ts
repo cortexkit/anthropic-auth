@@ -1175,6 +1175,76 @@ describe('OpenCode 2 native Anthropic adapter: request shape', () => {
     expect(body.tools[0]?.name).toBe('mcp_Bash')
   })
 
+  test.each([
+    ['claude-haiku-5-5', 'adaptive', 'low'],
+    ['claude-mythos-5-2', 'adaptive', 'low'],
+    ['claude-haiku-5-5', 'disabled', 'high'],
+    ['claude-opus-5', 'adaptive', 'low'],
+    ['claude-opus-5', 'disabled', 'high'],
+    ['claude-mythos-5-1', 'adaptive', 'low'],
+  ] as const)(
+    '%s with %s thinking keeps top-level effort at %s on OC2',
+    async (model, thinking, expectedEffort) => {
+      const user = (id: string, variant: string, text: string) => ({
+        info: {
+          id,
+          sessionID: 'ses_effort',
+          role: 'user',
+          model: { providerID: 'anthropic', modelID: model, variant },
+        },
+        parts: [{ type: 'text', text }],
+      })
+      const messages = [
+        user('u1', 'low', 'first'),
+        {
+          info: { id: 'a1', sessionID: 'ses_effort', role: 'assistant' },
+          parts: [{ type: 'text', text: 'answer' }],
+        },
+        user('u2', 'high', 'second'),
+      ]
+      const plan = markOpenCodeEffortTransitions(messages)
+      const { source } = makeSource({
+        options: {
+          midConversationEffortEnabled: true,
+          ...(plan && {
+            midConversationEffortPlan: encodeOpenCodeEffortPlan(plan),
+          }),
+        },
+      })
+      const host = new Host(createNativeAnthropicAdapter({ source }).adapter)
+      const { final } = await host.run(
+        scopeOf({ modelID: model }),
+        hostRequest({
+          model,
+          max_tokens: 1024,
+          thinking: { type: thinking },
+          output_config: { effort: 'high' },
+          messages: messages.map(({ info, parts }) => ({
+            role: info.role,
+            content: parts,
+          })),
+        }),
+      )
+      const body = await bodyOf(final)
+      expect(body.thinking).toMatchObject({ type: thinking })
+      expect(body.output_config).toEqual({ effort: expectedEffort })
+      const expectedMessages = [
+        { role: 'user', content: [{ type: 'text', text: 'first' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'answer' }] },
+        ...(thinking === 'adaptive'
+          ? [{ role: 'system', content: [], output_config: { effort: 'high' } }]
+          : []),
+        { role: 'user', content: [{ type: 'text', text: 'second' }] },
+      ]
+      expect(body.messages).toEqual(expectedMessages)
+      if (thinking === 'adaptive') {
+        expect(final.headers.get('anthropic-beta')?.split(',')).toContain(
+          core.PER_TURN_CONTROL_BETA,
+        )
+      }
+    },
+  )
+
   test('API route gains no OAuth persona, prefix, betas or signature', async () => {
     const { source, seen } = makeSource({
       authorize: () =>

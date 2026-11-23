@@ -946,35 +946,37 @@
       "stickyRouteFamily": "fable",
       "nativeQuotaScope": "mythos",
       "betas": {
-        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
-        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
-        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
-        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
-        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
-        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-clear-at-2026-08-21"
+        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
+        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
+        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
+        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01",
+        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-system-clear-at-2026-08-21"
       },
       "effort": {
-        "sendsPerTurnControlBeta": false,
+        "sendsPerTurnControlBeta": true,
         "usesPerTurnControl": false,
         "defaultAdaptiveEffort": "high",
         "supportsPerMessageEffort": {
-          "adaptive": false,
-          "disabled": false,
-          "between_tools": false,
-          "absent": false
+          "adaptive": true,
+          "disabled": true,
+          "between_tools": true,
+          "absent": true
         },
         "midConversation": {
           "adaptive/none/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "high"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "adaptive/none/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
@@ -984,51 +986,85 @@
           },
           "adaptive/single/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "low"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "adaptive/single/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "adaptive/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "adaptive/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/none/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "high"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "absent/none/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
@@ -1038,39 +1074,71 @@
           },
           "absent/single/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "low"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "absent/single/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "absent/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           }
         }
       },
@@ -1799,35 +1867,37 @@
       "stickyRouteFamily": "fable",
       "nativeQuotaScope": "mythos",
       "betas": {
-        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
-        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
-        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
-        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
-        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
-        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-clear-at-2026-08-21"
+        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
+        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
+        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
+        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01",
+        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-system-clear-at-2026-08-21"
       },
       "effort": {
-        "sendsPerTurnControlBeta": false,
+        "sendsPerTurnControlBeta": true,
         "usesPerTurnControl": false,
         "defaultAdaptiveEffort": "high",
         "supportsPerMessageEffort": {
-          "adaptive": false,
-          "disabled": false,
-          "between_tools": false,
-          "absent": false
+          "adaptive": true,
+          "disabled": true,
+          "between_tools": true,
+          "absent": true
         },
         "midConversation": {
           "adaptive/none/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "high"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "adaptive/none/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
@@ -1837,51 +1907,85 @@
           },
           "adaptive/single/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "low"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "adaptive/single/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "adaptive/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "adaptive/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/none/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "high"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "absent/none/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
@@ -1891,39 +1995,71 @@
           },
           "absent/single/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "low"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "absent/single/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "absent/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           }
         }
       },
@@ -2030,35 +2166,37 @@
       "stickyRouteFamily": "fable",
       "nativeQuotaScope": "mythos",
       "betas": {
-        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
-        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
-        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
-        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
-        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
-        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-clear-at-2026-08-21"
+        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
+        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
+        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
+        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01",
+        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-system-clear-at-2026-08-21"
       },
       "effort": {
-        "sendsPerTurnControlBeta": false,
+        "sendsPerTurnControlBeta": true,
         "usesPerTurnControl": false,
         "defaultAdaptiveEffort": "high",
         "supportsPerMessageEffort": {
-          "adaptive": false,
-          "disabled": false,
-          "between_tools": false,
-          "absent": false
+          "adaptive": true,
+          "disabled": true,
+          "between_tools": true,
+          "absent": true
         },
         "midConversation": {
           "adaptive/none/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "high"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "adaptive/none/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
@@ -2068,51 +2206,85 @@
           },
           "adaptive/single/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "low"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "adaptive/single/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "adaptive/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "adaptive/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/none/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "high"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "absent/none/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
@@ -2122,39 +2294,71 @@
           },
           "absent/single/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "low"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "absent/single/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "absent/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           }
         }
       },
@@ -2261,19 +2465,19 @@
       "stickyRouteFamily": "opus",
       "nativeQuotaScope": "model:claudeopus5",
       "betas": {
-        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
-        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
-        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
-        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
-        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
-        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-clear-at-2026-08-21"
+        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
+        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
+        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
+        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01",
+        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-system-clear-at-2026-08-21"
       },
       "effort": {
-        "sendsPerTurnControlBeta": false,
-        "usesPerTurnControl": false,
+        "sendsPerTurnControlBeta": true,
+        "usesPerTurnControl": true,
         "defaultAdaptiveEffort": "high",
         "supportsPerMessageEffort": {
-          "adaptive": false,
+          "adaptive": true,
           "disabled": false,
           "between_tools": false,
           "absent": false
@@ -2317,21 +2521,51 @@
           },
           "adaptive/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "adaptive/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/none/noConfig": {
             "result": {
@@ -3266,10 +3500,10 @@
       },
       "effort": {
         "sendsPerTurnControlBeta": true,
-        "usesPerTurnControl": false,
+        "usesPerTurnControl": true,
         "defaultAdaptiveEffort": "medium",
         "supportsPerMessageEffort": {
-          "adaptive": false,
+          "adaptive": true,
           "disabled": false,
           "between_tools": false,
           "absent": false
@@ -3313,21 +3547,51 @@
           },
           "adaptive/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "adaptive/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/none/noConfig": {
             "result": {
@@ -4347,35 +4611,37 @@
       "stickyRouteFamily": "fable",
       "nativeQuotaScope": "mythos",
       "betas": {
-        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
-        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
-        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
-        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
-        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
-        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-clear-at-2026-08-21"
+        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
+        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
+        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
+        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01",
+        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-system-clear-at-2026-08-21"
       },
       "effort": {
-        "sendsPerTurnControlBeta": false,
+        "sendsPerTurnControlBeta": true,
         "usesPerTurnControl": false,
         "defaultAdaptiveEffort": "high",
         "supportsPerMessageEffort": {
-          "adaptive": false,
-          "disabled": false,
-          "between_tools": false,
-          "absent": false
+          "adaptive": true,
+          "disabled": true,
+          "between_tools": true,
+          "absent": true
         },
         "midConversation": {
           "adaptive/none/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "high"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "adaptive/none/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
@@ -4385,51 +4651,85 @@
           },
           "adaptive/single/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "low"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "adaptive/single/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "adaptive/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "adaptive/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/none/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "high"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "absent/none/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
@@ -4439,39 +4739,71 @@
           },
           "absent/single/noConfig": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
-            "output_config": null,
+            "output_config": {
+              "effort": "low"
+            },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "absent/single/xhigh": {
             "result": {
-              "applied": false,
+              "applied": true,
               "inserted": 0
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
             "messages": ["user", "assistant", "user", "assistant", "user"]
           },
           "absent/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           }
         }
       },
@@ -4578,19 +4910,19 @@
       "stickyRouteFamily": "opus",
       "nativeQuotaScope": "model:claudeopus51m",
       "betas": {
-        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
-        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
-        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
-        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
-        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
-        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-clear-at-2026-08-21"
+        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
+        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
+        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
+        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01",
+        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-system-clear-at-2026-08-21"
       },
       "effort": {
-        "sendsPerTurnControlBeta": false,
-        "usesPerTurnControl": false,
+        "sendsPerTurnControlBeta": true,
+        "usesPerTurnControl": true,
         "defaultAdaptiveEffort": "high",
         "supportsPerMessageEffort": {
-          "adaptive": false,
+          "adaptive": true,
           "disabled": false,
           "between_tools": false,
           "absent": false
@@ -4634,21 +4966,51 @@
           },
           "adaptive/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "adaptive/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/none/noConfig": {
             "result": {
@@ -4803,19 +5165,19 @@
       "stickyRouteFamily": "opus",
       "nativeQuotaScope": "model:claudeopus5fast",
       "betas": {
-        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
-        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
-        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
-        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
-        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
-        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-clear-at-2026-08-21"
+        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
+        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
+        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
+        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01",
+        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-system-clear-at-2026-08-21"
       },
       "effort": {
-        "sendsPerTurnControlBeta": false,
-        "usesPerTurnControl": false,
+        "sendsPerTurnControlBeta": true,
+        "usesPerTurnControl": true,
         "defaultAdaptiveEffort": "high",
         "supportsPerMessageEffort": {
-          "adaptive": false,
+          "adaptive": true,
           "disabled": false,
           "between_tools": false,
           "absent": false
@@ -4859,21 +5221,51 @@
           },
           "adaptive/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "adaptive/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/none/noConfig": {
             "result": {
@@ -5028,19 +5420,19 @@
       "stickyRouteFamily": "opus",
       "nativeQuotaScope": "model:claudeopus520260701",
       "betas": {
-        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
-        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
-        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
-        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
-        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
-        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-clear-at-2026-08-21"
+        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
+        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
+        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
+        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01",
+        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-system-clear-at-2026-08-21"
       },
       "effort": {
-        "sendsPerTurnControlBeta": false,
-        "usesPerTurnControl": false,
+        "sendsPerTurnControlBeta": true,
+        "usesPerTurnControl": true,
         "defaultAdaptiveEffort": "high",
         "supportsPerMessageEffort": {
-          "adaptive": false,
+          "adaptive": true,
           "disabled": false,
           "between_tools": false,
           "absent": false
@@ -5084,21 +5476,51 @@
           },
           "adaptive/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "adaptive/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/none/noConfig": {
             "result": {
@@ -6579,10 +7001,10 @@
       },
       "effort": {
         "sendsPerTurnControlBeta": true,
-        "usesPerTurnControl": false,
+        "usesPerTurnControl": true,
         "defaultAdaptiveEffort": "medium",
         "supportsPerMessageEffort": {
-          "adaptive": false,
+          "adaptive": true,
           "disabled": false,
           "between_tools": false,
           "absent": false
@@ -6626,21 +7048,51 @@
           },
           "adaptive/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "adaptive/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/none/noConfig": {
             "result": {
@@ -6822,10 +7274,10 @@
       },
       "effort": {
         "sendsPerTurnControlBeta": true,
-        "usesPerTurnControl": false,
+        "usesPerTurnControl": true,
         "defaultAdaptiveEffort": "medium",
         "supportsPerMessageEffort": {
-          "adaptive": false,
+          "adaptive": true,
           "disabled": false,
           "between_tools": false,
           "absent": false
@@ -6869,21 +7321,51 @@
           },
           "adaptive/change/noConfig": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
-            "output_config": null,
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "adaptive/change/xhigh": {
             "result": {
-              "applied": false,
-              "inserted": 0
+              "applied": true,
+              "inserted": 1
             },
             "output_config": {
-              "effort": "xhigh"
+              "effort": "low"
             },
-            "messages": ["user", "assistant", "user", "assistant", "user"]
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
           },
           "absent/none/noConfig": {
             "result": {
