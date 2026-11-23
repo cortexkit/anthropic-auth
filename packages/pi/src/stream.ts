@@ -65,7 +65,6 @@ import {
   logger,
   type MessageThreadRequest,
   MessageThreadTracker,
-  type MidConversationEffortTransition,
   mergeAnthropicBetas,
   NativeAccountRefusal,
   type NativeAccountSnapshot,
@@ -142,6 +141,7 @@ import {
   fromClaudeCodeToolName,
   piThreadCacheSlot,
 } from './convert.ts'
+import type { PiEffortTransition } from './effort-history.ts'
 import {
   type PiForkEffortHint,
   PiForkRefusal,
@@ -924,7 +924,7 @@ async function sendAnthropicRequestAttempt(
     routingRelay?: ReturnType<typeof createRoutingRelay>
     expectedAccountIdentity?: string
     route?: string
-    effortTransitions?: readonly MidConversationEffortTransition[]
+    effortTransitions?: readonly PiEffortTransition[]
     onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
     onForkEffortApplied?: (effort: PiForkEffortHint | undefined) => void
     onThreadPrepared?: (fail: () => void) => void
@@ -1817,7 +1817,7 @@ async function executeWithFallback(options: {
   streamOptions?: SimpleStreamOptions
   requestOrigin?: 'agent-loop' | 'direct'
   storagePath: string
-  effortTransitions?: readonly MidConversationEffortTransition[]
+  effortTransitions?: readonly PiEffortTransition[]
   onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
   onForkEffortApplied?: (effort: PiForkEffortHint | undefined) => void
   onThreadPrepared?: (fail: () => void) => void
@@ -2783,7 +2783,7 @@ export function streamCortexKitAnthropic(
   model: Model<Api>,
   context: Context,
   options?: SimpleStreamOptions,
-  effortTransitions?: readonly MidConversationEffortTransition[],
+  effortTransitions?: readonly PiEffortTransition[],
   wait?: PiQuotaWaitOptions,
   requestOrigin: 'agent-loop' | 'direct' = 'direct',
 ): AssistantMessageEventStream {

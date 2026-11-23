@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test'
+import type { Message } from '@earendil-works/pi-ai'
 import {
   collectPiEffortHistory,
+  collectPiRequestEffortHistory,
   deriveContextEntries,
 } from '../effort-history.ts'
 
@@ -75,6 +77,67 @@ describe('Pi Fable 5.1 effort history', () => {
       afterAssistantMessages: 0,
       effort: 'high',
     })
+  })
+
+  test('leaves an in-flight reply at its starting effort even if Pi persists it after the change', () => {
+    const branch = [
+      entry('u1', 'message', { message: { role: 'user' } }),
+      entry('t1', 'thinking_level_change', {
+        thinkingLevel: 'xhigh',
+        timestamp: new Date(20).toISOString(),
+      }),
+      entry('a1', 'message', { message: { role: 'assistant', timestamp: 10 } }),
+      entry('u2', 'message', { message: { role: 'toolResult' } }),
+    ]
+    expect(collectPiEffortHistory(branch, branch)).toEqual([
+      { afterAssistantMessages: 0, effort: 'high' },
+      { afterAssistantMessages: 1, effort: 'xhigh' },
+    ])
+  })
+
+  test('does not treat an ambiguous timestamp as a retained branch assistant', () => {
+    const first = { role: 'assistant', timestamp: 10 } as Message
+    const second = { role: 'assistant', timestamp: 10 } as Message
+    const branch = [
+      entry('u1', 'message', { message: { role: 'user' } }),
+      entry('a1', 'message', { message: first }),
+      entry('t1', 'thinking_level_change', { thinkingLevel: 'xhigh' }),
+      entry('u2', 'message', { message: { role: 'user' } }),
+      entry('a2', 'message', { message: second }),
+      entry('u3', 'message', { message: { role: 'user' } }),
+    ]
+    expect(
+      collectPiRequestEffortHistory(branch, [{ ...first }], 'high'),
+    ).toEqual([
+      { afterAssistantMessages: 0, effort: 'high' },
+      { afterAssistantMessages: 1, effort: 'xhigh', beforeNewestUser: true },
+    ])
+    expect(
+      collectPiRequestEffortHistory(branch, [first, second], 'high'),
+    ).toEqual([
+      { afterAssistantMessages: 0, effort: 'high' },
+      { afterAssistantMessages: 1, effort: 'xhigh' },
+    ])
+  })
+
+  test('uses the effort of the oldest verified retained reply when alignment fails later', () => {
+    const retained = { role: 'assistant', timestamp: 20 } as Message
+    const branch = [
+      entry('u1', 'message', { message: { role: 'user' } }),
+      entry('a1', 'message', { message: { role: 'assistant', timestamp: 10 } }),
+      entry('t1', 'thinking_level_change', { thinkingLevel: 'medium' }),
+      entry('u2', 'message', { message: { role: 'user' } }),
+      entry('a2', 'message', { message: retained }),
+      entry('t2', 'thinking_level_change', { thinkingLevel: 'xhigh' }),
+      entry('u3', 'message', { message: { role: 'user' } }),
+    ]
+    const unknown = { ...retained, timestamp: 30 }
+    expect(
+      collectPiRequestEffortHistory(branch, [retained, unknown], 'high'),
+    ).toEqual([
+      { afterAssistantMessages: 0, effort: 'medium' },
+      { afterAssistantMessages: 2, effort: 'xhigh', beforeNewestUser: true },
+    ])
   })
 })
 

@@ -133,6 +133,26 @@ test('the fork effort hint becomes one effort change at the question', () => {
   ])
 })
 
+test('an unaligned effort marker stays on the head user message in the fork', () => {
+  const body = forkBody('claude-sonnet-5-5', { type: 'adaptive' })
+  const messages = body.messages as Array<Record<string, unknown>>
+  const headTail = { role: 'user', content: 'Newest head request' }
+  messages.splice(-1, 0, headTail)
+  const transitions = [
+    { afterAssistantMessages: 0, effort: 'high' },
+    { afterAssistantMessages: 1, effort: 'xhigh', beforeNewestUser: true },
+  ] as const
+  applyPiForkEffort(body, transitions, undefined, headTail)
+  expect(body.output_config).toEqual({ effort: 'high' })
+  expect(body.messages).toEqual([
+    { role: 'user', content: 'Base question' },
+    { role: 'assistant', content: 'Head answer' },
+    { role: 'system', content: [], output_config: { effort: 'xhigh' } },
+    headTail,
+    { role: 'user', content: 'Fork question' },
+  ])
+})
+
 test('the fork effort hint leaves Sonnet 5.5 between_tools requests as the base history built them', () => {
   // Anthropic rejects a differing per-message effort on between_tools.
   const history = [

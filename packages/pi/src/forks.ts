@@ -8,6 +8,7 @@ import {
   supportsPerMessageEffort,
 } from '@cortexkit/anthropic-auth-core'
 import type { Context, SimpleStreamOptions } from '@earendil-works/pi-ai'
+import type { PiEffortTransition } from './effort-history.ts'
 
 /** Unknown Pi options survive provider dispatch; only a distinct, named fork opts in. */
 export function piForkHeadSession(
@@ -68,6 +69,40 @@ function topLevelEffort(body: Record<string, unknown>): AdaptiveEffort {
   )
 }
 
+function applyPiEffortHistory(
+  body: Record<string, unknown>,
+  transitions: readonly PiEffortTransition[],
+  forkBaseTail?: Record<string, unknown>,
+): { applied: boolean } {
+  const latest = transitions.at(-1)
+  if (!latest?.beforeNewestUser)
+    return applyMidConversationOutputConfig(body, transitions)
+  if (!supportsPerMessageEffort(body) || !Array.isArray(body.messages))
+    return { applied: false }
+
+  const baseline = transitions[0]?.effort ?? topLevelEffort(body)
+  const messages = body.messages as Record<string, unknown>[]
+  // The fork must keep the marker on the same user message as the head.
+  const index = forkBaseTail
+    ? messages.indexOf(forkBaseTail)
+    : messages.findLastIndex((message) => message.role === 'user')
+  body.output_config = {
+    ...(isRecord(body.output_config) ? body.output_config : {}),
+    effort: baseline,
+  }
+  if (
+    index > 0 &&
+    messages[index]?.role === 'user' &&
+    latest.effort !== baseline
+  )
+    body.messages = [
+      ...messages.slice(0, index),
+      { role: 'system', content: [], output_config: { effort: latest.effort } },
+      ...messages.slice(index),
+    ]
+  return { applied: true }
+}
+
 /**
  * Apply the fork base's effort history to `body`, as a head request would, and
  * lower the effort of the fork's question (its last message) to `hint` when
@@ -86,17 +121,18 @@ function topLevelEffort(body: Record<string, unknown>): AdaptiveEffort {
  */
 export function applyPiForkEffort(
   body: Record<string, unknown>,
-  transitions: readonly MidConversationEffortTransition[],
+  transitions: readonly PiEffortTransition[],
   hint?: PiForkEffortHint,
+  forkBaseTail?: Record<string, unknown>,
 ): PiForkEffortHint | undefined {
   if (!hint) {
-    applyMidConversationOutputConfig(body, transitions)
+    applyPiEffortHistory(body, transitions, forkBaseTail)
     return undefined
   }
-  // applyMidConversationOutputConfig replaces `messages` and `output_config`
+  // Effort application replaces `messages` and `output_config`
   // rather than editing them, so shallow copies keep `body` untouched.
   const base = { ...body }
-  const baseResult = applyMidConversationOutputConfig(base, transitions)
+  const baseResult = applyPiEffortHistory(base, transitions, forkBaseTail)
   const lowered = loweredQuestionEffort(
     base,
     body,
@@ -210,7 +246,7 @@ function messageDigests(context: Context): string[] {
 
 type EffortSnapshot = {
   digests: string[]
-  transitions: MidConversationEffortTransition[]
+  transitions: PiEffortTransition[]
 }
 
 /** Retain provenance, not prompts: a later head turn must not reshape an older fork base. */
@@ -220,7 +256,7 @@ export class PiForkEffortSnapshots {
   record(
     sessionId: string,
     context: Context,
-    transitions: readonly MidConversationEffortTransition[] = [],
+    transitions: readonly PiEffortTransition[] = [],
   ) {
     const snapshots = this.sessions.get(sessionId) ?? []
     snapshots.push({
@@ -239,7 +275,7 @@ export class PiForkEffortSnapshots {
     context: Context,
   ): {
     messageCount: number
-    transitions: readonly MidConversationEffortTransition[]
+    transitions: readonly PiEffortTransition[]
   } {
     const digests = messageDigests(context)
     let snapshot: EffortSnapshot | undefined

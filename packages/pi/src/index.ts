@@ -13,24 +13,27 @@ import {
   defaultAdaptiveEffort,
   getClaudeModelCatalogue,
   isVaultHosted,
-  type MidConversationEffortTransition,
+  logger,
   type NativeAccountSnapshot,
   type NativeCustodyClient,
   nativeAccountCanServe,
   readNativeEnrollmentMode,
+  resolveClaudeModelCapabilities,
   sessionCacheActivity,
 } from '@cortexkit/anthropic-auth-core'
-import type { Provider, SimpleStreamOptions } from '@earendil-works/pi-ai'
+import type {
+  Context,
+  Provider,
+  SimpleStreamOptions,
+} from '@earendil-works/pi-ai'
 import type {
   ExtensionAPI,
+  ExtensionContext,
   ProviderConfig,
 } from '@earendil-works/pi-coding-agent'
 
 import { registerCommands } from './commands.ts'
-import {
-  collectPiEffortHistory,
-  deriveContextEntries,
-} from './effort-history.ts'
+import { collectPiRequestEffortHistory } from './effort-history.ts'
 import { piForkEffortSnapshots, piForkHeadSession } from './forks.ts'
 import {
   closePiNativeRuntime,
@@ -121,14 +124,65 @@ export default async function cortexKitPiAnthropicAuth(
     ...(options.connectScoped && { connect: options.connectScoped }),
   })
   registerCommands(pi, createPiNativeCommands(storagePath))
-  const effortHistoryBySession = new Map<
+  const effortSessionManagers = new Map<
     string,
-    MidConversationEffortTransition[]
+    { manager: ExtensionContext['sessionManager']; loggedFallback?: true }
   >()
   const workingMessageBySession = new Map<string, (message?: string) => void>()
+
+  function trackEffortSession(sessionId: string, ctx: ExtensionContext) {
+    const previous = effortSessionManagers.get(sessionId)
+    effortSessionManagers.delete(sessionId)
+    effortSessionManagers.set(sessionId, {
+      ...previous,
+      manager: ctx.sessionManager,
+    })
+    const oldest = effortSessionManagers.keys().next().value
+    if (effortSessionManagers.size > 128 && oldest !== undefined)
+      effortSessionManagers.delete(oldest)
+  }
+
+  function requestEffortHistory(
+    modelId: string,
+    context: Context,
+    options?: SimpleStreamOptions,
+  ) {
+    // Forks use the history of the retained head request instead of the live
+    // session. Models without markers keep the provider's original request.
+    if (!options?.sessionId || piForkHeadSession(options)) return undefined
+    const capabilities = resolveClaudeModelCapabilities(modelId)
+    if (!capabilities || capabilities.effortMarkers === 'none') return undefined
+    const session = effortSessionManagers.get(options.sessionId)
+    try {
+      if (!session || session.manager.getSessionId() !== options.sessionId)
+        return undefined
+      // Pi can change thinking levels between requests in one turn. Read the
+      // current branch, then map it to the context the host actually dispatched.
+      const transitions = collectPiRequestEffortHistory(
+        session.manager.getBranch(),
+        context.messages,
+        defaultAdaptiveEffort(modelId),
+      )
+      if (transitions.at(-1)?.beforeNewestUser && !session.loggedFallback) {
+        session.loggedFallback = true
+        logger.debug('pi-effort', 'Could not align Pi effort history', {
+          sessionId: options.sessionId,
+        })
+      }
+      return transitions
+    } catch {
+      // Older hosts may expose a different session shape. An unreadable
+      // branch should cost the request its effort markers, not the reply.
+      return undefined
+    }
+  }
+
   pi.on('session_start', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
-    if (sessionId) void startPiCacheKeepSession(storagePath, sessionId)
+    if (sessionId) {
+      trackEffortSession(sessionId, ctx)
+      void startPiCacheKeepSession(storagePath, sessionId)
+    }
   })
   pi.on('turn_start', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
@@ -137,6 +191,7 @@ export default async function cortexKitPiAnthropicAuth(
     if (sessionId) void startPiCacheKeepSession(storagePath, sessionId)
     beginPiPrimaryTurn(storagePath, sessionId)
     if (!sessionId) return
+    trackEffortSession(sessionId, ctx)
     if (ctx.hasUI) {
       workingMessageBySession.set(sessionId, (message) => {
         if (ctx.sessionManager.getSessionId() === sessionId)
@@ -146,35 +201,6 @@ export default async function cortexKitPiAnthropicAuth(
         const oldest = workingMessageBySession.keys().next().value
         if (oldest !== undefined) workingMessageBySession.delete(oldest)
       }
-    }
-    // This hook collects effort history for the per-message effort markers
-    // that core adds to Fable 5.1/5.2, Opus 5.5 and Sonnet 5.5 requests. A host
-    // whose session entries do not match what this reads must cost the
-    // session its transitions and nothing else: the handler runs before every
-    // turn, and an exception here surfaced as a per-turn extension error while
-    // collecting no effort history at all (issue #200).
-    //
-    // The catch stays quiet: `ExtensionAPI` carries no log surface on either
-    // host, and writing to stdout from a per-turn hook corrupts the host's
-    // rendering — which is the same per-turn noise this fix removes. The
-    // degraded state is observable in the request: no effort markers.
-    let transitions: MidConversationEffortTransition[]
-    try {
-      const branch = ctx.sessionManager.getBranch()
-      transitions = collectPiEffortHistory(
-        deriveContextEntries(branch),
-        branch,
-        defaultAdaptiveEffort(ctx.model?.id),
-      )
-    } catch {
-      transitions = []
-    }
-    effortHistoryBySession.delete(sessionId)
-    effortHistoryBySession.set(sessionId, transitions)
-    while (effortHistoryBySession.size > 128) {
-      const oldest = effortHistoryBySession.keys().next().value
-      if (oldest) effortHistoryBySession.delete(oldest)
-      else break
     }
   })
   pi.on('agent_settled', async (_event, ctx) => {
@@ -188,7 +214,7 @@ export default async function cortexKitPiAnthropicAuth(
     endPiPrimaryTurn(storagePath, sessionId)
     if (sessionId) {
       clearPiStickyQuotaRetries(storagePath, sessionId)
-      effortHistoryBySession.delete(sessionId)
+      effortSessionManagers.delete(sessionId)
       piForkEffortSnapshots.forget(sessionId)
       workingMessageBySession.delete(sessionId)
       sessionCacheActivity.forget(sessionId)
@@ -347,11 +373,7 @@ export default async function cortexKitPiAnthropicAuth(
         model,
         context,
         options,
-        options?.sessionId
-          ? effortHistoryBySession.get(
-              piForkHeadSession(options) ?? options.sessionId,
-            )
-          : undefined,
+        requestEffortHistory(model.id, context, options),
         {
           ...quotaWait,
           setWorkingMessage:

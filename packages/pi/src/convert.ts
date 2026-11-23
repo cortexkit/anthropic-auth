@@ -25,7 +25,6 @@ import {
   isClaudeSonnet55Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
-  type MidConversationEffortTransition,
   orderClaudeCodeBody,
   readSessionCachePolicy,
   requestCacheLifetimeMs,
@@ -43,6 +42,7 @@ import type {
   Tool,
   ToolResultMessage,
 } from '@earendil-works/pi-ai'
+import type { PiEffortTransition } from './effort-history.ts'
 import {
   applyPiForkEffort,
   type PiForkEffortHint,
@@ -687,7 +687,7 @@ export async function buildAnthropicRequest(
   fastModeEnabled = false,
   identity?: ClaudeCodeIdentity,
   controls: {
-    effortTransitions?: readonly MidConversationEffortTransition[]
+    effortTransitions?: readonly PiEffortTransition[]
     forkBaseMessageCount?: number
     /** A fork's lower answer effort, applied to its question turn only. */
     forkEffort?: PiForkEffortHint
@@ -902,6 +902,7 @@ export async function buildAnthropicRequest(
     body,
     controls.effortTransitions ?? [],
     controls.forkEffort,
+    baseLastMessage,
   )
   body.messages = body.messages.filter(
     (message) => !droppedAssistants.has(message),
