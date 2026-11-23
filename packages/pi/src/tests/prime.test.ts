@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
-import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import {
+  __setLogTestSink,
   type AccountStorage,
+  getLogLevel,
+  LANE_START_TEXT,
   PROMPT_CACHE_DEFAULT_TTL_MS,
   PrimeManager,
   primeAccountMarkerDir,
@@ -12,19 +15,22 @@ import {
   resolveNativePoolPaths,
   StickySessionRouter,
   sessionCacheActivity,
+  setLogLevel,
   signRequestBody,
   stickyRouteFamilyForModel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
+import {
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  SessionManager,
 } from '@earendil-works/pi-coding-agent'
-import { registerCommands } from '../commands.ts'
 import cortexKitPiAnthropicAuth from '../index.ts'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import { createPiNativeCommands } from '../native-commands.ts'
 import {
+  beginPiPrimaryTurn,
+  endPiPrimaryTurn,
   getPiTrackedCacheKeepSessions,
   sendPiPrimeRequest,
   streamCortexKitAnthropic,
@@ -113,9 +119,36 @@ beforeEach(async () => {
       ).toString()
       sends.push({ headers: request.headers, text })
       if (JSON.parse(text).stream) {
-        return new Response('data: {"type":"message_stop"}\n\n', {
-          headers: { 'content-type': 'text/event-stream' },
-        })
+        return new Response(
+          [
+            {
+              type: 'message_start',
+              message: {
+                id: `msg_pi_lane_${sends.length}`,
+                model: JSON.parse(text).model,
+                diagnostics: null,
+                usage: {
+                  input_tokens: 1,
+                  cache_read_input_tokens: 0,
+                  cache_creation_input_tokens: 0,
+                  cache_creation: {
+                    ephemeral_5m_input_tokens: 0,
+                    ephemeral_1h_input_tokens: 0,
+                  },
+                },
+              },
+            },
+            { type: 'message_stop' },
+          ]
+            .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+            .join(''),
+          {
+            headers: {
+              'content-type': 'text/event-stream',
+              'request-id': `req_lane_test_${sends.length}`,
+            },
+          },
+        )
       }
       return Response.json({ usage: { input_tokens: 17, output_tokens: 1 } })
     },
@@ -237,7 +270,11 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
     ],
   })
   const modelId = 'claude-sonnet-5-5'
-  const sessionId = 'lane-start-session'
+  const transcript = SessionManager.create(
+    directory,
+    join(directory, 'transcripts'),
+  )
+  const sessionId = transcript.getSessionId()
   const router = new StickySessionRouter({ path: await native.routingPath() })
   expect(
     await router.resolve({
@@ -260,27 +297,31 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
     Parameters<ExtensionAPI['registerCommand']>[1]
   >()
   const queued: Parameters<ExtensionAPI['sendUserMessage']>[] = []
-  registerCommands(
-    {
-      registerCommand: (
-        name: string,
-        definition: Parameters<ExtensionAPI['registerCommand']>[1],
-      ) => commands.set(name, definition),
-      sendUserMessage: (
-        ...args: Parameters<ExtensionAPI['sendUserMessage']>
-      ) => {
-        queued.push(args)
-      },
-    } as unknown as ExtensionAPI,
-    createPiNativeCommands(storagePath),
-  )
+  const handlers = new Map<
+    string,
+    (event: unknown, context: unknown) => Promise<void>
+  >()
+  await cortexKitPiAnthropicAuth({
+    on: (
+      name: string,
+      handler: (event: unknown, context: unknown) => Promise<void>,
+    ) => handlers.set(name, handler),
+    registerProvider() {},
+    registerCommand: (
+      name: string,
+      definition: Parameters<ExtensionAPI['registerCommand']>[1],
+    ) => commands.set(name, definition),
+    sendUserMessage: (...args: Parameters<ExtensionAPI['sendUserMessage']>) => {
+      queued.push(args)
+    },
+  } as unknown as ExtensionAPI)
   async function invoke(model?: ExtensionCommandContext['model']) {
     const notices: string[] = []
     let picked = false
     await commands.get('claude')?.handler('', {
       model,
       hasUI: true,
-      sessionManager: { getSessionId: () => sessionId },
+      sessionManager: transcript,
       ui: {
         notify: (text: string) => notices.push(text),
         async select(title: string, choices: string[]) {
@@ -314,8 +355,15 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
     maxTokens: 64_000,
   }
   const notice = await invoke(model)
-  const marker = '[lane start] — automated cache warm; no response needed.'
-  expect(queued).toEqual([[marker, { deliverAs: 'followUp' }]])
+  const marker = LANE_START_TEXT
+  expect(queued).toEqual([
+    [
+      expect.stringMatching(
+        /^\[lane start\].*\n\[cortexkit lane start: [\da-f-]+\]$/,
+      ),
+      { deliverAs: 'followUp' },
+    ],
+  ])
   expect(sends).toHaveLength(0)
   expect(notice).toContain('Claude lane start queued in this session.')
 
@@ -327,19 +375,28 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
   const lane = {
     role: 'user',
     content: [{ type: 'text', text: queued[0]![0] as string }],
-    timestamp: now + 1,
+    timestamp: now + 2,
   } satisfies Parameters<typeof streamCortexKitAnthropic>[1]['messages'][number]
+  const typed = { role: 'user', content: marker, timestamp: now + 1 } as const
   const next = {
     role: 'user',
     content: 'Now answer my question',
-    timestamp: now + 2,
+    timestamp: now + 3,
   } as const
   async function runTurn(
     messages: Parameters<typeof streamCortexKitAnthropic>[1]['messages'],
+    newUser = messages.at(-1),
   ) {
+    if (newUser?.role === 'user') {
+      await handlers.get('message_start')?.(
+        { message: newUser },
+        { sessionManager: transcript },
+      )
+      transcript.appendMessage(newUser)
+    }
     const result = await streamCortexKitAnthropic(
       model,
-      { messages },
+      { messages: structuredClone(messages) },
       { sessionId, maxTokens: 123 },
       undefined,
       undefined,
@@ -347,43 +404,101 @@ test('Pi /claude queues lane start as a visible turn that warms the session cach
     ).result()
     expect(result.stopReason).toBe('stop')
   }
+  const records: string[] = []
+  const level = getLogLevel()
+  setLogLevel('debug')
+  __setLogTestSink(({ message }) => records.push(message))
+  beginPiPrimaryTurn(storagePath, sessionId)
   try {
-    await runTurn([first, lane])
-    expect(sends).toHaveLength(1)
-    const sent = sends[0]!
+    await runTurn([first, typed])
+    const human = JSON.parse(sends[0]!.text)
+    expect(human.max_tokens).toBe(123)
+    expect(human.thinking).toBeDefined()
+    expect(human.system[0].text).toContain('cc_prompt_index=2;')
+
+    await runTurn([first, typed, lane])
+    expect(sends).toHaveLength(2)
+    const sent = sends[1]!
     expect(sent.headers.get('authorization')).toBe(
       'Bearer sk-ant-oat01-fallback-access',
     )
     const body = JSON.parse(sent.text)
     expect(body).toMatchObject({ model: modelId, max_tokens: 1 })
-    expect(body.messages).toHaveLength(2)
+    expect(body.messages).toHaveLength(3)
     expect(body.messages[0]).toMatchObject({
       role: 'user',
       content: first.content,
     })
     expect(body.messages[1]).toMatchObject({
       role: 'user',
+      content: marker,
+    })
+    expect(body.messages[2]).toMatchObject({
+      role: 'user',
       content: [
         { type: 'text', text: marker, cache_control: { type: 'ephemeral' } },
       ],
     })
+    // Pi appends the live message after message_start and clones it for the provider.
+    const persisted = await readFile(transcript.getSessionFile()!, 'utf8')
+    expect(persisted).not.toContain('cortexkit lane start:')
+    expect(
+      JSON.parse(persisted.trimEnd().split('\n').at(-1)!).message.content,
+    ).toEqual([{ type: 'text', text: marker }])
+    expect(sent.text).not.toContain('cortexkit lane start:')
+    expect(body.system[0].text).not.toMatch(/cc_(?:prompt_id|prev_req)=/)
     expect(body.thinking).toBeUndefined()
     expect(await signRequestBody(sent.text)).toBe(sent.text)
     expect(sessionCacheActivity.ttlMs(sessionId)).toBe(
       PROMPT_CACHE_DEFAULT_TTL_MS,
     )
 
-    await runTurn([first, lane, next])
-    expect(sends).toHaveLength(2)
-    const following = JSON.parse(sends[1]!.text)
+    await runTurn([
+      first,
+      typed,
+      lane,
+      {
+        role: 'assistant',
+        content: [
+          { type: 'toolCall', id: 'tool_lane', name: 'read', arguments: {} },
+        ],
+      } as Parameters<typeof streamCortexKitAnthropic>[1]['messages'][number],
+      {
+        role: 'toolResult',
+        toolCallId: 'tool_lane',
+        toolName: 'read',
+        content: [{ type: 'text', text: 'Tool reply' }],
+        isError: false,
+        timestamp: now + 3,
+      },
+    ])
+    const toolStep = JSON.parse(sends[2]!.text)
+    expect(toolStep.max_tokens).toBe(123)
+    expect(toolStep.thinking).toBeDefined()
+    expect(toolStep.system[0].text).not.toMatch(/cc_(?:prompt_id|prev_req)=/)
+
+    await runTurn([first, typed, lane, next])
+    expect(sends).toHaveLength(4)
+    const following = JSON.parse(sends[3]!.text)
     expect(following.max_tokens).toBe(123)
     expect(following.thinking).toBeDefined()
     expect(following.messages[0]).toEqual(body.messages[0])
-    expect(following.messages[1]).toMatchObject({
+    expect(following.messages[2]).toMatchObject({
       role: 'user',
       content: marker,
     })
+    expect(following.system[0].text).toContain('cc_prev_req=req_lane_test_1;')
+    expect(following.system[0].text).toContain('cc_prompt_index=3;')
+    expect(
+      records
+        .filter((message) => message.startsWith('MC-CACHE-DIAG '))
+        .map((message) => JSON.parse(message.slice('MC-CACHE-DIAG '.length)))
+        .find((record) => record.message_id === 'msg_pi_lane_2'),
+    ).toMatchObject({ source: 'start', synthetic: true })
   } finally {
+    endPiPrimaryTurn(storagePath, sessionId, true)
+    __setLogTestSink(null)
+    setLogLevel(level)
     sessionCacheActivity.forget(sessionId)
   }
   expect((await native.view()).policyStorage.prime?.enabled).toBe(false)

@@ -88,7 +88,7 @@ export function createPiNativeCommands(
       }
       return {
         ...settings,
-        killswitch: { ...limits, enabled: true, main, accounts },
+        killswitch: { ...limits, main, accounts },
       }
     })
   }
@@ -246,13 +246,22 @@ export function createPiNativeCommands(
       }
       case 'quota-refresh': {
         const snapshot = await native.view()
-        for (const account of snapshot.accounts) {
-          if (!nativeAccountCanServe(account) || account.type !== 'oauth')
-            continue
-          await runtime.fetchQuota(account.id, fetchPiOAuth, options.signal)
-          await runtime.fetchProfile(account.id, fetchPiOAuth, options.signal)
+        const accounts = snapshot.accounts.filter(
+          (account) =>
+            account.type === 'oauth' && nativeAccountCanServe(account),
+        )
+        const results = await Promise.allSettled(
+          accounts.map((account) =>
+            runtime.fetchQuota(account.id, fetchPiOAuth, options.signal),
+          ),
+        )
+        const refreshed = results.filter(
+          (result) => result.status === 'fulfilled',
+        ).length
+        return {
+          ok: refreshed === accounts.length,
+          text: `${refreshed}/${accounts.length} native quota readings refreshed.`,
         }
-        return { ok: true, text: 'Native OAuth quota and profile refreshed.' }
       }
       case 'routing-mode':
         return written(

@@ -337,6 +337,54 @@ describe('native diagnostics persistence', () => {
     })
   })
 
+  test('quota refresh reports partial success without requesting profiles', async () => {
+    const runtime = await getPiNativeRuntime(storagePath).service()
+    const fetchQuota = spyOn(runtime, 'fetchQuota').mockImplementation(
+      async (id) => {
+        if (id === 'main') throw new Error('main quota unavailable')
+        return {}
+      },
+    )
+    const fetchProfile = spyOn(runtime, 'fetchProfile').mockRejectedValue(
+      new Error('profile unavailable'),
+    )
+    try {
+      expect(
+        await controller().execute({ action: 'quota-refresh' }),
+      ).toMatchObject({
+        status: 'executed',
+        ok: false,
+        text: '1/2 native quota readings refreshed.',
+      })
+      expect(fetchQuota.mock.calls.map(([id]) => id).sort()).toEqual([
+        'fallback',
+        'main',
+      ])
+      expect(fetchProfile).not.toHaveBeenCalled()
+    } finally {
+      fetchQuota.mockRestore()
+      fetchProfile.mockRestore()
+    }
+  })
+
+  test('editing killswitch thresholds leaves the disabled switch off', async () => {
+    const { execute } = controller()
+    expect(await execute({ action: 'killswitch-off' })).toMatchObject({
+      status: 'executed',
+      ok: true,
+    })
+    expect(
+      await execute({
+        action: 'killswitch-set',
+        values: { entries: [{ account: 'main', fh: 90, sd: 95 }] },
+      }),
+    ).toMatchObject({ status: 'executed', ok: true })
+    expect((await readNativePiFixture(storagePath)).killswitch).toMatchObject({
+      enabled: false,
+      main: { five_hour: 90, seven_day: 95 },
+    })
+  })
+
   test('Ultra quota status shows only weekly and Fable limits through Core', async () => {
     const checkedAt = Date.now()
     await saveNativePiFixture(

@@ -330,6 +330,7 @@ test('Pi API-key requests preserve the host prompt and tools without Claude Code
           storagePath,
           streamOptions: {
             sessionId: 'pi-api-thread',
+            cacheRetention: 'short',
             onPayload: (payload) => ({
               ...(payload as Record<string, unknown>),
               service_tier: 'standard_only',
@@ -341,10 +342,17 @@ test('Pi API-key requests preserve the host prompt and tools without Claude Code
       )
     ).text()
     const body = JSON.parse(String(sent?.body))
+    const cacheControl = { type: 'ephemeral' }
     expect(body.system).toEqual([
-      { type: 'text', text: 'Keep the Pi system prompt.' },
+      {
+        type: 'text',
+        text: 'Keep the Pi system prompt.',
+        cache_control: cacheControl,
+      },
     ])
-    expect(body.tools).toMatchObject([{ name: 'read' }])
+    expect(body.tools).toMatchObject([
+      { name: 'read', cache_control: cacheControl },
+    ])
     expect(body.messages).toEqual([
       { role: 'user', content: 'Hello' },
       {
@@ -361,6 +369,7 @@ test('Pi API-key requests preserve the host prompt and tools without Claude Code
             tool_use_id: 'call_read',
             content: 'Result',
             is_error: false,
+            cache_control: cacheControl,
           },
         ],
       },

@@ -49,7 +49,6 @@ import {
   type ProviderConfig,
 } from '@earendil-works/pi-coding-agent'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
-import { promptCacheSnapshot } from '../../../core/src/tests/prompt-cache-snapshot.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import {
   recordedTimers,
@@ -220,10 +219,22 @@ function forkContext(base: Context, branchLength = 0): Context {
 }
 
 function normalizedForkBody(text: string) {
-  return JSON.parse(
-    text.replace(/cch=[a-f0-9]+/g, 'cch=SIGNATURE'),
-    (key, value) => (key === 'cache_control' ? undefined : value),
-  )
+  return JSON.parse(text, (key, value) => {
+    if (key === 'cache_control') return undefined
+    if (
+      typeof value === 'string' &&
+      key === 'text' &&
+      value.startsWith('x-anthropic-billing-header:')
+    )
+      return value.replace(/ cch=[a-f0-9]+;/, ' cch=SIGNATURE;')
+    return value
+  })
+}
+
+function forkSystemSnapshot(body: ReturnType<typeof normalizedForkBody>) {
+  const { diagnostics: _diagnostics, messages: _messages, ...prefix } = body
+  prefix.system[0].text = stripBillingLineageFields(prefix.system[0].text)
+  return JSON.stringify(prefix)
 }
 
 function stateBytes(value: unknown) {
@@ -245,11 +256,18 @@ for (const mode of [
   'turn notes',
   'head TTL',
   'long branch',
+  'bridged head at the lookback limit',
 ] as const) {
   test(`Pi fork preserves the head cache prefix: ${mode}`, async () => {
     const f = await fixture()
     const head = `fork-prefix-${mode}-${f.path}`
     const fork = `${head}-fork`
+    const bridged = mode === 'bridged head at the lookback limit'
+    if (bridged)
+      await (await f.native.service()).updateSettings((settings) => ({
+        ...settings,
+        claudeCache: { enabled: false, mode: 'hybrid' },
+      }))
     const note = { after_tool_use_id: 'tool-1', text: 'Runner base note' }
     const notesReads: string[] = []
     const policyReads: string[] = []
@@ -279,7 +297,7 @@ for (const mode of [
           : null
       },
     }))
-    const base: Context =
+    let base: Context =
       mode === 'multi-turn'
         ? forkContext(context)
         : mode === 'long branch'
@@ -320,6 +338,23 @@ for (const mode of [
                 ],
               }
             : context
+    if (bridged) {
+      const [first, answer, latest] = forkContext(context).messages
+      base = {
+        ...context,
+        messages: [
+          first!,
+          {
+            ...(answer as AssistantMessage),
+            content: Array.from({ length: 20 }, (_, i) => ({
+              type: 'text' as const,
+              text: `Head answer block ${i}`,
+            })),
+          },
+          latest!,
+        ],
+      }
+    }
     const bodies: string[] = []
     const server = Bun.serve({
       hostname: '127.0.0.1',
@@ -383,7 +418,7 @@ for (const mode of [
     const before = JSON.stringify(await getPiTrackedCacheKeepSessions())
     const result = await streamCortexKitAnthropic(
       model,
-      forkContext(base, mode === 'long branch' ? 30 : 0),
+      forkContext(base, mode === 'long branch' ? 30 : bridged ? 9 : 0),
       forkOptions(head),
       mode === 'plain'
         ? history
@@ -402,6 +437,14 @@ for (const mode of [
     ).toEqual([])
     const rawHead = JSON.parse(bodies[0]!)
     const rawFork = JSON.parse(bodies.at(-1)!)
+    if (bridged) {
+      expect(
+        rawHead.system.some(
+          (block: Record<string, unknown>) => block.cache_control,
+        ),
+      ).toBe(false)
+      expect(rawHead.messages[0].content.at(-1)).toHaveProperty('cache_control')
+    }
     expect(rawHead.diagnostics).toEqual({ previous_message_id: null })
     expect(rawFork).not.toHaveProperty('diagnostics')
     expect(rawFork.system[0].text).not.toMatch(
@@ -418,10 +461,12 @@ for (const mode of [
     )
     expect(
       markerPositions.some(
-        (position) => position >= basePosition && position - basePosition <= 20,
+        (position) => position >= basePosition && position - basePosition < 20,
       ),
     ).toBe(true)
-    expect(Boolean(baseBlock.cache_control)).toBe(mode === 'long branch')
+    expect(Boolean(baseBlock.cache_control)).toBe(
+      mode === 'long branch' || bridged,
+    )
     if (mode === 'long branch')
       expect(rawFork.messages[0].content[0].cache_control).toBeUndefined()
     if (mode === 'turn notes') expect(bodies[0]).toContain(note.text)
@@ -440,9 +485,7 @@ for (const mode of [
         ),
       ].filter((holder) => holder.cache_control).length
     expect(countMarkers(rawFork)).toBeLessThanOrEqual(4)
-    delete headBody.messages
-    delete forkBody.messages
-    expect(promptCacheSnapshot(forkBody)).toBe(promptCacheSnapshot(headBody))
+    expect(forkSystemSnapshot(forkBody)).toBe(forkSystemSnapshot(headBody))
     expect(JSON.stringify(await getPiTrackedCacheKeepSessions())).toBe(before)
     expect(sessionCacheActivity.ttlMs(head)).toBe(
       mode === 'head TTL' ? 3_600_000 : 300_000,

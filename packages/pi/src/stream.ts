@@ -162,6 +162,7 @@ import {
   piForkEffortSnapshots,
   piForkHeadSession,
 } from './forks.ts'
+import { takePiLaneStart } from './lane-start.ts'
 import {
   getPiNativeRuntime,
   type PiNativeAttempt,
@@ -197,7 +198,7 @@ const primarySessions = new Map<
   string,
   {
     storagePath: string
-    turn?: { promptId?: string }
+    turn?: { promptId?: string; synthetic?: boolean }
     previousRequestId?: string
     sent: number
     committed: number
@@ -245,10 +246,15 @@ export function beginPiPrimaryTurn(
   }
 }
 
-export function observePiUserPrompt(storagePath: string, sessionId: string) {
+export function observePiUserPrompt(
+  storagePath: string,
+  sessionId: string,
+  synthetic = false,
+) {
   const session = primarySessions.get(sessionId)
   // A queued user message can start a new prompt before the agent settles.
-  if (session?.storagePath === storagePath && session.turn) session.turn = {}
+  if (session?.storagePath === storagePath && session.turn)
+    session.turn = { synthetic }
 }
 
 export function endPiPrimaryTurn(
@@ -981,6 +987,7 @@ async function sendAnthropicRequestAttempt(
     context: Context
     streamOptions?: SimpleStreamOptions
     requestOrigin?: 'agent-loop' | 'direct'
+    laneStart?: boolean
     apiAccount?: NativeAccountView
     storagePath: string
     oauthAccountId?: string
@@ -1029,7 +1036,8 @@ async function sendAnthropicRequestAttempt(
           options.requestOrigin,
         )
       : undefined
-  const turn = primary?.turn
+  const turn =
+    options.laneStart || primary?.turn?.synthetic ? undefined : primary?.turn
   if (primary && turn) {
     turn.promptId ??= randomUUID()
     primary.sent += 1
@@ -1138,6 +1146,9 @@ async function sendAnthropicRequestAttempt(
         identity,
         {
           apiKey: !!options.apiAccount,
+          apiKeyModelCompat: options.model
+            .compat as Model<'anthropic-messages'>['compat'],
+          laneStart: options.laneStart,
           deferSigning: true,
           billingLineage: lineage,
           ...(diagnosticsSession && {
@@ -1814,9 +1825,9 @@ async function sendAnthropicRequestAttempt(
             isSubagent: false,
             ttlSent,
           },
-          source: 'turn',
+          source: options.laneStart ? 'start' : 'turn',
           accountId: routeId,
-          synthetic: false,
+          synthetic: options.laneStart === true,
           betasHash: sent.betasHash,
           requestedModel,
           message,
@@ -2004,6 +2015,7 @@ async function executeWithFallback(options: {
   context: Context
   streamOptions?: SimpleStreamOptions
   requestOrigin?: 'agent-loop' | 'direct'
+  laneStart?: boolean
   storagePath: string
   effortTransitions?: readonly PiEffortTransition[]
   onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
@@ -3004,6 +3016,12 @@ export function streamCortexKitAnthropic(
     try {
       buildPiOAuthMessagesUrl(model.baseUrl)
       const storagePath = getPiAccountStoragePath()
+      const laneStart =
+        requestOrigin === 'agent-loop' &&
+        !piForkHeadSession(options) &&
+        takePiLaneStart(context.messages, options?.sessionId)
+      if (laneStart && options?.sessionId)
+        observePiUserPrompt(storagePath, options.sessionId, true)
       let toolNames: ReadonlyMap<string, string> = new Map()
       let recordCacheUsage:
         | ((usage?: Record<string, number>) => void)
@@ -3014,6 +3032,7 @@ export function streamCortexKitAnthropic(
         context,
         streamOptions: options,
         requestOrigin,
+        laneStart,
         storagePath,
         onCapacityWait: setWorkingMessage
           ? () => {

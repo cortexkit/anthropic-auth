@@ -4,6 +4,7 @@ import {
   CLAUDE_CODE_IDENTITY,
   CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
+  LANE_START_TEXT,
   MessageThreadTracker,
   type ProviderAccountUuid,
   signRequestBody,
@@ -13,6 +14,7 @@ import type { Context, Message } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest, piThreadCacheSlot } from '../convert'
 import { collectPiEffortHistory } from '../effort-history.ts'
 import { PiForkEffortSnapshots } from '../forks.ts'
+import { forgetPiLaneStarts, queuePiLaneStart } from '../lane-start.ts'
 import { normalizeContext } from '../transcript.ts'
 
 function userMsg(text: string): Message {
@@ -58,6 +60,105 @@ const PI_PROMPT = [
   'KEEP TWO: available tools.',
   'Pi documentation (read only when the user asks about pi itself):\n- MOVE THIS',
 ].join('\n\n')
+
+test('conversion strips a lane delivery nonce when the host hook did not run', async () => {
+  const sessionId = 'lane-converter-backstop'
+  const user = userMsg(queuePiLaneStart(sessionId))
+  try {
+    const { bodyText } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      { messages: [user] },
+      { sessionId },
+      defaultCache,
+    )
+    expect(user).toMatchObject({ role: 'user', content: LANE_START_TEXT })
+    expect(bodyText).not.toContain('cortexkit lane start:')
+    expect(bodyText).toContain(LANE_START_TEXT)
+  } finally {
+    forgetPiLaneStarts(sessionId)
+  }
+})
+
+test('paid Pi requests keep the native Anthropic cache markers and lifetimes', async () => {
+  const tools = ['read', 'write'].map((name) => ({
+    name,
+    description: name,
+    parameters: {},
+  }))
+  for (const retention of [
+    'default',
+    'short',
+    'long',
+    'none',
+    'env long',
+    'compat short',
+  ] as const) {
+    const compatible = retention !== 'compat short'
+    const control =
+      retention === 'none'
+        ? undefined
+        : {
+            type: 'ephemeral',
+            ...((retention === 'long' || retention === 'env long') && {
+              ttl: '1h',
+            }),
+          }
+    const { body, bodyText, cacheTtlMs } = await buildAnthropicRequest(
+      'claude-sonnet-5',
+      {
+        systemPrompt: PI_PROMPT,
+        tools,
+        messages: [userMsg('First'), assistantMsg('Reply'), userMsg('Latest')],
+      },
+      {
+        env: {
+          PI_CACHE_RETENTION: retention === 'env long' ? 'long' : 'short',
+        },
+        ...(retention === 'compat short'
+          ? { cacheRetention: 'long' }
+          : retention !== 'default' && retention !== 'env long'
+            ? { cacheRetention: retention }
+            : {}),
+      },
+      { enabled: true, mode: 'automatic' },
+      false,
+      undefined,
+      {
+        apiKey: true,
+        ...(compatible
+          ? {}
+          : {
+              apiKeyModelCompat: {
+                supportsLongCacheRetention: false,
+                supportsCacheControlOnTools: false,
+              },
+            }),
+      },
+    )
+    expect(body.system).toEqual([
+      {
+        type: 'text',
+        text: PI_PROMPT,
+        ...(control && { cache_control: control }),
+      },
+    ])
+    expect(
+      body.tools?.map(({ name, cache_control }) => [name, cache_control]),
+    ).toEqual([
+      ['read', undefined],
+      ['write', compatible ? control : undefined],
+    ])
+    expect(body.messages[0]?.content).toBe('First')
+    expect(body.messages.at(-1)?.content).toEqual(
+      control
+        ? [{ type: 'text', text: 'Latest', cache_control: control }]
+        : 'Latest',
+    )
+    expect(body.cache_control).toBeUndefined()
+    expect(bodyText).not.toContain('x-anthropic-billing-header')
+    expect(cacheTtlMs).toBe(control ? (control.ttl ? 3_600_000 : 300_000) : 0)
+  }
+})
 
 test('Pi full-after-thread trades only its system slot for the accepted full tail', async () => {
   const messages = [
@@ -1918,6 +2019,36 @@ describe('buildAnthropicRequest — cache breakpoint budget', () => {
       expect(bridgeBlock(body)).not.toHaveProperty('cache_control')
       expect(countBreakpoints(body)).toBe(4)
     }
+  })
+
+  test('Pi hybrid anchors the tail of the first user message beyond the lookback', async () => {
+    const { body } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      {
+        systemPrompt: PI_PROMPT,
+        tools: [{ name: 'read', description: 'Read', parameters: {} }],
+        messages: [
+          userMsg('Long first prompt'),
+          {
+            ...assistantMsg('response'),
+            content: Array.from({ length: 20 }, (_, index) => ({
+              type: 'text' as const,
+              text: `response block ${index}`,
+            })),
+          },
+          userMsg('second prompt'),
+        ],
+      },
+      undefined,
+      { enabled: true, mode: 'hybrid' },
+    )
+    expect(piThreadCacheSlot(body)).toEqual({
+      type: 'text',
+      text: 'Long first prompt',
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+    })
+    expect(body.system?.some((block) => block.cache_control)).toBe(false)
+    expect(countBreakpoints(body)).toBe(4)
   })
 
   test('leaves the full body for an image-bearing array user message unchanged', async () => {
