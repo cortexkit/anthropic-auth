@@ -34,6 +34,16 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Pi now links cache diagnostics across conversation replies like OpenCode 1 and 2, with cache results and beta lists in the debug log.
 - OpenCode 2 now uses the five-minute Claude prompt cache by default, like OpenCode 1 and Pi. An explicit cache setting or Agent Runner session policy still takes precedence.
 - OpenCode 1 no longer publishes the optional quota header feed; quota readings still reach the vault. The `quota_header_feed_enabled` setting is gone and can be deleted from your settings file.
+- OpenCode 1 on Thalamus honors Claude's own wait before using the main login, even when shared routing picks it, and tries another eligible login when a routing pick can't authenticate.
+- OpenCode 1 no longer switches to a paid API key on a retry where shared routing gave advice, retries an earlier login once when nothing untried can serve, and asks shared routing before sending one-shot request bodies.
+- OpenCode 1 and 2 no longer wait for saved keep-warm sessions before starting or sending the first request.
+- OpenCode 1 and 2 servers sharing an account store no longer warm the same saved session twice or overwrite its warm budget; all three hosts now use one keep-warm session claim.
+- Pi's paid API-key requests keep Pi's own prompt-cache markers.
+- Pi's hybrid cache keeps the same layout at five minutes and one hour, can reuse a long first prompt's cache after a long tool exchange, and lets forks reach the head's cache at the 20-block lookback limit.
+- Pi: only a lane start queued from `/claude` gets the one-token warm, and it no longer joins the conversation's request chain.
+- Pi: `/claude` quota refresh continues when one account fails, and editing killswitch thresholds no longer turns the killswitch on.
+- OpenCode 2 and Pi no longer wait for optional cache diagnostics before delivering replies, and keep diagnostics linked to the latest reply when detailed cache usage is missing.
+- OpenCode 2 keeps subscription prices at zero when a credential lookup fails temporarily.
 
 ## 2.16.6
 
