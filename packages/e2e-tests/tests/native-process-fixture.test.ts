@@ -158,7 +158,6 @@ describe('native process fixture preparation', () => {
           token: 'relay-token',
           transport: 'websocket',
         },
-        quotaFeed: true,
         hybridCache: true,
       })
       expect(String(run.failure)).toContain(

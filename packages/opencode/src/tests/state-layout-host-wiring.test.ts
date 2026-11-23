@@ -58,7 +58,6 @@ const ENV_KEYS = [
   'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
   'OPENCODE_TUI_PREFERENCES_FILE',
   'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
-  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
   'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
   'OPENCODE_AUTH_CONTENT',
 ] as const
@@ -214,7 +213,6 @@ async function startHost(host: 'opencode1' | 'opencode2', m: Machine) {
     m.root,
     'registry',
   )
-  process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = join(m.root, 'feed')
   process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = join(m.root, 'rpc')
   const plugin = await AnthropicAuthPlugin(
     {

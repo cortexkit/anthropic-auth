@@ -64,7 +64,6 @@ export type NativeOpencodeFixtureEnv = Readonly<{
   OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: string
   OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE: string
   OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR: string
-  OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR: string
   OPENCODE_ANTHROPIC_AUTH_RPC_DIR: string
   CLAUDE_CONFIG_DIR: string
 }>
@@ -217,7 +216,6 @@ async function migrate(
       root,
       'cachekeep-registry',
     ),
-    OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR: join(root, 'quota-header-feed'),
     OPENCODE_ANTHROPIC_AUTH_RPC_DIR: join(root, 'rpc'),
     CLAUDE_CONFIG_DIR: join(root, 'claude'),
   })

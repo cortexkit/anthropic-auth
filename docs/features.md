@@ -20,7 +20,7 @@
 
 `~` is your home folder; on Windows it is `%USERPROFILE%`, so the default OpenCode pool is `%USERPROFILE%\.config\opencode\anthropic-auth-pool.json`. See [paths on each OS](environment.md#paths-on-windows-macos-and-linux).
 
-[Setup](installation.md#recommended-setup) prepares the selected hosts and records which credential store they may use before sign-in. OpenCode 2 has its own [login and transport boundaries](opencode-2.md); OpenCode 1's host-local quota-feed publisher and deterministic client safety recovery are not OpenCode 2 features.
+[Setup](installation.md#recommended-setup) prepares the selected hosts and records which credential store they may use before sign-in. OpenCode 2 has its own [login and transport boundaries](opencode-2.md); OpenCode 1's deterministic client safety recovery is not an OpenCode 2 feature.
 
 ## What CortexKit adds over the original plugin
 
@@ -28,7 +28,7 @@ CortexKit adds account and request controls beyond OpenCode's or Pi's single bui
 
 - **Fallback accounts and quota-aware routing:** ordered OAuth accounts and API-key routes, minimum remaining-quota thresholds, and `sticky-balanced` session affinity. See [accounts](accounts-and-routing.md) and the [routing reference](configuration.md#fallback-accounts-and-session-affinity).
 - **Cache controls:** explicit, automatic or hybrid prompt-cache placement, optional keepalive, and opt-in quota-window priming. [Cache controls](cache.md) explain the schedules and billed synthetic requests.
-- **Quota visibility and limits:** per-account status, quota refresh and killswitch thresholds in OpenCode and Pi, the OpenCode quota sidebar, and OpenCode 1's optional sanitized [quota header feed](configuration.md#quota-header-feed).
+- **Quota visibility and limits:** per-account status, quota refresh and killswitch thresholds in OpenCode and Pi, plus the OpenCode quota sidebar.
 - **Model controls:** adaptive reasoning summaries, effort levels, fast mode and OpenCode 1 safety fallback. See [models](models.md) and [safety fallback](request-rewriting.md#safety-fallback-opencode-1).
 - **Optional custody and transport:** Claustrum is a local credential-vault service that can supply accounts instead of the local pool; a user-owned Cloudflare Worker can relay request bodies. See [vault custody](vault.md) and [transports](transports.md).
 - **Claude-compatible request shaping:** identity and billing headers, final-body signing, tool replay and prompt-cache placement. See [request rewriting](request-rewriting.md#request-rewriting).

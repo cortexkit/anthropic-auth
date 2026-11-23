@@ -50,8 +50,6 @@ Quota figures use the shared wording, such as `5h 40% left, resets 2h29m` and `7
 - A positive `scoped` minimum-remaining percentage blocks missing model-specific quota information. An explicitly empty scoped-window list means no separate window applies.
 - OpenCode and Pi can edit killswitch thresholds in **Limits**.
 
-The optional `quota_header_feed_enabled` setting is OpenCode-only, disabled by default and requires restart. It publishes allowlisted quota observations, opaque identity and timestamps to owner-only temporary lease files, not tokens, request bodies, model IDs or refresh errors. It shares observations already obtained from responses rather than making new quota API requests.
-
 ## Settings and custody
 
 User settings are shared across OpenCode 1, OpenCode 2 and Pi in [`anthropic-auth.jsonc`](settings-file.md), independent of local, vault or hosted custody. The default is `$HOME/.config/cortexkit/anthropic-auth.jsonc` on Linux/macOS or `%APPDATA%\cortexkit\anthropic-auth.jsonc` on Windows; an absolute `XDG_CONFIG_HOME` takes precedence on every OS, and `ANTHROPIC_AUTH_SETTINGS_FILE` can name another absolute path. See the [complete path and separate-install rules](settings-file.md#location).

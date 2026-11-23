@@ -1132,7 +1132,10 @@ for (const mode of ['local', 'claustrum'] as const)
         expect(await (await native.service()).getSettingsPath()).toBe(file)
         expect(await fs.exists(`${file}.moved`)).toBe(true)
         expect(await fs.readFile(selected.config, 'utf8')).toBe(sourceBytes)
-        const expected = JSON.stringify(releaseSnapshots[fixture])
+        const released = releaseSnapshots[fixture]
+        const { quota_header_feed_enabled: _removed, ...readers } =
+          released.readers
+        const expected = JSON.stringify({ ...released, readers })
         for (const [phase, storage] of [
           ['before', before],
           ['after', after],
@@ -1201,7 +1204,6 @@ function readerOutputs(storage: core.AccountStorage) {
     ).scoped,
     quota_fail_closed_on_unknown_quota: core.failClosedOnUnknownQuota(storage),
     quota_show_toasts: storage.quota?.showToasts === true,
-    quota_header_feed_enabled: storage.quotaHeaderFeed?.enabled === true,
     killswitch_enabled: core.isKillswitchEnabled(storage),
     killswitch_default_five_hour: main.five_hour,
     killswitch_default_seven_day: main.seven_day,
@@ -1257,7 +1259,6 @@ for (const mode of ['local', 'claustrum'] as const)
           failClosedOnUnknownQuota: false,
           showToasts: true,
         },
-        quotaHeaderFeed: { enabled: true },
         killswitch: {
           enabled: true,
           main: { five_hour: 9, seven_day: 21, scoped: 3 },

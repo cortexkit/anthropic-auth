@@ -70,10 +70,6 @@ export function settingsReaderOutputs(
       /function showQuotaToastFromCache\(\) \{\s*if \(([^\n]+)\) return/,
       s,
     ),
-    quota_header_feed_enabled: predicate(
-      /const quotaHeaderFeedRegistry =\s*(initialStorage[\s\S]*?)\s*\? new QuotaHeaderFeedRegistry/,
-      s,
-    ),
     killswitch_enabled: core.isKillswitchEnabled(s),
     killswitch_default_five_hour:
       core.getKillswitchThresholdsForAccount(s).five_hour,
@@ -147,7 +143,6 @@ export function nondefaultSettings(account: string) {
       failClosedOnUnknownQuota: false,
       showToasts: true,
     },
-    quotaHeaderFeed: { enabled: true },
     killswitch: {
       enabled: true,
       main: { five_hour: 21, seven_day: 22, scoped: 23 },

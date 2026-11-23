@@ -50,7 +50,7 @@ import {
   useTempAccountFile as useTempAccountFileWithCtx,
   withNativeAdmission as withNativeAdmissionWithCtx,
 } from './support/opencode1-pool-fixture.ts'
-import { waitForLogRecord as waitForLogRecordWithCtx } from './support/opencode1-quota-feed.ts'
+import { waitForLogRecord as waitForLogRecordWithCtx } from './support/opencode1-quota.ts'
 import {
   readAccountStorage as readAccountStorageWithCtx,
   waitForAccountStorage as waitForAccountStorageWithCtx,

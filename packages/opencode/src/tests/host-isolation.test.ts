@@ -3,7 +3,6 @@ import { readFile } from 'node:fs/promises'
 import {
   getAccountStoragePath,
   getDefaultCacheKeepRegistryDirectory,
-  getDefaultQuotaHeaderFeedDirectory,
   getDumpDirectory,
   getLogFilePath,
   resolveClaustrumConnectionPath,
@@ -20,7 +19,6 @@ const FEATURE_OVERRIDES = [
   'OPENCODE_ANTHROPIC_AUTH_FILE',
   'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
   'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
-  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
   'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
   'OPENCODE_ANTHROPIC_AUTH_DUMP_DIR',
 ] as const
@@ -42,7 +40,6 @@ test('feature-path overrides deleted by a test cannot resolve outside the preloa
       getPiAuthPath(),
       getSidebarStateFile(),
       getDefaultCacheKeepRegistryDirectory('opencode'),
-      getDefaultQuotaHeaderFeedDirectory(),
       getRpcDir('/tmp/hostile-project'),
       getDumpDirectory(),
       getLogFilePath(),

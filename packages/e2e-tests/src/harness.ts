@@ -43,7 +43,6 @@ type SdkClient = {
 
 export type E2EHarnessOptions = {
   relay?: 'websocket' | 'http'
-  quotaFeed?: boolean
   relayResponseStartDelayMs?: number
   hybridCache?: boolean
   fallbackMode?: 'server' | 'legacy'
@@ -98,7 +97,6 @@ export class E2EHarness {
       hybridCache: options.hybridCache,
       fallbackMode: options.fallbackMode,
       childTmpDir: options.childTmpDir,
-      quotaFeed: options.quotaFeed,
       childEnv: options.childEnv,
       beforeSpawn: options.beforeSpawn,
       nativeAccounts: options.nativeAccounts,

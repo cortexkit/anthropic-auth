@@ -455,28 +455,6 @@
         }
       ]
     },
-    "quota_header_feed_enabled": {
-      "anyOf": [
-        {
-          "type": "boolean"
-        },
-        {
-          "type": "object",
-          "properties": {
-            "default": {
-              "type": "boolean"
-            },
-            "opencode": {
-              "type": "boolean"
-            },
-            "pi": {
-              "type": "boolean"
-            }
-          },
-          "additionalProperties": false
-        }
-      ]
-    },
     "killswitch_enabled": {
       "anyOf": [
         {

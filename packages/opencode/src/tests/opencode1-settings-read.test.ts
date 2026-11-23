@@ -7,10 +7,12 @@ import { applyEdits, modify, parse } from 'jsonc-parser'
 import { nativeAccountSettings } from '../../../core/src/native-account-view'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
-import releaseSnapshots from './fixtures/settings-2.11.2.json'
 import { settingsReaderOutputs } from './opencode2-settings-readers'
 import { getPluginTestHandles } from './plugin-test-handles'
-import { snapshotSettings } from './settings-snapshot-fixture'
+import {
+  expectedReleaseSnapshot,
+  snapshotSettings,
+} from './settings-snapshot-fixture'
 import { observeSettings } from './settings-snapshot-observe'
 import {
   applyMenuAction,
@@ -32,10 +34,6 @@ import {
   useVaultAccountFile,
   withNativeAdmission,
 } from './support/opencode1-pool-fixture'
-import {
-  readFeedEntries,
-  waitForFeedEntries,
-} from './support/opencode1-quota-feed'
 import {
   createOpencode1Test,
   createOpencode1TestContext,
@@ -60,8 +58,6 @@ async function fixture(
   const saved = process.env.ANTHROPIC_AUTH_SETTINGS_FILE
   const level = process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL
   const liveLevel = core.getLogLevel()
-  const feed = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR
-  process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = join(pool.root, 'feed')
   if (mode !== 'separate') process.env.ANTHROPIC_AUTH_SETTINGS_FILE = target
   else delete process.env.ANTHROPIC_AUTH_SETTINGS_FILE
   delete process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL
@@ -73,9 +69,6 @@ async function fixture(
     if (level === undefined)
       delete process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL
     else process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL = level
-    if (feed === undefined)
-      delete process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR
-    else process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = feed
   })
   const protection = core.legacySettingsProtection(
     await readNativeSettings(ctx),
@@ -524,7 +517,6 @@ describe('OpenCode 1 settings service reads', () => {
       claude_cache_enabled: 'on',
       claude_cache_mode: 'automatic',
       quota_enabled: 'off',
-      quota_header_feed_enabled: true,
     })
     expect(core.isDumpEnabled()).toBe(true)
     expect(core.getLogLevel()).toBe('debug')
@@ -534,9 +526,6 @@ describe('OpenCode 1 settings service reads', () => {
     const changed = await instance.request()
     expect(changed.body.speed).toBe('fast')
     expect(changed.body.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
-    expect(
-      (await instance.runtime.read()).policyStorage.quotaHeaderFeed?.enabled,
-    ).toBe(true)
     await f.change({
       dump_enabled: false,
       log_level: 'debug',
@@ -556,24 +545,6 @@ describe('OpenCode 1 settings service reads', () => {
     core.setLogLevel('debug')
     await f.launch()
     expect(core.getLogLevel()).toBe('debug')
-  })
-
-  test('quota header feed enablement still requires a restart after a hand edit', async () => {
-    const f = await fixture()
-    const a = await f.launch()
-    await f.change({ quota_header_feed_enabled: true, quota_enabled: 'off' })
-    await a.request()
-    expect(await readFeedEntries()).toEqual([])
-    await a.plugin.dispose!()
-    ctx.livePlugins.delete(a.plugin)
-    const b = await f.launch()
-    await b.request()
-    const entries = await waitForFeedEntries(
-      ctx,
-      (entries) => entries.length > 0,
-      'enabled feed after restart',
-    )
-    expect(entries.length).toBeGreaterThan(0)
   })
 
   for (const event of ['action', 'timer'] as const) {
@@ -823,7 +794,7 @@ describe('OpenCode 1 settings service reads', () => {
               ),
             }
             expect(JSON.stringify(compatible), phase).toBe(
-              JSON.stringify(releaseSnapshots[`oc1-${sample}`]),
+              JSON.stringify(expectedReleaseSnapshot(1, sample)),
             )
             expect(observed.logs.length).toBeGreaterThan(0)
             expect(observed.track.tracked).toBe(true)

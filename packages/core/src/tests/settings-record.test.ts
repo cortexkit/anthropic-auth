@@ -122,7 +122,6 @@ const defaults = {
     failClosedOnUnknownQuota: 'default',
     showToasts: false,
   },
-  quotaHeaderFeed: { enabled: false },
   killswitch: {
     enabled: false,
     main: { five_hour: 5, seven_day: 10, scoped: 0 },
@@ -160,7 +159,6 @@ const explicit = {
     failClosedOnUnknownQuota: 'off',
     showToasts: true,
   },
-  quotaHeaderFeed: { enabled: true },
   killswitch: {
     enabled: true,
     main: { five_hour: 21, seven_day: 22, scoped: 23 },
@@ -199,7 +197,6 @@ const fileValues = {
   quota_minimum_remaining_scoped: 13,
   quota_fail_closed_on_unknown_quota: 'off',
   quota_show_toasts: true,
-  quota_header_feed_enabled: true,
   killswitch_enabled: true,
   killswitch_default_five_hour: 21,
   killswitch_default_seven_day: 22,

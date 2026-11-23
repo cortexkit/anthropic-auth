@@ -58,7 +58,6 @@ export const settingsDefinition = defineSettings({
       default: 'default',
     },
     quota_show_toasts: { ...host, value: boolean(), default: false },
-    quota_header_feed_enabled: { ...host, value: boolean(), default: false },
     killswitch_enabled: { ...host, value: boolean(), default: false },
     killswitch_default_five_hour: { ...host, value: floor, default: 5 },
     killswitch_default_seven_day: { ...host, value: floor, default: 10 },
@@ -166,8 +165,6 @@ export const SETTINGS_DEFAULT_READERS = {
   quota_fail_closed_on_unknown_quota:
     'packages/core/src/accounts.ts:failClosedOnUnknownQuota',
   quota_show_toasts: 'packages/opencode/src/index.ts:showQuotaToastFromCache',
-  quota_header_feed_enabled:
-    'packages/opencode/src/index.ts:AnthropicAuthPlugin quotaHeaderFeedRegistry',
   killswitch_enabled: 'packages/core/src/accounts.ts:isKillswitchEnabled',
   killswitch_default_five_hour:
     'packages/core/src/accounts.ts:getKillswitchThresholdsForAccount',
@@ -232,7 +229,7 @@ export const SETTINGS_THREE_WAY_READERS = {
     {
       path: 'packages/opencode/src/v2/wire.ts',
       reader: 'createNativeWirePolicy transformOptions',
-      absent: true,
+      absent: false,
     },
     {
       path: 'packages/pi/src/stream.ts',

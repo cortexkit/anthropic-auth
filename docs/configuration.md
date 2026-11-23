@@ -15,9 +15,8 @@ The flat keys below describe user choices, not a complete default configuration.
 | `fallback_on` | Retryable OAuth fallback statuses; default `[401, 403, 429]` |
 | `refresh_enabled`, `refresh_interval_minutes`, `refresh_refresh_before_expiry_minutes` | Token refresh policy |
 | `quota_enabled`, `quota_check_interval_minutes`, `quota_refresh_every_n_requests`, `quota_minimum_remaining_five_hour`, `quota_minimum_remaining_seven_day`, `quota_minimum_remaining_scoped`, `quota_fail_closed_on_unknown_quota`, `quota_show_toasts` | Quota policy, floors and notifications |
-| `quota_header_feed_enabled` | OpenCode 1 opt-in, disabled by default; restart required |
 | `killswitch_enabled`, `killswitch_default_five_hour`, `killswitch_default_seven_day`, `killswitch_default_scoped`, `killswitch_account_floors` | Default and per-account remaining-quota floors |
-| `claude_cache_enabled`, `claude_cache_mode` | 1-hour cache; mode is `explicit`, `automatic` or `hybrid` |
+| `claude_cache_enabled`, `claude_cache_mode` | Five-minute cache by default; choose `on` for one hour. Mode is `explicit`, `automatic` or `hybrid` |
 | `cache_keep_enabled`, `cache_keep_always`, `cache_keep_window`, `cache_keep_subagents` | Keep-warm policy; the window list permits at most one entry |
 | `prime_enabled` | Opt-in quota-window priming |
 | `dump_enabled`, `log_level` | Request dumps and logging (`default`, `error`, `warn`, `info`, `debug`, `trace`) |
@@ -79,10 +78,4 @@ Local refresh and its persisted retry delay are bound to the refresh-token gener
 
 Quota routing compares **remaining** percentages. `five_hour` / `seven_day` accept menu aliases `5h` / `1w`. A killswitch floor is the minimum remaining percentage required to use an account. A positive five-hour or seven-day floor blocks requests on that account when its reading is missing, regardless of `quota_fail_closed_on_unknown_quota`; without a positive floor, unknown readings follow that setting. A positive `scoped` floor requires a model-specific quota reading; an explicitly empty scoped list means no separate window applies. OpenCode offers the threshold edits in **Limits**; Pi does not.
 
-## Quota header feed
-
-The OpenCode 1 plugin can publish quota observations from Anthropic model-response headers; the feed does not independently poll the quota API. Enable `quota_header_feed_enabled` and restart. Owner-only files under `opencode-anthropic-auth/quota-header-feed` in the [system temp folder](environment.md#paths-on-windows-macos-and-linux) (`$TMPDIR` or `/tmp` on macOS and Linux, `%TEMP%` on Windows) expire after three minutes; `OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR` redirects them.
-
-The allowlisted record contains quota-window values and provenance (which values came from response headers or quota polling), observation time, configured OAuth-account count and account identity references (including a resolved Anthropic account UUID when available). It does not contain tokens, raw headers, request bodies, model IDs or refresh errors. Treat the directory as local account metadata, not an anonymous public telemetry feed.
-
-Implementation: [settings import whitelist](../packages/core/src/native-migration-source.ts), [native account view](../packages/core/src/native-account-view.ts), [sticky routing](../packages/core/src/sticky-routing.ts), [account policy](../packages/core/src/accounts.ts), [native credential runtime](../packages/core/src/native-account-runtime.ts), [quota feed](../packages/core/src/quota-header-feed.ts), and [OpenCode publisher](../packages/opencode/src/index.ts).
+Implementation: [settings import whitelist](../packages/core/src/native-migration-source.ts), [native account view](../packages/core/src/native-account-view.ts), [sticky routing](../packages/core/src/sticky-routing.ts), [account policy](../packages/core/src/accounts.ts), and [native credential runtime](../packages/core/src/native-account-runtime.ts).

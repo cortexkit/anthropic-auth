@@ -31,13 +31,10 @@ import {
   useTempAccountFile as useTempAccountFileWithCtx,
   withNativeAdmission as withNativeAdmissionWithCtx,
 } from './support/opencode1-pool-fixture.ts'
-import {
-  readFeedEntries,
-  waitForFeedEntries as waitForFeedEntriesWithCtx,
-  waitForLogRecord as waitForLogRecordWithCtx,
-} from './support/opencode1-quota-feed.ts'
+import { waitForLogRecord as waitForLogRecordWithCtx } from './support/opencode1-quota.ts'
 import {
   readAccountStorage as readAccountStorageWithCtx,
+  waitForAccountStorage,
   waitForSidebarState as waitForSidebarStateWithCtx,
 } from './support/opencode1-state-observers.ts'
 import type { PluginRuntimeOverrides } from './support/opencode1-test-context.ts'
@@ -105,12 +102,6 @@ function waitForSidebarState(
 }
 function readAccountStorage(): Promise<AccountStorage | null> {
   return readAccountStorageWithCtx(testContext)
-}
-function waitForFeedEntries(
-  predicate: (entries: Awaited<ReturnType<typeof readFeedEntries>>) => boolean,
-  description: string,
-) {
-  return waitForFeedEntriesWithCtx(testContext, predicate, description)
 }
 function waitForLogRecord(
   records: LogTestRecord[],
@@ -637,14 +628,14 @@ describe('killswitch fetch gate', () => {
   })
 })
 
-describe('quota header feed integration', () => {
+describe('main account quota and identity', () => {
   const originalFetch = globalThis.fetch
 
   afterEach(() => {
     globalThis.fetch = originalFetch
   })
 
-  test('main account replacement fences quota, backoff, and feed identity', async () => {
+  test('main account replacement fences quota and backoff by account identity', async () => {
     const uuidA = syntheticMainAccountUuid
     const uuidB = syntheticFallbackAccountUuid(99)
     const accessA = 'sk-ant-oat01-token-a'
@@ -659,7 +650,6 @@ describe('quota header feed integration', () => {
         createFallbackStorage({
           mainAccountId: 'main-slot',
           accounts: [],
-          quotaHeaderFeed: { enabled: true },
           quota: {
             enabled: true,
             checkIntervalMinutes: 5,
@@ -760,16 +750,11 @@ describe('quota header feed integration', () => {
       const response = await modelRequest
       expect(response.status).toBe(200)
       await response.text()
-      const entries = await waitForFeedEntries(
-        (entries) =>
-          entries.some(
-            (entry) =>
-              entry !== null &&
-              typeof entry === 'object' &&
-              'anthropic_account_uuid' in entry &&
-              entry.anthropic_account_uuid === uuidB,
-          ),
-        'replacement account quota feed',
+      await waitForAccountStorage(
+        testContext,
+        (storage) =>
+          storage?.quota?.mainQuota?.accountIdentity === uuidB &&
+          storage.quota.mainQuota.five_hour?.usedPercent === 20,
       )
       expect(quotaManager.getMain(uuidA)).toBeNull()
       expect(quotaManager.getMain(uuidB)?.quota.accountIdentity).toBe(uuidB)
@@ -781,15 +766,6 @@ describe('quota header feed integration', () => {
       expect(
         (await readAccountStorage())?.quota?.mainLastQuotaApiError,
       ).toBeUndefined()
-      expect(entries).toContainEqual(
-        expect.objectContaining({
-          identity_source: 'account_ref',
-          anthropic_account_uuid: uuidB,
-        }),
-      )
-      expect(await readFeedEntries()).not.toContainEqual(
-        expect.objectContaining({ anthropic_account_uuid: uuidA }),
-      )
     } finally {
       releaseOldPoll.open()
       await Promise.allSettled([priorPoll, modelRequest])
@@ -1354,7 +1330,6 @@ describe('quota header feed integration', () => {
         createFallbackStorage({
           mainAccountId: 'main-slot',
           accounts: [],
-          quotaHeaderFeed: { enabled: true },
           quota: {
             enabled: true,
             checkIntervalMinutes: 5,
@@ -1461,16 +1436,11 @@ describe('quota header feed integration', () => {
       const currentResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
       expect(currentResponse.status).toBe(200)
       await currentResponse.text()
-      await waitForFeedEntries(
-        (entries) =>
-          entries.some(
-            (entry) =>
-              entry !== null &&
-              typeof entry === 'object' &&
-              'anthropic_account_uuid' in entry &&
-              entry.anthropic_account_uuid === uuidB,
-          ),
-        'new account observation before old response release',
+      await waitForAccountStorage(
+        testContext,
+        (storage) =>
+          storage?.quota?.mainQuota?.accountIdentity === uuidB &&
+          storage.quota.mainQuota.five_hour?.usedPercent === 60,
       )
       expect(
         getPluginTestHandles(plugin).quotaManager.getMain(uuidB)?.quota
@@ -1484,9 +1454,6 @@ describe('quota header feed integration', () => {
           record.channel === 'quota' &&
           record.message === 'discarded stale main quota headers',
         'old account header discard',
-      )
-      expect(await readFeedEntries()).not.toContainEqual(
-        expect.objectContaining({ anthropic_account_uuid: uuidA }),
       )
       expect(
         getPluginTestHandles(plugin).quotaManager.getMain(uuidA),

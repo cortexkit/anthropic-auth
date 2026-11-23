@@ -178,7 +178,6 @@ async function runPackedHostRuntimeProbe(
   const xdgState = join(home, 'state')
   const bunInstallCache = join(fixtureRoot, 'bun-install-cache')
   const cacheKeepDir = join(fixtureRoot, 'cachekeep')
-  const quotaFeedDir = join(fixtureRoot, 'quota-feed')
   const dumpDir = join(fixtureRoot, 'dumps')
   const rpcDir = join(fixtureRoot, 'rpc')
   const env: NodeJS.ProcessEnv = {
@@ -211,7 +210,6 @@ async function runPackedHostRuntimeProbe(
     ),
     OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE: sidebarStateFile,
     OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR: cacheKeepDir,
-    OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR: quotaFeedDir,
     OPENCODE_ANTHROPIC_AUTH_DUMP_DIR: dumpDir,
     OPENCODE_ANTHROPIC_AUTH_RPC_DIR: rpcDir,
   }
@@ -226,7 +224,6 @@ async function runPackedHostRuntimeProbe(
     xdgState,
     bunInstallCache,
     cacheKeepDir,
-    quotaFeedDir,
     dumpDir,
     rpcDir,
   ]

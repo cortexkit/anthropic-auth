@@ -403,7 +403,6 @@ async function seedOc1Bootstrap(
       configDir: env.XDG_CONFIG_HOME!,
       dataDir: env.XDG_DATA_HOME!,
       cacheDir: env.XDG_CACHE_HOME!,
-      quotaFeedDir: join(root, 'quota-feed'),
     },
     // OC1 runs here without OPENCODE_CONFIG_DIR, but the shared helper always
     // adds that variable's directory as a target. Name the XDG config

@@ -61,9 +61,7 @@ export type AccountBase = {
 export type OAuthAccount = AccountBase & {
   type: 'oauth'
   authLineageId?: string
-  // Persisted under this name on both fallback accounts and the main profile because the
-  // quota feed schema owns the anthropicAccountUuid key; only the branded type and the
-  // request-scoped identity variables use the provider-neutral providerAccountUuid name.
+  // Keep the stored field name so older releases can still read the account identity.
   anthropicAccountUuid?: ProviderAccountUuid
   /** Non-secret scoped identity; never a capability handle or bearer token. */
   claustrumScopedCredentialId?: string
@@ -318,6 +316,7 @@ export type AccountStorage = {
     // when a separate process allocated an equal or higher generation.
     mainQuotaErrorClearedAt?: number
   }
+  /** Legacy stored field; retained for rollback, not used by the plugin. */
   quotaHeaderFeed?: {
     enabled?: boolean
   }

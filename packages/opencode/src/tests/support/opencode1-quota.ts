@@ -1,6 +1,4 @@
 import { expect, mock } from 'bun:test'
-import { readdir, readFile } from 'node:fs/promises'
-import { join } from 'node:path'
 import type {
   AccountStorage,
   LogTestRecord,
@@ -29,52 +27,6 @@ import {
   untilStateOrTestEnd,
 } from './opencode1-test-context.ts'
 
-export async function readFeedEntries() {
-  const directory = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR
-  if (!directory) return []
-  try {
-    // The producer writes a complete .tmp before renaming it into a committed
-    // .json lease. Match the real consumer: transient files are not published.
-    const files = (await readdir(directory)).filter((name) =>
-      name.endsWith('.json'),
-    )
-    const records = await Promise.all(
-      files.map(async (file) =>
-        JSON.parse(await readFile(join(directory, file), 'utf8')),
-      ),
-    )
-    return records.flatMap((record) => Object.values(record.entries ?? {}))
-  } catch {
-    return []
-  }
-}
-
-/**
- * Wait for the committed feed leases to satisfy `predicate`, re-reading them
- * until they match or the test ends instead of polling to a fixed wall-clock
- * deadline.
- */
-export async function waitForFeedEntries(
-  ctx: Opencode1TestContext,
-  predicate: (entries: Awaited<ReturnType<typeof readFeedEntries>>) => boolean,
-  description: string,
-) {
-  const changes = untilStateOrTestEnd(ctx, STATE_READ_PAUSE_MS)
-  try {
-    while (!changes.ended) {
-      await changes.next()
-      const entries = await readFeedEntries()
-      if (predicate(entries)) return entries
-    }
-  } finally {
-    changes.close()
-  }
-  const entries = await readFeedEntries()
-  throw new Error(
-    `Quota header feed did not match ${description}: ${JSON.stringify(entries)}`,
-  )
-}
-
 /**
  * Wait for a log record matching `predicate`, re-checking the test's sink
  * until one arrives or the test ends rather than to a fixed wall-clock
@@ -102,39 +54,6 @@ export async function waitForLogRecord(
   }
 }
 
-export async function loadMainAndFetch(
-  ctx: Opencode1TestContext,
-  storage: AccountStorage,
-  response: Response | (() => Response),
-  requestHeaders?: Record<string, string>,
-) {
-  await useTempAccountFile(ctx, storage)
-  globalThis.fetch = mock(
-    withNativeAdmission(ctx, () =>
-      Promise.resolve(
-        typeof response === 'function' ? response() : response.clone(),
-      ),
-    ),
-  ) as unknown as typeof fetch
-  const plugin = await getPlugin(ctx)
-  const result = await plugin.auth.loader(
-    () =>
-      Promise.resolve({
-        type: 'oauth',
-        access: 'sk-ant-oat01-main-access',
-        refresh: 'main-refresh',
-        expires: Date.now() + 100000,
-      }),
-    { models: {} },
-  )
-  const fetched = await result.fetch(MESSAGES_URL, {
-    method: 'POST',
-    headers: requestHeaders,
-    body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
-  })
-  return { plugin, response: fetched }
-}
-
 export {
   extractUrl,
   MESSAGES_URL,
@@ -152,11 +71,11 @@ export async function expectNonOatMainRefused(
   ctx: Opencode1TestContext,
   access: string,
 ) {
-  await useTempAccountFile(
-    ctx,
-    createFallbackStorage({ accounts: [], quotaHeaderFeed: { enabled: true } }),
-    { access, refresh: `refresh-${access}`, expires: Date.now() + 100_000 },
-  )
+  await useTempAccountFile(ctx, createFallbackStorage({ accounts: [] }), {
+    access,
+    refresh: `refresh-${access}`,
+    expires: Date.now() + 100_000,
+  })
   const modelRequests: string[] = []
   globalThis.fetch = mock(
     withNativeTokenExchange(ctx, (input: Parameters<typeof fetch>[0]) => {
@@ -189,7 +108,6 @@ export async function expectNonOatMainRefused(
     }),
   ).rejects.toThrow(/API key/i)
   expect(modelRequests).toEqual([])
-  expect(await readFeedEntries()).toEqual([])
   const pool = ctx.migratedPool
   if (!pool) throw new Error('Expected migrated pool for non-OAT refusal check')
   const runtime = createNativeAccountRuntime({

@@ -103,7 +103,6 @@ async function fixture(override: Override, named = false) {
       root,
       'sidebar-state.json',
     ),
-    OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR: join(root, 'feed'),
   })
   if (override === 'account')
     process.env.OPENCODE_ANTHROPIC_AUTH_FILE = join(

@@ -168,10 +168,6 @@ export function resolveSettingsRecord(
       failClosedOnUnknownQuota: values.quota_fail_closed_on_unknown_quota,
       showToasts: values.quota_show_toasts,
     },
-    quotaHeaderFeed: {
-      ...section(stored, 'quotaHeaderFeed'),
-      enabled: values.quota_header_feed_enabled,
-    },
     killswitch: killswitchRecord(stored, values, host),
     claudeCache: {
       ...section(stored, 'claudeCache'),

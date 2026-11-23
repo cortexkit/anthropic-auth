@@ -4,7 +4,8 @@ Prompt caching, cache keepalive and quota-window priming do different jobs. Enab
 
 ## Cache modes
 
-Use `/claude` → **Cache** to enable caching and choose `claudeCache.mode`:
+OpenCode 1, OpenCode 2 and Pi use the five-minute prompt cache by default. Use
+`/claude` → **Cache** to enable one-hour caching and choose `claudeCache.mode`:
 
 - `explicit`: use explicit prompt-cache placement.
 - `automatic`: use automatic cache behavior.

@@ -42,7 +42,6 @@ const safetyPaths = {
     testDir,
     'cachekeep-registry',
   ),
-  OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR: join(testDir, 'quota-header-feed'),
   OPENCODE_ANTHROPIC_AUTH_RPC_DIR: join(testDir, 'rpc'),
   OPENCODE_ANTHROPIC_AUTH_DUMP_DIR: join(testDir, 'dumps'),
 } as const

@@ -35,6 +35,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Pi, like OpenCode 1 and 2, now updates each subscription account's quota from Claude's replies without waiting for the next quota poll.
 - Pi's paid API-key route now honors the same model aliases as OpenCode 1 and 2 and keeps its configured endpoint.
 - Pi now links cache diagnostics across conversation replies like OpenCode 1 and 2, with cache results and beta lists in the debug log.
+- OpenCode 2 now uses the five-minute Claude prompt cache by default, like OpenCode 1 and Pi. An explicit cache setting or Agent Runner session policy still takes precedence.
+- OpenCode 1 no longer publishes the optional quota header feed; quota readings still reach the vault. The `quota_header_feed_enabled` setting is gone and can be deleted from your settings file.
 
 ## 2.16.5
 

@@ -117,7 +117,7 @@ const settingFields: Record<string, readonly string[]> = {
     'failClosedOnUnknownQuota',
     'showToasts',
   ],
-  quotaHeaderFeed: ['enabled'],
+  quotaHeaderFeed: ['enabled'], // Preserve an existing value when migrating stored settings for rollback.
   claudeCache: ['enabled', 'mode'],
   dump: ['enabled'],
   logging: ['level'],

@@ -2508,7 +2508,6 @@ async function sendSetupOc1(
       f.env.HOME!,
       'sidebar.json',
     ),
-    OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR: join(f.env.HOME!, 'quota-feed'),
     OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR: join(
       f.env.HOME!,
       'cachekeep',

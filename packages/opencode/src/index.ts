@@ -52,7 +52,6 @@ import {
   claudeGatewayHeaderValues,
   claudeGatewayModelUrl,
   claudeGatewayStatusNotes,
-  configuredAnthropicOAuthAccountCount,
   createDumpResponseObserver,
   createEmptyStorage,
   createNativeAccountRuntime,
@@ -195,11 +194,8 @@ import {
   parseSseFrame,
   peekRoutingAccount,
   prepareMessageThreadRequest,
-  QUOTA_HEADER_FEED_SCHEMA_VERSION,
   type QuotaAccountSummary,
   type QuotaEntry,
-  type QuotaHeaderFeedPublishEntry,
-  QuotaHeaderFeedRegistry,
   QuotaManager,
   type QuotaManagerOptions,
   type QuotaReadingPurpose,
@@ -2478,10 +2474,6 @@ const anthropicAuthPlugin = async (
     }
   }
 
-  const quotaHeaderFeedRegistry =
-    initialStorage?.quotaHeaderFeed?.enabled === true
-      ? new QuotaHeaderFeedRegistry()
-      : null
   // Profiles fetched by this plugin instance, keyed by route and account
   // identity. A failed network request is not repeated for that account this
   // boot, and a fetched profile is reused until it goes stale, even if saving
@@ -3022,114 +3014,6 @@ const anthropicAuthPlugin = async (
     })
   }
 
-  function getCredentialId(value: unknown): string | undefined {
-    if (!value || typeof value !== 'object') return undefined
-    const record = value as Record<string, unknown>
-    const direct = record.credential_id
-    if (typeof direct === 'string' && direct && direct !== 'main') return direct
-    const vault = record.vault
-    if (vault && typeof vault === 'object') {
-      const nested = (vault as Record<string, unknown>).credential_id
-      if (typeof nested === 'string' && nested && nested !== 'main')
-        return nested
-    }
-    return undefined
-  }
-
-  async function publishQuotaHeaderFeed(
-    served: ServedQuotaHeaders,
-    entry: QuotaEntry,
-  ): Promise<void> {
-    if (!quotaHeaderFeedRegistry) return
-    if (served.accountId === 'main' && !served.mainQuotaIdentity?.quotaKey) {
-      // An unresolved main account must not overwrite verified account-bound quota.
-      return
-    }
-    const storage =
-      (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
-    const mainAuth = await latestGetAuth?.()
-    const mainOAuthConfigured = mainAuth?.type === 'oauth'
-    const account =
-      served.accountId === 'main'
-        ? storage.main
-        : storage.accounts.find(
-            (candidate) => candidate.id === served.accountId,
-          )
-    const credentialId = getCredentialId(account)
-    const configuredAccountCount = configuredAnthropicOAuthAccountCount({
-      storage,
-      mainOAuthConfigured,
-    })
-    const observedAtMs = entry.checkedAt
-    const quota = {
-      five_hour: entry.quota.five_hour,
-      seven_day: entry.quota.seven_day,
-      bindingWindow: entry.quota.bindingWindow,
-      fallbackAdvised: entry.quota.fallbackAdvised,
-      scoped: entry.quota.scoped,
-      extraUsage: entry.quota.extraUsage,
-      fieldSources: entry.quota.fieldSources,
-    }
-    const accountKey =
-      credentialId ??
-      (served.accountId === 'main'
-        ? (served.mainQuotaIdentity?.quotaKey ?? 'main')
-        : served.accountId)
-    const feedEntry: QuotaHeaderFeedPublishEntry = credentialId
-      ? {
-          identity_source: 'credential_id',
-          credential_id: credentialId,
-          schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
-          provider: 'anthropic',
-          configured_account_count: configuredAccountCount,
-          observed_at_ms: observedAtMs,
-          anthropic_account_uuid: served.anthropicAccountUuid ?? null,
-          quota,
-          accountKey,
-        }
-      : served.accountId === 'main' && served.mainQuotaIdentity?.quotaKey
-        ? {
-            identity_source: 'account_ref',
-            account_ref: served.mainQuotaIdentity.quotaKey,
-            schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
-            provider: 'anthropic',
-            configured_account_count: configuredAccountCount,
-            observed_at_ms: observedAtMs,
-            anthropic_account_uuid: served.anthropicAccountUuid ?? null,
-            quota,
-            accountKey,
-          }
-        : served.accountId === 'main'
-          ? {
-              identity_source: 'none',
-              schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
-              provider: 'anthropic',
-              configured_account_count: configuredAccountCount,
-              observed_at_ms: observedAtMs,
-              anthropic_account_uuid: served.anthropicAccountUuid ?? null,
-              quota,
-              accountKey,
-            }
-          : {
-              identity_source: 'account_ref',
-              account_ref: served.accountId,
-              schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
-              provider: 'anthropic',
-              configured_account_count: configuredAccountCount,
-              observed_at_ms: observedAtMs,
-              anthropic_account_uuid: served.anthropicAccountUuid ?? null,
-              quota,
-              accountKey,
-            }
-    await quotaHeaderFeedRegistry.publish(feedEntry)
-  }
-
-  function logQuotaHeaderFeedFailure(error: unknown) {
-    logger.debug('quota', 'failed to publish quota header feed', {
-      error: error instanceof Error ? error.message : String(error),
-    })
-  }
-
   function harvestQuotaHeaders(
     headers: Headers,
     served: ServedQuotaHeaders,
@@ -3232,7 +3116,7 @@ const anthropicAuthPlugin = async (
           )
             return
           // Store acceptance checks that the row still has the observed
-          // credential epoch and account identity before updating cache or feed.
+          // credential epoch and account identity before updating the cache.
           // The accepted write may still be queued rather than on disk.
           const entry = persistedEntry
           if (
@@ -3249,7 +3133,6 @@ const anthropicAuthPlugin = async (
               authLineageId: served.authLineageId,
             })
           void refreshSidebarQuota().catch(() => {})
-          await publishQuotaHeaderFeed(served, entry)
           logger.debug('quota', 'harvested response quota', {
             account: served.accountId,
             fiveHourPercent: entry.quota.five_hour?.usedPercent,
@@ -3269,7 +3152,7 @@ const anthropicAuthPlugin = async (
               })
           }
         }
-      })().catch(logQuotaHeaderFeedFailure)
+      })().catch(logPersistFailure)
       logger.trace('quota', 'response quota awaiting publication', {
         account: served.accountId,
       })
@@ -4729,13 +4612,6 @@ const anthropicAuthPlugin = async (
     try {
       quotaManager.close()
     } catch {}
-    try {
-      await quotaHeaderFeedRegistry?.dispose()
-    } catch (error) {
-      logger.warn('quota-header-feed', 'failed to dispose', {
-        error: error instanceof Error ? error.message : String(error),
-      })
-    }
     // Per-instance background services must be torn down before the RPC
     // guard so a disposed instance never leaves its timer running for the
     // rest of the process. Each step is isolated: one failure cannot skip

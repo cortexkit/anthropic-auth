@@ -2,10 +2,7 @@ import { describe, expect, mock } from 'bun:test'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import {
-  createEmptyStorage,
-  QuotaHeaderFeedRegistry,
-} from '@cortexkit/anthropic-auth-core'
+import { createEmptyStorage } from '@cortexkit/anthropic-auth-core'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
 import { createOpencodeClient } from '@opencode-ai/sdk'
 import { $ } from 'bun'
@@ -41,7 +38,6 @@ const envKeys = [
   'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',
   'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
   'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
-  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
   'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
   'CLAUDE_CONFIG_DIR',
   'OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION',
@@ -241,43 +237,6 @@ async function migratedProjects(
 }
 
 describe('RPC server lifecycle', () => {
-  test('dispose stops and removes its server when feed cleanup rejects', async () => {
-    // The migrated settings enable the quota header feed, so the plugin builds
-    // the registry whose disposal is made to fail here.
-    await migratedProjects({
-      ...createEmptyStorage(),
-      quotaHeaderFeed: { enabled: true },
-    })
-    const originalDispose = QuotaHeaderFeedRegistry.prototype.dispose
-    let feedDisposals = 0
-    QuotaHeaderFeedRegistry.prototype.dispose = async () => {
-      feedDisposals++
-      throw new Error('feed disposal failed')
-    }
-    try {
-      const directory = join(testRoot, 'project')
-      const plugin = await getPlugin(directory)
-      const rpcDir = getRpcDir(directory)
-      const entry = await discoverPortFile(rpcDir)
-
-      expect(entry).not.toBeNull()
-      await plugin.dispose?.()
-
-      // Quota-feed disposal threw as configured. The assertions below prove
-      // that this failure did not prevent RPC server cleanup.
-      expect(feedDisposals).toBe(1)
-      expect(await discoverPortFile(rpcDir)).toBeNull()
-      expect(
-        (globalThis as RpcGlobal).__anthropicAuthRpcServers?.get(rpcDir),
-      ).toBeUndefined()
-      await expect(
-        fetch(`http://127.0.0.1:${entry?.port}/health`),
-      ).rejects.toThrow()
-    } finally {
-      QuotaHeaderFeedRegistry.prototype.dispose = originalDispose
-    }
-  })
-
   test('keeps RPC servers live for distinct project directories', async () => {
     await migratedProjects()
     const directoryA = join(testRoot, 'project-a')

@@ -18,9 +18,11 @@ import { createNativeMenuCapabilities } from '../v2/menu'
 import * as reloadFactory from '../v2/reload'
 import { setupAnthropicAuth } from '../v2/setup'
 import * as sourceFactory from '../v2/source'
-import releaseSnapshots from './fixtures/settings-2.11.2.json'
 import { settingsReaderOutputs } from './opencode2-settings-readers'
-import { snapshotSettings } from './settings-snapshot-fixture'
+import {
+  expectedReleaseSnapshot,
+  snapshotSettings,
+} from './settings-snapshot-fixture'
 import { observeSettings } from './settings-snapshot-observe'
 
 const cleanups: (() => unknown | Promise<unknown>)[] = []
@@ -1254,7 +1256,7 @@ for (const mode of ['local', 'claustrum'] as const) {
             ),
           }
           expect(JSON.stringify(compatible), phase).toBe(
-            JSON.stringify(releaseSnapshots[`oc2-${sample}`]),
+            JSON.stringify(expectedReleaseSnapshot(2, sample)),
           )
           expect(observed.logs.length).toBeGreaterThan(0)
           expect(observed.track.tracked).toBe(true)

@@ -162,7 +162,7 @@ export function createNativeWirePolicy(
           input.agent !== 'title' &&
           readThreeWayBoolean(
             snapshot.policyStorage.claudeCache?.enabled,
-            true,
+            false,
           ),
         cache1hMode: snapshot.policyStorage.claudeCache?.mode ?? 'explicit',
         fastModeEnabled: snapshot.policyStorage.claudeFast?.enabled === true,

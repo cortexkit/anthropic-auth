@@ -70,7 +70,6 @@ test('the closed move map names every schema key and only explicitly held user s
       failClosedOnUnknownQuota: true,
       showToasts: true,
     },
-    quotaHeaderFeed: { enabled: true },
     killswitch: {
       enabled: true,
       main: { five_hour: 9, seven_day: 21, scoped: 3 },
@@ -128,7 +127,6 @@ test('the closed move map names every schema key and only explicitly held user s
     quota_minimum_remaining_scoped: 4,
     quota_fail_closed_on_unknown_quota: 'on',
     quota_show_toasts: true,
-    quota_header_feed_enabled: true,
     killswitch_enabled: true,
     killswitch_default_five_hour: 9,
     killswitch_default_seven_day: 21,
@@ -458,7 +456,6 @@ test('invalid non-protection domains are omitted independently', () => {
         },
         claudeCache: { enabled: 1, mode: 'unknown' },
         cacheKeep: { enabled: 'yes', always: 0, subagents: null },
-        quotaHeaderFeed: { enabled: 1 },
         dump: { enabled: 'yes' },
         prime: { enabled: 0 },
         claudeFast: { enabled: 1 },
@@ -469,7 +466,7 @@ test('invalid non-protection domains are omitted independently', () => {
       }),
     ),
   ).toEqual({})
-  expect(reader.messages).toHaveLength(22)
+  expect(reader.messages).toHaveLength(21)
 })
 
 test('window hours use the legacy numeric domain, but require a complete pair', () => {

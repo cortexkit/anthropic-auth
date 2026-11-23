@@ -359,7 +359,6 @@ export {
   summarizePrewarmProviderError,
 } from './provider-error.ts'
 export { renameWithWindowsSharingRetry } from './publication-rename.ts'
-export * from './quota-header-feed.ts'
 export * from './quota-headers.ts'
 export * from './quota-manager.ts'
 export * from './quota-refusal.ts'
