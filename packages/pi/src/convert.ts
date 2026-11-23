@@ -31,8 +31,8 @@ import {
   isOpenAIReasoningSignature,
   LANE_START_TEXT,
   orderClaudeCodeBody,
+  prepareApiKeyRequestBody,
   readSessionCachePolicy,
-  remapRequestBodyModel,
   requestCacheLifetimeMs,
   selectClaudeCodeBetas,
   signRequestBody,
@@ -255,6 +255,7 @@ function convertMessages(
   targetModelId: string,
   visibleReplies: WeakMap<object, string>,
   droppedAssistants: WeakSet<object>,
+  mapToolName = toClaudeCodeToolName,
 ): AnthropicRequestBody['messages'] {
   const result: AnthropicRequestBody['messages'] = []
   // Effort history counts source assistant turns, including ones with nothing
@@ -353,7 +354,7 @@ function convertMessages(
           blocks.push({
             type: 'tool_use',
             id: sanitizeToolId(block.id),
-            name: toClaudeCodeToolName(block.name),
+            name: mapToolName(block.name),
             input: block.arguments,
           })
         }
@@ -423,11 +424,12 @@ function convertMessages(
 
 function convertTools(
   tools: Tool[] | undefined,
+  mapToolName: (name: string) => string,
 ): AnthropicRequestBody['tools'] {
   if (!tools?.length) return undefined
   return tools.map((tool) => ({
     // Names are checked for collisions by createClaudeCodeToolNameMap first.
-    name: toClaudeCodeToolName(tool.name),
+    name: mapToolName(tool.name),
     description: tool.description,
     input_schema: {
       type: 'object',
@@ -757,6 +759,8 @@ export async function buildAnthropicRequest(
   fastModeEnabled = false,
   identity?: ClaudeCodeIdentity,
   controls: {
+    /** Convert Pi's typed context without adding Claude Code wire shaping. */
+    apiKey?: boolean
     billingLineage?: BillingLineageFields
     effortTransitions?: readonly PiEffortTransition[]
     forkBaseMessageCount?: number
@@ -765,7 +769,6 @@ export async function buildAnthropicRequest(
     /** Leave the billing signature placeholder for the transport to finalize. */
     deferSigning?: boolean
     cacheDiagnosticsPreviousMessageId?: string | null
-    modelRemapEnabled?: boolean
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
     turnEndNote?: { tools: string[] }
     /**
@@ -784,6 +787,8 @@ export async function buildAnthropicRequest(
   /** Set only when `controls.forkEffort` changed the request. */
   forkEffortApplied?: PiForkEffortHint
 }> {
+  const apiKey = controls.apiKey === true
+  const mapToolName = apiKey ? (name: string) => name : toClaudeCodeToolName
   const forkBase =
     controls.forkBaseMessageCount === undefined
       ? undefined
@@ -831,6 +836,7 @@ export async function buildAnthropicRequest(
     modelId,
     visibleReplies,
     droppedAssistants,
+    mapToolName,
   )
   stripEmptyTrailingAssistantMessages(messages)
   const baseLastMessage = forkBase
@@ -856,30 +862,35 @@ export async function buildAnthropicRequest(
     : undefined
   if (forkHead && forkFirstUserText === undefined)
     throw new PiForkRefusal('base')
-  const system = [
-    {
-      type: 'text',
-      text: buildBillingHeaderValue(
-        messages,
-        undefined,
-        CLAUDE_CODE_ENTRYPOINT,
-        options?.sessionId
-          ? forkHead
-            ? forkFirstUserText
-            : firstUserTextTracker.resolve(options.sessionId, messages)
-          : undefined,
-        identity && !forkHead && controls.billingLineage?.promptId
-          ? {
-              ...controls.billingLineage,
-              promptIndex: countUserPrompts(messages),
-            }
-          : undefined,
-      ),
-    },
-    { type: 'text', text: CLAUDE_CODE_IDENTITY },
-  ]
+  const system = apiKey
+    ? []
+    : [
+        {
+          type: 'text',
+          text: buildBillingHeaderValue(
+            messages,
+            undefined,
+            CLAUDE_CODE_ENTRYPOINT,
+            options?.sessionId
+              ? forkHead
+                ? forkFirstUserText
+                : firstUserTextTracker.resolve(options.sessionId, messages)
+              : undefined,
+            identity && !forkHead && controls.billingLineage?.promptId
+              ? {
+                  ...controls.billingLineage,
+                  promptIndex: countUserPrompts(messages),
+                }
+              : undefined,
+          ),
+        },
+        { type: 'text', text: CLAUDE_CODE_IDENTITY },
+      ]
   const systemPrompt = systemPromptText(context.systemPrompt)
-  if (systemPrompt.trim()) {
+  if (apiKey) {
+    if (systemPrompt.trim())
+      system.push({ type: 'text', text: sanitize(systemPrompt) })
+  } else if (systemPrompt.trim()) {
     // Pi's prompt cannot sit whole in the top-level system[] array: two lines of
     // its documentation paragraph (the docs/*.md enumeration and the "follow .md
     // cross-references" instruction) are each independently sufficient to make
@@ -915,15 +926,17 @@ export async function buildAnthropicRequest(
     model: modelId,
     max_tokens: options?.maxTokens ?? 16_384,
     stream: true,
-    system,
+    ...(system.length ? { system } : {}),
     messages,
   }
 
-  const declaredToolNames = createClaudeCodeToolNameMap(context.tools ?? [])
-  const tools = convertTools(context.tools)
+  const declaredToolNames = apiKey
+    ? new Map<string, string>()
+    : createClaudeCodeToolNameMap(context.tools ?? [])
+  const tools = convertTools(context.tools, mapToolName)
   if (tools?.length) body.tools = tools
 
-  if (fastModeEnabled && isFastModeSupportedModel(modelId)) {
+  if (!apiKey && fastModeEnabled && isFastModeSupportedModel(modelId)) {
     body.speed = 'fast'
   }
 
@@ -1009,13 +1022,19 @@ export async function buildAnthropicRequest(
     modelId,
     isOAuth: !!identity,
   })
-  addEphemeralCacheControl(body)
-  const cachePolicy = readSessionCachePolicy(options?.sessionId, !!identity)
-  const cacheEnabled =
-    cachePolicy?.ttl !== undefined ? cachePolicy.ttl !== 'none' : cache.enabled
-  applyCacheMode(body, cacheEnabled, cache.mode)
-  if (cacheEnabled && cache.mode === 'hybrid' && !forkHead && !forkBase)
-    applyHybridCacheBridge(body)
+  const cachePolicy = apiKey
+    ? undefined
+    : readSessionCachePolicy(options?.sessionId, !!identity)
+  if (!apiKey) {
+    addEphemeralCacheControl(body)
+    const cacheEnabled =
+      cachePolicy?.ttl !== undefined
+        ? cachePolicy.ttl !== 'none'
+        : cache.enabled
+    applyCacheMode(body, cacheEnabled, cache.mode)
+    if (cacheEnabled && cache.mode === 'hybrid' && !forkHead && !forkBase)
+      applyHybridCacheBridge(body)
+  }
   if (identity) {
     applyThinkingBindingControls(
       body,
@@ -1036,7 +1055,8 @@ export async function buildAnthropicRequest(
     body.max_tokens = 1
     delete body.thinking
   }
-  applySessionCacheTtl(body, cachePolicy?.ttl)
+  if (apiKey) prepareApiKeyRequestBody(body)
+  else applySessionCacheTtl(body, cachePolicy?.ttl)
   if (baseBoundary >= 0) applyForkCacheBridge(body, baseBoundary)
   // As in Pi's native adapter, replacements must still request SSE. Hooks own
   // the validity of their other edits and must not add a fifth cache breakpoint:
@@ -1049,18 +1069,16 @@ export async function buildAnthropicRequest(
     throw new Error(
       `Anthropic accepts at most 4 cache breakpoints; the onPayload hook left ${breakpoints}`,
     )
-  if (controls.modelRemapEnabled) remapRequestBodyModel(body)
   if (
     controls.cacheDiagnosticsPreviousMessageId !== undefined &&
     selectClaudeCodeBetas(body).split(',').includes(CACHE_DIAGNOSTICS_BETA)
   )
     applyCacheDiagnosticsOptIn(body, controls.cacheDiagnosticsPreviousMessageId)
   const unsigned = JSON.stringify(
-    orderClaudeCodeBody(body, { isOAuth: !!identity }),
+    apiKey ? body : orderClaudeCodeBody(body, { isOAuth: !!identity }),
   )
-  const bodyText = controls.deferSigning
-    ? unsigned
-    : await signRequestBody(unsigned)
+  const bodyText =
+    apiKey || controls.deferSigning ? unsigned : await signRequestBody(unsigned)
   // Translate only known host/wire pairs that survived the hook and JSON
   // serialization. Hook-added or renamed tools must not acquire an alias, and
   // response decoding must never change outgoing names or signed history.

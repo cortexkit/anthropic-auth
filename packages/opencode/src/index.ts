@@ -13,6 +13,7 @@ import {
   type AnthropicBillingRequest,
   type ApiKeyAccount,
   acquireNativeAccountRuntime,
+  apiKeyRequestBetas,
   applyCustomHeaders,
   assertNotCustodyTombstone,
   authorize,
@@ -228,6 +229,7 @@ import {
   resetWaitDelayMs,
   resolveClaudeModelCapabilities,
   resolveNativePoolPaths,
+  rewriteApiKeyRequestBody,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   StickyQuotaRetryCounter,
   type StickyRouteCandidate,
@@ -292,6 +294,7 @@ import {
   reconcileCustodyStartup,
 } from './custody-mode.ts'
 import {
+  applyOpenCodeEffortMarkers,
   EFFORT_PLAN_REQUEST_HEADER,
   EffortMarkerCorrelationError,
   markOpenCodeEffortTransitions,
@@ -387,7 +390,6 @@ import {
   createStrippedStream,
   extractLatestHybridMessageCacheAnchor,
   hybridUserMessageCacheAnchorFingerprints,
-  isInsecure,
   mergeHeaders,
   normalizeToolNameResponseError,
   rewriteRequestBody,
@@ -7661,7 +7663,6 @@ const anthropicAuthPlugin = async (
             account: ApiKeyAccount,
             trace?: PerfTrace,
             route = 'api_fallback',
-            currentStorage?: Awaited<ReturnType<typeof loadAccounts>>,
             fableRequest?: FableRequestContext,
             mainAccessToken?: string,
             mainQuotaIdentity?: MainQuotaIdentityBinding,
@@ -7675,7 +7676,6 @@ const anthropicAuthPlugin = async (
             const directAffinity =
               requestHeaders.get('x-session-affinity') ||
               requestHeaders.get('x-opencode-session')
-            const subagentRequest = isSubagentRequest(requestHeaders)
             const effortPlanHeader =
               requestHeaders.get(EFFORT_PLAN_REQUEST_HEADER) ?? undefined
             const resolvedEffortPlan =
@@ -7697,47 +7697,37 @@ const anthropicAuthPlugin = async (
             requestHeaders.delete(REQUEST_CLASS_REQUEST_HEADER)
             const billingRequestKind = takeBillingRequestKind(requestHeaders)
             let body = await fetchBody(input, init)
-            const wireSettings = requestWireSettings(
-              currentStorage,
-              parseRequestModel(body),
-            )
             let streaming = false
             let dump: DumpHandle | null = null
-            let toolNameMap: ToolNameMap | undefined
 
             const originalBytes =
               typeof body === 'string' ? body.length : undefined
             if (body && typeof body === 'string') {
               const rewriteStart = nowMs()
-              const fastModeRequested = (() => {
-                if (!wireSettings.fastModeEnabled) return false
-                try {
-                  return isFastModeSupportedModel(JSON.parse(body).model)
-                } catch {
-                  return false
-                }
-              })()
               try {
-                body = await rewriteRequestBody(body, {
-                  onToolNameMap: (map) => {
-                    toolNameMap = map
-                  },
-                  cache1hEnabled: !subagentRequest && wireSettings.cacheEnabled,
-                  cache1hMode: wireSettings.cacheMode,
-                  fastModeEnabled: fastModeRequested,
+                const originalBody = body
+                body = rewriteApiKeyRequestBody(body, {
                   sessionId: directAffinity || undefined,
                   modelId:
                     fableRequest?.plan.requestedModel ??
                     parseRequestModel(body) ??
                     '',
-                  midConversationEffortEnabled: false,
-                  midConversationEffortPlan: effortPlanHeader,
-                  midConversationEffortResolvedPlan: resolvedEffortPlan,
-                  midConversationEffortPlanVersions: effortPlanVersions,
-                  modelRemapEnabled: true,
-                  perf: (stage, data) =>
-                    trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
+                  // OpenCode 1 carries effort transitions in its transcript.
+                  // Validate and consume them without sending OAuth effort messages.
+                  scrubHostMarkers: (payload) => {
+                    const messages = payload.messages
+                    applyOpenCodeEffortMarkers(
+                      payload,
+                      false,
+                      effortPlanHeader,
+                      resolvedEffortPlan,
+                      effortPlanVersions,
+                    )
+                    return payload.messages !== messages
+                  },
                 })
+                if (body !== originalBody)
+                  requestHeaders.delete('content-length')
               } catch (error) {
                 if (error instanceof EffortMarkerCorrelationError) {
                   return effortMarkerFailureResponse(error)
@@ -7747,12 +7737,6 @@ const anthropicAuthPlugin = async (
                 }
                 throw error
               }
-              configureApiRouteHeaders(requestHeaders, account)
-              requestHeaders.set(
-                'anthropic-beta',
-                mergeAnthropicBetas(requestHeaders.get('anthropic-beta'), []),
-              )
-              if (fastModeRequested) addFastModeBetaHeader(requestHeaders)
               try {
                 streaming = JSON.parse(body).stream === true
               } catch {}
@@ -7761,15 +7745,15 @@ const anthropicAuthPlugin = async (
                 ms: roundMs(nowMs() - rewriteStart),
                 originalBytes,
                 rewrittenBytes: body.length,
-                cacheEnabled: !subagentRequest && wireSettings.cacheEnabled,
-                cacheMode: wireSettings.cacheMode,
-                fastModeEnabled: fastModeRequested,
-                subagent: subagentRequest,
               })
-            } else {
-              configureApiRouteHeaders(requestHeaders, account)
             }
 
+            const betas = requestHeaders.get('anthropic-beta')
+            if (betas !== null) {
+              const kept = apiKeyRequestBetas(betas)
+              if (kept) requestHeaders.set('anthropic-beta', kept)
+              else requestHeaders.delete('anthropic-beta')
+            }
             const cacheDiagnosticsBetas =
               await getCacheDiagnosticsBetas(requestHeaders)
             const apiCredential = await authorizePaidFallback(
@@ -7807,7 +7791,14 @@ const anthropicAuthPlugin = async (
                   ...init,
                   body,
                   headers: requestHeaders,
-                  ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
+                  tls: {
+                    ...(
+                      init as
+                        | (RequestInit & { tls?: Bun.TLSOptions })
+                        | undefined
+                    )?.tls,
+                    rejectUnauthorized: true,
+                  },
                 })
               // Redact the sent API key before response dumps, diagnostics or routing.
               response = scope.redactResponse(
@@ -7845,7 +7836,6 @@ const anthropicAuthPlugin = async (
             }
             attachCacheDiagnosticsResponse(response, {
               source: 'turn',
-              toolNameMap,
               accountId: account.id,
               synthetic: false,
               ...cacheDiagnosticsBetas,
@@ -8541,9 +8531,7 @@ const anthropicAuthPlugin = async (
                   wireHeaders: Headers,
                 ) => {
                   // fetchOAuthModel rechecks the destination, refuses
-                  // redirects and, with a gateway, sends there instead. The
-                  // ANTHROPIC_INSECURE opt-out applies to API-key routes only:
-                  // an OAuth send always checks certificates.
+                  // redirects and, with a gateway, sends there instead.
                   const send = () =>
                     fetchOAuthModel(gateway)(rewritten.input, {
                       ...init,
@@ -9531,7 +9519,6 @@ const anthropicAuthPlugin = async (
                   account,
                   trace,
                   `api_fallback_${index}`,
-                  storage,
                   options?.fableRequest,
                   options?.mainAccessToken,
                   options?.mainQuotaIdentity,

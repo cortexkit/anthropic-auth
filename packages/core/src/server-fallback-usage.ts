@@ -1,3 +1,5 @@
+export const SERVER_SIDE_FALLBACK_BETA = 'server-side-fallback-2026-07-01'
+export const SERVER_FALLBACK_SIGNATURE_PREFIX = 'cortexkit-server-fallback-v1:'
 export const SERVER_FALLBACK_USAGE_MARKER_TEXT = '\u2060\u2060'
 export const SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX =
   'cortexkit-server-fallback-usage-v1:'

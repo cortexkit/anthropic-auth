@@ -19,7 +19,7 @@ Model-family normalization supplies [adaptive thinking and effort](models.md#ada
 
 Pi replaces the Anthropic provider implementation and converts its transcript, tools and system prompt to the signed Claude-compatible request shape described above. Pi's ordinary subscription requests use the same billing lineage and turn indexes as OpenCode 1 and 2. Cache keep-warm requests, quota-window Prime requests and requests for a forked conversation stay outside the active turn's chain. When the converter recognizes Pi's standard documentation section, that paragraph is moved into a separate cached block before the first user's text. If the section layout is unrecognized, the prompt is moved as a whole rather than placing the documentation in top-level `system[]`, where Anthropic rejects it. Tool replay and origin-aware thinking-signature filtering preserve compatible Anthropic thinking and remove incompatible OpenAI reasoning signatures.
 
-API-key/proxy sends have a separate policy: proxy header/model overrides apply there, while OAuth-only fallback fields and persona betas are removed. These controls do not turn an API-key route into subscription OAuth. See [environment overrides](environment.md#api-endpoint-and-proxy-routes).
+OpenCode 1, OpenCode 2 and Pi send paid API-key requests without adding a Claude Code identity, changing tool names, or signing the body. The plugin still checks the message history, removes internal markers and OAuth-only fallback fields and persona betas, and applies the API route's endpoint, header and model overrides. See [environment overrides](environment.md#api-endpoint-and-proxy-routes).
 
 ## Safety fallback (OpenCode 1)
 

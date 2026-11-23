@@ -9,9 +9,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import {
   type AnthropicBillingRequest,
   AnthropicOAuthOriginError,
+  apiKeyRequestBetas,
   applyClaudeGatewayHeaders,
   applyCustomHeaders,
-  applyRunnerTurnNotes,
   assertHostAuthorityStable,
   assertNotCustodyTombstone,
   CACHE_DIAGNOSTICS_BETA,
@@ -41,7 +41,6 @@ import {
   isNativeTransientAccountError,
   type MessageThreadRequest,
   MessageThreadTracker,
-  mergeAnthropicBetas,
   observeAnthropicBillingResponse,
   type ProviderErrorRedactor,
   type ProviderErrorResponseScope,
@@ -51,12 +50,12 @@ import {
   type RequestGzipLatch,
   relayProxyApplies,
   remapModelId,
-  remapRequestBodyModel,
   reportAnthropicBillingFailure,
   requestCacheLifetimeMs,
   requestShortestCacheLifetimeMs,
   requestSignal,
   resolveNativePoolPaths,
+  rewriteApiKeyRequestBody,
   runWithRequestSignal,
   sendWithRequestGzip,
   setDumpEnabled as setDumpEnabledCore,
@@ -64,7 +63,6 @@ import {
   stateLayoutOfPaths,
   stateRefusalCause,
   stateRefusalPublicMessage,
-  stripEmptyTrailingAssistantMessages,
   summarizeCacheTtl,
   TrailingAssistantHistoryError,
 } from '@cortexkit/anthropic-auth-core'
@@ -94,10 +92,6 @@ import {
 import { LANE_START_REQUEST_HEADER } from '../lane-start'
 import { requireOAuthDestination } from '../oauth-destination'
 import { isAuxiliaryAgent } from '../request-class'
-import {
-  applyServerSideFallbackToBody,
-  SERVER_SIDE_FALLBACK_BETA,
-} from '../server-fallback'
 import {
   createStrippedStream,
   rewriteRequestBody,
@@ -780,50 +774,6 @@ function sendSecrets(send: PendingSend, physical: Headers): string[] {
   return [...new Set(secrets.filter(Boolean))]
 }
 
-/**
- * Betas that this plugin itself adds to its OAuth sends: the OAuth beta, the
- * Claude Code persona beta, and the server-side fallback opt-in that goes
- * with the `fallbacks` body field the API route also removes. They are
- * stripped from API-key sends so the plugin's OAuth persona and fallback
- * handoff never reach an API key or proxy route. Every other beta value the
- * host requested is passed on unchanged.
- */
-const OAUTH_ONLY_BETAS = new Set([
-  'oauth-2025-04-20',
-  'claude-code-20250219',
-  SERVER_SIDE_FALLBACK_BETA,
-])
-
-/** Remove plugin-added OAuth authentication, Claude Code compatibility and server
- * safety-fallback betas from paid API/proxy sends; preserve unrelated host betas. */
-function apiBetas(value: string) {
-  const kept = value
-    .split(',')
-    .map((beta) => beta.trim())
-    .filter((beta) => beta && !OAUTH_ONLY_BETAS.has(beta))
-  return mergeAnthropicBetas(null, kept)
-}
-
-/**
- * Validate history, remove OAuth-only fallback fields and internal boundary
- * markers, and apply the configured model alias for paid API/proxy requests.
- * No Claude Code identity, tool-name prefix or body signature is added.
- * Preserve the original text when no field changes or the body is not an object.
- */
-function rewriteApiBody(body: string, sessionId: string, modelId: string) {
-  const parsed = parseJson(body)
-  if (!isRecord(parsed)) return body
-  const removed = stripEmptyTrailingAssistantMessages(parsed.messages)
-  const hadFallbacks = Object.hasOwn(parsed, 'fallbacks')
-  const { droppedMarkers } = applyServerSideFallbackToBody(parsed, false)
-  const fallbacksRemoved = hadFallbacks && !Object.hasOwn(parsed, 'fallbacks')
-  const remapped = remapRequestBodyModel(parsed)
-  applyRunnerTurnNotes(parsed, { sessionId, modelId, isOAuth: false })
-  return removed > 0 || droppedMarkers > 0 || fallbacksRemoved || remapped
-    ? JSON.stringify(parsed)
-    : body
-}
-
 /** Resolves `work` or gives up after `ms`, so a stuck callback cannot hold the host. */
 async function settleWithin(
   work: Promise<void> | void,
@@ -1438,7 +1388,10 @@ export function createNativeAnthropicAdapter<Q, P>(
         })
       } else {
         if (body !== undefined && messages)
-          body = rewriteApiBody(body, input.sessionID, input.modelID)
+          body = rewriteApiKeyRequestBody(body, {
+            sessionId: input.sessionID,
+            modelId: input.modelID,
+          })
         headers.delete('authorization')
         headers.delete('x-api-key')
         for (const [name, value] of Object.entries(send.apiHeaders ?? {})) {
@@ -1450,7 +1403,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         }
         const betas = headers.get('anthropic-beta')
         if (betas !== null) {
-          const kept = apiBetas(betas)
+          const kept = apiKeyRequestBetas(betas)
           if (kept) headers.set('anthropic-beta', kept)
           else headers.delete('anthropic-beta')
         }

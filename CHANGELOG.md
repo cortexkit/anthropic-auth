@@ -18,6 +18,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - OpenCode 1: after a server restart, a threaded session's first full request can reuse the previous full request's cache boundary, as on OpenCode 2 and Pi.
 - OpenCode 1 and Pi: eligible direct CacheKeep requests now use gzip, like OpenCode 2, and resend uncompressed if gzip is rejected.
 - OpenCode 1: keep-warm requests no longer appear in cache diagnostics or replace the previous real response, as on OpenCode 2.
+- OpenCode 1 and Pi now send paid API-key requests like OpenCode 2, without adding a Claude Code prompt or billing signature or renaming tools. Claude subscription requests are unchanged.
+- OpenCode 1, OpenCode 2 and Pi always verify TLS for API-key requests to custom HTTPS addresses. The `ANTHROPIC_INSECURE` environment variable is gone.
 - Pi: changing thinking effort during a conversation now preserves the prompt cache on models that support per-message effort, including in conversations shortened by Magic Context.
 - OpenCode 2 now keeps custom proxy headers off Claude sign-in requests, like OpenCode 1 and Pi, while still sending them on API-key routes.
 - For conversation requests, OpenCode 2 now matches OpenCode 1: the first eligible request sends a null previous message ID, and cache results and beta lists appear in debug logs.

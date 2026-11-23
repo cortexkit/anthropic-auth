@@ -524,17 +524,6 @@ function createToolNameRewriter(
 }
 
 /**
- * Check if TLS verification should be skipped for custom API endpoints.
- * Only effective when ANTHROPIC_BASE_URL is also set, and only on API-key
- * routes: Claude OAuth sends always check certificates.
- */
-export function isInsecure(): boolean {
-  if (!process.env.ANTHROPIC_BASE_URL?.trim()) return false
-  const raw = process.env.ANTHROPIC_INSECURE?.trim()
-  return raw === '1' || raw === 'true'
-}
-
-/**
  * Rewrite the request URL to add ?beta=true for /v1/messages requests.
  * When ANTHROPIC_BASE_URL is set, overrides the origin (protocol + host)
  * for all API requests flowing through the fetch wrapper.

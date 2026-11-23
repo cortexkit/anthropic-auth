@@ -208,8 +208,7 @@ Through the gateway:
   requests the gateway does not take still use the relay as before, and a
   WebSocket relay still refuses them.
 - Redirects are refused, as for every sign-in request.
-- Certificates are always checked; `ANTHROPIC_INSECURE` never applies to
-  sign-in requests.
+- TLS certificates are always checked.
 - A loopback `http:` gateway is refused while `HTTP_PROXY` or `http_proxy` is
   set, because Bun would send those plain-text requests, with your sign-in
   token and gateway headers, through that proxy, and a repository's `.env`

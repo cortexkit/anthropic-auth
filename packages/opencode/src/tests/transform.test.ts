@@ -44,7 +44,6 @@ import {
   extractLatestHybridMessageCacheAnchor,
   getSanitizeMemoStats,
   hasPinnedFirstUserTextForTest,
-  isInsecure,
   mergeBetaHeaders,
   mergeHeaders,
   NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
@@ -1781,60 +1780,6 @@ describe('rewriteUrl', () => {
     const url = new URL((input as Request).url)
     expect(url.origin).toBe('http://localhost:8080')
     expect(url.pathname).toBe('/v1/messages')
-  })
-})
-
-describe('isInsecure', () => {
-  const originalBaseUrl = process.env.ANTHROPIC_BASE_URL
-  const originalInsecure = process.env.ANTHROPIC_INSECURE
-
-  afterEach(() => {
-    if (originalBaseUrl === undefined) {
-      delete process.env.ANTHROPIC_BASE_URL
-    } else {
-      process.env.ANTHROPIC_BASE_URL = originalBaseUrl
-    }
-    if (originalInsecure === undefined) {
-      delete process.env.ANTHROPIC_INSECURE
-    } else {
-      process.env.ANTHROPIC_INSECURE = originalInsecure
-    }
-  })
-
-  test('returns false when neither env var is set', () => {
-    delete process.env.ANTHROPIC_BASE_URL
-    delete process.env.ANTHROPIC_INSECURE
-    expect(isInsecure()).toBe(false)
-  })
-
-  test('returns false when only ANTHROPIC_INSECURE is set (no base URL)', () => {
-    delete process.env.ANTHROPIC_BASE_URL
-    process.env.ANTHROPIC_INSECURE = '1'
-    expect(isInsecure()).toBe(false)
-  })
-
-  test('returns false when ANTHROPIC_BASE_URL is set but ANTHROPIC_INSECURE is not', () => {
-    process.env.ANTHROPIC_BASE_URL = 'https://proxy.local'
-    delete process.env.ANTHROPIC_INSECURE
-    expect(isInsecure()).toBe(false)
-  })
-
-  test('returns true when both are set and ANTHROPIC_INSECURE is "1"', () => {
-    process.env.ANTHROPIC_BASE_URL = 'https://proxy.local'
-    process.env.ANTHROPIC_INSECURE = '1'
-    expect(isInsecure()).toBe(true)
-  })
-
-  test('returns true when ANTHROPIC_INSECURE is "true"', () => {
-    process.env.ANTHROPIC_BASE_URL = 'https://proxy.local'
-    process.env.ANTHROPIC_INSECURE = 'true'
-    expect(isInsecure()).toBe(true)
-  })
-
-  test('returns false for other ANTHROPIC_INSECURE values', () => {
-    process.env.ANTHROPIC_BASE_URL = 'https://proxy.local'
-    process.env.ANTHROPIC_INSECURE = 'yes'
-    expect(isInsecure()).toBe(false)
   })
 })
 

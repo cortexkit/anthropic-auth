@@ -1137,13 +1137,13 @@ async function sendAnthropicRequestAttempt(
         isFastModePersistentlyEnabled(storage),
         identity,
         {
+          apiKey: !!options.apiAccount,
           deferSigning: true,
           billingLineage: lineage,
           ...(diagnosticsSession && {
             cacheDiagnosticsPreviousMessageId:
               diagnosticsSession.previous?.messageId ?? null,
           }),
-          modelRemapEnabled: options.apiAccount !== undefined,
           forkBaseMessageCount: forkBase?.messageCount,
           // API-key routes send no effort history, so no fork hint either.
           forkEffort: options.apiAccount
@@ -1436,7 +1436,7 @@ async function sendAnthropicRequestAttempt(
     options.onThreadPrepared?.(threadRequest.fail)
     wireBodyText = threadRequest.bodyText
     init.body = wireBodyText
-  } else {
+  } else if (!options.apiAccount) {
     wireBodyText = await signRequestBody(bodyText)
     init.body = wireBodyText
   }
