@@ -1,5 +1,6 @@
+import { setTimeout as sleep } from 'node:timers/promises'
 import {
-  askRouting,
+  askRoutingUntilCapacity,
   type RoutingRefusal,
 } from '@cortexkit/common-auth/routing-accessor'
 import type { OAuthQuotaSnapshot } from './accounts.ts'
@@ -22,6 +23,12 @@ export type RoutingChoice = {
   hold?: { retry_after_ms: number }
 }
 type RoutingSubject = { accountIdentity?: string; credentialId?: string }
+type RoutingAskOptions = {
+  capacityWait: 'wait' | { maxInRequestMs: number }
+  signal?: AbortSignal
+  warmCredentialId?: string
+  onCapacityWait?: () => () => void
+}
 
 /** Routing owns quota reserves, including unknown readings and the minimum remaining quota set by the killswitch. Offer only subscription credentials the host may use. */
 export function routingCandidates(accounts: readonly NativeAccountView[]) {
@@ -55,20 +62,24 @@ export function routingChoiceMatches(
   )
 }
 
-/** Fixed text avoids exposing router internals and is not a host auto-retry signal. */
+/** Fixed text avoids exposing router internals. */
 export class RoutingRefusalError extends Error {
   readonly code: RoutingRefusal['refused']['code']
   readonly retryAfterSecs?: number
+  readonly resetsAtMs?: number
   readonly status: number
 
   constructor(refusal: RoutingRefusal['refused'], now = Date.now()) {
     super(
       refusal.code === 'account_selection_final'
         ? 'Shared routing refused an account for this request.'
-        : 'Shared routing has no account for this request right now.',
+        : refusal.code === 'concurrency_full'
+          ? 'Every Claude account is at its concurrent-request limit. Retrying when a slot frees.'
+          : 'Shared routing has no account for this request right now.',
     )
     this.name = 'RoutingRefusalError'
     this.code = refusal.code
+    this.resetsAtMs = refusal.resetsAtMs
     this.status = refusal.code === 'account_selection_final' ? 403 : 429
     this.retryAfterSecs =
       this.status === 429
@@ -102,6 +113,15 @@ export class RoutingRefusalError extends Error {
       },
     )
   }
+}
+
+async function waitForCapacity(ms: number, signal?: AbortSignal) {
+  // A delay above the platform timer limit would fire almost immediately.
+  do {
+    const delay = Math.min(ms, 2_147_483_647)
+    await sleep(delay, undefined, { signal, ref: false })
+    ms -= delay
+  } while (ms > 0)
 }
 
 export function createRoutingRelay(
@@ -159,31 +179,64 @@ export function createRoutingRelay(
       sessionId: string,
       modelId: string,
       candidates: readonly RoutingSubject[],
-      warmCredentialId?: string,
-    ): Promise<RoutingChoice | null> {
+      {
+        capacityWait,
+        signal,
+        warmCredentialId,
+        onCapacityWait,
+      }: RoutingAskOptions,
+    ): Promise<RoutingChoice | undefined> {
       admissions.delete(sessionId)
       silenced.delete(sessionId)
-      const result = await askRouting({
-        sessionId,
-        provider: 'anthropic',
-        modelId,
-        deadlineMs: 2000,
-        refusals: true,
-        ...(warmCredentialId ? { warmCredentialId } : {}),
-        candidates: candidates.flatMap((row) =>
-          row.accountIdentity
-            ? [
-                {
-                  accountId: row.accountIdentity,
-                  credentialId: row.credentialId ?? 'local',
+      const waitUntil =
+        capacityWait === 'wait'
+          ? undefined
+          : Date.now() + capacityWait.maxInRequestMs
+      let clearWait: (() => void) | undefined
+      const result = await askRoutingUntilCapacity(
+        {
+          sessionId,
+          provider: 'anthropic',
+          modelId,
+          deadlineMs: 2000,
+          refusals: true,
+          ...(warmCredentialId ? { warmCredentialId } : {}),
+          candidates: candidates.flatMap((row) =>
+            row.accountIdentity
+              ? [
+                  {
+                    accountId: row.accountIdentity,
+                    credentialId: row.credentialId ?? 'local',
+                  },
+                ]
+              : [],
+          ),
+        },
+        {
+          signal,
+          sleep:
+            waitUntil === undefined && !onCapacityWait
+              ? undefined
+              : async (ms, signal) => {
+                  const now = Date.now()
+                  // The helper supplies a delay, so rebuild the reset for the host's retry.
+                  const resetsAtMs = now + ms
+                  if (
+                    waitUntil !== undefined &&
+                    (now >= waitUntil || resetsAtMs > waitUntil)
+                  )
+                    throw new RoutingRefusalError(
+                      { code: 'concurrency_full', resetsAtMs },
+                      now,
+                    )
+                  clearWait ??= onCapacityWait?.()
+                  await waitForCapacity(ms, signal)
                 },
-              ]
-            : [],
-        ),
-      })
+        },
+      ).finally(() => clearWait?.())
       if (!result) {
         override(sessionId, 'no valid answer within routing deadline')
-        return null
+        return undefined
       }
       if ('refused' in result) throw new RoutingRefusalError(result.refused)
       const choice = {

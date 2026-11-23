@@ -339,6 +339,35 @@ describe('OC1 shared routing relay', () => {
     expect(f.sends).toEqual([])
   })
 
+  test('long capacity waits return a retryable 429 and use a fresh id on host retry', async () => {
+    const f = await fixture()
+    const ids: unknown[] = []
+    const reset = Date.now() + 30 * 60_000
+    globals[key] = () => ({
+      accountFor: async (request: Record<string, unknown>) => {
+        ids.push(request.request_id)
+        return request.waits_for_capacity
+          ? { refused: { code: 'concurrency_full', resets_at_ms: reset } }
+          : { refused: { code: 'account_selection_final' } }
+      },
+    })
+    for (let i = 0; i < 2; i++) {
+      const response = await f.send()
+      expect(response.status).toBe(429)
+      expect(response.headers.get('retry-after')).toBe('900')
+      expect(await response.json()).toMatchObject({
+        error: {
+          code: 'concurrency_full',
+          message:
+            'Every Claude account is at its concurrent-request limit. Retrying when a slot frees.',
+        },
+      })
+    }
+    expect(f.sends).toEqual([])
+    expect(ids).toEqual([expect.any(String), expect.any(String)])
+    expect(ids[1]).not.toBe(ids[0])
+  })
+
   test.each(['floor', 'reserve', 'unknown quota'])(
     'routing quota trust serves OC1 advice despite %s',
     async (mode) => {

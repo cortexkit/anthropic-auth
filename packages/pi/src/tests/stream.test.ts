@@ -186,13 +186,17 @@ describe('Pi shared routing relay', () => {
         { headers: { 'content-type': 'text/event-stream' } },
       )
     }) as unknown as typeof fetch
-    const send = (wait?: Parameters<typeof streamCortexKitAnthropic>[4]) =>
+    const send = (
+      wait?: Parameters<typeof streamCortexKitAnthropic>[4],
+      signal?: AbortSignal,
+    ) =>
       streamCortexKitAnthropic(
         anthropicModel,
         anthropicContext,
         {
           sessionId: 'ses_pi_routing_relay',
           apiKey: 'sk-ant-oat01-main-access',
+          signal,
         },
         undefined,
         wait,
@@ -224,6 +228,63 @@ describe('Pi shared routing relay', () => {
     expect(asks).toBe(1)
     expect(f.sends).toEqual([])
   })
+
+  test.each(['slot opens', 'Escape cancels'])(
+    'Pi shows and clears its capacity wait message when %s',
+    async (outcome) => {
+      const f = await fixture()
+      const controller = new AbortController()
+      const messages: (string | undefined)[] = []
+      let asks = 0
+      globals[routingKey] = () => ({
+        accountFor: async (request: Record<string, unknown>) => {
+          if (!request.waits_for_capacity)
+            return { refused: { code: 'account_selection_final' } }
+          if (++asks === 1)
+            return {
+              refused: {
+                code: 'concurrency_full',
+                resets_at_ms:
+                  Date.now() + (outcome === 'Escape cancels' ? 60_000 : 5),
+              },
+            }
+          return {
+            account_id: fixtureAccountIdentity('fallback'),
+            credential_id: 'local',
+          }
+        },
+      })
+      const result = await f
+        .send(
+          {
+            setWorkingMessage: (message) => {
+              if (message) {
+                expect(f.sends).toEqual([])
+                // Escape in Pi aborts the active stream's signal.
+                if (outcome === 'Escape cancels')
+                  setTimeout(() => controller.abort(), 0)
+              }
+              messages.push(message)
+            },
+          },
+          controller.signal,
+        )
+        .result()
+      expect(messages).toEqual([
+        'Waiting for a free account slot (Esc to cancel)',
+        undefined,
+      ])
+      if (outcome === 'Escape cancels') {
+        expect(result.stopReason).toBe('aborted')
+        expect(asks).toBe(1)
+        expect(f.sends).toEqual([])
+      } else {
+        expect(result.stopReason).toBe('stop')
+        expect(asks).toBe(2)
+        expect(f.sends).toEqual(['Bearer sk-ant-oat01-fallback-access'])
+      }
+    },
+  )
 
   test.each(['floor', 'unknown quota'])(
     'routing quota trust serves Pi advice despite %s',

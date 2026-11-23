@@ -2434,7 +2434,9 @@ function expectedVaultRoutingAsk(includePrimary: boolean) {
   return {
     provider: 'anthropic',
     modelId: 'claude-sonnet-4-6',
+    request_id: expect.any(String),
     refusals: true,
+    waits_for_capacity: true,
     candidates: {
       view_digest: includePrimary
         ? 'f4028c74216e6e34a57580234815738d687a464335ec616965dc401213f0efdf'
@@ -2486,9 +2488,9 @@ for (const condition of ['disabled', 'signed out', 'unservable']) {
       await f.runtime.vault.refresh()
     }
     expect((await sendNative(f.plugin)).status).toBe(200)
-    expect(f.requests.map((request) => JSON.stringify(request))).toEqual([
-      JSON.stringify(expectedVaultRoutingAsk(true)),
-      JSON.stringify(expectedVaultRoutingAsk(false)),
+    expect(f.requests).toEqual([
+      expectedVaultRoutingAsk(true),
+      expectedVaultRoutingAsk(false),
     ])
   })
 }

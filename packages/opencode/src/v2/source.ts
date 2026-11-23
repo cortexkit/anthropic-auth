@@ -1055,7 +1055,14 @@ export function createNativeAnthropicSource(
         input.sessionID,
         modelID,
         routingCandidates(snapshot.accounts),
-        routingWarmCredential(snapshot.accounts, assignment),
+        {
+          capacityWait: 'wait',
+          signal: active.signal,
+          warmCredentialId: routingWarmCredential(
+            snapshot.accounts,
+            assignment,
+          ),
+        },
       )
       active.signal.throwIfAborted()
       if (advice) {
@@ -1788,7 +1795,15 @@ export function createNativeAnthropicSource(
         input.sessionID,
         modelID,
         routingCandidates(snapshot.accounts),
-        routingWarmCredential(snapshot.accounts, assignment),
+        {
+          // This probe only decides the text of an existing 429 response.
+          capacityWait: { maxInRequestMs: 0 },
+          signal: state.active.signal,
+          warmCredentialId: routingWarmCredential(
+            snapshot.accounts,
+            assignment,
+          ),
+        },
       )
       const retry: ChooseAccountInput = {
         ...input,

@@ -4257,7 +4257,9 @@ function expectedVaultRoutingAsk(includePrimary: boolean) {
   return {
     provider: 'anthropic',
     modelId: model.id,
+    request_id: expect.any(String),
     refusals: true,
+    waits_for_capacity: true,
     candidates: {
       // Only the digest sorts the pairs; the wire array stays in fixture order.
       view_digest: includePrimary
@@ -4302,9 +4304,9 @@ for (const condition of ['disabled', 'signed out', 'unservable']) {
       await f.runtime.vault.refresh()
     }
     expect((await f.send()).stopReason).toBe('stop')
-    expect(f.requests.map((request) => JSON.stringify(request))).toEqual([
-      JSON.stringify(expectedVaultRoutingAsk(true)),
-      JSON.stringify(expectedVaultRoutingAsk(false)),
+    expect(f.requests).toEqual([
+      expectedVaultRoutingAsk(true),
+      expectedVaultRoutingAsk(false),
     ])
   })
 }
