@@ -10,8 +10,13 @@ import {
   applyCustomHeaders,
   assertHostAuthorityStable,
   buildBillingHeaderValue,
+  buildCacheDiagnosticsRecord,
   buildPrimeRequestBody,
+  CACHE_DIAGNOSTICS_BETA,
+  CACHE_DIAGNOSTICS_SESSION_LIMIT,
   CACHE_KEEP_EXTENDED_TTL_BETA,
+  CacheDiagnosticsBetaTracker,
+  CacheDiagnosticsTracker,
   type CacheKeepManager,
   type CacheKeepRealTurn,
   CacheKeepSessionRegistry,
@@ -38,7 +43,9 @@ import {
   dumpResponseArtifact,
   effectiveRelayTransport,
   FAST_MODE_BETA,
+  formatCacheDiagnosticsLogLine,
   getCache1hPersistentMode,
+  getCacheDiagnosticsBetas,
   getCacheKeepRegistryDirectories,
   getClaudeCodeIdentityForVerifiedAccount,
   getFallbackReauthLabels,
@@ -121,6 +128,7 @@ import {
   stickyRetryAfterWithJitter,
   stickyRouteCandidateWeight,
   stickyRouteFamilyForModel,
+  summarizeCacheTtl,
   warnClaudeGatewayRelayIgnored,
   withAnthropicBilling,
   withCacheKeepRealTurn,
@@ -196,6 +204,25 @@ const primarySessions = new Map<
   }
 >()
 
+const cacheDiagnostics = new CacheDiagnosticsTracker()
+const cacheDiagnosticBetas = new CacheDiagnosticsBetaTracker()
+const cacheDiagnosticsSessions = new Map<string, object>()
+const cacheDiagnosticsObservers = new WeakMap<
+  Response,
+  (message: unknown) => Promise<void>
+>()
+
+function cacheDiagnosticsSession(sessionId: string): object {
+  const session = cacheDiagnosticsSessions.get(sessionId) ?? {}
+  cacheDiagnosticsSessions.delete(sessionId)
+  cacheDiagnosticsSessions.set(sessionId, session)
+  if (cacheDiagnosticsSessions.size > CACHE_DIAGNOSTICS_SESSION_LIMIT) {
+    const oldest = cacheDiagnosticsSessions.keys().next().value
+    if (oldest !== undefined) cacheDiagnosticsSessions.delete(oldest)
+  }
+  return session
+}
+
 export function beginPiPrimaryTurn(
   storagePath: string,
   sessionId?: string,
@@ -268,6 +295,8 @@ export function forgetPiMessageThread(
   disposition: 'session_closed' | 'session_deleted' = 'session_deleted',
 ): void {
   messageThreads.forget(sessionId, disposition)
+  cacheDiagnostics.forgetSession(sessionId)
+  cacheDiagnosticsSessions.delete(sessionId)
 }
 
 /** Dump label for a physical send that failed before any response arrived. */
@@ -820,6 +849,7 @@ export async function* parseSse(
     return
   }
   const dumpObserver = dumpResponseObservers.get(response)
+  let cacheDiagnosticsObserver = cacheDiagnosticsObservers.get(response)
   const reader = response.body.getReader()
   // Core's byte framer ends frames at blank lines with CRLF, LF or CR line
   // endings and keeps a multibyte character split across reads in one frame,
@@ -844,6 +874,11 @@ export async function* parseSse(
         if (!data || data === '[DONE]') continue
         const event = JSON.parse(data) as AnthropicEvent
         dumpObserver?.observe(event)
+        if (event.type === 'message_start' && cacheDiagnosticsObserver) {
+          const observe = cacheDiagnosticsObserver
+          cacheDiagnosticsObserver = undefined
+          await observe(event.message).catch(() => {})
+        }
         yield event
       }
     }
@@ -1021,6 +1056,14 @@ async function sendAnthropicRequestAttempt(
     primary.committed = lineage.sequence
     primary.previousRequestId = id
   }
+  const diagnosticsSession =
+    realSession && !options.apiAccount && !options.prime && !forkHead
+      ? {
+          id: realSession,
+          token: cacheDiagnosticsSession(realSession),
+          previous: cacheDiagnostics.previousFor(realSession),
+        }
+      : undefined
   if (!options.prime && !forkHead && realSession) {
     if (options.apiAccount || !options.storagePath) {
       try {
@@ -1096,6 +1139,10 @@ async function sendAnthropicRequestAttempt(
         {
           deferSigning: true,
           billingLineage: lineage,
+          ...(diagnosticsSession && {
+            cacheDiagnosticsPreviousMessageId:
+              diagnosticsSession.previous?.messageId ?? null,
+          }),
           modelRemapEnabled: options.apiAccount !== undefined,
           forkBaseMessageCount: forkBase?.messageCount,
           // API-key routes send no effort history, so no fork hint either.
@@ -1352,14 +1399,17 @@ async function sendAnthropicRequestAttempt(
     relayConfig = null
   }
   let threadRequest: MessageThreadRequest | undefined
-  if (
-    primary &&
+  // A real conversation request in the turn this process still owns.
+  const primaryThread =
+    primary !== undefined &&
     primary ===
       piPrimarySession(
         options.storagePath,
         options.streamOptions,
         options.requestOrigin,
-      ) &&
+      )
+  if (
+    primaryThread &&
     // Gateways may refuse the thread route: send full requests.
     !gateway &&
     typeof options.streamOptions?.onPayload === 'function' &&
@@ -1733,6 +1783,66 @@ async function sendAnthropicRequestAttempt(
       createDumpResponseObserver(dumpHandle, response.status),
     )
   }
+  if (diagnosticsSession && response.ok) {
+    const previousMessageId = diagnosticsSession.previous?.messageId ?? null
+    const payload = JSON.parse(wireBodyText) as {
+      diagnostics?: { previous_message_id?: string | null }
+      model?: unknown
+    }
+    // Thread recovery can replace the prepared body. Attribute the result only
+    // if the actual send carried this diagnostic predecessor and beta.
+    if (payload.diagnostics?.previous_message_id === previousMessageId) {
+      const betas = getCacheDiagnosticsBetas(headers).catch(() => undefined)
+      const ttlSent = summarizeCacheTtl(payload)
+      const requestedModel =
+        typeof payload.model === 'string' ? payload.model : undefined
+      cacheDiagnosticsObservers.set(response, async (message) => {
+        const receivedAt = Date.now()
+        const sent = await betas
+        if (
+          !sent?.betas.includes(CACHE_DIAGNOSTICS_BETA) ||
+          init.signal?.aborted ||
+          cacheDiagnosticsSessions.get(diagnosticsSession.id) !==
+            diagnosticsSession.token
+        )
+          return
+        const { record, messageId, canary } = buildCacheDiagnosticsRecord({
+          request: {
+            sessionId: diagnosticsSession.id,
+            previousMessageId,
+            previousMessageReceivedAt: diagnosticsSession.previous?.receivedAt,
+            isSubagent: false,
+            ttlSent,
+          },
+          source: 'turn',
+          accountId: routeId,
+          synthetic: false,
+          betasHash: sent.betasHash,
+          requestedModel,
+          message,
+          receivedAt,
+        })
+        if (!record || !messageId) return
+        logger.debug('cache-diagnostics', formatCacheDiagnosticsLogLine(record))
+        const betaLine = cacheDiagnosticBetas.capture(
+          sent.betasHash,
+          sent.betas,
+        )
+        if (betaLine) logger.debug('cache-diagnostics', betaLine)
+        if (canary)
+          logger.warn(
+            'cache-diagnostics',
+            'short-gap previous_message_not_found',
+            {
+              message_id: canary.messageId,
+              previous_message_id: canary.previousMessageId,
+            },
+          )
+        if (primaryThread)
+          cacheDiagnostics.capture(diagnosticsSession.id, messageId, receivedAt)
+      })
+    }
+  }
   return response
 }
 
@@ -1883,6 +1993,9 @@ export async function firstStreamingError(
   const inspected = copyStreamResponseTiming(response, replay(true))
   const dumpObserver = dumpResponseObservers.get(response)
   if (dumpObserver) dumpResponseObservers.set(inspected, dumpObserver)
+  const cacheDiagnosticsObserver = cacheDiagnosticsObservers.get(response)
+  if (cacheDiagnosticsObserver)
+    cacheDiagnosticsObservers.set(inspected, cacheDiagnosticsObserver)
   return { response: inspected, preflight: inspected }
 }
 

@@ -32,6 +32,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Pi: `/claude` can now start a five-hour quota window with a one-time request, like OpenCode 1 and 2.
 - Pi, like OpenCode 1 and 2, now updates each subscription account's quota from Claude's replies without waiting for the next quota poll.
 - Pi's paid API-key route now honors the same model aliases as OpenCode 1 and 2 and keeps its configured endpoint.
+- Pi now links cache diagnostics across conversation replies like OpenCode 1 and 2, with cache results and beta lists in the debug log.
 
 ## 2.16.5
 

@@ -1,4 +1,5 @@
 import {
+  applyCacheDiagnosticsOptIn,
   applyClaudeCodeMetadata,
   applyRunnerTurnNotes,
   applySessionCacheTtl,
@@ -7,6 +8,7 @@ import {
   assertNoMeaningfulTrailingAssistant,
   type BillingLineageFields,
   buildBillingHeaderValue,
+  CACHE_DIAGNOSTICS_BETA,
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
@@ -32,6 +34,7 @@ import {
   readSessionCachePolicy,
   remapRequestBodyModel,
   requestCacheLifetimeMs,
+  selectClaudeCodeBetas,
   signRequestBody,
   stripEmptyTrailingAssistantMessages,
   type ThinkingPrefixMismatchBehavior,
@@ -761,6 +764,7 @@ export async function buildAnthropicRequest(
     forkEffort?: PiForkEffortHint
     /** Leave the billing signature placeholder for the transport to finalize. */
     deferSigning?: boolean
+    cacheDiagnosticsPreviousMessageId?: string | null
     modelRemapEnabled?: boolean
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
     turnEndNote?: { tools: string[] }
@@ -1046,6 +1050,11 @@ export async function buildAnthropicRequest(
       `Anthropic accepts at most 4 cache breakpoints; the onPayload hook left ${breakpoints}`,
     )
   if (controls.modelRemapEnabled) remapRequestBodyModel(body)
+  if (
+    controls.cacheDiagnosticsPreviousMessageId !== undefined &&
+    selectClaudeCodeBetas(body).split(',').includes(CACHE_DIAGNOSTICS_BETA)
+  )
+    applyCacheDiagnosticsOptIn(body, controls.cacheDiagnosticsPreviousMessageId)
   const unsigned = JSON.stringify(
     orderClaudeCodeBody(body, { isOAuth: !!identity }),
   )

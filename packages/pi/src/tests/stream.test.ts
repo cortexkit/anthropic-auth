@@ -735,6 +735,132 @@ test.each([
   },
 )
 
+test('Pi conversation cache diagnostics link replies and log one beta list per hash', async () => {
+  tempDir = await mkdtemp(join(tmpdir(), 'pi-cache-diagnostics-'))
+  const storagePath = join(tempDir, 'accounts.json')
+  const sessionId = 'ses_pi_cache_diagnostics'
+  process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+  await saveNativePiFixture(
+    {
+      version: 1,
+      accounts: [],
+      logging: { level: 'debug' },
+      quota: { enabled: false },
+    },
+    storagePath,
+  )
+  const sent: Array<{ diagnostics?: unknown; betas: string[] }> = []
+  const records: LogTestRecord[] = []
+  const level = core.getLogLevel()
+  await getPiNativeRuntime(storagePath).service()
+  core.setLogLevel('debug')
+  __setLogTestSink((record) => records.push(record))
+  globalThis.fetch = mock(
+    async (input: string | URL | Request, init?: RequestInit) => {
+      if (!String(input).includes('/v1/messages'))
+        throw new Error('unexpected request')
+      const body = JSON.parse(String(init?.body)) as { diagnostics?: unknown }
+      const betas = (
+        new Headers(init?.headers).get('anthropic-beta') ?? ''
+      ).split(',')
+      sent.push({ diagnostics: body.diagnostics, betas })
+      return new Response(
+        [
+          {
+            type: 'message_start',
+            message: {
+              id: `msg_pi_diag_${sent.length}`,
+              model: anthropicModel.id,
+              diagnostics: null,
+              usage: {
+                input_tokens: 24,
+                output_tokens: 0,
+                cache_read_input_tokens: 12,
+                cache_creation_input_tokens: 4,
+                cache_creation: {
+                  ephemeral_5m_input_tokens: 4,
+                  ephemeral_1h_input_tokens: 0,
+                },
+              },
+            },
+          },
+          { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+          { type: 'message_stop' },
+        ]
+          .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+          .join(''),
+        { headers: { 'content-type': 'text/event-stream' } },
+      )
+    },
+  ) as unknown as typeof fetch
+
+  const send = (origin: 'agent-loop' | 'direct' = 'agent-loop') =>
+    streamCortexKitAnthropic(
+      anthropicModel,
+      anthropicContext,
+      {
+        sessionId,
+        onPayload: (payload) => payload,
+        onResponse: () => {},
+        onProviderStreamEvent: () => {},
+      },
+      undefined,
+      undefined,
+      origin,
+    ).result()
+  beginPiPrimaryTurn(storagePath, sessionId)
+  try {
+    expect((await send()).stopReason).toBe('stop')
+    expect((await send('direct')).stopReason).toBe('stop')
+    expect((await send()).stopReason).toBe('stop')
+    expect(sent[0]?.betas).toContain(core.CACHE_DIAGNOSTICS_BETA)
+    expect(sent.map((request) => request.diagnostics)).toEqual([
+      { previous_message_id: null },
+      { previous_message_id: 'msg_pi_diag_1' },
+      { previous_message_id: 'msg_pi_diag_1' },
+    ])
+    const lines = records.filter(({ message }) =>
+      message.startsWith('MC-CACHE-DIAG '),
+    )
+    expect(lines.map(({ level }) => level)).toEqual(['debug', 'debug', 'debug'])
+    const [first, auxiliary, second] = lines.map(({ message }) =>
+      JSON.parse(message.slice('MC-CACHE-DIAG '.length)),
+    )
+    expect(first).toMatchObject({
+      source: 'turn',
+      session_id: sessionId,
+      message_id: 'msg_pi_diag_1',
+      previous_message_id: null,
+      diag_state: 'server_null',
+      cache_read: 12,
+    })
+    expect(auxiliary).toMatchObject({
+      message_id: 'msg_pi_diag_2',
+      previous_message_id: 'msg_pi_diag_1',
+    })
+    expect(auxiliary.betas_hash).toMatch(/^[0-9a-f]{16}$/)
+    expect(auxiliary.betas_hash).not.toBe(first.betas_hash)
+    expect(second).toMatchObject({
+      message_id: 'msg_pi_diag_3',
+      previous_message_id: 'msg_pi_diag_1',
+      betas_hash: first.betas_hash,
+    })
+    const betaLines = records.filter(({ message }) =>
+      message.startsWith('MC-CACHE-DIAG-BETAS '),
+    )
+    expect(betaLines.map(({ level }) => level)).toEqual(['debug', 'debug'])
+    expect(betaLines.map(({ message }) => message)).toEqual([
+      `MC-CACHE-DIAG-BETAS ${JSON.stringify({ hash: first.betas_hash, betas: [...sent[0]!.betas].sort() })}`,
+      `MC-CACHE-DIAG-BETAS ${JSON.stringify({ hash: auxiliary.betas_hash, betas: [...sent[1]!.betas].sort() })}`,
+    ])
+  } finally {
+    endPiPrimaryTurn(storagePath, sessionId)
+    forgetPiMessageThread(sessionId)
+    __setLogTestSink(null)
+    core.setLogLevel(level)
+  }
+})
+
 describe('Pi stream stop reasons', () => {
   const refusal = 'Claude refused this request (stop_reason: refusal).'
   const cases = [
