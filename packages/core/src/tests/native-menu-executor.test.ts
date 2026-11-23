@@ -491,28 +491,8 @@ test('dispatched requests are fresh copies, not the caller objects', async () =>
   ])
 })
 
-test('actions the host does not offer and unknown actions are refused', async () => {
-  const unavailable = hostActionIds('opencode').filter(
-    (id) => !hostActionIds('pi').includes(id),
-  )
-  expect(unavailable.sort()).toEqual(
-    (
-      [
-        'quota-refresh',
-        'killswitch-on',
-        'killswitch-off',
-        'killswitch-set',
-        'start-fire',
-      ] satisfies NativeMenuActionId[]
-    ).sort(),
-  )
+test('unknown actions are refused', async () => {
   const { calls, executor } = harness('pi')
-  for (const id of unavailable) {
-    expect(await executor.execute(samples[id], full)).toEqual({
-      status: 'refused',
-      code: 'unsupported-action',
-    })
-  }
   for (const action of [
     'nope',
     'status',

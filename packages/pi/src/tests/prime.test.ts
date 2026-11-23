@@ -5,18 +5,30 @@ import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import {
   type AccountStorage,
+  PROMPT_CACHE_DEFAULT_TTL_MS,
   PrimeManager,
   primeAccountMarkerDir,
   primeMarkerPath,
   resolveNativePoolPaths,
+  StickySessionRouter,
+  sessionCacheActivity,
   signRequestBody,
+  stickyRouteFamilyForModel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+} from '@earendil-works/pi-coding-agent'
+import { registerCommands } from '../commands.ts'
 import cortexKitPiAnthropicAuth from '../index.ts'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import { createPiNativeCommands } from '../native-commands.ts'
-import { getPiTrackedCacheKeepSessions, sendPiPrimeRequest } from '../stream.ts'
+import {
+  getPiTrackedCacheKeepSessions,
+  sendPiPrimeRequest,
+  streamCortexKitAnthropic,
+} from '../stream.ts'
 import { saveNativePiFixture } from './native-fixture.ts'
 
 const originalFetch = globalThis.fetch
@@ -94,13 +106,17 @@ beforeEach(async () => {
       )
       expect(request.redirect).toBe('error')
       const bytes = Buffer.from(await request.arrayBuffer())
-      sends.push({
-        headers: request.headers,
-        text: (request.headers.get('content-encoding') === 'gzip'
+      const text = (
+        request.headers.get('content-encoding') === 'gzip'
           ? gunzipSync(bytes)
           : bytes
-        ).toString(),
-      })
+      ).toString()
+      sends.push({ headers: request.headers, text })
+      if (JSON.parse(text).stream) {
+        return new Response('data: {"type":"message_stop"}\n\n', {
+          headers: { 'content-type': 'text/event-stream' },
+        })
+      }
       return Response.json({ usage: { input_tokens: 17, output_tokens: 1 } })
     },
     { preconnect: originalFetch.preconnect },
@@ -205,6 +221,172 @@ test('Pi Prime enabled with a due account fires once through the signed model tr
     (await native.view()).accounts.find((row) => row.id === 'main')?.prime,
   ).toMatchObject({ count: 1, inputTokens: 17, outputTokens: 1 })
   expect([...timeouts.values()].map((timer) => timer.ms)).toEqual([90_000])
+})
+
+test('Pi /claude queues lane start as a visible turn that warms the session cache', async () => {
+  const native = await fixture(false, {
+    routing: { mode: 'sticky-balanced' },
+    accounts: [
+      {
+        id: 'fallback',
+        type: 'oauth',
+        access: 'sk-ant-oat01-fallback-access',
+        refresh: 'fallback-refresh',
+        expires: now + 3_600_000,
+      },
+    ],
+  })
+  const modelId = 'claude-sonnet-5-5'
+  const sessionId = 'lane-start-session'
+  const router = new StickySessionRouter({ path: await native.routingPath() })
+  expect(
+    await router.resolve({
+      sessionId,
+      modelId,
+      family: stickyRouteFamilyForModel(modelId),
+      affinityModelId: modelId,
+      candidates: [
+        { accountId: 'fallback', order: 1, quota: { kind: 'unknown' } },
+      ],
+      retainAccountIds: new Set(['fallback']),
+      inputBytes: 1,
+      storage: (await native.view()).policyStorage,
+    }),
+  ).toMatchObject({ accountId: 'fallback' })
+  await router.drain()
+
+  const commands = new Map<
+    string,
+    Parameters<ExtensionAPI['registerCommand']>[1]
+  >()
+  const queued: Parameters<ExtensionAPI['sendUserMessage']>[] = []
+  registerCommands(
+    {
+      registerCommand: (
+        name: string,
+        definition: Parameters<ExtensionAPI['registerCommand']>[1],
+      ) => commands.set(name, definition),
+      sendUserMessage: (
+        ...args: Parameters<ExtensionAPI['sendUserMessage']>
+      ) => {
+        queued.push(args)
+      },
+    } as unknown as ExtensionAPI,
+    createPiNativeCommands(storagePath),
+  )
+  async function invoke(model?: ExtensionCommandContext['model']) {
+    const notices: string[] = []
+    let picked = false
+    await commands.get('claude')?.handler('', {
+      model,
+      hasUI: true,
+      sessionManager: { getSessionId: () => sessionId },
+      ui: {
+        notify: (text: string) => notices.push(text),
+        async select(title: string, choices: string[]) {
+          if (picked) return undefined
+          if (title === 'Claude')
+            return choices.find((choice) => choice.startsWith('Extras'))
+          picked = true
+          return choices.find((choice) => choice === 'Fire lane start')
+        },
+      },
+    } as unknown as ExtensionCommandContext)
+    return notices.join('\n')
+  }
+
+  const refusal = await invoke()
+  expect(refusal).toBeTruthy()
+  expect(refusal).not.toContain('Claude lane start queued in this session.')
+  expect(queued).toHaveLength(0)
+  expect(sends).toHaveLength(0)
+
+  const model: NonNullable<ExtensionCommandContext['model']> = {
+    id: modelId,
+    name: 'Claude Sonnet 5.5',
+    api: 'anthropic-messages',
+    provider: 'anthropic',
+    baseUrl: 'https://api.anthropic.com',
+    reasoning: true,
+    input: ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200_000,
+    maxTokens: 64_000,
+  }
+  const notice = await invoke(model)
+  const marker = '[lane start] — automated cache warm; no response needed.'
+  expect(queued).toEqual([[marker, { deliverAs: 'followUp' }]])
+  expect(sends).toHaveLength(0)
+  expect(notice).toContain('Claude lane start queued in this session.')
+
+  const first = {
+    role: 'user',
+    content: 'Earlier session prompt',
+    timestamp: now,
+  } as const
+  const lane = {
+    role: 'user',
+    content: [{ type: 'text', text: queued[0]![0] as string }],
+    timestamp: now + 1,
+  } satisfies Parameters<typeof streamCortexKitAnthropic>[1]['messages'][number]
+  const next = {
+    role: 'user',
+    content: 'Now answer my question',
+    timestamp: now + 2,
+  } as const
+  async function runTurn(
+    messages: Parameters<typeof streamCortexKitAnthropic>[1]['messages'],
+  ) {
+    const result = await streamCortexKitAnthropic(
+      model,
+      { messages },
+      { sessionId, maxTokens: 123 },
+      undefined,
+      undefined,
+      'agent-loop',
+    ).result()
+    expect(result.stopReason).toBe('stop')
+  }
+  try {
+    await runTurn([first, lane])
+    expect(sends).toHaveLength(1)
+    const sent = sends[0]!
+    expect(sent.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-fallback-access',
+    )
+    const body = JSON.parse(sent.text)
+    expect(body).toMatchObject({ model: modelId, max_tokens: 1 })
+    expect(body.messages).toHaveLength(2)
+    expect(body.messages[0]).toMatchObject({
+      role: 'user',
+      content: first.content,
+    })
+    expect(body.messages[1]).toMatchObject({
+      role: 'user',
+      content: [
+        { type: 'text', text: marker, cache_control: { type: 'ephemeral' } },
+      ],
+    })
+    expect(body.thinking).toBeUndefined()
+    expect(await signRequestBody(sent.text)).toBe(sent.text)
+    expect(sessionCacheActivity.ttlMs(sessionId)).toBe(
+      PROMPT_CACHE_DEFAULT_TTL_MS,
+    )
+
+    await runTurn([first, lane, next])
+    expect(sends).toHaveLength(2)
+    const following = JSON.parse(sends[1]!.text)
+    expect(following.max_tokens).toBe(123)
+    expect(following.thinking).toBeDefined()
+    expect(following.messages[0]).toEqual(body.messages[0])
+    expect(following.messages[1]).toMatchObject({
+      role: 'user',
+      content: marker,
+    })
+  } finally {
+    sessionCacheActivity.forget(sessionId)
+  }
+  expect((await native.view()).policyStorage.prime?.enabled).toBe(false)
 })
 
 test('Pi Prime disabled never polls or sends, and the menu enables it live', async () => {

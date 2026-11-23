@@ -48,7 +48,7 @@ Quota figures use the shared wording, such as `5h 40% left, resets 2h29m` and `7
 
 - A positive five-hour or seven-day floor blocks missing readings for that window regardless of `failClosedOnUnknownQuota`.
 - A positive `scoped` minimum-remaining percentage blocks missing model-specific quota information. An explicitly empty scoped-window list means no separate window applies.
-- OpenCode can edit killswitch thresholds in **Limits**; Pi does not expose those edits.
+- OpenCode and Pi can edit killswitch thresholds in **Limits**.
 
 The optional `quota_header_feed_enabled` setting is OpenCode-only, disabled by default and requires restart. It publishes allowlisted quota observations, opaque identity and timestamps to owner-only temporary lease files, not tokens, request bodies, model IDs or refresh errors. It shares observations already obtained from responses rather than making new quota API requests.
 

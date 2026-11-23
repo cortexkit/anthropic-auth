@@ -49,7 +49,7 @@ When content-filter recovery switches a session to Opus 4.8 temporarily, the ori
 
 Prime is opt-in quota-window priming. The **Extras** group in OpenCode and Pi can enable or disable it and shows each account's next due time and last result. In OpenCode 1 and 2, Prime runs without waiting for a chat request and picks up changes to `prime_enabled` in the shared settings file without a restart. After a confirmed five-hour reset, Prime checks fresh quota and limits, then approximately one minute after reset can send a minimal `claude-haiku-4-5` request. Cross-process claims prevent duplicate priming for the same verified Claude account/reset, even when OpenCode and Pi (or two OpenCode installs) use separate account files. Accounts without a verified identity are deduplicated only within the same account storage. This is a real request, not a quota API trick or a guarantee of free usage. Prime does not create a message thread or register a cache for keepalive. It stops when the host shuts down.
 
-OpenCode's **Fire lane start** is an explicit one-shot action. It inserts a visible synthetic lane-start marker and runs a one-token request through normal routing, custody, limits, cache shaping and transport. It is also billed usage; it neither enables Prime nor installs an automatic schedule. Pi does not expose lane start.
+In OpenCode and Pi, **Fire lane start** is an explicit one-shot action. It inserts a visible synthetic lane-start marker in the conversation and runs a one-token request through normal routing, custody, limits, cache shaping and transport. This warms the session's prompt cache for the next turn and counts as billed usage. It neither enables Prime nor installs an automatic schedule.
 
 ## Diagnostics and history analysis
 

@@ -2,6 +2,7 @@ import { join } from 'node:path'
 import {
   createNativeUi,
   disconnectNativeVaultForHost,
+  LANE_START_TEXT,
   type NativeMenuCommandId,
   type NativeMenuDispatch,
   type NativeUiOptions,
@@ -13,7 +14,9 @@ import { type ExtensionAPI, getAgentDir } from '@earendil-works/pi-coding-agent'
 
 /** Backend callbacks use native authority; the renderer never receives credentials. */
 export interface PiNativeCommands {
-  dispatch: NativeMenuDispatch
+  dispatch: (
+    ...args: [...Parameters<NativeMenuDispatch>, queueLaneStart?: () => void]
+  ) => ReturnType<NativeMenuDispatch>
   readStatus: (
     command: Exclude<NativeMenuCommandId, 'start'>,
     invocation: { sessionId?: string },
@@ -60,9 +63,18 @@ export function registerCommands(pi: ExtensionAPI, backend: PiNativeCommands) {
         return
       }
       const disconnect = backend.disconnectVault ?? disconnectPi
+      const queueLaneStart = () => {
+        if (
+          ctx.model?.provider !== 'anthropic' ||
+          ctx.model.api !== 'anthropic-messages'
+        )
+          throw new Error('Lane start requires an active Claude model')
+        pi.sendUserMessage(LANE_START_TEXT, { deliverAs: 'followUp' })
+      }
       const menu = createNativeUi({
         host: 'pi',
-        dispatch: backend.dispatch,
+        dispatch: (request, options) =>
+          backend.dispatch(request, options, queueLaneStart),
         readStatus: backend.readStatus,
         readAccounts: backend.readAccounts,
         readMode:

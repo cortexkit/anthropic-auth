@@ -27,6 +27,7 @@ import {
   isClaudeSonnet55Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
+  LANE_START_TEXT,
   orderClaudeCodeBody,
   readSessionCachePolicy,
   requestCacheLifetimeMs,
@@ -802,6 +803,17 @@ export async function buildAnthropicRequest(
     systemPrompt: getCurrentSystemPrompt(transcript.messages),
     tools: getCurrentTools(transcript.messages),
   }
+  // Pi delivers extension prompts as ordinary user messages. Only the exact
+  // marker as the newest user message is a lane start; older markers are history.
+  const userContent = context.messages.findLast(
+    (message) => message.role === 'user',
+  )?.content
+  const laneStart =
+    typeof userContent === 'string'
+      ? userContent === LANE_START_TEXT
+      : userContent?.length === 1 &&
+        userContent[0]?.type === 'text' &&
+        userContent[0].text === LANE_START_TEXT
   // Conversion can discard opaque or incomplete blocks. Check context.messages
   // first so those losses cannot hide a meaningful final assistant turn. Check
   // the Anthropic messages again after conversion removes empty user messages.
@@ -1014,6 +1026,10 @@ export async function buildAnthropicRequest(
     : undefined
   if (replaced !== undefined)
     body = { ...(replaced as AnthropicRequestBody), stream: true }
+  if (laneStart) {
+    body.max_tokens = 1
+    delete body.thinking
+  }
   applySessionCacheTtl(body, cachePolicy?.ttl)
   if (baseBoundary >= 0) applyForkCacheBridge(body, baseBoundary)
   // As in Pi's native adapter, replacements must still request SSE. Hooks own

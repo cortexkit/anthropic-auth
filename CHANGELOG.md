@@ -28,6 +28,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - OpenCode 1 on Thalamus now asks for the shared login choice in every routing mode and when switching logins on a retry, like OpenCode 2.
 - OpenCode 1 on Thalamus now reports when a request starts waiting for routing or quota, like OpenCode 2; OpenCode still handles the wait.
 - OpenCode 1 on Thalamus now reports which login paid for each Claude send and how many tokens it used, including relayed sends and keep-warm requests, like OpenCode 2.
+- Pi: `/claude` can now refresh quota and edit quota floors, like OpenCode 1 and 2.
+- Pi: `/claude` can now start a five-hour quota window with a one-time request, like OpenCode 1 and 2.
 
 ## 2.16.5
 

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -273,6 +273,68 @@ describe('native diagnostics persistence', () => {
     const text = await controller().backend.readStatus('quota', {})
     expect(text).toContain('5h 40% left')
     expect(text).toContain('checked 2d ago')
+  })
+
+  test('Pi /claude offers quota refresh and persists quota floor edits in shared settings', async () => {
+    const groups = ['Quota', 'Limits']
+    const seen = new Map<string, string[]>()
+    const { commands, ctx } = registration(undefined, {
+      async select(title: string, choices: string[]) {
+        if (title === 'Claude') {
+          const group = groups.shift()
+          return choices.find((choice) => group && choice.startsWith(group))
+        }
+        seen.set(title.split('\n')[0] ?? '', choices)
+        return undefined
+      },
+    })
+    await commands.get('claude')?.handler('', ctx)
+    await commands.get('claude')?.handler('', ctx)
+    expect([...seen]).toEqual([
+      ['Quota', expect.arrayContaining(['Refresh quota'])],
+      [
+        'Limits',
+        expect.arrayContaining([
+          'Enable killswitch',
+          'Disable killswitch',
+          'Set killswitch thresholds',
+        ]),
+      ],
+    ])
+
+    const { execute } = controller()
+    const runtime = await getPiNativeRuntime(storagePath).service()
+    const fetchQuota = spyOn(runtime, 'fetchQuota').mockResolvedValue({})
+    const fetchProfile = spyOn(runtime, 'fetchProfile').mockResolvedValue({
+      tier: 'max',
+      orgType: 'individual',
+      checkedAt: Date.now(),
+    })
+    try {
+      expect(await execute({ action: 'quota-refresh' })).toMatchObject({
+        status: 'executed',
+        ok: true,
+      })
+      expect(fetchQuota.mock.calls.map(([id]) => id)).toContain('fallback')
+    } finally {
+      fetchQuota.mockRestore()
+      fetchProfile.mockRestore()
+    }
+    const entry = { account: 'fallback', fh: 10, sd: 20, scoped: 5 }
+    for (const request of [
+      { action: 'killswitch-on' },
+      { action: 'killswitch-set', values: { entries: [entry] } },
+      { action: 'killswitch-off' },
+    ] satisfies NativeMenuRequest[]) {
+      expect(await execute(request)).toMatchObject({
+        status: 'executed',
+        ok: true,
+      })
+    }
+    expect((await readNativePiFixture(storagePath)).killswitch).toMatchObject({
+      enabled: false,
+      accounts: { fallback: { five_hour: 10, seven_day: 20, scoped: 5 } },
+    })
   })
 
   test('Ultra quota status shows only weekly and Fable limits through Core', async () => {

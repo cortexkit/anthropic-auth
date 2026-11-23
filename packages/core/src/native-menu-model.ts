@@ -745,13 +745,6 @@ function offeredUnder(
     : !isNativeMenuLocalCustodyAction(id)
 }
 
-function hostOffers(host: NativeMenuHost, action: NativeMenuAction): boolean {
-  return (
-    host === 'opencode' ||
-    !['quota', 'killswitch', 'start'].includes(action.command)
-  )
-}
-
 function buildModel(
   host: NativeMenuHost,
   custody: NativeMenuCustodyMode,
@@ -765,17 +758,11 @@ function buildModel(
           actions: Object.freeze(
             actions.filter(
               (action) =>
-                action.group === id &&
-                hostOffers(host, action) &&
-                offeredUnder(custody, action.id),
+                action.group === id && offeredUnder(custody, action.id),
             ),
           ),
           statuses: Object.freeze(
-            statuses.filter(
-              (status) =>
-                status.group === id &&
-                (host === 'opencode' || status.command !== 'killswitch'),
-            ),
+            statuses.filter((status) => status.group === id),
           ),
         }),
       ),
@@ -794,22 +781,15 @@ const models = Object.freeze({
   }),
 })
 
-const actionLists = Object.freeze({
-  opencode: Object.freeze(
-    actions.filter((action) => hostOffers('opencode', action)),
-  ),
-  pi: Object.freeze(actions.filter((action) => hostOffers('pi', action))),
-})
-
 /**
  * Every action the host supports under either custody mode, in menu order.
  * Request checking uses this list so it can recognise an action the current
  * custody mode no longer offers and refuse it by name.
  */
 export function listNativeMenuActions(
-  host: NativeMenuHost,
+  _host: NativeMenuHost,
 ): readonly NativeMenuAction[] {
-  return actionLists[host]
+  return actions
 }
 
 /**

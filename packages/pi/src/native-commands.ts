@@ -28,7 +28,6 @@ import {
   isVaultHosted,
   logger,
   type NativeAccountSnapshot,
-  type NativeMenuDispatch,
   type NativeMenuKillswitchEntry,
   type NativeSettingsWriteResult,
   nativeAccountCanServe,
@@ -93,7 +92,11 @@ export function createPiNativeCommands(
       }
     })
   }
-  const dispatch: NativeMenuDispatch = async (request, options) => {
+  const dispatch: PiNativeCommands['dispatch'] = async (
+    request,
+    options,
+    queueLaneStart,
+  ) => {
     const runtime = await native.service()
     await runtime.prepareSettingsAction?.()
     if (
@@ -370,10 +373,10 @@ export function createPiNativeCommands(
         return result
       }
       case 'start-fire':
-        return {
-          ok: false,
-          text: 'Pi has no lane-start action.',
-        }
+        options.signal?.throwIfAborted()
+        if (!queueLaneStart) throw new Error('Pi cannot queue a lane start')
+        queueLaneStart()
+        return { ok: true, text: 'Claude lane start queued in this session.' }
     }
   }
   return {

@@ -1,4 +1,6 @@
 export const CLAUDE_START_COMMAND_NAME = 'claude-start'
+export const LANE_START_TEXT =
+  '[lane start] — automated cache warm; no response needed.'
 
 const START_STATUS_TITLE = '## Claude Lane Start Status'
 const START_QUEUED_TITLE = '## Claude Lane Start Queued'
