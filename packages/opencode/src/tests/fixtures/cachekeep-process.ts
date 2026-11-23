@@ -1,6 +1,7 @@
 import { join } from 'node:path'
 import {
   type AccountStorage,
+  CACHE_KEEP_PREWARM_LEAD_MS,
   CacheKeepManager,
   type NativeAccountRuntime,
   type NativeAccountSnapshot,
@@ -87,18 +88,19 @@ export async function openKeeper(
     return {
       manager,
       sent: () => sent,
-      prepare: async () =>
+      prepare: async (prompt = 'Hello') =>
         manager.track({
           sessionId: SESSION,
           url,
           headers: new Headers(),
-          bodyText,
+          bodyText: bodyText.replace('Hello', prompt),
           storage,
           cacheMode: 'hybrid',
           oauthAccountId: account.id,
           hostMetadata: { restartCredential: identity },
         }),
       dispose: lease.dispose,
+      forget: () => lease.forget(SESSION, true),
     }
   }
   const source: Pick<NativeSource, 'chooseAccount' | 'authorizeAccount'> = {
@@ -134,7 +136,7 @@ export async function openKeeper(
   return {
     manager: owner.manager,
     sent: () => sent,
-    async prepare() {
+    async prepare(prompt = 'Hello') {
       const attemptId = 'synthetic-attempt'
       await keeper.track({
         attemptId,
@@ -147,28 +149,36 @@ export async function openKeeper(
         transport: 'http',
         dispatch: 'direct',
         url,
-        bodyText,
+        bodyText: bodyText.replace('Hello', prompt),
         accountId: account.id,
         provenance: { kind: 'vault', credentialId, recordVersion: 1 },
       })
       return keeper.onResponseHeaders({ attemptId, status: 200 })
     },
     dispose: keeper.dispose,
+    forget: () => keeper.forgetSession(SESSION),
   }
 }
 
 if (import.meta.main) {
-  const [host, storageId, root, now] = process.argv.slice(2) as [
+  const [host, storageId, root, startAt, action] = process.argv.slice(2) as [
     Host,
     string,
     string,
     string,
+    string?,
   ]
-  const keeper = await openKeeper(host, storageId, root, () => Number(now))
+  let now = Number(startAt)
+  const keeper = await openKeeper(host, storageId, root, () => now)
+  if (action === 'turn') {
+    const result = await keeper.prepare('A new real turn')
+    if (!result?.tracked) throw new Error('Real turn was not tracked')
+    now += 60 * 60_000 - CACHE_KEEP_PREWARM_LEAD_MS + 1
+  }
   const tracked = keeper.manager.trackedCount()
   await keeper.manager.tick()
   process.send?.({ tracked, sent: keeper.sent() })
   const finish = await Bun.stdin.text()
-  if (finish === 'delete') keeper.manager.untrack(SESSION)
+  if (finish === 'delete') keeper.forget()
   await keeper.dispose()
 }

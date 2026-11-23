@@ -164,6 +164,13 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
       host: 'opencode1',
       now: lease.now,
       sessionClaims: true,
+      onClaimLost(id) {
+        const hash = sessionHash(id)
+        const owner = shared.owners.get(hash)
+        shared.owners.delete(hash)
+        shared.restored.delete(hash)
+        owner?.manager.releaseTarget(id)
+      },
     }),
     leases: new Set<Lease>(),
     owners: new Map(),
@@ -203,7 +210,7 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
         shared.restored.delete(hash)
         previous?.manager.releaseTarget(target.id)
       }
-      shared.store.changed(entry)
+      shared.store.changed(entry, !lease.manager.isRestoredTarget(target))
     },
     removed(id: string) {
       const hash = sessionHash(id)
@@ -212,16 +219,15 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
       shared.restored.delete(hash)
       shared.store.removed(id)
     },
-    forget(id: string) {
+    forget(id: string, deleted = false) {
       const hash = sessionHash(id)
       if (shared.loading) shared.skippedDuringLoad.add(hash)
       const owner = shared.owners.get(hash)
-      if (owner?.manager.untrack(id)) return
-      if (owner || shared.loading) {
-        shared.owners.delete(hash)
-        shared.restored.delete(hash)
-        shared.store.removed(id, true)
-      }
+      if (owner?.manager.untrack(id) && !deleted) return
+      if (!deleted && !owner && !shared.loading) return
+      shared.owners.delete(hash)
+      shared.restored.delete(hash)
+      shared.store.removed(id, deleted ? 'deleted' : true)
     },
     reserve,
     settle: (target: Readonly<CacheKeepTarget>) =>

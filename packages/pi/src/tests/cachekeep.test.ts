@@ -876,29 +876,44 @@ test('Pi still drops a restart record requiring a real request', async () => {
   expect(f.sends).toEqual([])
 })
 
-test('two live Pi processes cannot restore or track the same session', async () => {
+test('only one live Pi process at a time can restore or warm a session', async () => {
   const f = await fixture()
   const seed = f.create()
   await seed.process.trackAccepted(f.input('session-S'), f.snapshot)
   await seed.process.stop()
-  f.advance(55 * 60_000)
+  f.advance(54 * 60_000)
   const one = f.create()
   const two = f.create()
   await Promise.all([
     one.process.startSession('pi-storage', 'session-S'),
     two.process.startSession('pi-storage', 'session-S'),
   ])
-  const nonOwner = one.process.manager.trackedCount() ? two : one
-  await nonOwner.process.trackAccepted(
-    f.input('session-S', 'another accepted body'),
-    f.snapshot,
-  )
   expect(
     one.process.manager.trackedCount() + two.process.manager.trackedCount(),
   ).toBe(1)
-  f.advance(30_000)
+  const [restoring, working] = one.process.manager.trackedCount()
+    ? [one, two]
+    : [two, one]
+  await working.process.trackAccepted(
+    f.input('session-S', 'another accepted body'),
+    f.snapshot,
+  )
+  // The idle opener learns it lost its claim on its next persistence operation.
+  // A pending copy of the restored prefix must not overwrite the new owner.
+  const oldStore = await Reflect.get(restoring.process, 'store').call(
+    restoring.process,
+    'pi-storage',
+  )
+  await oldStore.drain()
+  f.advance(60_001)
   await Promise.all([one.tick(), two.tick()])
+  expect(restoring.process.manager.trackedCount()).toBe(0)
+  expect(working.process.manager.trackedCount()).toBe(1)
+  expect(f.sends).toHaveLength(0)
+  f.advance(54 * 60_000)
+  await working.tick()
   expect(f.sends).toHaveLength(1)
+  expect(JSON.stringify(f.sends[0]?.body)).toContain('another accepted body')
 })
 
 test('opening another Pi session leaves unresumed records untouched until expiry', async () => {

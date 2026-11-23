@@ -27,6 +27,7 @@ import {
 // Each invocation is a real process boundary: no module manager, timer or
 // credential runtime can be inherited from the preceding Pi instance.
 const phase = process.argv[2]
+const shouldSend = ['seed', 'locked', 'takeover'].includes(phase ?? '')
 const sessionId = 'pi-restart-session-S'
 __setLogTestSink((record) => {
   if (JSON.stringify(record).includes('cachekeep'))
@@ -105,7 +106,7 @@ globalThis.fetch = Object.assign(
   { preconnect: originalFetch.preconnect },
 ) as typeof fetch
 
-if (phase !== 'resume') {
+if (phase === 'seed' || phase === 'locked') {
   await saveNativePiFixture({ version: 1, accounts: [] }, storagePath)
   const runtime = await getPiNativeRuntime(storagePath).service()
   // The synthetic login outlives the clock advance; this test is about cache
@@ -126,7 +127,7 @@ if (phase !== 'resume') {
     claudeCache: { enabled: true, mode: 'hybrid' },
     cacheKeep: { enabled: true, always: true },
   }))
-} else {
+} else if (phase === 'resume') {
   now += 55 * 60_000
 }
 
@@ -220,13 +221,19 @@ async function emit(name: string, event: unknown) {
 
 try {
   await emit('session_start', { type: 'session_start', reason: 'startup' })
-  if (phase !== 'resume') {
+  if (shouldSend) {
     await emit('turn_start', { type: 'turn_start', turnIndex: 0 })
     const stream = provider?.streamSimple?.(
       model,
       {
         systemPrompt: 'Keep the same prompt prefix across the Pi restart.',
-        messages: [{ role: 'user', content: 'hello', timestamp: now }],
+        messages: [
+          {
+            role: 'user',
+            content: phase === 'takeover' ? 'real turn elsewhere' : 'hello',
+            timestamp: now,
+          },
+        ],
       },
       { sessionId },
     )
@@ -250,20 +257,29 @@ try {
       : stream.result())
     if (result.stopReason === 'error') throw new Error(result.errorMessage)
     await events.get('agent_settled')?.({ type: 'agent_settled' }, ctx)
-  } else {
+  }
+  if (!shouldSend || phase === 'takeover') {
     // Observe the public registry, not a private restore API. Production starts
     // restoration detached. An implementation without restart restoration
     // still reaches the warm-count assertion instead of hanging at startup.
     const { getPiTrackedCacheKeepSessions } = await import('../../stream.ts')
+    let tracked = false
     for (let attempt = 0; attempt < 200; attempt++) {
       if (
         (await getPiTrackedCacheKeepSessions()).some(
           (row) => row.id === sessionId,
         )
-      )
+      ) {
+        tracked = true
         break
+      }
       await Bun.sleep(10)
     }
+    if (phase === 'idle-owner') {
+      process.send?.({ tracked })
+      await Bun.stdin.text()
+    }
+    if (phase !== 'resume') now += 55 * 60_000
     now += 60_000
     for (const callback of [...intervals.values()]) await callback()
   }

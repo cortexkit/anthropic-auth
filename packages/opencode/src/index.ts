@@ -6767,7 +6767,7 @@ const anthropicAuthPlugin = async (
         stickyQuotaRetries.clear(sessionId)
         sessionCacheActivity.forget(sessionId)
         messageThreads.forget(sessionId)
-        cacheKeepRestart.forget(sessionId)
+        cacheKeepRestart.forget(sessionId, true)
         fableFallbackManager.clearSession(sessionId)
         recoveryThinking.forgetSession(sessionId)
         dropSessionSourceWarms(sessionId)

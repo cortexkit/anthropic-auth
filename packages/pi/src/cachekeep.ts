@@ -173,6 +173,13 @@ export class PiCacheKeep {
             pluginVersion,
             ...this.options.persistence,
             now: () => this.now(),
+            externalClaim: (id) => {
+              const session = this.sessions.get(id)
+              return session?.storagePath === storagePath
+                ? session.claim
+                : undefined
+            },
+            onClaimLost: (id) => this.dropClaimTarget(id),
           }),
       )
       this.stores.set(storagePath, store)
@@ -185,9 +192,38 @@ export class PiCacheKeep {
   }
   private managerOptionsNow?: () => number
 
-  private claim(storagePath: string, sessionId: string) {
+  private dropClaimTarget(sessionId: string) {
+    this.sessions.delete(sessionId)
+    this.claims.delete(sessionId)
+    this.starts.delete(sessionId)
+    this.restored.delete(sessionId)
+    this.manager.releaseTarget(sessionId)
+  }
+
+  private claim(
+    storagePath: string,
+    sessionId: string,
+    realTurn = false,
+  ): Promise<Session | undefined> {
     const existing = this.claims.get(sessionId)
-    if (existing) return existing
+    if (existing) {
+      if (!realTurn) return existing
+      return existing
+        .then(async (session) => {
+          if (!session) return this.claim(storagePath, sessionId, true)
+          if (await session.claim.promote()) return session
+          if (this.sessions.get(sessionId) === session)
+            this.dropClaimTarget(sessionId)
+          return undefined
+        })
+        .catch(() => {
+          logger.warn(
+            'cachekeep',
+            'session claim unavailable; not warming session',
+          )
+          return undefined
+        })
+    }
     let claiming: Promise<Session | undefined>
     claiming = (async () => {
       const store = await this.store(storagePath)
@@ -195,7 +231,7 @@ export class PiCacheKeep {
         ownerOnly: this.options.persistence?.ownerOnly,
         liveness: this.options.liveness,
       })
-      if (!(await claim.acquire())) return undefined
+      if (!(await claim.acquire(!realTurn))) return undefined
       const session: Session = { storagePath, claim, store }
       this.sessions.set(sessionId, session)
       return session
@@ -254,10 +290,10 @@ export class PiCacheKeep {
         (id) => createHash('sha256').update(id).digest('hex') === hash,
       )
     if (!(await canRemove())) {
-      await cleanup.release()
+      await cleanup.releaseEventually()
       return undefined
     }
-    return Object.assign(() => cleanup.release(), { canRemove })
+    return Object.assign(() => cleanup.releaseEventually(), { canRemove })
   }
 
   private startCleanup() {
@@ -364,6 +400,8 @@ export class PiCacheKeep {
 
   realTurn(sessionId: string) {
     this.realTurns.add(sessionId)
+    const session = this.sessions.get(sessionId)
+    if (session) void this.claim(session.storagePath, sessionId, true)
     try {
       const previous = this.turnStarts.get(sessionId)
       if (previous && !previous.claimed) previous.turn.finish()
@@ -421,7 +459,7 @@ export class PiCacheKeep {
     const acceptedAt = this.now()
     if (turn) this.pendingTurns.add(turn)
     const tracking = (async () => {
-      const session = await this.claim(storagePath, sessionId)
+      const session = await this.claim(storagePath, sessionId, true)
       if (!session) return
       const account =
         snapshot.accounts.find((row) => row.id === input.oauthAccountId) ??
@@ -474,7 +512,8 @@ export class PiCacheKeep {
     await this.cleaning
     // Drain before releasing claims so a successor can never read an older body.
     for (const store of this.stores.values()) await (await store).drain()
-    for (const session of this.sessions.values()) await session.claim.release()
+    for (const session of this.sessions.values())
+      await session.claim.releaseEventually()
     await this.manager.dispose()
     this.realTurns.clear()
     this.turnStarts.clear()

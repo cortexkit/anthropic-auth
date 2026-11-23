@@ -133,6 +133,7 @@ interface SharedCacheKeep {
     | 'registrySessions'
     | 'reserveWarmDispatch'
     | 'isCurrentTarget'
+    | 'isRestoredTarget'
     | 'recordAcceptedUsage'
     | 'hasPlannedTarget'
     | 'updateSubagent'
@@ -179,6 +180,7 @@ interface SharedCacheKeep {
   readonly retain: () => void | Promise<void>
   /** Called when a lease is taken; resumes warming any retained sessions. */
   readonly adopt: () => Promise<void>
+  readonly dropClaimTarget?: (id: string) => void
   hybridDisabled?: boolean
   localCleanup?: Promise<void>
   plannedUnsupportedLogged?: boolean
@@ -299,7 +301,8 @@ function createSharedCacheKeep(
         : Promise.resolve(false),
     deferWarmReservation: true,
     responseTtlMs: (response) => warmResponseLifetimes.get(response),
-    onTargetChanged: (target) => shared.persistence.changed(target),
+    onTargetChanged: (target) =>
+      shared.persistence.changed(target, !manager.isRestoredTarget(target)),
     onTargetRemoved: (id) => {
       restored.delete(id)
       shared.persistence.removed(id)
@@ -386,6 +389,10 @@ function createSharedCacheKeep(
     prepared,
     leases,
     nextGeneration: 0,
+    dropClaimTarget(id) {
+      restored.delete(id)
+      manager.releaseTarget(id)
+    },
     retain() {
       manager.stop()
       manager.abortWarms()
@@ -399,12 +406,17 @@ function createSharedCacheKeep(
         if (leases.size === 0 && !shared.persistence.isMemoryOnly) {
           // Once the claim is released, only the disk record is authoritative:
           // another server may spend its budget, replace it, or delete it.
+          const retained = new Set<string>()
           for (const { id, cacheExpiresAt } of manager.trackedSessions()) {
+            if (!shared.persistence.isCommitted(id)) {
+              retained.add(sessionHash(id))
+              continue
+            }
             retainedUntil = Math.max(retainedUntil, cacheExpiresAt)
             manager.releaseTarget(id)
+            restored.delete(id)
           }
-          restored.clear()
-          await shared.persistence.releaseClaims(() => true)
+          await shared.persistence.releaseClaims((hash) => !retained.has(hash))
         }
         dropExpired()
       })().finally(() => {
@@ -413,14 +425,15 @@ function createSharedCacheKeep(
       return retaining
     },
     async adopt() {
-      if (retaining) await retaining
-      stopExpiry()
-      retainedUntil = 0
+      const retained = retaining
       shared.loading ??= (async () => {
-        const lease = newestLease()
-        if (!lease) return
         const skipped = new Set<string>()
         shared.restoreSkips = skipped
+        await retained
+        stopExpiry()
+        retainedUntil = 0
+        const lease = newestLease()
+        if (!lease) return
         const snapshot = await lease.read()
         const now = options.now?.() ?? Date.now()
         let overdue = 0
@@ -550,6 +563,10 @@ export function createNativeCacheKeep(
       storageId: options.storageId,
       ...options.persistence,
       sessionClaims: true,
+      onClaimLost(id) {
+        if (owner.dropClaimTarget) owner.dropClaimTarget(id)
+        else owner.manager.releaseTarget(id)
+      },
     },
     previous?.persistence,
   )
@@ -581,6 +598,7 @@ export function createNativeCacheKeep(
     )
       return undefined
     owner.restoreSkips?.add(sessionHash(input.sessionID))
+    owner.persistence.realTurn(input.sessionID, false)
     try {
       if (manager.beginRealTurn) {
         for (const turn of realTurns) if (!turn.active) realTurns.delete(turn)
@@ -1205,8 +1223,8 @@ export function createNativeCacheKeep(
     forgetSession(sessionID: string) {
       acceptedStates.delete(sessionID)
       owner.restoreSkips?.add(sessionHash(sessionID))
-      if (!manager.untrack(sessionID) && owner.restoreSkips)
-        owner.persistence.removed(sessionID, true)
+      manager.untrack(sessionID)
+      owner.persistence.removed(sessionID, 'deleted')
       for (const [attemptId, entry] of pending)
         if (entry.sessionID === sessionID) discardAttempt(attemptId)
     },

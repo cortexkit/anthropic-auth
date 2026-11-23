@@ -1242,6 +1242,10 @@ export class CacheKeepManager {
       : this.immediateTargets.get(target.id) === target
   }
 
+  isRestoredTarget(target: Readonly<CacheKeepTarget>): boolean {
+    return this.restoredTargets.has(target)
+  }
+
   /**
    * The tracked policy state keeps the same object identity across warm
    * updates; each newly accepted real request gets a new one.

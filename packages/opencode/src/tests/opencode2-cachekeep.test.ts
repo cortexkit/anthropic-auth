@@ -521,6 +521,7 @@ async function fixture(
     store,
     routingPath: join(directory, 'routing.json'),
     registry,
+    root: directory,
     disk: cacheKeepStoreDirectory(paths.storageId, directory),
     timers,
     now: () => now,
@@ -1611,6 +1612,105 @@ test('a later OpenCode 2 instance for the same storage keeps warming a session t
     'Bearer sk-ant-oat01-reloaded-first',
   )
 })
+
+test('OC2 hands off committed sessions but keeps an accepted body whose final write failed', async () => {
+  const f = await fixture()
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const owner = (globalThis as any)[key].get(f.paths.storageId) as {
+    manager: CacheKeepManager
+    persistence: CacheKeepStore
+  }
+  await f.live()
+  await owner.persistence.drain()
+  const [name] = await readdir(f.disk)
+  expect(name).toEndWith('.json.gz')
+  const record = join(f.disk, name!)
+  const old = await readFile(record)
+  await f.live(undefined, {
+    messages: [{ role: 'user', content: 'Latest accepted body' }],
+  })
+  await f.live(undefined, {}, 'ses_committed')
+  await rm(record)
+  await mkdir(record)
+  try {
+    await f.dispose()
+  } finally {
+    await rm(record, { recursive: true })
+    await writeFile(record, old, { mode: 0o600 })
+  }
+  expect(owner.manager.trackedSessions().map(({ id }) => id)).toEqual([
+    'ses_oc2_keep',
+  ])
+  const contender = new CacheKeepStore({
+    storageId: f.paths.storageId,
+    root: f.root,
+    sessionClaims: true,
+  })
+  const visible: string[] = []
+  await contender.load(f.now(), (entry) => {
+    visible.push(entry.id)
+    return undefined
+  })
+  expect(visible).toEqual(['ses_committed'])
+  await f.start()
+  expect(owner.manager.trackedRequest('ses_oc2_keep')?.bodyText).toContain(
+    'Latest accepted body',
+  )
+})
+
+test.each(['delete', 'turn'])(
+  'OC2 remembers a %s while adoption waits for the last claim release',
+  async (action) => {
+    const f = await fixture()
+    await f.live()
+    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+    const owner = (globalThis as any)[key].get(f.paths.storageId) as {
+      manager: CacheKeepManager
+      persistence: CacheKeepStore
+    }
+    const entered = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    const release = owner.persistence.releaseClaims.bind(owner.persistence)
+    const releasing = spyOn(
+      owner.persistence,
+      'releaseClaims',
+    ).mockImplementation(async (filter) => {
+      entered.resolve()
+      await resume.promise
+      await release(filter)
+    })
+    const create = cacheKeepFactory.createNativeCacheKeep
+    let next: ReturnType<typeof create> | undefined
+    const creating = spyOn(
+      cacheKeepFactory,
+      'createNativeCacheKeep',
+    ).mockImplementation((options) => (next = create(options)))
+    const stopping = f.dispose()
+    try {
+      await entered.promise
+      await f.start('enrollment.json', false)
+      expect(next).toBeDefined()
+      if (action === 'delete') next!.forgetSession('ses_oc2_keep')
+      else
+        next!.beginRealTurn({
+          sessionID: 'ses_oc2_keep',
+          kind: 'primary',
+          agent: 'build',
+          providerID: 'anthropic',
+          modelID: 'claude-sonnet-4-6',
+        })
+      resume.resolve()
+      await stopping
+      await next!.ready
+      expect(owner.manager.trackedRequest('ses_oc2_keep')).toBeUndefined()
+    } finally {
+      resume.resolve()
+      await stopping
+      creating.mockRestore()
+      releasing.mockRestore()
+    }
+  },
+)
 
 test('retired OpenCode 2 hooks serve the next step through the successor with the session pin', async () => {
   const f = await fixture()
