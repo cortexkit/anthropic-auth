@@ -10,6 +10,10 @@ import { parse } from 'jsonc-parser'
 import { nativeAccountSettings } from '../../../core/src/native-account-view'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
+import {
+  CLAUDE_POOL_LOGIN_METHOD_ID,
+  CLAUDE_VAULT_ACTIVATION_METHOD_ID,
+} from '../v2/activation'
 import { createNativeMenuCapabilities } from '../v2/menu'
 import * as reloadFactory from '../v2/reload'
 import { setupAnthropicAuth } from '../v2/setup'
@@ -230,9 +234,13 @@ async function fixture(
     startupSpy.mockRestore()
     sourceSpy.mockRestore()
   })
-  const start = async (onInstall?: () => void) => {
+  const start = async (
+    onInstall?: () => void,
+    host?: Partial<Plugin.Context>,
+  ) => {
     const hooks = new Map<string, TestHook[]>()
-    const dispose = await setupAnthropicAuth(context(onInstall, hooks), {
+    const ctx = { ...context(onInstall, hooks), ...host }
+    const dispose = await setupAnthropicAuth(ctx, {
       paths,
       vault: { env },
       local: { resolveIdentity: legacyIdentity },
@@ -304,6 +312,156 @@ async function fixture(
 
 const legacyIdentity = async () =>
   ({ accountUuid: '11111111-2222-4333-8444-555555555555' }) as never
+
+test('OpenCode 2 shows zero prices only for active OAuth unless opted out', async () => {
+  const f = await fixture()
+  await put(f.target, {})
+  type Connection = Awaited<
+    ReturnType<Plugin.Context['integration']['connection']['active']>
+  >
+  const initial = Promise.withResolvers<Connection>()
+  let active = initial.promise
+  const registrations = new Map<string, 'oauth'>()
+  let transform: Parameters<Plugin.Context['model']['transform']>[0] | undefined
+  let publish: ((event: unknown) => void) | undefined
+  let reloaded = Promise.withResolvers<void>()
+  const registration = { dispose: async () => {} }
+  const host = {
+    model: {
+      transform: async (apply: typeof transform) => {
+        transform = apply
+        return registration
+      },
+      reload: async () => reloaded.resolve(),
+    },
+    integration: {
+      transform: async (
+        apply: Parameters<Plugin.Context['integration']['transform']>[0],
+      ) => {
+        apply({
+          method: {
+            list: () => [],
+            update: ({ method }: { method: { id: string; type: 'oauth' } }) => {
+              registrations.set(method.id, method.type)
+            },
+          },
+        } as never)
+        return registration
+      },
+      connection: { active: () => active },
+    },
+    event: {
+      subscribe: ({
+        signal,
+        types,
+      }: {
+        signal: AbortSignal
+        types?: string[]
+      }) =>
+        types?.includes('credential.switched')
+          ? new ReadableStream({
+              start(controller) {
+                publish = (event) => controller.enqueue(event)
+                signal.addEventListener('abort', () => controller.close(), {
+                  once: true,
+                })
+              },
+            })
+          : (async function* () {})(),
+    },
+  } as unknown as Partial<Plugin.Context>
+  await f.start(undefined, host)
+
+  const listPrice = [
+    { input: 1, output: 4, cache: { read: 0.2, write: 1.25 } },
+    {
+      input: 2,
+      output: 8,
+      cache: { read: 0.4, write: 2.5 },
+      tier: { type: 'context', size: 100_000 },
+    },
+  ]
+  const zeroPrice = [{ input: 0, output: 0, cache: { read: 0, write: 0 } }]
+  const price = () => {
+    // OpenCode runs each projection against the original catalogue, not the
+    // result of the previous projection.
+    const model = {
+      id: 'claude-haiku-5-5',
+      modelID: 'claude-haiku-5-5',
+      variants: [],
+      cost: structuredClone(listPrice),
+    }
+    transform!({
+      list: () => [model],
+      update: (
+        _provider: string,
+        _id: string,
+        update: (value: typeof model) => void,
+      ) => update(model),
+    } as never)
+    return model.cost
+  }
+  const connection = (id: string, method: 'oauth' | 'key' | undefined) =>
+    ({ type: 'credential', id, label: id, method }) as Connection
+  const select = async (next: Connection, event?: unknown) => {
+    active = Promise.resolve(next)
+    reloaded = Promise.withResolvers<void>()
+    publish!(
+      event ?? {
+        type: 'credential.switched',
+        data: { integrationID: 'anthropic' },
+      },
+    )
+    await reloaded.promise
+  }
+  expect(price()).toEqual(listPrice)
+  expect(registrations.get(CLAUDE_POOL_LOGIN_METHOD_ID)).toBe('oauth')
+  expect(registrations.get(CLAUDE_VAULT_ACTIVATION_METHOD_ID)).toBe('oauth')
+  initial.resolve(
+    connection('pool', registrations.get(CLAUDE_POOL_LOGIN_METHOD_ID)),
+  )
+  await Bun.sleep(0)
+  expect(price()).toEqual(zeroPrice)
+
+  await select(connection('api-key', 'key'))
+  expect(price()).toEqual(listPrice)
+  await select(
+    connection('vault', registrations.get(CLAUDE_VAULT_ACTIVATION_METHOD_ID)),
+  )
+  expect(price()).toEqual(zeroPrice)
+  await select({ type: 'env', name: 'ANTHROPIC_API_KEY' } as Connection, {
+    type: 'credential.updated',
+    data: {},
+  })
+  expect(price()).toEqual(listPrice)
+
+  await select(connection('pool', 'oauth'))
+  reloaded = Promise.withResolvers<void>()
+  await put(f.target, { cost_zeroing_enabled: false })
+  await f.changed()
+  await reloaded.promise
+  expect(price()).toEqual(listPrice)
+})
+
+test('OpenCode 2 starts opted-in Prime before any model request', async () => {
+  const f = await fixture()
+  await put(f.target, { prime_enabled: true })
+  const managers: core.PrimeManager[] = []
+  const start = core.PrimeManager.prototype.start
+  const spy = spyOn(core.PrimeManager.prototype, 'start').mockImplementation(
+    function (this: core.PrimeManager) {
+      managers.push(this)
+      start.call(this)
+    },
+  )
+  cleanups.push(() => spy.mockRestore())
+
+  const plugin = await f.start()
+  expect(managers).toHaveLength(1)
+  expect((await managers[0]!.options.loadStorage())?.prime?.enabled).toBe(true)
+  await plugin.dispose()
+  expect(managers[0]!.isStopped()).toBe(true)
+})
 
 async function seedLegacyRequest(f: Awaited<ReturnType<typeof fixture>>) {
   await f.store.add({

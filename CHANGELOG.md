@@ -17,6 +17,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Pi: changing thinking effort during a conversation now preserves the prompt cache on models that support per-message effort, including in conversations shortened by Magic Context.
 - OpenCode 2 now keeps custom proxy headers off Claude sign-in requests, like OpenCode 1 and Pi, while still sending them on API-key routes.
 - For conversation requests, OpenCode 2 now matches OpenCode 1: the first eligible request sends a null previous message ID, and cache results and beta lists appear in debug logs.
+- OpenCode 2: Claude subscription models now show zero token prices by default, like OpenCode 1. You can opt out to display catalogue prices; API-key prices are unchanged.
+- OpenCode 1 and 2: opt-in Prime can start a quota window without a first chat request, and enabling Prime in the settings file takes effect without restarting OpenCode.
 
 ## 2.16.5
 

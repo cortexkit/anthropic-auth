@@ -3,6 +3,7 @@ import {
   assertUnmanagedInjectedPaths,
   authorize,
   connectVaultHost,
+  createEmptyStorage,
   createNativeAccountRuntime,
   createNativeUi,
   decideOpenCodeStateLayoutOnce,
@@ -460,14 +461,18 @@ export async function setupAnthropicAuth(
   )
   // Read the current custody mode's settings before starting background work.
   // As in OpenCode 1, an environment override wins over the saved log level.
+  let initialStorage = createEmptyStorage()
   try {
     const initial = await runtime.read()
+    initialStorage = initial.policyStorage
     if (!process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL)
       setLogLevel(getPersistedLogLevel(initial.policyStorage) ?? 'info')
     setDumpEnabled(isDumpPersistentlyEnabled(initial.policyStorage))
   } catch {}
   let active = true
-  const models = createNativeClaudeModelRules()
+  const models = createNativeClaudeModelRules(
+    () => runtime.resolveSettings?.(initialStorage) ?? initialStorage,
+  )
   let lifecycle: ReturnType<typeof startNativeAnthropicLifecycle> | undefined
   let prime: ReturnType<typeof createNativePrime> | undefined
   let cacheKeep: ReturnType<typeof createNativeCacheKeep> | undefined
@@ -551,12 +556,6 @@ export async function setupAnthropicAuth(
     resolveModelId: async (scope) => models.modelId(scope.modelID),
     onOwnedRequest: () => {
       lifecycle ??= startNativeAnthropicLifecycle(runtime, options.fetch)
-      prime ??= createNativePrime({
-        runtime,
-        paths,
-        source,
-        fetch: options.fetch,
-      })
     },
     beginRealTurn: (input) => cacheKeep?.beginRealTurn(input),
   })
@@ -665,6 +664,9 @@ export async function setupAnthropicAuth(
     }
     const command = createNativeUi(ui)
     registrations.push(await registerNativeMenu(ctx, command, capabilities))
+    registrations.push(models.watchPricing(ctx, settingsService))
+    // Prime can open the next quota window even when no session is active.
+    prime = createNativePrime({ runtime, paths, source, fetch: options.fetch })
     // Only a completed, explicit Claude-pool login selects the plugin's inert
     // OAuth connection. Startup never creates or replaces a host connection.
     requests.activate()

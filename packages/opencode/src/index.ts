@@ -4643,9 +4643,8 @@ const anthropicAuthPlugin = async (
     },
   )
   const primeManager: PrimeManager = primeManagerAdoption.manager
-  if (isPrimePersistentlyEnabled(initialStorage)) {
-    primeManager.start()
-  }
+  // Each tick checks the saved setting, so file edits can enable Prime live.
+  primeManager.start()
 
   async function getAllTrackedCacheKeepSessions() {
     aggregateCacheKeepSessions = await cacheKeepRegistry.list(
@@ -5681,17 +5680,11 @@ const anthropicAuthPlugin = async (
     if (action.type === 'enable') {
       enabled = true
       await setPrimePersistentEnabled(true, accountStoragePath)
-      if (!previous) {
-        primeManager.start()
-        logger.info('commands', 'prime changed', { enabled: true })
-      }
+      if (!previous) logger.info('commands', 'prime changed', { enabled: true })
     } else if (action.type === 'disable') {
       enabled = false
       await setPrimePersistentEnabled(false, accountStoragePath)
-      if (previous) {
-        primeManager.stop()
-        logger.info('commands', 'prime changed', { enabled: false })
-      }
+      if (previous) logger.info('commands', 'prime changed', { enabled: false })
     }
 
     // After toggling quota priming, update its sidebar status immediately.

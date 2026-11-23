@@ -8,6 +8,7 @@ import {
 } from '@cortexkit/common-auth/settings'
 import { parse } from 'jsonc-parser'
 import * as commands from '../native-command'
+import { getPluginTestHandles } from './plugin-test-handles'
 import { applyMenuAction, openClaudeMenu } from './support/opencode1-client'
 import {
   getPlugin,
@@ -19,6 +20,7 @@ import {
   createOpencode1Test,
   createOpencode1TestContext,
   installOpencode1TestHooks,
+  type PluginRuntimeOverrides,
 } from './support/opencode1-test-context'
 
 const ctx = createOpencode1TestContext()
@@ -39,6 +41,7 @@ async function fixture(
     failWrite?: boolean
     unavailableProtection?: boolean
     diagnostic?: core.SettingsMoveDiagnostic
+    runtimeOverrides?: PluginRuntimeOverrides
   } = {},
 ) {
   await useTempAccountFile(ctx, { version: 1, accounts: [] })
@@ -86,8 +89,9 @@ async function fixture(
     quota: { enabled: false, failClosedOnUnknownQuota: false },
   }))
   const originalStore = await readFile(pool.paths.config, 'utf8')
+  let service: core.SettingsService | undefined
   if (mode !== 'separate') {
-    const service = await core.openSettingsService({
+    service = await core.openSettingsService({
       file,
       host: 'opencode',
       // These menu tests are about a host that uses the file.
@@ -149,7 +153,12 @@ async function fixture(
     acquisition.mockRestore()
     command.mockRestore()
   })
-  const plugin = await getPlugin(ctx, undefined, pool.root)
+  const plugin = await getPlugin(
+    ctx,
+    undefined,
+    pool.root,
+    options.runtimeOverrides,
+  )
   const payload = await openClaudeMenu(plugin, 'settings-menu')
   if (!runtime || !native) throw new Error('Missing native menu callbacks')
   const menu = native
@@ -157,6 +166,7 @@ async function fixture(
     file,
     pool,
     runtime,
+    service,
     plugin,
     payload,
     originalStore,
@@ -173,6 +183,37 @@ async function fixture(
       (await readNativeSettings(ctx)) as unknown as core.AccountStorage,
   }
 }
+
+test('OpenCode 1 picks up Prime enabled in the settings file without restarting', async () => {
+  const intervals = new Map<object, number>()
+  const f = await fixture({
+    source: '{"prime_enabled":false}',
+    runtimeOverrides: {
+      setInterval: ((_callback: () => void, delay: number) => {
+        const handle = { unref() {} }
+        intervals.set(handle, delay)
+        return handle
+      }) as unknown as typeof setInterval,
+      clearInterval: ((handle: object) => {
+        intervals.delete(handle)
+      }) as typeof clearInterval,
+    },
+  })
+  const { primeManager } = getPluginTestHandles(f.plugin)
+  const scheduled = () =>
+    [...intervals].filter(([, delay]) => delay === core.PRIME_TICK_MS)
+  expect((await primeManager.options.loadStorage())?.prime?.enabled).toBe(false)
+  expect(scheduled()).toHaveLength(1)
+
+  expect((await f.apply('prime-on')).ok).toBe(true)
+  expect((await f.apply('prime-off')).ok).toBe(true)
+  expect(scheduled()).toHaveLength(1)
+
+  await writeFile(f.file, '{"prime_enabled":true}')
+  await f.service!.refresh()
+  expect((await primeManager.options.loadStorage())?.prime?.enabled).toBe(true)
+  expect(scheduled()).toHaveLength(1)
+})
 
 const actions: {
   action: MenuRequest['action']

@@ -27,7 +27,7 @@ Standard input/output rates are $0.10/$0.50 per million tokens. Above 100K total
 | Five-minute cache write | $0.125 | $0.625 |
 | One-hour cache write | $0.20 | $1.00 |
 
-OpenCode's OAuth model costs are zeroed by default because subscription use is quota-based. `costZeroing.enabled: false` retains model pricing for display; it does not turn OpenCode's dollar accounting into route-aware billing when a paid fallback serves a request. Pi's catalog includes a higher Haiku pricing tier above 100K input tokens, counting cached input toward that threshold; its displayed costs remain estimates, not billing receipts.
+OpenCode 1 and 2 show zero model prices by default when signed in with OAuth because subscription use is quota-based. API-key prices are unchanged. Set `cost_zeroing_enabled: false` in the shared settings file (or `costZeroing.enabled: false` in a legacy account file) to show catalogue prices. This does not make OpenCode's dollar accounting route-aware when a paid fallback serves a request. Pi's catalog includes a higher Haiku pricing tier above 100K input tokens, counting cached input toward that threshold; its displayed costs remain estimates, not billing receipts.
 
 ## Adaptive thinking and effort
 

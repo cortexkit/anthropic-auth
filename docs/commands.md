@@ -16,7 +16,7 @@ Both hosts register one `/claude` command. It opens a menu whose actions collect
 
 In local custody, Accounts offers local management and enrollment reset, not disconnect. While enrolled, only enable/disable, reset backoff and disconnect remain. Unreadable enrollment keeps that reduced set so disconnect is available. **Custody setup guidance** explains the stopped-host requirement without changing custody.
 
-Remove, reset-enrollment and disconnect actions require confirmation. Sign-in, API-key additions, guidance and disconnect require an interactive session. In the OpenCode TUI the command opens a dialog; Desktop/headless OpenCode posts a text summary, and Pi without a UI prints status sections only.
+Remove, reset-enrollment and disconnect actions require confirmation. Sign-in, API-key additions, guidance and disconnect require an interactive session. In OpenCode's terminal UI the command opens a dialog. Without the terminal UI, OpenCode 1 posts a text summary and OpenCode 2 does not. Pi without a UI prints status sections only.
 
 ## OpenCode CLI
 
