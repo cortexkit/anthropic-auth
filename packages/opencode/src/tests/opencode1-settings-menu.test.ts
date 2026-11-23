@@ -246,13 +246,14 @@ const actions: {
   {
     action: 'killswitch-set',
     values: { entries: [{ account: 'main', fh: 7, sd: 12 }] },
+    // Editing thresholds after switching off must not enable enforcement.
     file: {
-      killswitch_enabled: true,
+      killswitch_enabled: false,
       killswitch_default_five_hour: 7,
       killswitch_default_seven_day: 12,
     },
     legacy: {
-      killswitch: { enabled: true, main: { five_hour: 7, seven_day: 12 } },
+      killswitch: { enabled: false, main: { five_hour: 7, seven_day: 12 } },
     },
   },
   {

@@ -42,6 +42,8 @@ describe('OC1 shared routing relay', () => {
     relay = false,
   ) {
     const now = Date.now()
+    const paidBackup = mode.startsWith('paid backup')
+    const mainExhausted = paidBackup && mode !== 'paid backup'
     const quota = (remaining: number, fable = 100) => ({
       checkedAt: now,
       five_hour: {
@@ -70,6 +72,7 @@ describe('OC1 shared routing relay', () => {
       bindPoolAccounts(
         createFallbackStorage({
           routing: { mode: routingMode },
+          ...(mode === 'overloaded' && { fallbackOn: [429, 503] }),
           ...(relay && {
             relay: {
               enabled: true,
@@ -84,10 +87,16 @@ describe('OC1 shared routing relay', () => {
             checkIntervalMinutes: 5,
             minimumRemaining: { five_hour: 1, seven_day: 1 },
             failClosedOnUnknownQuota: true,
-            mainQuota: quota(
-              mode === 'blocked' ? 10 : 100,
-              mode === 'reserve' ? 0 : 100,
-            ),
+            mainQuota: {
+              ...quota(
+                mainExhausted ? 0 : mode === 'blocked' ? 10 : 100,
+                mode === 'reserve' ? 0 : 100,
+              ),
+              ...(mode === 'paid backup without provider wait' && {
+                source: 'headers' as const,
+                fieldSources: { five_hour: 'poll' as const },
+              }),
+            },
             mainQuotaCheckedAt: now,
             mainQuotaToken: tokenFingerprint('sk-ant-oat01-main-access'),
             ...(mode === 'provider wait' && {
@@ -103,53 +112,50 @@ describe('OC1 shared routing relay', () => {
           ...(mode === 'floor' || mode === 'blocked'
             ? { killswitch: { enabled: true, main: { five_hour: 20 } } }
             : {}),
-          accounts:
-            mode === 'paid backup'
-              ? [
-                  {
-                    id: 'paid',
-                    type: 'api',
-                    apiKey: 'paid-key',
-                    baseURL: 'https://paid.example.test',
-                    authHeader: 'authorization-bearer',
-                  },
-                ]
-              : [
-                  {
-                    id: 'fallback-1',
-                    type: 'oauth',
-                    access: 'sk-ant-oat01-fallback-access',
-                    refresh: 'fallback-refresh',
-                    expires: now + 3600_000,
-                    quota:
-                      mode === 'unknown quota'
-                        ? undefined
-                        : quota(
-                            mode === 'floor' || mode === 'blocked' ? 10 : 80,
-                          ),
-                    ...(mode === 'signed out'
-                      ? {
-                          lastRefreshError: {
-                            message: 'sign in required',
-                            checkedAt: now,
-                            permanent: true,
-                          },
-                        }
-                      : {}),
-                  },
-                  ...(mode === 'three accounts'
-                    ? [
-                        {
-                          id: 'fallback-2',
-                          type: 'oauth' as const,
-                          access: 'sk-ant-oat01-third-access',
-                          refresh: 'third-refresh',
-                          expires: now + 3600_000,
-                          quota: quota(80),
+          accounts: paidBackup
+            ? [
+                {
+                  id: 'paid',
+                  type: 'api',
+                  apiKey: 'paid-key',
+                  baseURL: 'https://paid.example.test',
+                  authHeader: 'authorization-bearer',
+                },
+              ]
+            : [
+                {
+                  id: 'fallback-1',
+                  type: 'oauth',
+                  access: 'sk-ant-oat01-fallback-access',
+                  refresh: 'fallback-refresh',
+                  expires: now + 3600_000,
+                  quota:
+                    mode === 'unknown quota'
+                      ? undefined
+                      : quota(mode === 'floor' || mode === 'blocked' ? 10 : 80),
+                  ...(mode === 'signed out'
+                    ? {
+                        lastRefreshError: {
+                          message: 'sign in required',
+                          checkedAt: now,
+                          permanent: true,
                         },
-                      ]
-                    : []),
-                ],
+                      }
+                    : {}),
+                },
+                ...(mode === 'three accounts'
+                  ? [
+                      {
+                        id: 'fallback-2',
+                        type: 'oauth' as const,
+                        access: 'sk-ant-oat01-third-access',
+                        refresh: 'third-refresh',
+                        expires: now + 3600_000,
+                        quota: quota(80),
+                      },
+                    ]
+                  : []),
+              ],
         }),
       ),
     )
@@ -176,7 +182,7 @@ describe('OC1 shared routing relay', () => {
                   ? {}
                   : {
                       five_hour: {
-                        utilization: mode === 'paid backup' ? 100 : 0,
+                        utilization: paidBackup ? 100 : 0,
                       },
                       seven_day: { utilization: 0 },
                     },
@@ -423,6 +429,188 @@ describe('OC1 shared routing relay', () => {
     }
   })
 
+  for (const mode of ['sticky-balanced', 'main-first'] as const) {
+    test(`${mode} tries another login when the advised account changes during authorization`, async () => {
+      const f = await fixture('normal', undefined, undefined, mode)
+      const read = f.nativeAccounts.read.bind(f.nativeAccounts)
+      const authorize = f.nativeAccounts.authorizeLocal.bind(f.nativeAccounts)
+      let advised = false
+      let removeFromNextRead = false
+      const readSpy = spyOn(f.nativeAccounts, 'read').mockImplementation(
+        async (...args) => {
+          const remove = removeFromNextRead
+          removeFromNextRead = false
+          const snapshot = await read(...args)
+          return remove
+            ? {
+                ...snapshot,
+                accounts: snapshot.accounts.filter(
+                  (row) => row.id !== 'fallback-1',
+                ),
+              }
+            : snapshot
+        },
+      )
+      const authorizeSpy = spyOn(
+        f.nativeAccounts,
+        'authorizeLocal',
+      ).mockImplementation(async (id, options) => {
+        const authorization = await authorize(id, options)
+        if (advised && id === 'fallback-1' && options?.intent === 'serve')
+          removeFromNextRead = true
+        return authorization
+      })
+      globals[key] = () => ({
+        accountFor: async () => {
+          advised = true
+          return {
+            account_id: syntheticFallbackAccountUuid(0),
+            credential_id: 'local',
+          }
+        },
+      })
+      try {
+        expect(await (await f.send()).text()).toBe('ok')
+        expect(f.sends).toEqual(['Bearer sk-ant-oat01-main-access'])
+      } finally {
+        readSpy.mockRestore()
+        authorizeSpy.mockRestore()
+      }
+    })
+  }
+
+  for (const [status, mode] of [
+    [429, 'main-first'],
+    [503, 'main-first'],
+    [429, 'fallback-first'],
+  ] as const) {
+    test(`${mode} returns the fallback ${status} if the next advised credential fails`, async () => {
+      const upstream = new Response('fallback refused', { status })
+      const cancel = spyOn(upstream.body!, 'cancel')
+      const f = await fixture('overloaded', () => upstream, undefined, mode)
+      const authorize = f.nativeAccounts.authorizeLocal.bind(f.nativeAccounts)
+      let asks = 0
+      const authorizeSpy = spyOn(
+        f.nativeAccounts,
+        'authorizeLocal',
+      ).mockImplementation(async (id, options) =>
+        id === 'main' && asks >= 2
+          ? { status: 'refused', reason: 'not-active', persisted: false }
+          : authorize(id, options),
+      )
+      globals[key] = () => ({
+        accountFor: async () => {
+          const first = ++asks === 1
+          if (first && mode === 'fallback-first') return null
+          return {
+            account_id: first
+              ? syntheticFallbackAccountUuid(0)
+              : syntheticMainAccountUuid,
+            credential_id: 'local',
+          }
+        },
+      })
+      try {
+        const response = await f.send()
+        expect(response.status).toBe(status)
+        expect(await response.text()).toBe('fallback refused')
+        expect(cancel).not.toHaveBeenCalled()
+        expect(asks).toBe(2)
+        expect(f.sends).toEqual(['Bearer sk-ant-oat01-fallback-access'])
+      } finally {
+        authorizeSpy.mockRestore()
+        cancel.mockRestore()
+      }
+    })
+  }
+
+  test('sticky advice does not try a credential already rejected by local authorization', async () => {
+    const f = await fixture()
+    const authorize = f.nativeAccounts.authorizeLocal.bind(f.nativeAccounts)
+    let asked = false
+    const attemptedAfterAdvice: string[] = []
+    const authorizeSpy = spyOn(
+      f.nativeAccounts,
+      'authorizeLocal',
+    ).mockImplementation(async (id, options) => {
+      if (asked) attemptedAfterAdvice.push(id)
+      return id === 'fallback-1'
+        ? { status: 'refused', reason: 'not-active', persisted: false }
+        : authorize(id, options)
+    })
+    globals[key] = () => ({
+      accountFor: async () => {
+        asked = true
+        return {
+          account_id: syntheticFallbackAccountUuid(0),
+          credential_id: 'local',
+        }
+      },
+    })
+    try {
+      expect(await (await f.send()).text()).toBe('ok')
+      expect(f.sends).toEqual(['Bearer sk-ant-oat01-main-access'])
+      expect(authorizeSpy.mock.calls.some(([id]) => id === 'fallback-1')).toBe(
+        true,
+      )
+      expect(attemptedAfterAdvice).not.toContain('fallback-1')
+    } finally {
+      authorizeSpy.mockRestore()
+    }
+  })
+
+  test('ordered routing does not replace a failed advised transport attempt with another login', async () => {
+    const transportError = new Error('network fixture')
+    const f = await fixture(
+      'normal',
+      () => {
+        throw transportError
+      },
+      undefined,
+      'main-first',
+    )
+    const accountFor = mock(async () => ({
+      account_id: syntheticFallbackAccountUuid(0),
+      credential_id: 'local',
+    }))
+    globals[key] = () => ({ accountFor })
+    await expect(f.send()).rejects.toThrow('network fixture')
+    expect(accountFor).toHaveBeenCalledTimes(1)
+    expect(f.sends).toEqual(['Bearer sk-ant-oat01-fallback-access'])
+  })
+
+  test('fallback-first does not retry a transport failure from the refusal consult', async () => {
+    let sends = 0
+    const f = await fixture(
+      'normal',
+      () => {
+        switch (++sends) {
+          case 1:
+            return new Response('fallback refused', { status: 403 })
+          case 2:
+            throw new Error('advised transport failed')
+          default:
+            return new Response('unexpected retry')
+        }
+      },
+      undefined,
+      'fallback-first',
+    )
+    let asks = 0
+    globals[key] = () => ({
+      accountFor: async () =>
+        ++asks === 1
+          ? null
+          : { account_id: syntheticMainAccountUuid, credential_id: 'local' },
+    })
+    await expect(f.send()).rejects.toThrow('advised transport failed')
+    expect(asks).toBe(2)
+    expect(f.sends).toEqual([
+      'Bearer sk-ant-oat01-fallback-access',
+      'Bearer sk-ant-oat01-main-access',
+    ])
+  })
+
   test.each(['recovered', 'exhausted', 'alternative'])(
     'ordered routing revisits an earlier refuser only when appropriate (%s)',
     async (scenario) => {
@@ -563,6 +751,182 @@ describe('OC1 shared routing relay', () => {
     expect(f.sends).toEqual([])
   })
 
+  test('fallback-first detaches main refusal cancellation when a later local fallback serves', async () => {
+    const main = new Response('main refused', { status: 403 })
+    const pending = Promise.withResolvers<void>()
+    const cancel = spyOn(main.body!, 'cancel').mockReturnValue(pending.promise)
+    const responses = [
+      new Response('first fallback refused', { status: 403 }),
+      main,
+      new Response('second fallback served'),
+    ]
+    const f = await fixture(
+      'three accounts',
+      () => responses.shift()!,
+      undefined,
+      'fallback-first',
+    )
+    let asks = 0
+    globals[key] = () => ({
+      accountFor: async () =>
+        ++asks === 2
+          ? { account_id: syntheticMainAccountUuid, credential_id: 'local' }
+          : null,
+    })
+    const request = f.send()
+    try {
+      const response = await Promise.race([
+        request,
+        Bun.sleep(1_000).then(() => null),
+      ])
+      expect(await response?.text()).toBe('second fallback served')
+      expect(asks).toBe(3)
+      expect(f.sends).toEqual([
+        'Bearer sk-ant-oat01-fallback-access',
+        'Bearer sk-ant-oat01-main-access',
+        'Bearer sk-ant-oat01-third-access',
+      ])
+      expect(cancel).toHaveBeenCalledTimes(1)
+    } finally {
+      pending.resolve()
+      await Promise.allSettled([request])
+      cancel.mockRestore()
+    }
+  })
+
+  for (const streaming of [false, true]) {
+    test(`sticky routing migrates while ${streaming ? 'stream inspection' : 'refused body'} cancellation is pending`, async () => {
+      const pending = Promise.withResolvers<void>()
+      const cancel = mock(() => pending.promise)
+      const refused = new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(
+                streaming
+                  ? 'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"limited"}}\n\n'
+                  : 'refused',
+              ),
+            )
+          },
+          cancel,
+        }),
+        {
+          status: streaming ? 200 : 403,
+          headers: streaming
+            ? {
+                'content-type': 'text/event-stream',
+                'anthropic-ratelimit-unified-7d-utilization': '1.0',
+              }
+            : {},
+        },
+      )
+      const responses = [
+        refused,
+        new Response(
+          streaming
+            ? 'event: message_start\ndata: {"type":"message_start","message":{"id":"migrated"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'
+            : 'migrated',
+        ),
+      ]
+      const f = await fixture('normal', () => responses.shift()!)
+      let asks = 0
+      globals[key] = () => ({
+        accountFor: async () => ({
+          account_id:
+            ++asks === 1
+              ? syntheticMainAccountUuid
+              : syntheticFallbackAccountUuid(0),
+          credential_id: 'local',
+        }),
+      })
+      const request = f.send({
+        model: 'claude-sonnet-5',
+        stream: streaming,
+        messages: [{ role: 'user', content: 'hello' }],
+      })
+      try {
+        const response = await Promise.race([
+          request,
+          Bun.sleep(1_000).then(() => null),
+        ])
+        expect(await response?.text()).toContain('migrated')
+        expect(cancel).toHaveBeenCalledTimes(1)
+        expect(f.sends).toEqual([
+          'Bearer sk-ant-oat01-main-access',
+          'Bearer sk-ant-oat01-fallback-access',
+        ])
+      } finally {
+        pending.resolve()
+        await Promise.allSettled([request])
+      }
+    })
+  }
+
+  for (const mode of ['main-first', 'fallback-first'] as const) {
+    test.each([true, false])(
+      `${mode} allows confirmed paid fallback only after a null retry probe (%s)`,
+      async (advised) => {
+        let sends = 0
+        const f = await fixture(
+          'paid backup',
+          () =>
+            ++sends === 1
+              ? new Response('usage limit reached', { status: 429 })
+              : new Response('paid'),
+          undefined,
+          mode,
+        )
+        let asks = 0
+        globals[key] = () => ({
+          accountFor: async () =>
+            ++asks === 1 || advised
+              ? { account_id: syntheticMainAccountUuid, credential_id: 'local' }
+              : null,
+        })
+        const response = await f.send()
+        expect(asks).toBe(2)
+        expect(response.status).toBe(advised ? 429 : 200)
+        expect(await response.text()).toBe(
+          advised ? 'usage limit reached' : 'paid',
+        )
+        expect(f.sends).toEqual(
+          advised
+            ? ['Bearer sk-ant-oat01-main-access']
+            : ['Bearer sk-ant-oat01-main-access', 'Bearer paid-key'],
+        )
+      },
+    )
+  }
+
+  for (const [mode, quotaMode] of [
+    ['main-first', 'paid backup with provider wait'],
+    ['main-first', 'paid backup without provider wait'],
+    ['fallback-first', 'paid backup without provider wait'],
+  ] as const) {
+    test(`${mode} preselection skips paid fallback after overridden advice (${quotaMode})`, async () => {
+      const f = await fixture(quotaMode, undefined, undefined, mode)
+      const accountFor = mock(async () => ({
+        account_id: syntheticMainAccountUuid,
+        credential_id: 'local',
+        // Ordered routing only honors holds for an account that just refused.
+        ...(quotaMode === 'paid backup without provider wait' && {
+          hold: { retry_after_ms: 100 },
+        }),
+      }))
+      globals[key] = () => ({ accountFor })
+      const response = await f.send()
+      await response.text()
+      expect(accountFor).toHaveBeenCalledTimes(1)
+      if (quotaMode === 'paid backup with provider wait') {
+        expect(response.status).toBe(429)
+        expect(f.sends).toEqual([])
+      } else {
+        expect(f.sends).toEqual(['Bearer sk-ant-oat01-main-access'])
+      }
+    })
+  }
+
   test.each([true, false])(
     'sticky retry advice blocks paid fallback only when given (%s)',
     async (advised) => {
@@ -590,6 +954,48 @@ describe('OC1 shared routing relay', () => {
       )
     },
   )
+
+  test('sticky paid fallback can follow a null retry after initial advice was overridden', async () => {
+    const responses = [
+      new Response('usage limit reached', { status: 429 }),
+      new Response('paid'),
+    ]
+    const f = await fixture('paid backup', () => responses.shift()!)
+    const read = f.nativeAccounts.read.bind(f.nativeAccounts)
+    let hideMainOnce = false
+    const readSpy = spyOn(f.nativeAccounts, 'read').mockImplementation(
+      async (...args) => {
+        const hideMain = hideMainOnce
+        hideMainOnce = false
+        const snapshot = await read(...args)
+        return hideMain
+          ? {
+              ...snapshot,
+              accounts: snapshot.accounts.filter((row) => row.id !== 'main'),
+            }
+          : snapshot
+      },
+    )
+    let asks = 0
+    globals[key] = () => ({
+      accountFor: async () => {
+        if (++asks !== 1) return null
+        // The advised account disappears from the recheck, then becomes available locally.
+        hideMainOnce = true
+        return { account_id: syntheticMainAccountUuid, credential_id: 'local' }
+      },
+    })
+    try {
+      expect(await (await f.send()).text()).toBe('paid')
+      expect(asks).toBe(2)
+      expect(f.sends).toEqual([
+        'Bearer sk-ant-oat01-main-access',
+        'Bearer paid-key',
+      ])
+    } finally {
+      readSpy.mockRestore()
+    }
+  })
 
   test('sticky reroute asks shared routing again and honors a final refusal', async () => {
     const f = await fixture('normal', () => new Response(null, { status: 403 }))

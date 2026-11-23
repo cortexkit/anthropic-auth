@@ -3,6 +3,7 @@ import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
+import * as core from '@cortexkit/anthropic-auth-core'
 import {
   __setLogTestSink,
   type AccountStorage,
@@ -1020,6 +1021,77 @@ describe('cache diagnostics', () => {
     // TestLifetime disposes those plugins and joins their work before removal.
     testContext.tempConfigDir = undefined
   })
+
+  for (const sparse of [false, true]) {
+    test(`cache diagnostics delivers the reply and links its ID ${sparse ? 'without detailed usage' : 'while the beta hash is pending'}`, async () => {
+      const sentBodies: Record<string, unknown>[] = []
+      const records: LogTestRecord[] = []
+      const pending = Promise.withResolvers<void>()
+      const hash = core.getCacheDiagnosticsBetas
+      const hashSpy = sparse
+        ? undefined
+        : spyOn(core, 'getCacheDiagnosticsBetas').mockImplementation(
+            async (headers) => {
+              await pending.promise
+              return hash(headers)
+            },
+          )
+      const reply = message('provider-first')
+      const { cache_creation: _omitted, ...sparseUsage } = reply.usage
+      globalThis.fetch = mock(
+        withNativeAdmission((_input: unknown, init: RequestInit) => {
+          sentBodies.push(JSON.parse(String(init.body)))
+          return Promise.resolve(
+            sseResponse(sparse ? { ...reply, usage: sparseUsage } : reply),
+          )
+        }),
+      ) as unknown as typeof fetch
+      __setLogTestSink((record) => records.push(record))
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(oauthLoader, { models: {} })
+      setLogLevel('debug')
+      const send = async () =>
+        (
+          await result.fetch(MESSAGES_URL, {
+            method: 'POST',
+            headers: { 'x-session-affinity': 'ses-diag-sparse' },
+            body: JSON.stringify({
+              model: 'claude-opus-4-8',
+              stream: true,
+              messages: [{ role: 'user', content: 'hello' }],
+            }),
+          })
+        ).text()
+      const delivered = (async () => {
+        expect(await send()).toContain('provider-first')
+        await send()
+        return true
+      })()
+      const logged = () =>
+        records.some((record) => record.message.startsWith('MC-CACHE-DIAG '))
+      try {
+        expect(
+          await Promise.race([delivered, Bun.sleep(1_000).then(() => false)]),
+        ).toBe(true)
+        expect(sentBodies.map((body) => body.diagnostics)).toEqual([
+          { previous_message_id: null },
+          { previous_message_id: 'provider-first' },
+        ])
+        expect(logged()).toBe(false)
+        if (hashSpy) {
+          expect(hashSpy).toHaveBeenCalledTimes(2)
+          pending.resolve()
+          for (let tries = 0; tries < 100 && !logged(); tries++)
+            await Bun.sleep(5)
+          expect(logged()).toBe(true)
+        }
+      } finally {
+        pending.resolve()
+        await Promise.allSettled([delivered])
+        hashSpy?.mockRestore()
+      }
+    })
+  }
 
   test('cache diagnostics binds the provider predecessor at request time', async () => {
     const sentBodies: Record<string, unknown>[] = []
