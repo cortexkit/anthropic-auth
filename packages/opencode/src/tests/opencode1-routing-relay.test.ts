@@ -535,6 +535,40 @@ describe('OC1 shared routing relay', () => {
     expect(ids[1]).not.toBe(ids[0])
   })
 
+  // A retry ask comes after a failed attempt has used part of OpenCode 1's
+  // 5-minute response budget, so a full pool must become a host retry at once
+  // rather than a wait inside the request (a 2-minute wait here would also
+  // outlast the test's timeout).
+  for (const mode of ['sticky-balanced', 'main-first'] as const) {
+    test(`${mode} retry ask hands a full pool to the host without waiting`, async () => {
+      const f = await fixture(
+        'normal',
+        () => new Response(null, { status: 403 }),
+        undefined,
+        mode === 'sticky-balanced' ? undefined : mode,
+      )
+      const reset = Date.now() + 2 * 60_000
+      let choices = 0
+      globals[key] = () => ({
+        accountFor: async () =>
+          ++choices === 1
+            ? mode === 'sticky-balanced'
+              ? { account_id: syntheticMainAccountUuid, credential_id: 'local' }
+              : null
+            : { refused: { code: 'concurrency_full', resets_at_ms: reset } },
+      })
+      const started = Date.now()
+      const response = await f.send()
+      expect(Date.now() - started).toBeLessThan(4_000)
+      expect(choices).toBe(2)
+      expect(response.status).toBe(429)
+      expect(await response.json()).toMatchObject({
+        error: { code: 'concurrency_full' },
+      })
+      expect(f.sends).toHaveLength(1)
+    })
+  }
+
   test.each(['floor', 'reserve', 'unknown quota'])(
     'routing quota trust serves OC1 advice despite %s',
     async (mode) => {
