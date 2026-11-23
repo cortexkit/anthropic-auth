@@ -5,6 +5,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - OpenCode 1, OpenCode 2 and Pi: when shared routing reports that every account is at its concurrent-request limit, requests wait for a free slot instead of ending the turn.
+- OpenCode: the one-time state move no longer treats a running older plugin as gone after the system clock is corrected forward. A start with a different XDG_STATE_HOME no longer moves the state while an earlier move under another state folder is unfinished; it stops and says to start again with the setting used then.
 
 ## 2.16.6
 

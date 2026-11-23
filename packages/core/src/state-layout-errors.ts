@@ -8,6 +8,11 @@ export type StateLayoutRefusalCode =
   | 'conflict'
   /** The dataset was moved under another state root (`XDG_STATE_HOME`). */
   | 'moved-elsewhere'
+  /**
+   * A move recorded under another state root stopped part way, leaving the
+   * journal set aside in the config folder.
+   */
+  | 'move-unfinished-elsewhere'
   /** A marker or tombstone belongs to a different config folder or dataset. */
   | 'other-dataset'
   /** `layout.json` exists but can't be read or parsed, or is missing after a move. */
@@ -41,6 +46,7 @@ const PUBLIC_MESSAGES: Record<StateLayoutRefusalCode, string> = {
   conflict:
     'anthropic-auth found two copies of the same account state and stopped using both so a refresh token is never used twice. The log names both files: keep the copy you trust, move the other one away, then restart OpenCode.',
   'moved-elsewhere': `anthropic-auth state for this config folder was moved under another state folder (XDG_STATE_HOME). Restore XDG_STATE_HOME, or run ${RESTORE_LEGACY_COMMAND} with the old XDG_STATE_HOME first. The log names both folders.`,
+  'move-unfinished-elsewhere': `An earlier move of anthropic-auth state for this config folder did not finish, and its record is in another state folder. Start again with the XDG_STATE_HOME (and HOME) that were set then, so that move finishes or rolls back; to keep the old layout afterwards, run ${RESTORE_LEGACY_COMMAND} with that same setting. The log names the journal the move set aside.`,
   'other-dataset':
     "anthropic-auth's state folder belongs to another config folder. Check OPENCODE_CONFIG_DIR and any symlink to the config folder; the log names both folders.",
   'marker-unreadable':

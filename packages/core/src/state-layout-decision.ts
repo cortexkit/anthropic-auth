@@ -1266,6 +1266,15 @@ async function underLayoutLock(
   await acquireHolderLocks(dataset, ctx)
   if (!relocationMoveEnabled(options))
     return stay([RELOCATION_MOVE_DISABLED_REASON], false)
+  // Before this start snapshots the old files for a move of its own: a
+  // journal another move set aside means that move is unfinished and
+  // recorded in another state folder.
+  const foreign = await foreignMovingJournals(dataset)
+  if (foreign === undefined)
+    return stay([
+      `${dataset.oldDir} can't be listed, so a move another state folder left unfinished can't be ruled out`,
+    ])
+  if (foreign.length) moveUnfinishedElsewhere(dataset, foreign)
   const holdersMark = ctx.stack.size
   const files = [...dataset.slots.flatMap((slot) => [slot.from, slot.to])]
   const artifacts =
@@ -1349,6 +1358,51 @@ async function underLayoutLock(
 
 async function stateLayoutFenceStep(ctx: StateLayoutTransitionContext) {
   await ctx.onStep?.('fence-checked')
+}
+
+/**
+ * Journals in the config folder that a move set aside
+ * (`<journal>.moving-<attempt>`), or undefined when the folder can't be
+ * listed. Called with the old folder's holder lock held, when this start's
+ * state folder records no unfinished move of its own, so any such journal
+ * belongs to a move whose record is in another state folder: a start under
+ * another `XDG_STATE_HOME` (or HOME) that stopped before writing its
+ * relocation tombstones: the small files written over the old runtime files
+ * that point older plugins at the new folder.
+ * A new move here would find no journal, move without one and retire the
+ * old files, leaving that move unable to roll back and this one without
+ * the journal local accounts need.
+ */
+async function foreignMovingJournals(
+  dataset: RelocationDataset,
+): Promise<string[] | undefined> {
+  const journal = dataset.oldPaths.journal
+  let names: string[]
+  try {
+    names = await readdir(dirname(journal))
+  } catch {
+    return undefined
+  }
+  return names
+    .filter((name) => isMovingJournalName(basename(journal), name))
+    .sort()
+    .map((name) => join(dirname(journal), name))
+}
+
+/**
+ * Refuse to move while another state folder's move is unfinished. Nothing
+ * of that move is removed or adopted: only a start with its state folder
+ * can finish or roll it back.
+ */
+function moveUnfinishedElsewhere(
+  dataset: RelocationDataset,
+  movingJournals: readonly string[],
+): never {
+  refuse(
+    'move-unfinished-elsewhere',
+    `An earlier move of anthropic-auth state for ${dataset.oldDir} did not finish: it set the journal aside as ${movingJournals.join(' and ')}, and its record is not in ${dataset.sub}, the state folder this process uses. Start anthropic-auth again with the XDG_STATE_HOME (and HOME) that were set then, so that move finishes or rolls back; to keep the old layout afterwards, run ${RESTORE_LEGACY_COMMAND} with that same setting. Nothing was changed.`,
+    [dataset.oldDir, ...movingJournals, dataset.sub],
+  )
 }
 
 /**

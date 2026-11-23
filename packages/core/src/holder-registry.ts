@@ -426,24 +426,29 @@ export function recordPredatesBoot(
 }
 
 /**
- * Whether an entry's process may still be running. An entry from before
- * this boot or a dead pid is stale. Otherwise an unreadable incarnation
- * counts as alive; only a different incarnation clears a live pid.
+ * Whether an entry's process may still be running. A dead pid is stale.
+ * When the entry's incarnation and the pid's current one are both known,
+ * they decide: equal is the same process, different is a reused pid. Only
+ * when the incarnation cannot settle it does a registration from before
+ * this boot count as stale. That rule reads the wall clock, which can be
+ * corrected forward while a process runs, so it must never override a
+ * matching incarnation.
  */
 export async function holderEntryIsLive(
   entry: Pick<HolderEntry, 'pid' | 'incarnation'> & { registeredAt?: unknown },
   liveness: HolderLiveness = defaultLiveness,
 ): Promise<boolean> {
-  if (recordPredatesBoot(entry.registeredAt, liveness)) return false
   if (!liveness.pidAlive(entry.pid)) return false
-  if (entry.incarnation === null) return true
-  let current: string | null
-  try {
-    current = await liveness.incarnation(entry.pid)
-  } catch {
-    current = null
+  if (entry.incarnation !== null) {
+    let current: string | null
+    try {
+      current = await liveness.incarnation(entry.pid)
+    } catch {
+      current = null
+    }
+    if (current !== null) return current === entry.incarnation
   }
-  return current === null || current === entry.incarnation
+  return !recordPredatesBoot(entry.registeredAt, liveness)
 }
 
 export interface HolderFileContents {
