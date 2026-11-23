@@ -5519,7 +5519,7 @@ async function sendPrimary(
   await response.text()
 }
 
-test('Pi gzips eligible prewarms and rescues them with the same signed body', async () => {
+test('Pi gzips eligible prewarms and rescues them with the same signed body outside the diagnostics chain', async () => {
   const f = await fixture()
   const sent: Array<{ encoding: string | null; body: string }> = []
   globalThis.fetch = Object.assign(
@@ -5545,6 +5545,7 @@ test('Pi gzips eligible prewarms and rescues them with the same signed body', as
     bodyText: JSON.stringify({
       model: model.id,
       max_tokens: 128,
+      diagnostics: { previous_message_id: 'msg_pi_conversation' },
       system: [
         {
           type: 'text',
@@ -5560,6 +5561,7 @@ test('Pi gzips eligible prewarms and rescues them with the same signed body', as
   })
   expect(result.ok).toBe(true)
   expect(sent.map(({ encoding }) => encoding)).toEqual(['gzip', null])
+  expect(JSON.parse(sent[0]!.body)).not.toHaveProperty('diagnostics')
   expect(sent[0]?.body.trimEnd()).toBe(sent[1]?.body)
 })
 

@@ -366,6 +366,8 @@ export async function buildCacheKeepPrewarmBody(
       reason: 'a thread continuation is not a full cache prefix',
     }
 
+  // Keep-warm refreshes the cache without advancing the conversation's previous-message ID.
+  delete body.diagnostics
   if (!hasExplicitCacheControl(body)) {
     return { ok: false, reason: 'body has no explicit cache breakpoints' }
   }
@@ -833,6 +835,8 @@ export class CacheKeepManager {
         headers: Headers,
         target: CacheKeepTarget,
         attempt: CacheKeepPrewarmAttempt,
+        /** Check the original target after waiting; `target` carries the rewritten body. */
+        isTargetCurrent: () => boolean,
       ) => Promise<Headers | undefined> | Headers | undefined
       /** Pure in-memory route lookup; an unknown answer keeps the target. */
       peekRoutingAccount?: (
@@ -2387,6 +2391,7 @@ export class CacheKeepManager {
             new Headers(target.headers),
             prewarmTarget,
             attempt,
+            () => this.isCurrentTarget(target),
           )
         : new Headers(target.headers)
       ensureActive()

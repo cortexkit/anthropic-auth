@@ -13,6 +13,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## 2.16.6
 
+- OpenCode 1 CacheKeep can run a one-off prewarm again without dropping its normal account and destination checks.
+- Pi keep-warms no longer send the conversation's previous message ID to Claude.
 - Changing effort mid-conversation now preserves the prompt cache in OpenCode v1, OpenCode v2, and Pi for Claude Mythos 5.1 and 5.2, and for Claude Opus 5 and Haiku 5.5 when adaptive thinking is on.
 - OpenCode 1: idle sessions can keep warming a still-live Claude prompt cache after a server restart without resetting their budgets; `auto` keep-warm now uses the accepted prefix's token counts to price warms, even without a restart.
 - OpenCode 1: after a server restart, a threaded session's first full request can reuse the previous full request's cache boundary, as on OpenCode 2 and Pi.

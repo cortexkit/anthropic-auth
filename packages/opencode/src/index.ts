@@ -3908,14 +3908,6 @@ const anthropicAuthPlugin = async (
       await cacheKeepRegistry.publish(sessions)
       aggregateCacheKeepSessions = await cacheKeepRegistry.list(sessions)
     },
-    prepareBody: (bodyText) => {
-      // Strip the real turn's diagnostic predecessor before signing. A warm
-      // refreshes the prefix but does not join the turn's diagnostics chain.
-      const body = JSON.parse(bodyText) as Record<string, unknown>
-      if (!Object.hasOwn(body, 'diagnostics')) return bodyText
-      delete body.diagnostics
-      return JSON.stringify(body)
-    },
     onResponse: async ({ target, bodyText, status, receivedAt, attempt }) => {
       const authorization = cacheKeepScopedAttempts.get(attempt.id)
       // A recovery source warm protects another model, not the active fallback's cache.
@@ -3997,12 +3989,9 @@ const anthropicAuthPlugin = async (
       cacheKeepScopedAttempts.set(attempt.id, current)
       return rotatedHeaders
     },
-    prepareHeaders: async (headers, target, attempt) => {
+    prepareHeaders: async (headers, target, attempt, isTargetCurrent) => {
       await cacheKeepRestart.stagger(target, attempt.signal)
-      if (
-        !cacheKeepRestart.active() ||
-        !cacheKeepManager.isCurrentTarget(target)
-      )
+      if (!cacheKeepRestart.active() || !isTargetCurrent())
         throw new CacheKeepWarmRefusal('stopped')
       // A remembered URL gets the same destination rule as a live request;
       // refuse it before any credential is authorized for the prewarm.

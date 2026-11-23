@@ -126,7 +126,7 @@ export class PiCacheKeep {
         this.sessions.get(id)?.store.removed(id)
         managerOptions.onTargetRemoved?.(id)
       },
-      prepareHeaders: async (headers, target, attempt) => {
+      prepareHeaders: async (headers, target, attempt, isTargetCurrent) => {
         // Delay the actual first send, not just its due time: minute ticks can
         // coalesce all overdue sessions after many Pi processes restart.
         const stagger = this.restored.get(target.id)
@@ -151,7 +151,12 @@ export class PiCacheKeep {
           if (!account || !nativeAccountCanServe(account)) return undefined
         } else if (this.manager.trackedRequest(target.id)) return undefined
         return managerOptions.prepareHeaders
-          ? managerOptions.prepareHeaders(headers, target, attempt)
+          ? managerOptions.prepareHeaders(
+              headers,
+              target,
+              attempt,
+              isTargetCurrent,
+            )
           : headers
       },
     })
