@@ -1,9 +1,16 @@
 import { afterEach, expect, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
 import * as fs from 'node:fs/promises'
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import {
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import {
   mutateVaultRoster,
   projectVaultRoster,
@@ -573,14 +580,30 @@ test('completed routing seed adds no legacy or routing file reads to later Core 
   ).toBeLessThanOrEqual(2)
 })
 
-test('malformed routing stays untouched while requests can still select an admitted account', async () => {
+test('routing seed preserves malformed routing separately and requests can persist new pins', async () => {
   const f = await fixture()
-  const bytes = 'pre-existing malformed vault routing'
+  const bytes = Buffer.from([0x7b, 0xff])
   await writeFile(f.vault.routing, bytes, { mode: 0o600 })
   expect((await f.readAndDrain()).mode).toBe('claustrum')
-  expect(await readFile(f.vault.routing, 'utf8')).toBe(bytes)
+  expect(JSON.parse(await readFile(f.vault.routing, 'utf8'))).toMatchObject({
+    version: 1,
+    vaultLegacySeed: 'complete',
+    assignments: { [key('work-session')]: { accountId: f.workRoute } },
+  })
   expect((await f.resolveAndDrain('session'))?.accountId).toBe(f.workRoute)
-  expect(await readFile(f.vault.routing, 'utf8')).toBe(bytes)
+  expect(
+    JSON.parse(await readFile(f.vault.routing, 'utf8')).assignments[
+      key('session')
+    ].accountId,
+  ).toBe(f.workRoute)
+  const directory = dirname(f.vault.routing)
+  const backups = (await readdir(directory)).filter((name) =>
+    name.startsWith(`${basename(f.vault.routing)}.invalid-`),
+  )
+  expect(backups).toHaveLength(1)
+  const [backup] = backups
+  if (!backup) throw new Error('Invalid state backup missing')
+  expect(await readFile(join(directory, backup))).toEqual(bytes)
   await f.assertLegacy()
 })
 
