@@ -626,7 +626,8 @@ test('OpenCode 2 logs cache diagnostics at debug level and one beta list per sen
         ts_ms_received: expect.any(Number),
         model: scope.modelID,
         is_subagent: false,
-        ttl_sent: '1h',
+        // When no cache lifetime is configured, OpenCode 2 now sends five minutes.
+        ttl_sent: '5m',
         cache_read: 4,
         cache_creation: 8,
         input_tokens: 20,
