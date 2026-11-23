@@ -5,12 +5,12 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - OpenCode 1, OpenCode 2 and Pi: when shared routing reports that every account is at its concurrent-request limit, requests wait for a free slot instead of ending the turn.
+- OpenCode: the one-time state move no longer treats a running older plugin as gone after the system clock is corrected forward. A start with a different XDG_STATE_HOME no longer moves the state while an earlier move under another state folder is unfinished; it stops and says to start again with the setting used then.
 
 ## 2.16.6
 
 - Changing effort mid-conversation now preserves the prompt cache in OpenCode v1, OpenCode v2, and Pi for Claude Mythos 5.1 and 5.2, and for Claude Opus 5 and Haiku 5.5 when adaptive thinking is on.
 - Pi: changing thinking effort during a conversation now preserves the prompt cache on models that support per-message effort, including in conversations shortened by Magic Context.
-- OpenCode: a running OpenCode or Pi no longer has its account files moved out from under it when the system clock is corrected forward. A start with a different XDG_STATE_HOME no longer moves the state while an earlier move under another state folder is unfinished; it stops and says to start again with the setting used then.
 
 ## 2.16.5
 
