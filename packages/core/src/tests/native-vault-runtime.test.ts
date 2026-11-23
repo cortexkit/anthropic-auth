@@ -1913,7 +1913,7 @@ test('kept receipt retry admission forgets before any later 401 reporting', asyn
 })
 
 test('vault enrollment revocation closes custody and forgets its receipt', async () => {
-  const f = await fixture()
+  const f = await fixture(true)
   await f.runtime.refresh()
   await f.runtime.authorize('main')
   f.failure(
@@ -1924,9 +1924,54 @@ test('vault enrollment revocation closes custody and forgets its receipt', async
   })
   expect(f.counts.closes).toBe(1)
   f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
-  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
-    code: 'closed',
+  await expect(f.finish(f.runtime.authorize('main'))).rejects.toMatchObject({
+    code: 'unavailable',
   })
+})
+
+test('the same vault runtime reads credentials after enrollment replacement', async () => {
+  const f = await fixture()
+  const runtime = createNativeVaultRuntime({
+    ...f.options,
+    readToken: undefined,
+  })
+  deferCleanup(() => runtime.close())
+  let validToken = '01'.repeat(32)
+  const getScoped = f.client.getScoped
+  f.client.getScoped = async (input) => {
+    if (input.enrollmentToken !== validToken)
+      throw new ClaustrumCredentialError(
+        'enrollment_revoked',
+        'permanent',
+        'gone',
+      )
+    return getScoped(input)
+  }
+  await runtime.refresh()
+  expect(await runtime.authorize('main')).toMatchObject({
+    accessToken: 'synthetic-bearer-7',
+  })
+
+  validToken = '02'.repeat(32)
+  await expect(runtime.authorize('main')).rejects.toMatchObject({
+    code: 'unavailable',
+  })
+  expect(f.counts.closes).toBe(1)
+  await expect(runtime.authorize('main')).rejects.toBeInstanceOf(
+    NativeCustodyError,
+  )
+
+  await writeFile(
+    f.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
+    JSON.stringify({ token: validToken, token_generation: 2 }),
+    { mode: 0o600 },
+  )
+  f.version(8)
+  const connects = f.counts.connects
+  expect(await runtime.authorize('main')).toMatchObject({
+    accessToken: 'synthetic-bearer-8',
+  })
+  expect(f.counts.connects).toBe(connects + 1)
 })
 
 test('adapter kept receipt state is nonsecret and clears on forget and close', async () => {
@@ -2369,20 +2414,10 @@ for (const code of ['not_found', 'enrollment_revoked'] as const) {
     expect(w.listPace()).toEqual([2_000])
     // An outage would now serve the kept receipt; it was dropped instead.
     f.failure(unreachable())
-    if (code === 'enrollment_revoked') {
-      // As a revocation met by any vault call: custody closes for good.
-      expect(f.counts.closes).toBe(1)
-      await expect(w.runtime.authorize('main')).rejects.toMatchObject({
-        code: 'closed',
-      })
-    } else {
-      expect(f.counts.closes).toBe(0)
-      await expect(f.finish(w.runtime.authorize('main'))).rejects.toMatchObject(
-        {
-          code: 'unavailable',
-        },
-      )
-    }
+    expect(f.counts.closes).toBe(code === 'enrollment_revoked' ? 1 : 0)
+    await expect(f.finish(w.runtime.authorize('main'))).rejects.toMatchObject({
+      code: 'unavailable',
+    })
   })
 }
 

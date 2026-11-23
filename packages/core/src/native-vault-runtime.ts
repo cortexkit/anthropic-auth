@@ -488,14 +488,12 @@ export function createNativeVaultRuntime(
     })
   let custody = newCustody()
   let custodyHosted = isVaultHosted()
-  let custodyClosed = false
   function closeCustody() {
     // Closing the custody also stops its roster watch.
     closeRosterWatch()
     try {
       custody.close()
     } finally {
-      custodyClosed = true
       insula?.release()
       insula = undefined
     }
@@ -745,7 +743,7 @@ export function createNativeVaultRuntime(
    * active. One watch per runtime: the runtime is already shared per process.
    */
   function openRosterWatch() {
-    if (rosterWatch || custodyClosed || shutdown.signal.aborted) return
+    if (rosterWatch || custody.closed || shutdown.signal.aborted) return
     if (!watchers.size) return
     const held = {
       live: true,
@@ -844,7 +842,7 @@ export function createNativeVaultRuntime(
   function assertCustodyOwner(owner: NativeCustody, generation: number) {
     assertHostAuthorityStable()
     if (
-      custodyClosed ||
+      custody.closed ||
       custody !== owner ||
       (owner.generation ?? 0) !== generation
     )
@@ -859,13 +857,12 @@ export function createNativeVaultRuntime(
     const mode = await readNativeEnrollmentMode(options.host, env)
     check()
     const hosted = isVaultHosted()
-    if (hosted !== custodyHosted) {
+    // Revocation can close custody without shutting down the runtime.
+    // Release the closed custody's watch and transport before replacing it.
+    if (hosted !== custodyHosted || custody.closed) {
       closeCustody()
       custodyHosted = hosted
-    }
-    if (mode === 'claustrum' && custodyClosed) {
-      custody = newCustody()
-      custodyClosed = false
+      if (mode === 'claustrum') custody = newCustody()
     }
     return mode === 'claustrum'
   }
