@@ -9006,6 +9006,7 @@ const anthropicAuthPlugin = async (
               usableOAuth.map((account) => [account.id, account]),
             )
             const usable: Array<OAuthAccount | ApiKeyAccount> = []
+            const paid: ApiKeyAccount[] = []
             for (const account of storageArg?.accounts ?? []) {
               if (storageArg && isOAuthAccount(account)) {
                 if (isScopedCustodyActive(storageArg)) {
@@ -9043,9 +9044,10 @@ const anthropicAuthPlugin = async (
                 nativeAccountCanServe(account) &&
                 isValidApiBaseURL(account.baseURL)
               ) {
-                usable.push(account)
+                paid.push(account)
               }
             }
+            usable.push(...paid)
             if (!isKillswitchEnabled(storageArg)) return usable
             return usable.filter((account) =>
               isOAuthAccount(account)
@@ -9381,6 +9383,56 @@ const anthropicAuthPlugin = async (
             void response?.body?.cancel().catch(() => {})
           }
 
+          function createRefusalOwner() {
+            let latest: Response | undefined
+            let main: Response | undefined
+            return {
+              get latest() {
+                return latest
+              },
+              get main() {
+                return main
+              },
+              keep(response: Response, isMain = false) {
+                if (latest !== main && latest !== response)
+                  cancelAbandonedResponse(latest)
+                // Keep the primary response separately: fallback-first may have
+                // already tried main on shared advice and must not send it again.
+                if (isMain && main !== response) {
+                  cancelAbandonedResponse(main)
+                  main = response
+                }
+                latest = response
+              },
+              finish(response?: Response) {
+                if (latest !== main && latest !== response)
+                  cancelAbandonedResponse(latest)
+                if (main !== response) cancelAbandonedResponse(main)
+                latest = main = undefined
+              },
+            }
+          }
+
+          function withRefusalOwner(
+            fetch: (
+              input: string | URL | Request,
+              init: RequestInit | undefined,
+              refusal: ReturnType<typeof createRefusalOwner>,
+            ) => Promise<Response>,
+          ) {
+            return async (
+              input: string | URL | Request,
+              init?: RequestInit,
+            ) => {
+              const refusal = createRefusalOwner()
+              try {
+                return await fetch(input, init, refusal)
+              } finally {
+                refusal.finish()
+              }
+            }
+          }
+
           function scheduleServedFallbackQuotaRefresh(
             account: OAuthAccount,
             storage: Awaited<ReturnType<typeof loadAccounts>>,
@@ -9400,26 +9452,27 @@ const anthropicAuthPlugin = async (
               .catch(() => {})
           }
 
-          const orderedRouting = new WeakMap<
-            PerfTrace,
-            {
+          type RequestRouting = {
+            trace: PerfTrace
+            refusal: ReturnType<typeof createRefusalOwner>
+            attemptedPaid: Set<string>
+            shared?: {
               afterRefusal: (
                 id: string,
                 response: Response,
               ) => Promise<Response | undefined>
               skipLocal: (id: string) => boolean
               allowPaidFallback: () => boolean
-              keepsRefusal: (response: Response) => boolean
             }
-          >()
+          }
 
           async function tryUsableFallbackAccounts(
             input: string | URL | Request,
             init: RequestInit | undefined,
             accounts: Array<OAuthAccount | ApiKeyAccount>,
             storage: Awaited<ReturnType<typeof loadAccounts>>,
-            currentResponse?: Response,
-            trace?: PerfTrace,
+            currentResponse: Response | undefined,
+            routing: RequestRouting,
             options?: {
               returnLastOnExhausted?: boolean
               mainAccessToken?: string
@@ -9432,21 +9485,16 @@ const anthropicAuthPlugin = async (
             if (!accounts.length) return currentResponse ?? null
 
             const returnLastOnExhausted = options?.returnLastOnExhausted ?? true
-            let lastResponse: Response | null = currentResponse ?? null
-            const shared = trace && orderedRouting.get(trace)
-            let canceledCurrentResponse = false
-            const cancelCurrentResponse = () => {
-              if (canceledCurrentResponse) return
-              canceledCurrentResponse = true
-              cancelAbandonedResponse(currentResponse)
-            }
+            const { trace, refusal, shared, attemptedPaid } = routing
+            let attempted = false
 
             for (const [index, account] of accounts.entries()) {
               if (shared?.skipLocal(account.id)) continue
               let response: Response
               if (isApiKeyAccount(account)) {
                 if (shared && !shared.allowPaidFallback()) continue
-                cancelCurrentResponse()
+                if (attemptedPaid.has(account.id)) continue
+                attemptedPaid.add(account.id)
                 response = await sendWithApiAccount(
                   input,
                   init,
@@ -9478,7 +9526,6 @@ const anthropicAuthPlugin = async (
                   throw new Error(
                     'Native vault fallback credential is unavailable',
                   )
-                cancelCurrentResponse()
                 response = await sendWithAccessToken(
                   input,
                   init,
@@ -9497,7 +9544,6 @@ const anthropicAuthPlugin = async (
                 getClaustrumMode(storage) === 'local' &&
                 account.access
               ) {
-                cancelCurrentResponse()
                 response = await sendWithAccessToken(
                   input,
                   init,
@@ -9511,7 +9557,6 @@ const anthropicAuthPlugin = async (
                   options?.laneStartRequest,
                 )
               } else continue
-              lastResponse = response
               let fallbackAgain = shouldFallbackResponse(response, storage)
               if (!fallbackAgain) {
                 const inspected = await inspectStreamingRateLimit(
@@ -9519,7 +9564,6 @@ const anthropicAuthPlugin = async (
                   trace,
                 )
                 response = inspected.response
-                lastResponse = response
                 fallbackAgain = inspected.rateLimited
               }
               if (!fallbackAgain) {
@@ -9533,6 +9577,8 @@ const anthropicAuthPlugin = async (
                   scheduleServedFallbackQuotaRefresh(account, storage)
                 return response
               }
+              attempted = true
+              refusal.keep(response)
               if (shared && isOAuthAccount(account)) {
                 const replacement = await shared.afterRefusal(
                   account.id,
@@ -9540,23 +9586,21 @@ const anthropicAuthPlugin = async (
                 )
                 if (replacement) return replacement
               }
-              if (
-                (index < accounts.length - 1 || !returnLastOnExhausted) &&
-                !shared?.keepsRefusal(response)
-              ) {
-                cancelAbandonedResponse(response)
-              }
             }
 
-            return returnLastOnExhausted ? lastResponse : null
+            return returnLastOnExhausted
+              ? ((attempted ? refusal.latest : currentResponse) ?? null)
+              : null
           }
 
           async function tryFallbackAccounts(
             input: string | URL | Request,
             init: RequestInit | undefined,
             mainResponse: Response,
-            preselectedAccounts?: Array<OAuthAccount | ApiKeyAccount>,
-            trace?: PerfTrace,
+            preselectedAccounts:
+              | Array<OAuthAccount | ApiKeyAccount>
+              | undefined,
+            routing: RequestRouting,
             existingStorage?: Awaited<ReturnType<typeof loadAccounts>>,
             mainAccessToken?: string,
             onFallbackSuccess?: (account: {
@@ -9570,6 +9614,7 @@ const anthropicAuthPlugin = async (
           ) {
             if (!isReplayableRequest(input, init?.body)) return mainResponse
 
+            const { trace, shared, attemptedPaid, refusal } = routing
             const loadStart = nowMs()
             const storage =
               existingStorage ?? (await loadAccounts(accountStoragePath))
@@ -9577,24 +9622,29 @@ const anthropicAuthPlugin = async (
               ms: roundMs(nowMs() - loadStart),
               cached: !!existingStorage,
             })
-            const hasPotentialFallbackRoute = (storage?.accounts ?? []).some(
+            const hasPotentialPaidRoute = (storage?.accounts ?? []).some(
               (account) =>
+                isApiKeyAccount(account) &&
                 nativeAccountCanServe(account) &&
-                (isOAuthAccount(account) ||
-                  (isApiKeyAccount(account) &&
-                    isValidApiBaseURL(account.baseURL))),
+                isValidApiBaseURL(account.baseURL) &&
+                !attemptedPaid.has(account.id),
             )
-            const shared = trace && orderedRouting.get(trace)
+            const hasPotentialFallbackRoute =
+              hasPotentialPaidRoute ||
+              (storage?.accounts ?? []).some(
+                (account) =>
+                  isOAuthAccount(account) && nativeAccountCanServe(account),
+              )
             if (!hasPotentialFallbackRoute && !shared) return mainResponse
 
             let currentResponse = mainResponse
-            let shouldFallback = shouldFallbackResponse(
-              currentResponse,
-              storage,
-            )
+            const mainAlreadyInspected = currentResponse === refusal.main
+            let shouldFallback =
+              mainAlreadyInspected ||
+              shouldFallbackResponse(currentResponse, storage)
             let mainQuotaExhaustedByResponse = responseShowsMainQuotaExhausted(
               currentResponse,
-              false,
+              mainAlreadyInspected && currentResponse.status === 200,
             )
             if (!shouldFallback) {
               const inspected = await inspectStreamingRateLimit(
@@ -9611,16 +9661,23 @@ const anthropicAuthPlugin = async (
             if (!shouldFallback) {
               return currentResponse
             }
+            if (!mainAlreadyInspected) refusal.keep(currentResponse, true)
             if (shared) {
               const replacement = await shared.afterRefusal(
                 'main',
                 currentResponse,
               )
               if (replacement) return replacement
+              // Shared routing can revisit main while trying other accounts.
+              // Only its latest primary refusal is still owned after that.
+              currentResponse = refusal.main ?? currentResponse
             }
             if (!hasPotentialFallbackRoute) return currentResponse
             let includeApiRoutes = false
-            if (!shared || shared.allowPaidFallback()) {
+            if (
+              hasPotentialPaidRoute &&
+              (!shared || shared.allowPaidFallback())
+            ) {
               includeApiRoutes =
                 preselectedAccounts?.some(isApiKeyAccount) ?? false
               if (
@@ -9677,7 +9734,7 @@ const anthropicAuthPlugin = async (
                 accounts,
                 storage,
                 currentResponse,
-                trace,
+                routing,
                 {
                   onSuccess: onFallbackSuccess,
                   mainAccessToken,
@@ -9691,7 +9748,7 @@ const anthropicAuthPlugin = async (
 
           const authTransport = withAbortableFetch({
             apiKey: '',
-            async fetch(input: string | URL | Request, init?: RequestInit) {
+            fetch: withRefusalOwner(async (input, init, refusal) => {
               const requestSequence = ++sidebarRequestSequence
               if (input instanceof Request && init?.signal === undefined)
                 init = { ...init, signal: input.signal }
@@ -9750,18 +9807,12 @@ const anthropicAuthPlugin = async (
                     ? initialBody.length
                     : undefined,
               })
-              let keptSharedRefusal:
-                | { main: boolean; response: Response }
-                | undefined
-              const keepSharedRefusal = (response: Response, main: boolean) => {
-                if (keptSharedRefusal?.response !== response)
-                  cancelAbandonedResponse(keptSharedRefusal?.response)
-                keptSharedRefusal = { main, response }
+              const requestRouting: RequestRouting = {
+                trace,
+                refusal,
+                attemptedPaid: new Set(),
               }
               const wrapResponse = (response: Response) => {
-                if (keptSharedRefusal?.response !== response)
-                  cancelAbandonedResponse(keptSharedRefusal?.response)
-                keptSharedRefusal = undefined
                 const diagnosticsContext =
                   cacheDiagnosticsResponses.get(response)
                 if (
@@ -10051,7 +10102,13 @@ const anthropicAuthPlugin = async (
                 const resetWaitMs = resetWaitDelayMs(response)
                 if (resetWaitMs !== undefined)
                   markResetWaitResponse(wrapped, resetWaitMs)
+                refusal.finish(response)
                 return hostRetryResponse(wrapped)
+              }
+              const keptRefusalResponse = () => {
+                const response = refusal.latest
+                if (response && !response.bodyUsed && !response.body?.locked)
+                  return wrapResponse(response)
               }
               const authStart = nowMs()
               const credentialModelId =
@@ -10267,6 +10324,7 @@ const anthropicAuthPlugin = async (
                 const assignment =
                   await routing.router.readAssignment(routingSessionId)
                 init?.signal?.throwIfAborted()
+                const probed = hasSharedRouting()
                 const advice = await routingRelay.accountFor(
                   routingSessionId,
                   routingModelId ?? '',
@@ -10290,7 +10348,7 @@ const anthropicAuthPlugin = async (
                   routingCandidates(current.accounts).find((row) =>
                     routingChoiceMatches(advice, row),
                   )
-                return { advice, account, snapshot: current, routing }
+                return { advice, account, snapshot: current, routing, probed }
               }
               function retryQuotaBlocked(
                 account: NativeAccountView,
@@ -10399,13 +10457,7 @@ const anthropicAuthPlugin = async (
                 }
                 async function consult(
                   lastRefuser?: string,
-                  localRefusal?: Response,
                 ): Promise<Response | undefined> {
-                  let lastSharedRefusal: Response | undefined
-                  const abandonLastFallback = () => {
-                    if (lastSharedRefusal !== keptSharedRefusal?.response)
-                      cancelAbandonedResponse(lastSharedRefusal)
-                  }
                   for (;;) {
                     let pick: Awaited<ReturnType<typeof askSharedRouting>>
                     try {
@@ -10414,18 +10466,13 @@ const anthropicAuthPlugin = async (
                         lastRefuser === undefined ? undefined : 0,
                       )
                     } catch (error) {
-                      abandonLastFallback()
                       if (error instanceof RoutingRefusalError)
                         return error.response()
                       throw error
                     }
                     const { advice, account, snapshot, routing } = pick
-                    if (!advice) {
-                      abandonLastFallback()
-                      return
-                    }
+                    if (!advice) return
                     if (account?.id === 'main' && providerRestriction) {
-                      abandonLastFallback()
                       routingRelay.override(
                         routingSessionId,
                         'provider wait on main account',
@@ -10446,7 +10493,6 @@ const anthropicAuthPlugin = async (
                                 lastRefuser,
                               )))))
                     ) {
-                      abandonLastFallback()
                       routingRelay.override(
                         routingSessionId,
                         'unknown account, credential or retry policy',
@@ -10460,7 +10506,7 @@ const anthropicAuthPlugin = async (
                         routingSessionId,
                         'account retry budget spent',
                       )
-                      return lastSharedRefusal ?? localRefusal
+                      return refusal.latest
                     }
                     const selected = await routing.router.resolve({
                       sessionId: routingSessionId,
@@ -10482,7 +10528,6 @@ const anthropicAuthPlugin = async (
                       accountIdentities: routing.accountIdentities,
                     })
                     if (!selected) {
-                      abandonLastFallback()
                       routingRelay.override(
                         routingSessionId,
                         'advised account is not selectable',
@@ -10490,7 +10535,6 @@ const anthropicAuthPlugin = async (
                       return
                     }
                     if (advice.hold) {
-                      abandonLastFallback()
                       return routingHoldResponse(advice.hold.retry_after_ms)
                     }
                     countSessionRequest()
@@ -10518,21 +10562,8 @@ const anthropicAuthPlugin = async (
                         init?.signal?.aborted ||
                         !isAdvisedCredentialFailure(error)
                       ) {
-                        abandonLastFallback()
                         init?.signal?.throwIfAborted()
                         throw error
-                      }
-                      // A credential that never reached the provider has not
-                      // replaced the last real response. Keep it as a last resort.
-                      const upstreamRefusal = lastSharedRefusal ?? localRefusal
-                      if (
-                        !keptSharedRefusal?.main &&
-                        upstreamRefusal &&
-                        lastRefuser !== 'main'
-                      ) {
-                        keepSharedRefusal(upstreamRefusal, false)
-                      } else {
-                        abandonLastFallback()
                       }
                       unavailable.add(account.id)
                       if (account.id === 'main')
@@ -10543,7 +10574,6 @@ const anthropicAuthPlugin = async (
                       )
                       return
                     }
-                    abandonLastFallback()
                     let retry =
                       replayableRequest &&
                       shouldFallbackResponse(response, storage)
@@ -10577,14 +10607,11 @@ const anthropicAuthPlugin = async (
                     judged.add(response)
                     refused.set(account.id, response.headers)
                     lastRefuser = account.id
-                    lastSharedRefusal = response
-                    if (account.id === 'main') keepSharedRefusal(response, true)
+                    refusal.keep(response, account.id === 'main')
                   }
                 }
-                orderedRouting.set(trace, {
+                requestRouting.shared = {
                   allowPaidFallback: () => !sharedRoutingDecision,
-                  keepsRefusal: (response) =>
-                    keptSharedRefusal?.response === response,
                   // Once shared routing sent on an account, the local loop
                   // should try routes that have not refused this request yet.
                   skipLocal: (id) =>
@@ -10594,51 +10621,30 @@ const anthropicAuthPlugin = async (
                     if (!replayableRequest || judged.has(response)) return
                     judged.add(response)
                     refused.set(id, response.headers)
-                    if (
-                      keptSharedRefusal &&
-                      !keptSharedRefusal.main &&
-                      id !== 'main'
-                    )
-                      keepSharedRefusal(response, false)
                     try {
-                      const replacement = await consult(id, response)
-                      if (
-                        replacement &&
-                        response !== replacement &&
-                        response !== keptSharedRefusal?.response
-                      )
-                        cancelAbandonedResponse(response)
-                      return replacement
+                      return await consult(id)
                     } catch (error) {
                       // The local fallback walk cannot recover a failed shared send.
                       sharedRoutingFailed = true
-                      cancelAbandonedResponse(response)
-                      if (keptSharedRefusal?.response !== response)
-                        cancelAbandonedResponse(keptSharedRefusal?.response)
-                      keptSharedRefusal = undefined
                       throw error
                     }
                   },
-                })
+                }
                 const selected = await consult()
                 if (selected) return wrapResponse(selected)
-                if (keptSharedRefusal?.main)
-                  return continueAfterSharedMainRefusal(
-                    keptSharedRefusal.response,
-                  )
+                if (refusal.main)
+                  return continueAfterSharedMainRefusal(refusal.main)
               }
               async function continueAfterSharedMainRefusal(
                 response: Response,
               ) {
-                // The local fallback loop now owns this response.
-                keptSharedRefusal = undefined
                 return wrapResponse(
                   await tryFallbackAccounts(
                     input,
                     init,
                     response,
                     undefined,
-                    trace,
+                    requestRouting,
                     storage,
                     auth.access,
                     (account) =>
@@ -10671,7 +10677,7 @@ const anthropicAuthPlugin = async (
                   fallbackAccounts,
                   storage,
                   undefined,
-                  trace,
+                  requestRouting,
                   {
                     onSuccess: (account) =>
                       writeCurrentSidebarState(account.id, 'fallback'),
@@ -10681,6 +10687,8 @@ const anthropicAuthPlugin = async (
                   },
                 )
                 if (response) return wrapResponse(response)
+                const kept = keptRefusalResponse()
+                if (kept) return kept
                 if (providerRestriction.exhausted)
                   return quotaRefusal(
                     'No OAuth account currently satisfies quota policy.',
@@ -10834,6 +10842,7 @@ const anthropicAuthPlugin = async (
                     requestedModelId: routingModelId,
                     mainQuotaIdentity: requestMainQuotaIdentity,
                   })
+                  const startedWithSharedRouting = hasSharedRouting()
                   const { snapshot, advice, account } =
                     await askSharedRouting(sessionId)
                   const credentialCanServe = (account: NativeAccountView) =>
@@ -11315,7 +11324,8 @@ const anthropicAuthPlugin = async (
 
                     if (migrate) {
                       // A cancelled request must not move the session's account.
-                      await endIfCancelled(inspected.response, init?.signal)
+                      refusal.keep(inspected.response)
+                      init?.signal?.throwIfAborted()
                       const failedRouteId = route.id
                       stickyRoutes = await buildStickyOAuthRoutes({
                         sessionId,
@@ -11328,26 +11338,23 @@ const anthropicAuthPlugin = async (
                         requestedModelId: routingModelId,
                         mainQuotaIdentity: requestMainQuotaIdentity,
                       })
-                      let retryAdviceGiven = false
+                      // A skipped shared-routing retry is not permission to spend.
+                      let allowPaidFallback = !startedWithSharedRouting
                       advisedAccountId = undefined
                       if (hasSharedRouting()) {
-                        let pick: Awaited<ReturnType<typeof askSharedRouting>>
-                        try {
-                          pick = await askSharedRouting(sessionId, 0)
-                        } catch (error) {
-                          if (error instanceof RoutingRefusalError)
-                            cancelAbandonedResponse(inspected.response)
-                          throw error
-                        }
-                        const { advice: retryAdvice, account, snapshot } = pick
+                        const {
+                          advice: retryAdvice,
+                          account,
+                          snapshot,
+                          probed,
+                        } = await askSharedRouting(sessionId, 0)
+                        allowPaidFallback = probed && !retryAdvice
                         if (retryAdvice) {
-                          retryAdviceGiven = true
                           if (account && credentialCanServe(account)) {
                             if (
                               retryAdvice.hold &&
                               account.id === failedRouteId
                             ) {
-                              cancelAbandonedResponse(inspected.response)
                               return routingHoldResponse(
                                 retryAdvice.hold.retry_after_ms,
                               )
@@ -11393,7 +11400,6 @@ const anthropicAuthPlugin = async (
                             [failedRouteId],
                           )
                           if (migrated) {
-                            cancelAbandonedResponse(inspected.response)
                             return completeRoute(
                               migrated.route,
                               migrated.response,
@@ -11401,7 +11407,7 @@ const anthropicAuthPlugin = async (
                           }
                         }
                       } else if (
-                        !retryAdviceGiven &&
+                        allowPaidFallback &&
                         (inspected.response.status === 429 ||
                           inspected.streamingRateLimit) &&
                         mainQuotaEntryIsFreshExhausted(
@@ -11425,7 +11431,7 @@ const anthropicAuthPlugin = async (
                             apiAccounts,
                             stickyRoutes.storage,
                             inspected.response,
-                            trace,
+                            requestRouting,
                             {
                               onSuccess: (account) =>
                                 writeCurrentSidebarState(
@@ -11471,7 +11477,7 @@ const anthropicAuthPlugin = async (
                           ),
                       )
                     ) {
-                      cancelAbandonedResponse(inspected.response)
+                      refusal.keep(inspected.response)
                       return completeRoute(route, await noRouteResponse())
                     }
                     return completeRoute(route, inspected.response)
@@ -11525,7 +11531,7 @@ const anthropicAuthPlugin = async (
                     preselectedFallbackAccounts,
                     storage,
                     undefined,
-                    trace,
+                    requestRouting,
                     {
                       returnLastOnExhausted: false,
                       mainAccessToken: auth.access,
@@ -11559,10 +11565,8 @@ const anthropicAuthPlugin = async (
                 }
               }
 
-              if (keptSharedRefusal?.main)
-                return continueAfterSharedMainRefusal(
-                  keptSharedRefusal.response,
-                )
+              if (refusal.main)
+                return continueAfterSharedMainRefusal(refusal.main)
 
               if (mainSharedCredentialError) {
                 const fallbackAccounts =
@@ -11578,7 +11582,7 @@ const anthropicAuthPlugin = async (
                   fallbackAccounts,
                   storage,
                   undefined,
-                  trace,
+                  requestRouting,
                   {
                     onSuccess: (account) =>
                       writeCurrentSidebarState(account.id, 'fallback'),
@@ -11587,8 +11591,8 @@ const anthropicAuthPlugin = async (
                   },
                 )
                 if (response) return wrapResponse(response)
-                if (keptSharedRefusal)
-                  return wrapResponse(keptSharedRefusal.response)
+                const kept = keptRefusalResponse()
+                if (kept) return kept
                 if (mainSharedCredentialError instanceof NativeModelPolicyError)
                   return modelDeniedResponse()
                 if (
@@ -11672,7 +11676,7 @@ const anthropicAuthPlugin = async (
                       fallbackAccounts,
                       storage,
                       undefined,
-                      trace,
+                      requestRouting,
                       {
                         onSuccess: (account) =>
                           writeCurrentSidebarState(account.id, 'fallback'),
@@ -11892,7 +11896,7 @@ const anthropicAuthPlugin = async (
                       preselectedFallbackAccounts,
                       storage,
                       undefined,
-                      trace,
+                      requestRouting,
                       {
                         onSuccess: (account) =>
                           writeCurrentSidebarState(account.id, 'fallback'),
@@ -11941,6 +11945,8 @@ const anthropicAuthPlugin = async (
                       undefined)) &&
                 quotaManager.isBackedOff()
               ) {
+                const kept = keptRefusalResponse()
+                if (kept) return kept
                 const lastError = quotaManager.getLastApiError()
                 const msg = lastError
                   ? formatQuotaBackoffMessage(lastError, Date.now())
@@ -12062,7 +12068,7 @@ const anthropicAuthPlugin = async (
                     survivingFallbacks,
                     storage,
                     undefined,
-                    trace,
+                    requestRouting,
                     {
                       // Correct the sidebar's active account — the routing
                       // writeback above optimistically set it to 'main', which
@@ -12088,6 +12094,8 @@ const anthropicAuthPlugin = async (
                 }
                 // Nowhere to route (no surviving fallback, or none produced a
                 // response): hard-block instead of using the killed main.
+                const kept = keptRefusalResponse()
+                if (kept) return kept
                 // Decide whether the block is scoped-driven (request's
                 // model matches a scoped window that is at/below the scoped
                 // threshold) vs a whole-account 5h/7d-driven block. A
@@ -12120,7 +12128,7 @@ const anthropicAuthPlugin = async (
                   fallbackAccounts,
                   storage,
                   undefined,
-                  trace,
+                  requestRouting,
                   {
                     onSuccess: (account) =>
                       writeCurrentSidebarState(account.id, 'fallback'),
@@ -12145,7 +12153,10 @@ const anthropicAuthPlugin = async (
                     credentialModelId,
                   )
                 if (!lastMainAttempt)
-                  return wrapResponse(await modelDeniedResponse())
+                  return (
+                    keptRefusalResponse() ??
+                    wrapResponse(await modelDeniedResponse())
+                  )
                 return wrapResponse(
                   await sendWithAccessToken(
                     input,
@@ -12182,7 +12193,7 @@ const anthropicAuthPlugin = async (
                 init,
                 mainResponse,
                 preselectedFallbackAccounts,
-                trace,
+                requestRouting,
                 storage,
                 auth.access,
                 (account) => {
@@ -12198,7 +12209,7 @@ const anthropicAuthPlugin = async (
 
               trace.done('return_response', { status: response.status })
               return wrapResponse(response)
-            },
+            }),
           })
           return {
             ...authTransport,

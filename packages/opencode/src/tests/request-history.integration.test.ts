@@ -1420,7 +1420,9 @@ describe('claude-start integration', () => {
     }
   })
 
-  test('claude-start shapes the OAuth fallback after an API-key failure', async () => {
+  test('claude-start shapes the last-resort primary OAuth send after an API-key failure', async () => {
+    // A healthy OAuth fallback would serve before the paid key. Exhausted main
+    // is the last resort here, so both sends exercise the same lane-start request.
     await useTempAccountFile(
       bindPoolAccounts(
         createFallbackStorage({
@@ -1432,25 +1434,6 @@ describe('claude-start integration', () => {
               apiKey: 'api-fails-key',
               baseURL: 'https://api.example.test',
               authHeader: 'x-api-key',
-            },
-            {
-              id: 'fallback-1',
-              type: 'oauth',
-              access: 'sk-ant-oat01-fallback-access',
-              refresh: 'fallback-refresh',
-              expires: Date.now() + 5 * 60 * 60 * 1000,
-              quota: {
-                five_hour: {
-                  usedPercent: 25,
-                  remainingPercent: 75,
-                  checkedAt: Date.now(),
-                },
-                seven_day: {
-                  usedPercent: 30,
-                  remainingPercent: 70,
-                  checkedAt: Date.now(),
-                },
-              },
             },
           ],
           quota: {
@@ -1533,19 +1516,18 @@ describe('claude-start integration', () => {
       },
       { headers },
     )
-    await result.fetch(MESSAGES_URL, {
+    const response = await result.fetch(MESSAGES_URL, {
       method: 'POST',
       headers: { 'x-session-affinity': 'ses-api-then-oauth', ...headers },
       body,
     })
 
-    const apiSend = sent.find(
-      (entry) => entry.headers.get('x-api-key') === 'api-fails-key',
-    )
-    const oauthSend = sent.find(
-      (entry) =>
-        entry.headers.get('authorization') ===
-        'Bearer sk-ant-oat01-fallback-access',
+    expect(response.status).toBe(200)
+    expect(sent).toHaveLength(2)
+    const [apiSend, oauthSend] = sent
+    expect(apiSend?.headers.get('x-api-key')).toBe('api-fails-key')
+    expect(oauthSend?.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-main-access',
     )
     expect(apiSend?.body).toMatchObject({ max_tokens: 99 })
     expect(apiSend?.body.thinking).toEqual({
