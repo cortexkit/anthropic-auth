@@ -23,8 +23,8 @@ const snapshot = JSON.parse(
 
 describe('model capability table', () => {
   test('Mythos 5.2 has its own catalogue, conservative Mythos request defaults and per-message effort', () => {
-    // Claude Code's catalog marks Mythos 5.2 `per_turn_effort`, so it takes the
-    // same per-turn control beta list as Fable 5.2.
+    // Mythos 5.2 accepts per-message effort, so it uses the same per-turn
+    // control beta list as Fable 5.2.
     const perTurnControlBetas =
       resolveClaudeModelCapabilities('claude-fable-5-2')?.claudeCodeBetas
     for (const id of ['claude-mythos-5-2', 'claude-mythos-5-2-20261109[1m]']) {
