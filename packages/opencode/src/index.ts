@@ -10181,7 +10181,8 @@ const anthropicAuthPlugin = async (
                   )
               }
               let sharedRoutingDecision = false
-              // OpenCode 1 ends a request that has no response after 5 minutes.
+              // The OpenCode 1 host (the app this plugin's fetch runs inside)
+              // abandons a model request that has no response after 5 minutes.
               // The first ask may wait up to 4 minutes for a free account slot.
               // An ask after a failed attempt has already spent part of that
               // budget, so it doesn't wait in the request: a full pool becomes
