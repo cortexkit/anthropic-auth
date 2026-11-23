@@ -1864,6 +1864,62 @@ describe('buildAnthropicRequest — cache breakpoint budget', () => {
     expect(newestUserBlocks[0]?.cache_control).toEqual(oneHourControl)
   })
 
+  test('Pi hybrid replaces the system slot at the 20-block lookback with a tool-result bridge', async () => {
+    const build = async (
+      blocks: number,
+      mode: 'hybrid' | 'explicit' = 'hybrid',
+    ) =>
+      (
+        await buildAnthropicRequest(
+          TEST_MODEL_ID,
+          {
+            messages: [
+              userMsg('first prompt'),
+              toolCallMsg('call_1', 'read'),
+              toolResultMsg('call_1', 'earlier boundary'),
+              {
+                ...assistantMsg('response'),
+                content: Array.from({ length: blocks }, (_, index) => ({
+                  type: 'text' as const,
+                  text: `response block ${index}`,
+                })),
+              },
+              userMsg('latest prompt'),
+            ],
+            systemPrompt: PI_PROMPT,
+            tools: [{ name: 'read', description: 'Read', parameters: {} }],
+          },
+          undefined,
+          { enabled: true, mode },
+        )
+      ).body
+
+    const nearby = await build(18)
+    const distant = await build(19)
+    const explicit = await build(19, 'explicit')
+    const control = { type: 'ephemeral', ttl: '1h' }
+    const bridgeBlock = (body: typeof distant) =>
+      (body.messages[2]?.content as Record<string, unknown>[] | undefined)?.at(
+        -1,
+      )
+    const bridge = bridgeBlock(distant)
+    expect(bridge).toMatchObject({
+      type: 'tool_result',
+      cache_control: control,
+    })
+    expect(piThreadCacheSlot(distant)).toBe(bridge)
+    expect(distant.system?.some((block) => block.cache_control)).toBe(false)
+    expect(distant.messages[0]).toEqual(nearby.messages[0])
+    expect(distant.messages.at(-1)).toEqual(nearby.messages.at(-1))
+    expect(distant.tools).toEqual(nearby.tools)
+    expect(countBreakpoints(distant)).toBe(4)
+    for (const body of [nearby, explicit]) {
+      expect(body.system?.at(-1)?.cache_control).toEqual(control)
+      expect(bridgeBlock(body)).not.toHaveProperty('cache_control')
+      expect(countBreakpoints(body)).toBe(4)
+    }
+  })
+
   test('leaves the full body for an image-bearing array user message unchanged', async () => {
     const firstUserText = 'earlier user message'
     const text = 'look at this'

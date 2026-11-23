@@ -22,6 +22,7 @@ import {
   sessionCacheActivity,
   setLogLevel,
   signRequestBody,
+  stripBillingLineageFields,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -1523,6 +1524,158 @@ const success = () =>
     'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
     { headers: { 'content-type': 'text/event-stream' } },
   )
+
+test('Pi billing lineage follows the user turn across tool iterations and retries', async () => {
+  const f = await fixture()
+  const hooks = new Map<string, (event: unknown, ctx: unknown) => unknown>()
+  await cortexKitPiAnthropicAuth(
+    {
+      registerCommand() {},
+      registerProvider() {},
+      on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) =>
+        hooks.set(name, handler),
+    } as unknown as ExtensionAPI,
+    { connectScoped: f.connect },
+  )
+  const sessionId = `pi-lineage-${f.path}`
+  const hookContext = {
+    hasUI: false,
+    sessionManager: { getSessionId: () => sessionId, getBranch: () => [] },
+  }
+  const emit = (name: string, fields: Record<string, unknown> = {}) =>
+    hooks.get(name)?.({ type: name, ...fields }, hookContext)
+  deferCleanup(async () => {
+    await emit('session_shutdown')
+  })
+
+  const nextContext = forkContext(context)
+  const toolHistory: Context = {
+    ...context,
+    messages: [
+      ...context.messages,
+      {
+        ...nextContext.messages.find(
+          (message): message is AssistantMessage =>
+            message.role === 'assistant',
+        )!,
+        content: [
+          { type: 'toolCall', id: 'call_read', name: 'read', arguments: {} },
+        ],
+        stopReason: 'toolUse',
+      },
+      {
+        role: 'toolResult',
+        toolCallId: 'call_read',
+        toolName: 'read',
+        content: [{ type: 'text', text: 'read result' }],
+        isError: false,
+        timestamp: 2,
+      },
+    ],
+  }
+  const sent: { text: string; line: string; promptHeader: string | null }[] = []
+  const send = async (
+    requestContext: Context,
+    responseId: string,
+    {
+      status = 200,
+      origin = 'agent-loop' as 'agent-loop' | 'direct',
+      alternateHeader = false,
+    } = {},
+  ) => {
+    const response = await __sendPiAnthropicRequestForTest(
+      {
+        model,
+        context: requestContext,
+        storagePath: f.path,
+        oauthAccountId: 'main',
+        requestOrigin: origin,
+        streamOptions: { sessionId },
+      },
+      {
+        native: f.native,
+        fetch: (async (_input: unknown, init?: RequestInit) => {
+          const text =
+            init?.body instanceof Uint8Array
+              ? gunzipSync(init.body).toString()
+              : String(init?.body)
+          sent.push({
+            text,
+            line: JSON.parse(text).system[0].text,
+            promptHeader: new Headers(init?.headers).get(
+              'x-claude-code-prompt-id',
+            ),
+          })
+          return new Response(status === 200 ? success().body : '{}', {
+            status,
+            headers: {
+              'content-type':
+                status === 200 ? 'text/event-stream' : 'application/json',
+              [alternateHeader ? 'x-request-id' : 'request-id']: responseId,
+            },
+          })
+        }) as typeof fetch,
+      },
+    )
+    expect(response.status).toBe(status)
+    await response.text()
+  }
+
+  await emit('turn_start', { turnIndex: 0 })
+  await emit('message_start', { message: context.messages[0] })
+  await send(context, 'req_pi_lineage_first')
+  await emit('turn_start', { turnIndex: 1 })
+  await send(toolHistory, 'req_pi_lineage_rejected', { status: 429 })
+  await send(toolHistory, 'req_pi_lineage_tool', { alternateHeader: true })
+  await send(context, 'req_pi_lineage_aux', { origin: 'direct' })
+  await emit('turn_start', { turnIndex: 2 })
+  await emit('message_start', { message: nextContext.messages.at(-1) })
+  await send(nextContext, 'invalid-upstream-id')
+  await emit('agent_settled')
+  await emit('turn_start', { turnIndex: 0 })
+  const lastContext: Context = {
+    ...nextContext,
+    messages: [
+      ...nextContext.messages,
+      { role: 'user', content: 'Third user prompt', timestamp: 101 },
+    ],
+  }
+  await send(lastContext, 'req_pi_lineage_next')
+
+  const [first, rejected, retried, auxiliary, queued, next] = sent
+  const promptId = first?.promptHeader
+  expect(promptId).toMatch(/^[a-f0-9-]{36}$/)
+  for (const attempt of [first, rejected, retried]) {
+    expect(attempt?.promptHeader).toBe(promptId!)
+    expect(attempt?.line).toContain(
+      `cc_prompt_id=${promptId}; cc_turn_origin=human; cc_prompt_index=1; cc_turn_index=1;`,
+    )
+  }
+  expect(first?.line).not.toContain('cc_prev_req=')
+  expect(rejected?.line).toContain('cc_prev_req=req_pi_lineage_first;')
+  expect(retried?.line).toContain('cc_prev_req=req_pi_lineage_rejected;')
+  expect(auxiliary?.promptHeader).toBeNull()
+  expect(auxiliary?.line).not.toMatch(/cc_(?:prev_req|prompt_id|turn_index)=/)
+  const prewarm = await buildCacheKeepPrewarmBody(retried!.text)
+  expect(prewarm.ok).toBe(true)
+  if (prewarm.ok)
+    expect(prewarm.bodyText).not.toMatch(
+      /cc_(?:prev_req|prompt_id|turn_index)=/,
+    )
+  expect(queued?.promptHeader).toMatch(/^[a-f0-9-]{36}$/)
+  expect(queued?.promptHeader).not.toBe(promptId!)
+  expect(queued?.line).toContain('cc_prev_req=req_pi_lineage_tool;')
+  expect(queued?.line).toContain(
+    `cc_prompt_id=${queued?.promptHeader}; cc_turn_origin=human; cc_prompt_index=2; cc_turn_index=2;`,
+  )
+  expect(next?.promptHeader).toMatch(/^[a-f0-9-]{36}$/)
+  expect(next?.promptHeader).not.toBe(queued?.promptHeader ?? null)
+  expect(next?.line).toContain('cc_prev_req=req_pi_lineage_tool;')
+  expect(next?.line).toContain(
+    `cc_prompt_id=${next?.promptHeader}; cc_turn_origin=human; cc_prompt_index=3; cc_turn_index=3;`,
+  )
+})
+
 const row = (id: string, accountId: string): ScopedInventoryRow => ({
   id,
   accountId,
@@ -4759,10 +4912,12 @@ for (const [transport, credentialSource] of [
     expect(first.tools.at(-1)?.cache_control).toEqual(oneHourControl)
     expect(first.system.at(-1)?.cache_control).toEqual(oneHourControl)
     expect(JSON.stringify(second.tools)).toBe(JSON.stringify(first.tools))
-    // The body signature (cch) changes when history is sliced. All other system
-    // bytes, including cache controls, must remain identical.
+    // The signature and lineage can change between user prompts. The fixed
+    // system bytes, including cache controls and the first-user version suffix, cannot.
     const systemBytes = (system: unknown) =>
-      JSON.stringify(system).replace(/cch=[a-f0-9]{5}/g, 'cch=00000')
+      stripBillingLineageFields(
+        JSON.stringify(system).replace(/cch=[a-f0-9]{5}/g, 'cch=00000'),
+      )
     expect(systemBytes(second.system)).toBe(systemBytes(first.system))
     expect(second.system[0].text.match(/cc_version=[^;]+/)?.[0]).toBe(
       first.system[0].text.match(/cc_version=[^;]+/)?.[0],
@@ -4786,6 +4941,7 @@ for (const [transport, credentialSource] of [
     const prewarm = JSON.parse(warm.ok ? warm.bodyText : '{}')
     expect(prewarm.thread).toBeUndefined()
     expect(prewarm.messages).toHaveLength(3)
+    expect(prewarm.system?.[0]?.text).not.toContain('cc_prompt_id=')
     const replay = history.messages.find(
       (message) => message.role === 'assistant',
     )

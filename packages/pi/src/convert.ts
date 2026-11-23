@@ -5,6 +5,7 @@ import {
   applyThinkingBindingControls,
   applyTurnEndNotes,
   assertNoMeaningfulTrailingAssistant,
+  type BillingLineageFields,
   buildBillingHeaderValue,
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
@@ -17,6 +18,7 @@ import {
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   ClaudeCodeFirstUserTextTracker,
   type ClaudeCodeIdentity,
+  countUserPrompts,
   isClaudeFableOrMythos5Model,
   isClaudeHaiku55Model,
   isClaudeOpus5Model,
@@ -631,6 +633,60 @@ function applyForkCacheBridge(
   baseBlock.cache_control = { ...control }
 }
 
+/** Find the previous boundary when the latest one's lookback cannot reach it. */
+function hybridLookbackBridge(messages: unknown[]) {
+  let position = 0
+  let previous:
+    | { message: Record<string, unknown>; index: number; end: number }
+    | undefined
+  let latest: typeof previous
+  for (const [index, value] of messages.entries()) {
+    if (!value || typeof value !== 'object') continue
+    const message = value as Record<string, unknown>
+    const content = message.content
+    // A system note inserted after a reply uses string content and consumes
+    // one lookback block, though only user messages can be bridge anchors.
+    const blocks = Array.isArray(content)
+      ? content.length
+      : content == null
+        ? 0
+        : 1
+    position += blocks
+    if (message.role === 'user' && blocks > 0) {
+      previous = latest
+      latest = { message, index, end: position }
+    }
+  }
+  // OpenCode reserves the first two messages for its fixed prefix. It counts
+  // both boundary blocks when checking Anthropic's 20-block search window.
+  return previous &&
+    previous.index > 1 &&
+    latest &&
+    latest.end - previous.end + 1 > 20
+    ? previous.message
+    : undefined
+}
+
+function applyHybridCacheBridge(body: AnthropicRequestBody) {
+  const system = body.system?.findLast((block) => block.cache_control)
+  if (!system) return
+  const bridge = hybridLookbackBridge(body.messages)
+  if (!bridge) return
+  if (typeof bridge.content === 'string')
+    bridge.content = [{ type: 'text', text: bridge.content }]
+  if (!Array.isArray(bridge.content)) return
+  const block = bridge.content.findLast(
+    (value) =>
+      value &&
+      typeof value === 'object' &&
+      value.type !== 'thinking' &&
+      value.type !== 'redacted_thinking',
+  )
+  if (!block) return
+  block.cache_control = system.cache_control
+  delete system.cache_control
+}
+
 /**
  * Anthropic accepts at most four cache breakpoints per request. This provider
  * composes its own body and has already placed exactly four
@@ -644,9 +700,8 @@ function applyForkCacheBridge(
  * rewrite path does (`applyAutomaticCache1h` / `applyHybridCache1h` both clear
  * every breakpoint first):
  * - `automatic`: the top-level control alone, at 1h.
- * - `hybrid`: the four block breakpoints extended to 1h, no top-level control.
- *   That is the placement OpenCode's hybrid anchors reconstruct by hand and
- *   this converter emits natively.
+ * - `hybrid`: the four block breakpoints extended to 1h, with the system slot
+ *   available for a lookback bridge on an ordinary request.
  * - `explicit`: the same four breakpoints, TTL only.
  */
 function applyCacheMode(
@@ -669,14 +724,24 @@ function applyCacheMode(
   })
 }
 
-/** Replace only the system cache marker, preserving the tool and message markers. */
+/** Let a full request after a thread reuse its last full-request cache boundary. */
 export function piThreadCacheSlot(
   body: Record<string, unknown>,
 ): Record<string, unknown> | undefined {
-  if (body.cache_control || !Array.isArray(body.system)) return undefined
-  return body.system.findLast(
-    (block) => block && typeof block === 'object' && block.cache_control,
-  )
+  if (body.cache_control) return undefined
+  const system = Array.isArray(body.system)
+    ? body.system.findLast(
+        (block) => block && typeof block === 'object' && block.cache_control,
+      )
+    : undefined
+  if (system) return system
+  if (!Array.isArray(body.messages)) return undefined
+  const bridge = hybridLookbackBridge(body.messages)
+  return Array.isArray(bridge?.content)
+    ? bridge.content.findLast(
+        (block) => block && typeof block === 'object' && block.cache_control,
+      )
+    : undefined
 }
 
 export async function buildAnthropicRequest(
@@ -687,6 +752,7 @@ export async function buildAnthropicRequest(
   fastModeEnabled = false,
   identity?: ClaudeCodeIdentity,
   controls: {
+    billingLineage?: BillingLineageFields
     effortTransitions?: readonly PiEffortTransition[]
     forkBaseMessageCount?: number
     /** A fork's lower answer effort, applied to its question turn only. */
@@ -783,6 +849,12 @@ export async function buildAnthropicRequest(
           ? forkHead
             ? forkFirstUserText
             : firstUserTextTracker.resolve(options.sessionId, messages)
+          : undefined,
+        identity && !forkHead && controls.billingLineage?.promptId
+          ? {
+              ...controls.billingLineage,
+              promptIndex: countUserPrompts(messages),
+            }
           : undefined,
       ),
     },
@@ -921,11 +993,11 @@ export async function buildAnthropicRequest(
   })
   addEphemeralCacheControl(body)
   const cachePolicy = readSessionCachePolicy(options?.sessionId, !!identity)
-  applyCacheMode(
-    body,
-    cachePolicy?.ttl !== undefined ? cachePolicy.ttl !== 'none' : cache.enabled,
-    cache.mode,
-  )
+  const cacheEnabled =
+    cachePolicy?.ttl !== undefined ? cachePolicy.ttl !== 'none' : cache.enabled
+  applyCacheMode(body, cacheEnabled, cache.mode)
+  if (cacheEnabled && cache.mode === 'hybrid' && !forkHead && !forkBase)
+    applyHybridCacheBridge(body)
   if (identity) {
     applyThinkingBindingControls(
       body,

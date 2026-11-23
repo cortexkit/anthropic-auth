@@ -8,7 +8,7 @@ Use `/claude` → **Cache** to enable caching and choose `claudeCache.mode`:
 
 - `explicit`: use explicit prompt-cache placement.
 - `automatic`: use automatic cache behavior.
-- `hybrid`: combine placement strategies; CacheKeep tracks hybrid-cache sessions.
+- `hybrid`: combine placement strategies and let CacheKeep keep recently used sessions warm. After the fixed prompt prefix, OpenCode 1, OpenCode 2 and Pi move the system cache marker to the previous user or tool-result boundary when the latest boundary cannot reach it within Anthropic's 20-block cache lookback.
 
 Cache settings do not reduce the complete input that Anthropic receives through a relay. A relay can send smaller patches between your machine and its Worker, but Anthropic still receives the reconstructed full request. Cache hits, not those smaller uploads, determine server-side cache benefits.
 

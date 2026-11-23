@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import {
   type AccountStorage,
   type AnthropicBillingRequest,
@@ -58,6 +59,7 @@ import {
   isNativeTransientAccountError,
   isOAuthAccount,
   isPermanentRefreshError,
+  isValidAnthropicRequestId,
   isValidApiBaseURL,
   killswitchPassesPolicy,
   LEGACY_STATE_LAYOUT,
@@ -179,8 +181,18 @@ const dumpResponseObservers = new WeakMap<
   Response,
   ReturnType<typeof createDumpResponseObserver>
 >()
-// Each session owns its lease; storage identifies which host may end it.
-const primaryTurns = new Map<string, string>()
+// The active turn ends when the agent settles. The previous response ID is
+// kept between turns in the same session, but cleared on session shutdown.
+const primarySessions = new Map<
+  string,
+  {
+    storagePath: string
+    turn?: { promptId?: string }
+    previousRequestId?: string
+    sent: number
+    committed: number
+  }
+>()
 
 export function beginPiPrimaryTurn(
   storagePath: string,
@@ -188,22 +200,40 @@ export function beginPiPrimaryTurn(
 ): void {
   if (!sessionId) return
   piCacheKeep.realTurn(sessionId)
-  primaryTurns.delete(sessionId)
-  primaryTurns.set(sessionId, storagePath)
-  while (primaryTurns.size > 128) {
-    const oldest = primaryTurns.keys().next().value
+  const previous = primarySessions.get(sessionId)
+  const session =
+    previous?.storagePath === storagePath
+      ? previous
+      : { storagePath, sent: 0, committed: 0 }
+  // Pi fires turn_start for each tool iteration, not only for a human prompt.
+  session.turn ??= {}
+  primarySessions.delete(sessionId)
+  primarySessions.set(sessionId, session)
+  while (primarySessions.size > 128) {
+    const oldest = primarySessions.keys().next().value
     if (oldest === undefined) break
-    primaryTurns.delete(oldest)
+    primarySessions.delete(oldest)
   }
+}
+
+export function observePiUserPrompt(storagePath: string, sessionId: string) {
+  const session = primarySessions.get(sessionId)
+  // A queued user message can start a new prompt before the agent settles.
+  if (session?.storagePath === storagePath && session.turn) session.turn = {}
 }
 
 export function endPiPrimaryTurn(
   storagePath: string,
   sessionId?: string,
+  closed = false,
 ): void {
-  if (sessionId && primaryTurns.get(sessionId) === storagePath)
-    primaryTurns.delete(sessionId)
-  if (sessionId) piCacheKeep.endTurn(sessionId)
+  if (!sessionId) return
+  const session = primarySessions.get(sessionId)
+  if (session?.storagePath === storagePath) {
+    if (closed) primarySessions.delete(sessionId)
+    else delete session.turn
+  }
+  piCacheKeep.endTurn(sessionId)
 }
 
 export function untrackPiCacheKeepTurn(sessionId?: string) {
@@ -212,25 +242,23 @@ export function untrackPiCacheKeepTurn(sessionId?: string) {
   } catch {}
 }
 
-function isPiPrimaryThreadRequest(
+function piPrimarySession(
   storagePath: string,
   options: SimpleStreamOptions | undefined,
   origin: 'agent-loop' | 'direct' | undefined,
-): boolean {
+) {
   // SDK summaries disable caching; SDK cache warms request exactly one token.
   if (
     origin !== 'agent-loop' ||
-    options?.cacheRetention === 'none' ||
-    options?.maxTokens === 1
+    !options?.sessionId ||
+    options.cacheRetention === 'none' ||
+    options.maxTokens === 1
   )
-    return false
-  return Boolean(
-    options?.sessionId &&
-      primaryTurns.get(options.sessionId) === storagePath &&
-      typeof options.onPayload === 'function' &&
-      typeof options.onResponse === 'function' &&
-      typeof options.onProviderStreamEvent === 'function',
-  )
+    return undefined
+  const session = primarySessions.get(options.sessionId)
+  return session?.storagePath === storagePath && session.turn
+    ? session
+    : undefined
 }
 
 export function forgetPiMessageThread(
@@ -957,6 +985,41 @@ async function sendAnthropicRequestAttempt(
   const keep = deps.cacheKeep ?? cacheKeepManager
   const realSession = options.streamOptions?.sessionId
   const forkHead = piForkHeadSession(options.streamOptions)
+  const primary =
+    !options.prime && !options.apiAccount && !forkHead
+      ? piPrimarySession(
+          options.storagePath,
+          options.streamOptions,
+          options.requestOrigin,
+        )
+      : undefined
+  const turn = primary?.turn
+  if (primary && turn) {
+    turn.promptId ??= randomUUID()
+    primary.sent += 1
+  }
+  const lineage =
+    primary && turn?.promptId
+      ? {
+          promptId: turn.promptId,
+          previousRequestId: primary.previousRequestId,
+          sequence: primary.sent,
+        }
+      : undefined
+  const observeRequestId = (headers: Headers) => {
+    if (
+      !lineage ||
+      !primary ||
+      !realSession ||
+      primarySessions.get(realSession) !== primary ||
+      lineage.sequence < primary.committed
+    )
+      return
+    const id = headers.get('request-id') ?? headers.get('x-request-id')
+    if (!id || !isValidAnthropicRequestId(id)) return
+    primary.committed = lineage.sequence
+    primary.previousRequestId = id
+  }
   if (!options.prime && !forkHead && realSession) {
     if (options.apiAccount || !options.storagePath) {
       try {
@@ -1031,6 +1094,7 @@ async function sendAnthropicRequestAttempt(
         identity,
         {
           deferSigning: true,
+          billingLineage: lineage,
           forkBaseMessageCount: forkBase?.messageCount,
           // API-key routes send no effort history, so no fork hint either.
           forkEffort: options.apiAccount
@@ -1286,16 +1350,18 @@ async function sendAnthropicRequestAttempt(
   }
   let threadRequest: MessageThreadRequest | undefined
   if (
-    !options.apiAccount &&
-    !options.prime &&
-    !forkHead &&
+    primary &&
+    primary ===
+      piPrimarySession(
+        options.storagePath,
+        options.streamOptions,
+        options.requestOrigin,
+      ) &&
     // Gateways may refuse the thread route: send full requests.
     !gateway &&
-    isPiPrimaryThreadRequest(
-      options.storagePath,
-      options.streamOptions,
-      options.requestOrigin,
-    ) &&
+    typeof options.streamOptions?.onPayload === 'function' &&
+    typeof options.streamOptions.onResponse === 'function' &&
+    typeof options.streamOptions.onProviderStreamEvent === 'function' &&
     (!relayConfig ||
       effectiveRelayTransport(relayConfig.transport, relayConfig.url) !==
         'websocket')
@@ -1557,6 +1623,7 @@ async function sendAnthropicRequestAttempt(
       // Some relay streams start before the provider answers. Report the
       // provider's actual status and headers, not that early placeholder.
       onResponseHeaders: (responseHeaders) => {
+        observeRequestId(responseHeaders)
         if (upstream)
           reportRoutingHeaders(
             upstream.attempt,
@@ -1637,6 +1704,7 @@ async function sendAnthropicRequestAttempt(
     })
     response = threadRequest.observe(response)
   }
+  if (lastTransport === 'direct') observeRequestId(response.headers)
   if (response.ok && lastTransport === 'relay' && relayAttempt) {
     if (
       options.prime &&

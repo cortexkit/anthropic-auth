@@ -52,6 +52,7 @@ import {
   clearPiStickyQuotaRetries,
   endPiPrimaryTurn,
   forgetPiMessageThread,
+  observePiUserPrompt,
   startPiCacheKeepSession,
   stopPiCacheKeep,
   streamCortexKitAnthropic,
@@ -203,6 +204,11 @@ export default async function cortexKitPiAnthropicAuth(
       }
     }
   })
+  pi.on('message_start', async (event, ctx) => {
+    if (event.message.role !== 'user') return
+    const sessionId = ctx.sessionManager.getSessionId()
+    if (sessionId) observePiUserPrompt(storagePath, sessionId)
+  })
   pi.on('agent_settled', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
     endPiPrimaryTurn(storagePath, sessionId)
@@ -211,7 +217,7 @@ export default async function cortexKitPiAnthropicAuth(
   pi.on('session_shutdown', async (_event, ctx) => {
     native.prime?.stop()
     const sessionId = ctx.sessionManager.getSessionId()
-    endPiPrimaryTurn(storagePath, sessionId)
+    endPiPrimaryTurn(storagePath, sessionId, true)
     if (sessionId) {
       clearPiStickyQuotaRetries(storagePath, sessionId)
       effortSessionManagers.delete(sessionId)
