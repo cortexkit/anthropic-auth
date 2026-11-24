@@ -742,7 +742,7 @@ export class CacheKeepStore {
     return item
   }
 
-  private closeClaim(key: string, item: StoreClaim) {
+  private closeClaim(key: string, item: StoreClaim, newerRecord = false) {
     const retrying = item.releaseRetry !== undefined
     if (retrying) clearTimeout(item.releaseRetry)
     item.releaseRetry = undefined
@@ -750,9 +750,10 @@ export class CacheKeepStore {
     item.closing ??= (async () => {
       if ((await item.acquired) === true) await item.claim.release()
       if (this.claims?.get(key) === item) this.claims.delete(key)
-      // A live keeper may have scanned while this claim was still held. Normal
-      // releases (including scans' own releases) must not start another scan.
-      if (retrying) process.emit(this.retriedReleaseEvent())
+      // A keeper may have skipped this record because another keeper held
+      // its claim or because it still tracked an older request for the session.
+      // A scan's own releases must not trigger scans.
+      if (retrying || newerRecord) process.emit(this.claimAvailableEvent())
     })().catch((error) => {
       item.closing = undefined
       // A failed unlink leaves a live PID in the file. Keep retrying even if
@@ -767,12 +768,12 @@ export class CacheKeepStore {
     return item.closing
   }
 
-  private retriedReleaseEvent() {
+  private claimAvailableEvent() {
     return `cortexkit.cachekeep.claim-release-retried:${this.directory}`
   }
 
-  onRetriedClaimRelease(listener: () => void) {
-    const event = this.retriedReleaseEvent()
+  onClaimAvailable(listener: () => void) {
+    const event = this.claimAvailableEvent()
     process.on(event, listener)
     return () => {
       process.off(event, listener)
@@ -819,7 +820,7 @@ export class CacheKeepStore {
         // claim now excludes peer writes, but doesn't make this body newer.
         if (entry && (await this.hasNewerRecord(id, when))) {
           dropStale()
-          await this.closeClaim(key, owned)
+          await this.closeClaim(key, owned, true)
           return
         }
       } catch (error) {
@@ -982,11 +983,20 @@ export class CacheKeepStore {
     mode: 'restore' | 'sweep' = 'restore',
   ) {
     const clock = this.options.now ?? Date.now
-    // Preserve the caller's time reference, but advance it while the scan runs.
+    // Follow forward clock changes without making a record look newer after a
+    // backward step. Keep the caller's time reference for validation.
     const clockOffset = now - clock()
     await this.chain
     if (!(await this.directoryReady())) return
     let directory = this.directory
+    let names: string[]
+    try {
+      names = await readdir(directory)
+    } catch {
+      // A failed listing says nothing about claims already held by this store.
+      this.writeFailed()
+      return
+    }
     // OpenCode 2 can recover old temp records once per writer, if the current
     // directory has nothing but deletion markers. Other hosts never used it.
     const firstLoad = !this.legacyLoadAttempted
@@ -994,7 +1004,6 @@ export class CacheKeepStore {
     let restored = 0
     let dropped = 0
     try {
-      let names = await readdir(directory)
       if (this.claims)
         for (const name of names) {
           if (TOMBSTONE.test(name))
@@ -1071,7 +1080,11 @@ export class CacheKeepStore {
           const raw = await this.inflateRecord(bytes)
           reason = 'invalid'
           entry = JSON.parse(raw) as SavedCacheKeepTarget
-          const invalid = invalidReason(entry, name, clock() + clockOffset)
+          const invalid = invalidReason(
+            entry,
+            name,
+            Math.max(now, clock() + clockOffset),
+          )
           if (invalid && invalid !== 'expired') {
             reason = invalid
             throw new Error('Invalid restart file')
@@ -1179,19 +1192,16 @@ export class CacheKeepStore {
 
   private async readRecordBytes(path: string) {
     const stat = await lstat(path)
-    if (
-      !stat.isFile() ||
-      stat.isSymbolicLink() ||
-      stat.size > MAX_RECORD_BYTES ||
-      !(await isOwnerOnly(
-        path,
-        () => stat.uid === process.getuid?.() && (stat.mode & 0o777) === 0o600,
-        this.options.ownerOnly,
-      ))
-    )
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_RECORD_BYTES)
       return 'unsafe-file' as const
-    const bytes = await readWindowsOwnerOnly(path, this.options.ownerOnly)
+    const bytes = await readWindowsOwnerOnly(
+      path,
+      this.options.ownerOnly,
+      'unsafe-file',
+    )
     if (bytes) return bytes
+    if (stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o600)
+      return 'unsafe-file' as const
     const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
     try {
       return await file.readFile()

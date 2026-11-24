@@ -19,6 +19,7 @@ import { gunzipSync } from 'node:zlib'
 import {
   CacheKeepClaim,
   CacheKeepStore,
+  type CacheKeepStoreOptions,
   legacyCacheKeepStoreDirectory,
 } from '../cachekeep-store.ts'
 import { withNativeLock } from '../native-lock-observer.ts'
@@ -39,7 +40,11 @@ function acceptedPolicy(time: number) {
 
 async function storeFixture() {
   const root = await mkdtemp(join(tmpdir(), 'cachekeep-claim-'))
-  const makeStore = (onClaimLost?: (id: string) => void, now?: () => number) =>
+  const makeStore = (
+    onClaimLost?: (id: string) => void,
+    now?: () => number,
+    ownerOnly?: CacheKeepStoreOptions['ownerOnly'],
+  ) =>
     new CacheKeepStore({
       root,
       storageId: 'test',
@@ -47,6 +52,7 @@ async function storeFixture() {
       sessionClaims: true,
       onClaimLost,
       now,
+      ownerOnly,
     })
   const store = makeStore()
   const now = Date.now()
@@ -132,6 +138,37 @@ test('a scan restores a record committed and released after the scan began', asy
       },
     )
     expect(restored).toEqual(['{"system":"newer"}'])
+    expect(await readdir(store.directory)).toEqual([`${key}.json.gz`])
+  } finally {
+    await scanning.releaseClaims(() => true)
+    await store.releaseClaims(() => true)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a backward clock step never makes a valid restart record look future-dated', async () => {
+  const { root, store, makeStore, target } = await storeFixture()
+  const start = Date.now()
+  let now = start
+  const scanning = makeStore(undefined, () => now)
+  const restored: string[] = []
+  try {
+    store.changed({ ...target, policyState: acceptedPolicy(start) })
+    await store.drain()
+    await store.releaseClaims(() => true)
+    await scanning.load(
+      start,
+      (entry) => {
+        restored.push(entry.id)
+        return true
+      },
+      undefined,
+      () => {
+        now = start - 10_000
+        return true
+      },
+    )
+    expect(restored).toEqual([session])
     expect(await readdir(store.directory)).toEqual([`${key}.json.gz`])
   } finally {
     await scanning.releaseClaims(() => true)
@@ -273,6 +310,75 @@ test.each(['open', 'readFile', 'close'] as const)(
   },
 )
 
+test.each(['scan', 'freshness check'] as const)(
+  'a Windows ownership I/O verdict during a %s preserves the peer record',
+  async (operation) => {
+    const { root, store, makeStore, target, claims } = await storeFixture()
+    const path = join(store.directory, `${key}.json.gz`)
+    let fail = false
+    let refused = false
+    const contender = makeStore(undefined, undefined, {
+      platform: 'win32',
+      privateFiles: {
+        verifySafeParent: async (path) => ({ ok: true, path }),
+        verifyOwnerOnly: async (file) => {
+          if (file === path && fail) {
+            refused = true
+            return {
+              ok: false,
+              refusal: {
+                reason: 'io-error',
+                message: 'Temporary ACL I/O failure',
+              },
+            }
+          }
+          return { ok: true }
+        },
+        readPrivateFile: readFile,
+        createPrivateFile: async (path, bytes) => {
+          await writeFile(path, bytes ?? '', { flag: 'wx', mode: 0o600 })
+        },
+      },
+    })
+    const now = Date.now()
+    const older = { ...target, policyState: acceptedPolicy(now - 5000) }
+    const newer = { ...target, policyState: acceptedPolicy(now) }
+    const restored: string[] = []
+    const scan = () =>
+      contender.load(Date.now(), (entry) => {
+        restored.push(entry.id)
+        return true
+      })
+    try {
+      store.changed(newer)
+      await store.drain()
+      const saved = await readFile(path)
+      if (operation === 'freshness check') {
+        contender.changed(older)
+        await contender.drain()
+        expect(contender.isCommitted(session)).toBe(false)
+      }
+      await store.releaseClaims(() => true)
+      fail = true
+      if (operation === 'scan') await scan()
+      else
+        expect(await contender.reserveWarm(older)).toBe('ownership-unverified')
+      expect(refused).toBe(true)
+      expect(restored).toEqual([])
+      expect(await readdir(store.directory)).toContain(`${key}.json.gz`)
+      expect(await readFile(path)).toEqual(saved)
+      expect(await readdir(claims)).not.toContain(`${key}.claim.json`)
+      fail = false
+      await scan()
+      expect(restored).toEqual([session])
+    } finally {
+      await contender.releaseClaims(() => true)
+      await store.releaseClaims(() => true)
+      await rm(root, { recursive: true, force: true })
+    }
+  },
+)
+
 test('a superseded warm reservation cannot verify a peer-owned claim', async () => {
   const { root, store, makeStore, target } = await storeFixture()
   const contender = makeStore()
@@ -302,9 +408,14 @@ test('a superseded warm reservation cannot verify a peer-owned claim', async () 
   }
 })
 
-test('a restart scan directory read failure cannot authorize a warm', async () => {
+test('a failed directory listing skips that scan without stopping owned warms', async () => {
   const { root, store, makeStore, target } = await storeFixture()
   const contender = makeStore()
+  const restored: string[] = []
+  const accept = (entry: { id: string }) => {
+    restored.push(entry.id)
+    return true as const
+  }
   try {
     store.changed(target)
     await store.drain()
@@ -318,13 +429,20 @@ test('a restart scan directory read failure cannot authorize a warm', async () =
       return Reflect.apply(enumerate, fs, [path, ...args])
     }) as typeof fs.readdir)
     try {
-      await contender.load(Date.now(), () => true)
+      await store.load(Date.now(), accept)
+      await contender.load(Date.now(), accept)
     } finally {
       reading.mockRestore()
     }
-    expect(contender.isMemoryOnly).toBe(false)
-    expect(await contender.reserveWarm(target)).toBe('ownership-unverified')
+    expect(restored).toEqual([])
+    expect(await store.reserveWarm(target)).toBe(true)
+    expect(store.isCommitted(session)).toBe(true)
+    expect(await contender.reserveWarm(target)).toBe('not-owner')
+    await store.releaseClaims(() => true)
+    await contender.load(Date.now(), accept)
+    expect(restored).toEqual([session])
   } finally {
+    await contender.releaseClaims(() => true)
     await store.releaseClaims(() => true)
     await rm(root, { recursive: true, force: true })
   }

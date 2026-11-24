@@ -36,13 +36,30 @@ export async function isOwnerOnly(
 /** Windows reads through the ACL-verified native handle, not a pathname reopen. */
 export async function readWindowsOwnerOnly(
   path: string,
+  options?: OwnerOnlyOptions,
+): Promise<Buffer | undefined>
+export async function readWindowsOwnerOnly(
+  path: string,
+  options: OwnerOnlyOptions | undefined,
+  unsafeVerdict: 'unsafe-file',
+): Promise<Buffer | undefined | 'unsafe-file'>
+export async function readWindowsOwnerOnly(
+  path: string,
   options: OwnerOnlyOptions = {},
-): Promise<Buffer | undefined> {
+  unsafeVerdict?: 'unsafe-file',
+): Promise<Buffer | undefined | 'unsafe-file'> {
   const api = await windowsBackend(options)
   if (!api) return undefined
   const verdict = await api.verifyOwnerOnly(path)
-  if (!verdict.ok && verdict.refusal.reason !== 'io-error')
-    throw new Error('Owner-only storage refused')
+  if (!verdict.ok) {
+    // Callers that may discard unsafe files must distinguish a failed check
+    // from a check that proved the file unsafe.
+    if (verdict.refusal.reason !== 'io-error') {
+      if (unsafeVerdict) return unsafeVerdict
+      throw new Error('Owner-only storage refused')
+    }
+    if (unsafeVerdict) throw new Error('Owner-only verification failed')
+  }
   try {
     return await api.readPrivateFile(path)
   } catch (error) {

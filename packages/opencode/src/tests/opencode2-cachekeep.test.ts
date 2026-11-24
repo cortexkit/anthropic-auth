@@ -4351,6 +4351,43 @@ test('a retried claim release prompts one rescan by a live OC2 keeper', async ()
   }
 })
 
+test('a freshness drop prompts one rescan that adopts the newer peer record', async () => {
+  const f = await fixture()
+  const { id, peer, tracked } = await seedPeer(f)
+  const next = await f.start()
+  const current = sharedKeeper(f)
+  expect(current.manager.trackedRequest(id)).toBeUndefined()
+  await next.live(undefined, {
+    messages: [{ role: 'user', content: 'Accepted by the contender' }],
+  })
+  await current.persistence.drain()
+  expect(current.persistence.isCommitted(id)).toBe(false)
+  const older = (
+    Reflect.get(current.manager, 'targets') as Map<string, CacheKeepTarget>
+  ).get(id)!
+  expect(older.bodyText).toContain('Accepted by the contender')
+
+  const newest = 'Accepted more recently by the peer'
+  f.advance(5_000)
+  peer.changed({
+    ...tracked,
+    bodyText: tracked.bodyText.replace('Hello', newest),
+    policyState: { ...tracked.policyState!, lastRealRequestAt: f.now() },
+  })
+  await peer.drain()
+  expect(peer.isCommitted(id)).toBe(true)
+  await peer.releaseClaims(() => true)
+  const scanning = spyOn(current.persistence, 'load')
+  try {
+    expect(await current.persistence.reserveWarm(older)).toBe('not-owner')
+    await keeperFor(f.paths.storageId)?.loading
+    expect(current.manager.trackedRequest(id)?.bodyText).toContain(newest)
+    expect(scanning).toHaveBeenCalledTimes(1)
+  } finally {
+    scanning.mockRestore()
+  }
+})
+
 test('OC2 saves a real turn at its next warm after the old folder releases its claim', async () => {
   const f = await fixture()
   const second = await f.start()

@@ -142,7 +142,7 @@ interface SharedCacheKeep {
   >
   /** Live leases by generation, in the order they were taken. */
   readonly leases: Map<number, CacheKeepLease>
-  unwatchRetriedReleases?: () => void
+  unwatchClaimAvailable?: () => void
   nextGeneration: number
   /** The scheduler pass in progress, so the last release can wait for it. */
   ticking?: Promise<void>
@@ -156,7 +156,7 @@ interface SharedCacheKeep {
 
 function discardLocalTargets(
   shared: SharedCacheKeep,
-  now: number,
+  now: (() => number) | undefined,
   disabled: boolean,
 ) {
   if (!disabled) {
@@ -178,7 +178,7 @@ function discardLocalTargets(
     .then(async () => {
       await persistence.drain()
       await persistence.load(
-        now,
+        now?.() ?? Date.now(),
         (entry) =>
           entry.policyState?.planned ||
           controlled(entry.policyState?.ownerSessionId ?? entry.id)
@@ -246,7 +246,7 @@ function createSharedCacheKeep(
       if (lease && !lease.stopped)
         discardLocalTargets(
           shared,
-          options.now?.() ?? Date.now(),
+          options.now,
           !isCacheKeepHybridActive(storage),
         )
       return storage
@@ -920,11 +920,9 @@ export function createNativeCacheKeep(
   }
   owner.leases.set(lease.generation, lease)
   if (owner.leases.size === 1)
-    owner.unwatchRetriedReleases = owner.persistence.onRetriedClaimRelease(
-      () => {
-        if (owner.leases.size) void owner.adopt()
-      },
-    )
+    owner.unwatchClaimAvailable = owner.persistence.onClaimAvailable(() => {
+      if (owner.leases.size) void owner.adopt()
+    })
   const ready = owner.adopt().then(() => {
     if (!lease.stopped)
       for (const session of manager.trackedSessions())
@@ -983,7 +981,7 @@ export function createNativeCacheKeep(
       const hadTarget =
         !hybridActive &&
         manager.trackedSessions().some(({ id }) => id === input.sessionID)
-      discardLocalTargets(owner, options.now?.() ?? Date.now(), !hybridActive)
+      discardLocalTargets(owner, options.now, !hybridActive)
       if (!hybridActive) {
         if (policy?.keep_warm === undefined) {
           if (!hadTarget) manager.recordWarmingOff(input.sessionID)
@@ -1165,8 +1163,8 @@ export function createNativeCacheKeep(
       const last =
         owner.leases.delete(lease.generation) && owner.leases.size === 0
       if (last) {
-        owner.unwatchRetriedReleases?.()
-        owner.unwatchRetriedReleases = undefined
+        owner.unwatchClaimAvailable?.()
+        owner.unwatchClaimAvailable = undefined
       }
       const ticking = last ? owner.ticking : undefined
       const retaining = last ? owner.retain() : undefined

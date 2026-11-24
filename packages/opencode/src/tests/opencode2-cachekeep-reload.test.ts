@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -7,6 +7,7 @@ import { gunzipSync } from 'node:zlib'
 import {
   CacheKeepManager,
   CacheKeepSessionRegistry,
+  type CacheKeepTarget,
   type NativeAccountRuntime,
 } from '@cortexkit/anthropic-auth-core'
 import { createNativeCacheKeep } from '../v2/cachekeep'
@@ -217,11 +218,11 @@ test.each([false, true])(
   },
 )
 
-test('OpenCode 2 hybrid disable removes local records but preserves a mixed store runner target', async () => {
+test('OpenCode 2 hybrid disable preserves a planned record written while the sweep waits', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'oc2-cachekeep-mixed-'))
   cleanups.push(() => rm(directory, { recursive: true, force: true }))
   const storageId = randomUUID()
-  const now = Date.now()
+  let now = Date.now()
   const policy: Awaited<
     ReturnType<NativeAccountRuntime['read']>
   >['policyStorage'] = {
@@ -274,6 +275,7 @@ test('OpenCode 2 hybrid disable removes local records but preserves a mixed stor
       .get(storageId)
       .values(),
   ][0]
+  const persistence: CacheKeepStore = shared.persistence
   const input = {
     attemptId: 'local',
     sessionID: 'ses_local',
@@ -298,10 +300,45 @@ test('OpenCode 2 hybrid disable removes local records but preserves a mixed stor
       name.endsWith('.json.gz'),
     ),
   ).toHaveLength(2)
-  policy.cacheKeep = { enabled: false }
-  await keep.track({ ...input, attemptId: 'disabled' })
-  await shared.localCleanup
-  await shared.persistence.drain()
+  const runner = (
+    Reflect.get(shared.manager, 'targets') as Map<string, CacheKeepTarget>
+  ).get('ses_runner')!
+  const peer = new CacheKeepStore({
+    storageId,
+    root: directory,
+    sessionClaims: true,
+  })
+  await persistence.releaseClaims(() => true)
+  cleanups.push(() => peer.releaseClaims(() => true))
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const drain = persistence.drain.bind(persistence)
+  const draining = spyOn(persistence, 'drain').mockImplementationOnce(
+    async () => {
+      entered.resolve()
+      await resume.promise
+      await drain()
+    },
+  )
+  const peerCommit = now + 10_000
+  try {
+    policy.cacheKeep = { enabled: false }
+    await keep.track({ ...input, attemptId: 'disabled' })
+    await entered.promise
+    now = peerCommit
+    peer.changed({
+      ...runner,
+      policyState: { ...runner.policyState!, lastRealRequestAt: peerCommit },
+    })
+    await peer.drain()
+    expect(peer.isCommitted(runner.id)).toBe(true)
+    await peer.releaseClaims(() => true)
+  } finally {
+    resume.resolve()
+    await shared.localCleanup
+    draining.mockRestore()
+  }
+  await persistence.drain()
   expect(
     shared.manager.trackedSessions().map(({ id }: { id: string }) => id),
   ).toEqual(['ses_runner'])
@@ -315,6 +352,7 @@ test('OpenCode 2 hybrid disable removes local records but preserves a mixed stor
     ).toString(),
   )
   expect(saved.id).toBe('ses_runner')
+  expect(saved.policyState.lastRealRequestAt).toBe(peerCommit)
   const reports: unknown[] = []
   shared.manager.track({
     sessionId: 'ses_runner',

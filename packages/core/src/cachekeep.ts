@@ -1500,6 +1500,10 @@ export class CacheKeepManager {
       if (!state) return
       state.warmsSinceLastRealRequest--
       state.pendingWarmCost = pendingCost
+      // A same-body update can copy the charge before the reservation returns.
+      // Supersede that snapshot even if the warm cannot prove ownership.
+      if (this.isCurrentTarget(target))
+        return this.options.settleWarm?.(current)
     }
     // Process-only keepers have no restart replay. Persistent hosts must prove
     // the new count is stored before sending; a failed attempt keeps its slot.
@@ -1515,17 +1519,7 @@ export class CacheKeepManager {
       if (cancelled()) {
         // Only the caller that hands us dispatch can tie the reservation to
         // the send. Keep the conservative charge for a standalone reservation.
-        if (dispatch) {
-          refund()
-          // A same-body usage update can queue a copy of the charge even if
-          // the reservation itself was superseded before it could write.
-          if (
-            state &&
-            reservation !== 'not-owner' &&
-            this.isCurrentTarget(target)
-          )
-            await this.options.settleWarm?.(current)
-        }
+        if (dispatch) await refund()
         throw new CacheKeepWarmWait()
       }
       if (
@@ -1533,7 +1527,7 @@ export class CacheKeepManager {
         reservation === 'ownership-unverified' ||
         (!reservation && (state?.planned || isCacheKeepAlways(storage)))
       ) {
-        refund()
+        await refund()
         if (reservation === 'not-owner') {
           if (this.isCurrentTarget(target)) this.releaseTarget(target.id)
           throw new CacheKeepWarmRefusal('stopped')
@@ -1550,11 +1544,8 @@ export class CacheKeepManager {
       : this.policyDecision(current, this.options.now?.() ?? Date.now(), true)
     if (fresh?.action === 'stop') throw new CacheKeepWarmRefusal(fresh.reason)
     if (fresh?.action === 'wait') {
-      if (state) {
-        refund()
-        this.admittedWarmCosts.delete(state)
-        await this.options.settleWarm?.(current)
-      }
+      if (state) this.admittedWarmCosts.delete(state)
+      await refund()
       throw new CacheKeepWarmWait()
     }
     // Do not yield between the cancellation check and dispatch: either the
