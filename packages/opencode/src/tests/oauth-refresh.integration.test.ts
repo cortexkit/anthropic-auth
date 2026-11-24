@@ -341,6 +341,97 @@ async function runStickyDnsBackoffScenario(options: {
 describe('auth.loader', () => {
   installLoaderSetup(testContext)
 
+  test('a failed post-refresh Claude lookup waits in OpenCode 1 without exchanging again', async () => {
+    const successor = 'sk-ant-oat01-oc1-validation-successor'
+    const rotatedAgain = 'sk-ant-oat01-oc1-unnecessary-rotation'
+    const expired = {
+      access: 'sk-ant-oat01-oc1-validation-expired',
+      refresh: 'old-refresh',
+      expires: Date.now() - 1000,
+    }
+    await useTempAccountFile(
+      bindMainAccount(
+        createFallbackStorage({ accounts: [], quota: { enabled: false } }),
+        expired.access,
+      ),
+      expired,
+    )
+    mainAccountIssues(successor, rotatedAgain)
+    const now = Date.now()
+    const clock = spyOn(Date, 'now').mockReturnValue(now)
+    try {
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () => Promise.resolve({ type: 'oauth', ...expired }),
+        { models: {} },
+      )
+      const exchanges: string[] = []
+      const bootstrap: string[] = []
+      const sent: string[] = []
+      let bootstrapStatus = 403
+      globalThis.fetch = mock(
+        async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          const url = extractUrl(input)
+          const bearer = new Headers(init?.headers).get('authorization') ?? ''
+          if (url === TOKEN_URL) {
+            const body = JSON.parse(String(init?.body)) as {
+              refresh_token: string
+            }
+            exchanges.push(body.refresh_token)
+            return Response.json({
+              access_token: exchanges.length === 1 ? successor : rotatedAgain,
+              refresh_token: 'oc1-validation-refresh-successor',
+              expires_in: 3600,
+            })
+          }
+          if (url.includes('/api/claude_cli/bootstrap')) {
+            bootstrap.push(bearer)
+            if (bearer === `Bearer ${successor}` && bootstrapStatus !== 200)
+              return new Response(null, { status: bootstrapStatus })
+            const answer = await nativeBootstrapAnswer(input, init)
+            if (answer) return answer
+          }
+          if (url.includes('/v1/messages')) {
+            sent.push(bearer)
+            return Response.json({})
+          }
+          throw new Error(`Unexpected provider request: ${url}`)
+        },
+      ) as unknown as typeof fetch
+
+      const checkAgainAt = new Date(now + 5 * 60_000).toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+      })
+      const refusal = `Claude couldn't confirm which account this login belongs to. It will check again at ${checkAgainAt}. To check now, use Reset account backoff in /claude.`
+      const first = await result
+        .fetch(MESSAGES_URL, EMPTY_POST)
+        .catch((error: unknown) => error)
+      expect(exchanges).toEqual(['old-refresh'])
+      expect(bootstrap).toEqual([`Bearer ${successor}`])
+      expect(sent).toEqual([])
+      expect(first).toHaveProperty('message', refusal)
+      bootstrapStatus = 200
+      clock.mockReturnValue(now + 5 * 60_000 - 1)
+      await expect(result.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toThrow(
+        refusal,
+      )
+      expect(exchanges).toEqual(['old-refresh'])
+      expect(bootstrap).toEqual([`Bearer ${successor}`])
+      expect(sent).toEqual([])
+
+      clock.mockReturnValue(now + 5 * 60_000)
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(response.status).toBe(200)
+      await response.text()
+      expect(exchanges).toEqual(['old-refresh'])
+      expect(bootstrap).toEqual([`Bearer ${successor}`, `Bearer ${successor}`])
+      expect(sent).toEqual([`Bearer ${successor}`])
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
   test('background refresh timers include per-process jitter', async () => {
     await useTempAccountFile(
       createFallbackStorage({

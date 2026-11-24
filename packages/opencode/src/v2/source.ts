@@ -7,6 +7,7 @@ import {
   createQuotaRefusalResponse,
   decideStickyQuotaFailure,
   effectiveRelayTransport,
+  formatNativeValidationBackoffMessage,
   getClaudeCodeIdentityForVerifiedAccount,
   getMaxSameAccountWait,
   getQuotaCheckIntervalMs,
@@ -35,6 +36,7 @@ import {
   nativeLocalAccountRefusal,
   nativeLocalQuotaLineage,
   nativePollQuotaGenerallyExhausted,
+  nativeValidationRetryAt,
   normalizeQuotaHeaders,
   type OAuthQuotaSnapshot,
   type ProviderAccountUuid,
@@ -84,6 +86,7 @@ import {
   routingChoiceMatches,
   routingWarmCredential,
 } from '../routing-relay'
+import { formatPrimeTime } from '../sidebar-state'
 import {
   type NativeAnthropicAttemptContext,
   type NativeAnthropicAuthorization,
@@ -670,6 +673,8 @@ export function createNativeAnthropicSource(
   ) => {
     const oauth: NativeAccountView[] = []
     const policies = new Map<string, NativeAccountPolicy>()
+    const validationWaits: { account: NativeAccountView; retryAt: number }[] =
+      []
     for (const account of snapshot.accounts) {
       if (account.type !== 'oauth') continue
       const policy = routingRelay.policy(
@@ -688,11 +693,15 @@ export function createNativeAnthropicSource(
             routingRelay.policy(input.sessionID, row, view, modelID),
         })
         active.signal.throwIfAborted()
-        if (admission.status !== 'usable') continue
+        if (admission.status !== 'usable') {
+          const retryAt = nativeValidationRetryAt(admission)
+          if (retryAt !== undefined) validationWaits.push({ account, retryAt })
+          continue
+        }
       }
       oauth.push(account)
     }
-    return { oauth, policies }
+    return { oauth, policies, validationWaits }
   }
   const paidFallback = async (
     input: ChooseAccountInput,
@@ -1141,7 +1150,7 @@ export function createNativeAnthropicSource(
         active.signal.throwIfAborted()
         assertTransport(snapshot, gateway())
       }
-      const { oauth, policies } = await oauthPool(
+      const { oauth, policies, validationWaits } = await oauthPool(
         input,
         snapshot,
         modelID,
@@ -1425,13 +1434,28 @@ export function createNativeAnthropicSource(
         }
         throw await refusal(response)
       }
-      if (advice) return undefined
-      const api = await paidFallback(input, snapshot, active)
-      if (api) return api
-      const holdForPool = poolHold()
-      if (holdForPool) return holdForPool
-      // Local mode explains a pool that is out of quota as the vault does.
-      if (quotaExplainsRefusal) throw await refusal(exhaustedRefusal())
+      if (!advice) {
+        const api = await paidFallback(input, snapshot, active)
+        if (api) return api
+        const holdForPool = poolHold()
+        if (holdForPool) return holdForPool
+        // Local mode explains a pool that is out of quota as the vault does.
+        if (quotaExplainsRefusal) throw await refusal(exhaustedRefusal())
+      }
+      // Explain the earliest check only for a login that could otherwise serve.
+      let earliestCheck = Infinity
+      for (const { account, retryAt } of validationWaits)
+        if (
+          account.id !== lastRefuser &&
+          !blockerFor(account) &&
+          routingRelay.policy(input.sessionID, account, snapshot, modelID)
+            .status === 'allowed'
+        )
+          earliestCheck = Math.min(earliestCheck, retryAt)
+      if (Number.isFinite(earliestCheck))
+        throw new Error(
+          formatNativeValidationBackoffMessage(formatPrimeTime(earliestCheck)),
+        )
       return undefined
     },
     dropChoice() {
@@ -1662,6 +1686,11 @@ export function createNativeAnthropicSource(
       })
       active.signal.throwIfAborted()
       if (material.status !== 'usable') {
+        const retryAt = nativeValidationRetryAt(material)
+        if (!onRefusal && retryAt !== undefined)
+          throw new Error(
+            formatNativeValidationBackoffMessage(formatPrimeTime(retryAt)),
+          )
         const refusal = nativeLocalAccountRefusal(material)
         if (refusal) onRefusal?.(refusal.reason)
         return undefined

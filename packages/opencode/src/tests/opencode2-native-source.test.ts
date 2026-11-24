@@ -48,6 +48,7 @@ import {
   setLogLevel,
   stickyRetryAfterWithJitter,
   TEST_RELAY_ACCOUNT_HOME_KEY,
+  TOKEN_URL,
 } from '@cortexkit/anthropic-auth-core'
 import { ClaustrumUnreachableError } from '@cortexkit/common-auth/claustrum'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
@@ -65,6 +66,7 @@ import {
   fromNativeQuotaMap,
   nativeQuotaCodec,
 } from '../../../core/src/native-quota-codec'
+import { readNativeRuntime } from '../../../core/src/native-runtime'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
 import { nativePoolStoreLocks } from '../../../core/src/pool-store'
 import {
@@ -2616,6 +2618,114 @@ async function retryHost(native: ReturnType<typeof source>) {
     },
   }
 }
+
+test.each(['scheduled check', 'reset account backoff'])(
+  'a failed post-refresh Claude lookup in OpenCode 2 recovers by %s',
+  async (recovery) => {
+    const { paths, runtime, store } = await local({ now: () => Date.now() })
+    const successor = `sk-ant-oat01-post-refresh-validation-${recovery.replaceAll(' ', '-')}`
+    const requests: string[] = []
+    let status = 403
+    const http = spyOn(globalThis, 'fetch').mockImplementation((async (
+      input: Parameters<typeof fetch>[0],
+    ) => {
+      const url = new URL(String(input))
+      requests.push(url.pathname)
+      if (url.href === TOKEN_URL)
+        return Response.json({
+          access_token: successor,
+          refresh_token: 'post-refresh-successor',
+          expires_in: 3600,
+        })
+      if (url.pathname === '/api/claude_cli/bootstrap')
+        return Response.json(
+          { oauth_account: { account_uuid: identity } },
+          { status },
+        )
+      throw new Error(`Unexpected provider request: ${url.pathname}`)
+    }) as typeof fetch)
+    cleanups.push(() => http.mockRestore())
+
+    const native = source(runtime, paths)
+    const host = await retryHost(native)
+    expect((await host.send()).headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-native-only',
+    )
+    expect(
+      await runtime.authorizeLocal('main', { intent: 'refresh' }),
+    ).toMatchObject({
+      status: 'refused',
+      persisted: true,
+      reason: 'validation-backoff',
+    })
+    const pool = await store.read()
+    if (pool.status !== 'ready') throw new Error('Missing local pool')
+    expect(pool.rows[0]?.credential).toMatchObject({ access: successor })
+    const saved = await readNativeRuntime(paths.runtime, paths.storageId)
+    if (saved.status !== 'ready') throw new Error('Missing runtime state')
+    const entry = saved.state.accounts['primary-row']
+    const retry = entry?.validationRetry
+    if (!retry) throw new Error('Missing persisted validation retry')
+    expect(retry.subject.version.accessFingerprint).toBe(
+      tokenFingerprint(successor),
+    )
+    expect(entry.credentialValidation?.version.accessFingerprint).toBe(
+      tokenFingerprint('sk-ant-oat01-native-only'),
+    )
+    expect(retry.nextRetryAt - retry.checkedAt).toBe(5 * 60_000)
+
+    status = 200
+    const time = new Date(retry.nextRetryAt).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+    const refusal = `Claude couldn't confirm which account this login belongs to. It will check again at ${time}. To check now, use Reset account backoff in /claude.`
+    await atTime(retry.nextRetryAt - 1, async () => {
+      await expect(host.send()).rejects.toThrow(refusal)
+    })
+    expect(requests).toEqual([
+      new URL(TOKEN_URL).pathname,
+      '/api/claude_cli/bootstrap',
+    ])
+
+    if (recovery === 'reset account backoff') {
+      const capabilities = createNativeMenuCapabilities({
+        runtime,
+        source: native,
+        start: async () => {},
+      })
+      cleanups.push(() => capabilities.close())
+      const menu = createNativeMenuExecutor({
+        host: 'opencode',
+        dispatch: capabilities.dispatch,
+      })
+      expect(
+        (
+          await menu.execute(
+            { action: 'reset-backoff', values: {} },
+            {
+              interactive: true,
+              custodyMode: 'local',
+            },
+          )
+        ).status,
+      ).toBe('executed')
+    }
+    await atTime(
+      recovery === 'scheduled check' ? retry.nextRetryAt : retry.checkedAt + 1,
+      async () => {
+        expect((await host.send()).headers.get('authorization')).toBe(
+          `Bearer ${successor}`,
+        )
+      },
+    )
+    expect(requests).toEqual([
+      new URL(TOKEN_URL).pathname,
+      '/api/claude_cli/bootstrap',
+      '/api/claude_cli/bootstrap',
+    ])
+  },
+)
 
 test('host retry cap bounds OpenCode 2 upstream 93151s headers and installer delays', async () => {
   for (const confirmed of [false, true]) {

@@ -15,6 +15,7 @@ import {
   TURN_END_NOTE_BETA,
 } from './model-capabilities.ts'
 import { THINKING_BINDING_CONTROLS_BETA } from './thinking-binding.ts'
+import { tokenFingerprint } from './token-fingerprint.ts'
 
 export type ProviderAccountUuid = string & {
   readonly __providerAccountUuid: unique symbol
@@ -74,8 +75,19 @@ const BOOTSTRAP_IDENTITY_NEGATIVE_TTL_MS = 5 * 60_000
 const bootstrapFetches = new Map<string, Promise<ProviderAccountUuid | null>>()
 const bootstrapResults = new Map<
   string,
-  { accountUuid: ProviderAccountUuid | null; expiresAt: number }
+  {
+    accountUuid: ProviderAccountUuid | null
+    expiresAt: number
+    accessFingerprint: string
+  }
 >()
+
+export function clearClaudeCodeBootstrapFailure(accessFingerprint: string) {
+  for (const [key, result] of bootstrapResults) {
+    if (!result.accountUuid && result.accessFingerprint === accessFingerprint)
+      bootstrapResults.delete(key)
+  }
+}
 
 export function resetClaudeCodeIdentityCachesForTest() {
   identityCache.clear()
@@ -286,6 +298,7 @@ export async function resolveClaudeCodeIdentity(
   })
   setBounded(bootstrapResults, bootstrapKey, {
     accountUuid,
+    accessFingerprint: tokenFingerprint(accessToken),
     expiresAt:
       now +
       (accountUuid

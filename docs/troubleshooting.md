@@ -47,6 +47,8 @@ For a fresh installation, complete the [main-account connection](opencode-2.md#e
 
 ### Other request failures
 
+If a request says Claude couldn't confirm which account your login belongs to, the local account check failed after a token refresh. The plugin won't send model requests with that token until Claude confirms the account. Try again at the time shown, or use `/claude` → **Accounts** → **Reset account backoff** to check on your very next turn. Checks retry after 5 minutes, then 15 minutes, then hourly, unless the token expires sooner. You don't need to restart the host.
+
 Check `/claude` for custody, account, routing and quota status first. Unknown quota, positive remaining-quota floors and model-scoped exhaustion can block an account even when it has a token. Resetting a session pin is not a way to bypass limits.
 
 For transport failures, inspect the [relay log](transports.md#diagnostics-and-dumps); direct fallback is not relay success. OpenCode 2 cannot use WebSocket relay. Enable dumps only for a bounded investigation, and redact prompts, tool content and credentials before sharing them. Silence in debug-only cache records does not prove no traffic. Never investigate by running tests or setup against a live user database or live credentials.

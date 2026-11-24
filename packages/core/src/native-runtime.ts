@@ -86,6 +86,43 @@ export interface NativeLocalValidationRetry {
   readonly nextRetryAt: number
 }
 
+const VALIDATION_RETRY_MINUTE_MS = 60_000
+const FIRST_VALIDATION_RETRY_MS = 5 * VALIDATION_RETRY_MINUTE_MS
+const SECOND_VALIDATION_RETRY_MS = 15 * VALIDATION_RETRY_MINUTE_MS
+const HOURLY_VALIDATION_RETRY_MS = 60 * VALIDATION_RETRY_MINUTE_MS
+const LEGACY_VALIDATION_RETRY_MS = 24 * HOURLY_VALIDATION_RETRY_MS
+
+export function effectiveNativeLocalValidationRetryAt(
+  retry: NativeLocalValidationRetry,
+): number {
+  // A previously saved day-long wait was the first failed account check.
+  // Shorten it on read so an already blocked login can recover after upgrading.
+  const deadline =
+    retry.nextRetryAt - retry.checkedAt === LEGACY_VALIDATION_RETRY_MS
+      ? retry.checkedAt + FIRST_VALIDATION_RETRY_MS
+      : retry.nextRetryAt
+  return Math.min(deadline, retry.subject.version.expires)
+}
+
+function nextValidationRetryAt(
+  checkedAt: number,
+  previous: NativeLocalValidationRetry | undefined,
+): number {
+  // Keep the full interval in the existing timestamp fields. Older releases
+  // reject extra keys, and capping the stored interval would lose the step.
+  const previousDelay = previous && previous.nextRetryAt - previous.checkedAt
+  switch (previousDelay) {
+    case FIRST_VALIDATION_RETRY_MS:
+    case LEGACY_VALIDATION_RETRY_MS:
+      return checkedAt + SECOND_VALIDATION_RETRY_MS
+    case SECOND_VALIDATION_RETRY_MS:
+    case HOURLY_VALIDATION_RETRY_MS:
+      return checkedAt + HOURLY_VALIDATION_RETRY_MS
+    default:
+      return checkedAt + FIRST_VALIDATION_RETRY_MS
+  }
+}
+
 /**
  * Match refresh failures using fingerprintOf({ type: 'oauth', refresh }),
  * the full refresh-credential fingerprint. The legacy tokenHash hashes the raw refresh token, and
@@ -1621,8 +1658,8 @@ export async function publishNativeLocalRefreshFailure(
         (!counter(policy.nextRetryAt) ||
           policy.nextRetryAt < policy.checkedAt)) ||
       (policy.retryCount !== undefined && !counter(policy.retryCount)) ||
-      ((attribution.kind === 'validation-retry' ||
-        (attribution.kind === 'refresh-error' && !attribution.permanent)) &&
+      (attribution.kind === 'refresh-error' &&
+        !attribution.permanent &&
         policy.nextRetryAt === undefined)
     )
       throw new NativeRuntimeError('publication-refused')
@@ -1677,9 +1714,6 @@ export async function publishNativeLocalRefreshFailure(
               policy.checkedAt,
             )
         } else if (attribution.kind === 'validation-retry') {
-          const nextRetryAt = policy.nextRetryAt
-          if (nextRetryAt === undefined)
-            throw new NativeRuntimeError('publication-refused')
           const sameSubject = (value: NativeLocalValidationRetry['subject']) =>
             sameLocalBinding(value.binding, subject.binding) &&
             value.credentialFingerprint === subject.credentialFingerprint &&
@@ -1689,12 +1723,22 @@ export async function publishNativeLocalRefreshFailure(
             sameSubject(old.credentialValidation)
           )
             superseded('already-proven')
+          const previous =
+            old?.validationRetry && sameSubject(old.validationRetry.subject)
+              ? old.validationRetry
+              : undefined
+          const nextRetryAt =
+            policy.nextRetryAt ??
+            nextValidationRetryAt(policy.checkedAt, previous)
           if (
-            old?.validationRetry &&
-            sameSubject(old.validationRetry.subject) &&
-            (old.validationRetry.checkedAt > policy.checkedAt ||
-              (old.validationRetry.checkedAt === policy.checkedAt &&
-                old.validationRetry.nextRetryAt !== policy.nextRetryAt))
+            previous &&
+            (previous.checkedAt > policy.checkedAt ||
+              (previous.checkedAt === policy.checkedAt &&
+                previous.nextRetryAt !== nextRetryAt) ||
+              // Concurrent checks must not advance an interval already in force.
+              (policy.nextRetryAt === undefined &&
+                effectiveNativeLocalValidationRetryAt(previous) >
+                  policy.checkedAt))
           )
             superseded('older-than-stored')
           entry.validationRetry = {

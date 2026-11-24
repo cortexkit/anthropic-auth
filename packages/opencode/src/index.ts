@@ -87,6 +87,7 @@ import {
   fallbackAccountUuidForLineage,
   formatEnrollmentStatus,
   formatNativeAccountState,
+  formatNativeValidationBackoffMessage,
   formatOAuthAccountTier,
   formatQuotaBackoffMessage,
   formatRefreshBackoffMessage,
@@ -168,6 +169,7 @@ import {
   nativeLocalAccountRefusal,
   nativeLocalQuotaLineage,
   nativeMigrationAuthorityPhase,
+  nativeValidationRetryAt,
   normalizeQuotaHeaders,
   type OAuthAccount,
   type OAuthAccountProfile,
@@ -376,6 +378,7 @@ import {
 } from './server-fallback.ts'
 import { getOpenCodeAuthPath } from './setup/paths.ts'
 import {
+  formatPrimeTime,
   getInitialSidebarRoutingTestHooks,
   getSidebarState,
   getSidebarStateFile,
@@ -1917,11 +1920,16 @@ const anthropicAuthPlugin = async (
       status: string,
       readonly tokenRefreshFailed = false,
       readonly failure?: NativeRefreshFailure,
+      readonly validationRetryAt?: number,
     ) {
       super(
-        failure?.kind === 'provider' && failure.status !== undefined
-          ? `Claude OAuth refresh failed: ${failure.status} — ${failure.classification === 'invalid-grant' ? 'invalid_grant' : 'OAuth operation failed'}`
-          : `Native OAuth authorization refused: ${status}`,
+        validationRetryAt !== undefined
+          ? formatNativeValidationBackoffMessage(
+              formatPrimeTime(validationRetryAt),
+            )
+          : failure?.kind === 'provider' && failure.status !== undefined
+            ? `Claude OAuth refresh failed: ${failure.status} — ${failure.classification === 'invalid-grant' ? 'invalid_grant' : 'OAuth operation failed'}`
+            : `Native OAuth authorization refused: ${status}`,
       )
     }
   }
@@ -2055,6 +2063,7 @@ const anthropicAuthPlugin = async (
           authorization.status === 'failed' &&
             authorization.failure.kind === 'provider',
           authorization.status === 'failed' ? authorization.failure : undefined,
+          nativeValidationRetryAt(authorization),
         )
       }
       result = {
@@ -10935,6 +10944,14 @@ const anthropicAuthPlugin = async (
                   ) {
                     return routingHoldResponse(advice.hold.retry_after_ms)
                   }
+                  if (
+                    !resolution &&
+                    auth.credentialFailure?.validationRetryAt !== undefined &&
+                    stickyRoutes.allRoutes.every(
+                      (route) => route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID,
+                    )
+                  )
+                    throw auth.credentialFailure
                   if (!resolution && incompleteQuotaPool) {
                     if (auth.modelDenied) return modelDeniedResponse()
                     throw new Error(
@@ -11495,7 +11512,9 @@ const anthropicAuthPlugin = async (
                   init?.signal?.throwIfAborted()
                   if (
                     stickyRouteSelected ||
-                    isNativeTransientAccountError(error)
+                    isNativeTransientAccountError(error) ||
+                    (error instanceof NativeCredentialUnavailableError &&
+                      error.validationRetryAt !== undefined)
                   )
                     throw error
                   const retryable =
@@ -11695,10 +11714,14 @@ const anthropicAuthPlugin = async (
                     throw error
                   }
                 }
-                // Report the refresh failure that happened in this request,
-                // rather than replacing it with its newly recorded backoff.
-                // Later requests still check the persisted retry deadline.
-                if (auth.credentialFailure?.tokenRefreshFailed)
+                // Report an OAuth exchange failure rather than immediately
+                // masking it with its backoff. A failed account check needs
+                // another lookup, not another exchange of the refresh token.
+                if (
+                  auth.credentialFailure?.tokenRefreshFailed ||
+                  auth.credentialFailure?.validationRetryAt !== undefined ||
+                  auth.credentialFailure?.failure?.kind === 'validation'
+                )
                   throw auth.credentialFailure
                 // Check backoff before attempting refresh — avoids noisy
                 // per-request retries during prolonged rate limits

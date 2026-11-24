@@ -6,6 +6,7 @@ import {
   type ClaudeGateway,
   createNativeUsagePublisher,
   decidePiStateLayout,
+  formatNativeValidationBackoffMessage,
   getAccountStatePath,
   getHostClaustrumEnrollmentPaths,
   getPersistedLogLevel,
@@ -33,6 +34,7 @@ import {
   nativeLocalAccountRefusal,
   nativeMigrationAuthorityPhase,
   nativeRuntimeOptionIdentity,
+  nativeValidationRetryAt,
   normalizeQuotaHeaders,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotPassesModelScope,
@@ -58,6 +60,7 @@ import {
   type PiPrimeLease,
   type PiPrimeOptions,
 } from './prime.ts'
+import { formatPiQuotaTime } from './quota-wait.ts'
 import { openPiSettings, type PiSettingsOptions } from './settings.ts'
 
 export type PiNativeAttempt =
@@ -505,6 +508,13 @@ export class PiNativeRuntime {
     if (admission.status !== 'usable') {
       const refusal = background && nativeLocalAccountRefusal(admission)
       if (refusal) throw refusal
+      const retryAt = nativeValidationRetryAt(admission)
+      if (retryAt !== undefined)
+        throw new Error(
+          formatNativeValidationBackoffMessage(
+            `${formatPiQuotaTime(retryAt)} UTC`,
+          ),
+        )
       throw new Error('Pi native OAuth admission refused')
     }
     if (!admission.binding.identity)

@@ -14,6 +14,7 @@ import {
   resolveNativePoolPaths,
   runNativeMigration,
   setLogLevel,
+  TOKEN_URL,
 } from '@cortexkit/anthropic-auth-core'
 import type { Api, Context, Model } from '@earendil-works/pi-ai'
 import { isRetryableAssistantError } from '@earendil-works/pi-ai/compat'
@@ -81,6 +82,83 @@ afterEach(async () => {
   delete process.env.PI_CODING_AGENT_DIR
   delete process.env.PI_ANTHROPIC_AUTH_FILE
   await rm(directory, { recursive: true, force: true })
+})
+
+test('a failed post-refresh Claude lookup in Pi recovers on the scheduled check', async () => {
+  await saveNativePiFixture(
+    { version: 1, accounts: [], quota: { enabled: false } },
+    storagePath,
+  )
+  const successor = 'sk-ant-oat01-pi-validation-successor'
+  let status = 403
+  const requests: string[] = []
+  const sent: (string | null)[] = []
+  globalThis.fetch = Object.assign(
+    async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = new URL(String(input))
+      requests.push(url.pathname)
+      if (url.href === TOKEN_URL)
+        return Response.json({
+          access_token: successor,
+          refresh_token: 'pi-validation-successor-refresh',
+          expires_in: 3600,
+        })
+      if (url.pathname === '/api/claude_cli/bootstrap')
+        return Response.json(
+          { oauth_account: { account_uuid: fixtureAccountIdentity('main') } },
+          { status },
+        )
+      if (url.pathname === '/v1/messages') {
+        sent.push(new Headers(init?.headers).get('authorization'))
+        return success()
+      }
+      throw new Error(`Unexpected provider request: ${url.pathname}`)
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  const runtime = await getPiNativeRuntime(storagePath, {
+    local: { now: () => Date.now() },
+  }).service()
+  const now = Date.now()
+  const clock = spyOn(Date, 'now').mockReturnValue(now)
+  try {
+    expect(
+      await runtime.authorizeLocal('main', { intent: 'refresh' }),
+    ).toMatchObject({
+      status: 'refused',
+      persisted: true,
+      reason: 'validation-backoff',
+    })
+    status = 200
+    const retryAt = now + 5 * 60_000
+    const time = new Date(retryAt).toLocaleTimeString('en-GB', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+      timeZone: 'UTC',
+    })
+    const turn = () => streamCortexKitAnthropic(model, context).result()
+    clock.mockReturnValue(retryAt - 1)
+    expect(await turn()).toMatchObject({
+      stopReason: 'error',
+      errorMessage: `Claude couldn't confirm which account this login belongs to. It will check again at ${time} UTC. To check now, use Reset account backoff in /claude.`,
+    })
+    expect(sent).toEqual([])
+    expect(requests).toEqual([
+      new URL(TOKEN_URL).pathname,
+      '/api/claude_cli/bootstrap',
+    ])
+
+    clock.mockReturnValue(retryAt)
+    expect((await turn()).stopReason).toBe('stop')
+    expect(sent).toEqual([`Bearer ${successor}`])
+    expect(requests.slice(2)).toEqual([
+      '/api/claude_cli/bootstrap',
+      '/v1/messages',
+    ])
+  } finally {
+    clock.mockRestore()
+  }
 })
 
 test('Pi classifies an exhausted account read as retryable and keeps the last snapshot', async () => {

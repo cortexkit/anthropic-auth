@@ -1,6 +1,18 @@
 import { NativeCustodyError } from './native-custody.ts'
 import type { NativeRefreshResult } from './native-refresh-coordinator.ts'
 
+export function nativeValidationRetryAt(
+  result: NativeRefreshResult,
+): number | undefined {
+  return result.status === 'refused' || result.status === 'failed'
+    ? result.validationRetryAt
+    : undefined
+}
+
+export function formatNativeValidationBackoffMessage(time: string): string {
+  return `Claude couldn't confirm which account this login belongs to. It will check again at ${time}. To check now, use Reset account backoff in /claude.`
+}
+
 export type NativeAccountRefusalReason =
   | 'account-policy'
   | 'account-unavailable'
