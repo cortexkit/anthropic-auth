@@ -8,6 +8,7 @@ import type {
   NativeRefreshSubject,
 } from './native-refresh-coordinator.ts'
 import {
+  effectiveNativeLocalValidationRetryAt,
   type NativeRuntimeEntry,
   NativeRuntimeError,
   readNativeRuntime,
@@ -180,13 +181,15 @@ export function createNativeLocalRuntimeReaders(
       const retry = entry?.validationRetry
       // An identity-lookup retry deadline blocks unproven, unexpired access,
       // but must not prevent exchanging an expired token for fresh access.
-      if (
-        retry &&
-        subject.version.expires > time &&
-        retry.nextRetryAt > time &&
-        sameCredential(retry.subject, subject)
-      )
-        return { status: 'blocked', reason: 'validation-backoff' }
+      if (retry && sameCredential(retry.subject, subject)) {
+        const validationRetryAt = effectiveNativeLocalValidationRetryAt(retry)
+        if (validationRetryAt > time)
+          return {
+            status: 'blocked',
+            reason: 'validation-backoff',
+            validationRetryAt,
+          }
+      }
       return { status: 'unproven' }
     },
   }

@@ -231,14 +231,14 @@ const actions: SettingCase[] = [
       values: { entries: [{ account: 'main', fh: 3, sd: 4 }] },
     },
     initial: {},
+    // Editing thresholds leaves the on/off switch alone, as on OpenCode 2;
+    // the tests below check that it isn't written.
     expected: {
-      killswitch_enabled: true,
       killswitch_default_five_hour: 3,
       killswitch_default_seven_day: 4,
     },
     legacy: {
       killswitch: {
-        enabled: true,
         main: { five_hour: 3, seven_day: 4, scoped: 0 },
       },
     },
@@ -349,6 +349,8 @@ for (const mode of ['user-file', 'legacy', 'separate'] as const)
           ...setting.expected,
         })
         expect(await fs.readFile(paths.config, 'utf8')).toBe(before)
+        if (setting.request.action === 'killswitch-set')
+          expect(parse(text)).not.toHaveProperty('killswitch_enabled')
         if (setting.request.action === 'cachekeep-always')
           expect(parse(text)).not.toHaveProperty('cache_keep_window')
         if (setting.request.action === 'cachekeep-subagents')
@@ -358,9 +360,10 @@ for (const mode of ['user-file', 'legacy', 'separate'] as const)
             ),
           ).toEqual(['cache_keep_subagents'])
       } else {
-        expect(parse(await fs.readFile(paths.config, 'utf8'))).toMatchObject(
-          setting.legacy,
-        )
+        const legacy = parse(await fs.readFile(paths.config, 'utf8'))
+        expect(legacy).toMatchObject(setting.legacy)
+        if (setting.request.action === 'killswitch-set')
+          expect(legacy.killswitch?.enabled).not.toBe(true)
         if (userBefore) expect(await fs.readFile(file, 'utf8')).toBe(userBefore)
         else expect(await fs.exists(file)).toBe(false)
       }

@@ -1,15 +1,21 @@
+import { randomUUID } from 'node:crypto'
 import {
   type AccountStorage,
   type AnthropicBillingRequest,
   type ApiKeyAccount,
+  applyAnthropicApiBaseUrl,
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
   applyClaudeGatewayHeaders,
   applyCustomHeaders,
   assertHostAuthorityStable,
   buildBillingHeaderValue,
+  buildCacheDiagnosticsRecord,
   buildPrimeRequestBody,
+  CACHE_DIAGNOSTICS_SESSION_LIMIT,
   CACHE_KEEP_EXTENDED_TTL_BETA,
+  CacheDiagnosticsBetaTracker,
+  CacheDiagnosticsTracker,
   type CacheKeepManager,
   type CacheKeepRealTurn,
   CacheKeepSessionRegistry,
@@ -17,6 +23,7 @@ import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
   type ClaudeCodeIdentity,
+  cacheDiagnosticsMessageId,
   claudeGatewayHeaderValues,
   claudeGatewayModelUrl,
   copyStreamResponseTiming,
@@ -36,7 +43,9 @@ import {
   dumpResponseArtifact,
   effectiveRelayTransport,
   FAST_MODE_BETA,
+  formatCacheDiagnosticsLogLine,
   getCache1hPersistentMode,
+  getCacheDiagnosticsBetas,
   getCacheKeepRegistryDirectories,
   getClaudeCodeIdentityForVerifiedAccount,
   getFallbackReauthLabels,
@@ -48,6 +57,7 @@ import {
   getScopedQuotaWindowForModel,
   getThinkingPrefixMismatchBehavior,
   getWaitForReset,
+  hasCacheDiagnosticsBeta,
   hostRetryHeaders,
   hostRetryResponse,
   isCache1hPersistentlyEnabled,
@@ -58,6 +68,7 @@ import {
   isNativeTransientAccountError,
   isOAuthAccount,
   isPermanentRefreshError,
+  isValidAnthropicRequestId,
   isValidApiBaseURL,
   killswitchPassesPolicy,
   LEGACY_STATE_LAYOUT,
@@ -84,6 +95,7 @@ import {
   type QuotaState,
   quotaBackoffActive,
   quotaExhaustionFromHeaders,
+  quotaFieldSource,
   quotaRefusalTiming,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotModelScopeIsExhausted,
@@ -117,6 +129,7 @@ import {
   stickyRetryAfterWithJitter,
   stickyRouteCandidateWeight,
   stickyRouteFamilyForModel,
+  summarizeCacheTtl,
   warnClaudeGatewayRelayIgnored,
   withAnthropicBilling,
   withCacheKeepRealTurn,
@@ -150,6 +163,7 @@ import {
   piForkEffortSnapshots,
   piForkHeadSession,
 } from './forks.ts'
+import { takePiLaneStart } from './lane-start.ts'
 import {
   getPiNativeRuntime,
   type PiNativeAttempt,
@@ -179,8 +193,37 @@ const dumpResponseObservers = new WeakMap<
   Response,
   ReturnType<typeof createDumpResponseObserver>
 >()
-// Each session owns its lease; storage identifies which host may end it.
-const primaryTurns = new Map<string, string>()
+// The active turn ends when the agent settles. The previous response ID is
+// kept between turns in the same session, but cleared on session shutdown.
+const primarySessions = new Map<
+  string,
+  {
+    storagePath: string
+    turn?: { promptId?: string; synthetic?: boolean }
+    previousRequestId?: string
+    sent: number
+    committed: number
+  }
+>()
+
+const cacheDiagnostics = new CacheDiagnosticsTracker()
+const cacheDiagnosticBetas = new CacheDiagnosticsBetaTracker()
+const cacheDiagnosticsSessions = new Map<string, object>()
+const cacheDiagnosticsObservers = new WeakMap<
+  Response,
+  (message: unknown) => Promise<void>
+>()
+
+function cacheDiagnosticsSession(sessionId: string): object {
+  const session = cacheDiagnosticsSessions.get(sessionId) ?? {}
+  cacheDiagnosticsSessions.delete(sessionId)
+  cacheDiagnosticsSessions.set(sessionId, session)
+  if (cacheDiagnosticsSessions.size > CACHE_DIAGNOSTICS_SESSION_LIMIT) {
+    const oldest = cacheDiagnosticsSessions.keys().next().value
+    if (oldest !== undefined) cacheDiagnosticsSessions.delete(oldest)
+  }
+  return session
+}
 
 export function beginPiPrimaryTurn(
   storagePath: string,
@@ -188,22 +231,45 @@ export function beginPiPrimaryTurn(
 ): void {
   if (!sessionId) return
   piCacheKeep.realTurn(sessionId)
-  primaryTurns.delete(sessionId)
-  primaryTurns.set(sessionId, storagePath)
-  while (primaryTurns.size > 128) {
-    const oldest = primaryTurns.keys().next().value
+  const previous = primarySessions.get(sessionId)
+  const session =
+    previous?.storagePath === storagePath
+      ? previous
+      : { storagePath, sent: 0, committed: 0 }
+  // Pi fires turn_start for each tool iteration, not only for a human prompt.
+  session.turn ??= {}
+  primarySessions.delete(sessionId)
+  primarySessions.set(sessionId, session)
+  while (primarySessions.size > 128) {
+    const oldest = primarySessions.keys().next().value
     if (oldest === undefined) break
-    primaryTurns.delete(oldest)
+    primarySessions.delete(oldest)
   }
+}
+
+export function observePiUserPrompt(
+  storagePath: string,
+  sessionId: string,
+  synthetic = false,
+) {
+  const session = primarySessions.get(sessionId)
+  // A queued user message can start a new prompt before the agent settles.
+  if (session?.storagePath === storagePath && session.turn)
+    session.turn = { synthetic }
 }
 
 export function endPiPrimaryTurn(
   storagePath: string,
   sessionId?: string,
+  closed = false,
 ): void {
-  if (sessionId && primaryTurns.get(sessionId) === storagePath)
-    primaryTurns.delete(sessionId)
-  if (sessionId) piCacheKeep.endTurn(sessionId)
+  if (!sessionId) return
+  const session = primarySessions.get(sessionId)
+  if (session?.storagePath === storagePath) {
+    if (closed) primarySessions.delete(sessionId)
+    else delete session.turn
+  }
+  piCacheKeep.endTurn(sessionId)
 }
 
 export function untrackPiCacheKeepTurn(sessionId?: string) {
@@ -212,25 +278,25 @@ export function untrackPiCacheKeepTurn(sessionId?: string) {
   } catch {}
 }
 
-function isPiPrimaryThreadRequest(
+function piPrimarySession(
   storagePath: string,
   options: SimpleStreamOptions | undefined,
   origin: 'agent-loop' | 'direct' | undefined,
-): boolean {
+) {
   // SDK summaries disable caching; SDK cache warms request exactly one token.
   if (
     origin !== 'agent-loop' ||
-    options?.cacheRetention === 'none' ||
-    options?.maxTokens === 1
+    !options?.sessionId ||
+    options.cacheRetention === 'none' ||
+    options.maxTokens === 1
   )
-    return false
-  return Boolean(
-    options?.sessionId &&
-      primaryTurns.get(options.sessionId) === storagePath &&
-      typeof options.onPayload === 'function' &&
-      typeof options.onResponse === 'function' &&
-      typeof options.onProviderStreamEvent === 'function',
-  )
+    return undefined
+  const session = primarySessions.get(options.sessionId)
+  return session?.storagePath === storagePath &&
+    session.turn &&
+    !session.turn.synthetic
+    ? session
+    : undefined
 }
 
 export function forgetPiMessageThread(
@@ -238,6 +304,8 @@ export function forgetPiMessageThread(
   disposition: 'session_closed' | 'session_deleted' = 'session_deleted',
 ): void {
   messageThreads.forget(sessionId, disposition)
+  cacheDiagnostics.forgetSession(sessionId)
+  cacheDiagnosticsSessions.delete(sessionId)
 }
 
 /** Dump label for a physical send that failed before any response arrived. */
@@ -500,12 +568,13 @@ const piCacheKeep = new PiCacheKeep(
     fetchImpl: fetchPiOAuth,
     // A keep-warm is a model request, so it follows the current gateway of
     // the target's own runtime.
-    fetchForTarget: (target) =>
-      createPiOAuthModelFetch(() =>
-        piClaudeGatewayFromMemory(
-          target.accountStoragePath ?? getPiAccountStoragePath(),
-        ),
-      ),
+    fetchForTarget: (target) => {
+      const storagePath = target.accountStoragePath ?? getPiAccountStoragePath()
+      return createPiOAuthModelFetch(
+        () => piClaudeGatewayFromMemory(storagePath),
+        getRequestGzipLatch(getRequestGzipLatchPath(storagePath)),
+      )
+    },
     loadStorage: async () => (await getPiNativeRuntime().view()).policyStorage,
     resolveSettings: resolvePiSettingsFromMemory,
     onTrackedSessionsChanged: (sessions) =>
@@ -747,13 +816,11 @@ function updateUsage(
 export function buildExplicitBaseMessagesUrl(baseURL: string) {
   const url = new URL(baseURL)
   const basePath = url.pathname.replace(/\/$/, '')
-  if (/\/v\d[^/]*\/messages$/.test(basePath)) {
-    url.pathname = basePath
-  } else if (/\/v\d[^/]*$/.test(basePath)) {
-    url.pathname = `${basePath}/messages`
-  } else {
-    url.pathname = `${basePath}/v1/messages`
-  }
+  // A route can already name the messages resource rather than a base path.
+  url.pathname = /\/v\d[^/]*\/messages$/.test(basePath)
+    ? basePath
+    : '/v1/messages'
+  applyAnthropicApiBaseUrl(url, baseURL)
   url.searchParams.set('beta', 'true')
   return url
 }
@@ -791,6 +858,7 @@ export async function* parseSse(
     return
   }
   const dumpObserver = dumpResponseObservers.get(response)
+  let cacheDiagnosticsObserver = cacheDiagnosticsObservers.get(response)
   const reader = response.body.getReader()
   // Core's byte framer ends frames at blank lines with CRLF, LF or CR line
   // endings and keeps a multibyte character split across reads in one frame,
@@ -815,6 +883,11 @@ export async function* parseSse(
         if (!data || data === '[DONE]') continue
         const event = JSON.parse(data) as AnthropicEvent
         dumpObserver?.observe(event)
+        if (event.type === 'message_start' && cacheDiagnosticsObserver) {
+          const observe = cacheDiagnosticsObserver
+          cacheDiagnosticsObserver = undefined
+          void observe(event.message).catch(() => {})
+        }
         yield event
       }
     }
@@ -917,6 +990,7 @@ async function sendAnthropicRequestAttempt(
     context: Context
     streamOptions?: SimpleStreamOptions
     requestOrigin?: 'agent-loop' | 'direct'
+    laneStart?: boolean
     apiAccount?: NativeAccountView
     storagePath: string
     oauthAccountId?: string
@@ -957,6 +1031,54 @@ async function sendAnthropicRequestAttempt(
   const keep = deps.cacheKeep ?? cacheKeepManager
   const realSession = options.streamOptions?.sessionId
   const forkHead = piForkHeadSession(options.streamOptions)
+  const primary =
+    !options.prime && !options.apiAccount && !forkHead
+      ? piPrimarySession(
+          options.storagePath,
+          options.streamOptions,
+          options.requestOrigin,
+        )
+      : undefined
+  const turn =
+    options.laneStart || primary?.turn?.synthetic ? undefined : primary?.turn
+  if (primary && turn) {
+    turn.promptId ??= randomUUID()
+    primary.sent += 1
+  }
+  const lineage =
+    primary && turn?.promptId
+      ? {
+          promptId: turn.promptId,
+          previousRequestId: primary.previousRequestId,
+          sequence: primary.sent,
+        }
+      : undefined
+  const observeRequestId = (headers: Headers) => {
+    if (
+      !lineage ||
+      !primary ||
+      !realSession ||
+      primarySessions.get(realSession) !== primary ||
+      lineage.sequence < primary.committed
+    )
+      return
+    const id = headers.get('request-id') ?? headers.get('x-request-id')
+    if (!id || !isValidAnthropicRequestId(id)) return
+    primary.committed = lineage.sequence
+    primary.previousRequestId = id
+  }
+  const diagnosticsSession =
+    realSession &&
+    !options.apiAccount &&
+    !options.prime &&
+    !forkHead &&
+    options.streamOptions?.maxTokens !== 1
+      ? {
+          id: realSession,
+          token: cacheDiagnosticsSession(realSession),
+          previous: cacheDiagnostics.previousFor(realSession),
+        }
+      : undefined
   if (!options.prime && !forkHead && realSession) {
     if (options.apiAccount || !options.storagePath) {
       try {
@@ -1030,7 +1152,17 @@ async function sendAnthropicRequestAttempt(
         isFastModePersistentlyEnabled(storage),
         identity,
         {
+          modelLimits: options.model,
+          apiKey: !!options.apiAccount,
+          apiKeyModelCompat: options.model
+            .compat as Model<'anthropic-messages'>['compat'],
+          laneStart: options.laneStart,
           deferSigning: true,
+          billingLineage: lineage,
+          ...(diagnosticsSession && {
+            cacheDiagnosticsPreviousMessageId:
+              diagnosticsSession.previous?.messageId ?? null,
+          }),
           forkBaseMessageCount: forkBase?.messageCount,
           // API-key routes send no effort history, so no fork hint either.
           forkEffort: options.apiAccount
@@ -1075,11 +1207,12 @@ async function sendAnthropicRequestAttempt(
         ...(options.prime && { requestClass: 'auxiliary' }),
       })
   const relayAffinity = options.streamOptions?.sessionId ?? null
-  const reportRoutingHeaders = (
+  const observeResponseHeaders = (
     attempt: PiNativeAttempt,
     responseHeaders: Headers,
     status: number,
   ) => {
+    native.observeQuotaHeaders(attempt, responseHeaders, servingRuntime)
     if (options.prime || !relayAffinity) return
     if (
       options.routingRelay &&
@@ -1285,17 +1418,23 @@ async function sendAnthropicRequestAttempt(
     relayConfig = null
   }
   let threadRequest: MessageThreadRequest | undefined
+  // A human prompt can replace the session's turn while a lane start is routing.
+  const primaryThread =
+    !options.laneStart &&
+    primary !== undefined &&
+    primary ===
+      piPrimarySession(
+        options.storagePath,
+        options.streamOptions,
+        options.requestOrigin,
+      )
   if (
-    !options.apiAccount &&
-    !options.prime &&
-    !forkHead &&
+    primaryThread &&
     // Gateways may refuse the thread route: send full requests.
     !gateway &&
-    isPiPrimaryThreadRequest(
-      options.storagePath,
-      options.streamOptions,
-      options.requestOrigin,
-    ) &&
+    typeof options.streamOptions?.onPayload === 'function' &&
+    typeof options.streamOptions.onResponse === 'function' &&
+    typeof options.streamOptions.onProviderStreamEvent === 'function' &&
     (!relayConfig ||
       effectiveRelayTransport(relayConfig.transport, relayConfig.url) !==
         'websocket')
@@ -1317,7 +1456,7 @@ async function sendAnthropicRequestAttempt(
     options.onThreadPrepared?.(threadRequest.fail)
     wireBodyText = threadRequest.bodyText
     init.body = wireBodyText
-  } else {
+  } else if (!options.apiAccount) {
     wireBodyText = await signRequestBody(bodyText)
     init.body = wireBodyText
   }
@@ -1412,7 +1551,7 @@ async function sendAnthropicRequestAttempt(
         ? withAnthropicBilling(billing, send)
         : send())
       if (attempt)
-        reportRoutingHeaders(attempt, response.headers, response.status)
+        observeResponseHeaders(attempt, response.headers, response.status)
       return response
     }
     let response: Response
@@ -1557,8 +1696,9 @@ async function sendAnthropicRequestAttempt(
       // Some relay streams start before the provider answers. Report the
       // provider's actual status and headers, not that early placeholder.
       onResponseHeaders: (responseHeaders) => {
+        observeRequestId(responseHeaders)
         if (upstream)
-          reportRoutingHeaders(
+          observeResponseHeaders(
             upstream.attempt,
             responseHeaders,
             upstream.status,
@@ -1637,6 +1777,7 @@ async function sendAnthropicRequestAttempt(
     })
     response = threadRequest.observe(response)
   }
+  if (lastTransport === 'direct') observeRequestId(response.headers)
   if (response.ok && lastTransport === 'relay' && relayAttempt) {
     if (
       options.prime &&
@@ -1661,6 +1802,70 @@ async function sendAnthropicRequestAttempt(
       response,
       createDumpResponseObserver(dumpHandle, response.status),
     )
+  }
+  if (diagnosticsSession && response.ok) {
+    const previousMessageId = diagnosticsSession.previous?.messageId ?? null
+    const payload = JSON.parse(wireBodyText) as {
+      diagnostics?: { previous_message_id?: string | null }
+      model?: unknown
+    }
+    // Thread recovery can replace the prepared body. Attribute the result only
+    // if the actual send carried this diagnostic predecessor and beta.
+    if (
+      payload.diagnostics?.previous_message_id === previousMessageId &&
+      hasCacheDiagnosticsBeta(headers)
+    ) {
+      const betas = getCacheDiagnosticsBetas(headers).catch(() => undefined)
+      const ttlSent = summarizeCacheTtl(payload)
+      const requestedModel =
+        typeof payload.model === 'string' ? payload.model : undefined
+      const current = () =>
+        !init.signal?.aborted &&
+        cacheDiagnosticsSessions.get(diagnosticsSession.id) ===
+          diagnosticsSession.token
+      cacheDiagnosticsObservers.set(response, async (message) => {
+        if (!current()) return
+        const receivedAt = Date.now()
+        const messageId = cacheDiagnosticsMessageId(message)
+        // Record the predecessor before yielding, even if debug logging is delayed or skipped.
+        if (primaryThread && messageId)
+          cacheDiagnostics.capture(diagnosticsSession.id, messageId, receivedAt)
+        const sent = await betas
+        if (!sent || !current()) return
+        const { record, canary } = buildCacheDiagnosticsRecord({
+          request: {
+            sessionId: diagnosticsSession.id,
+            previousMessageId,
+            previousMessageReceivedAt: diagnosticsSession.previous?.receivedAt,
+            isSubagent: false,
+            ttlSent,
+          },
+          source: options.laneStart ? 'start' : 'turn',
+          accountId: routeId,
+          synthetic: options.laneStart === true,
+          betasHash: sent.betasHash,
+          requestedModel,
+          message,
+          receivedAt,
+        })
+        if (!record) return
+        logger.debug('cache-diagnostics', formatCacheDiagnosticsLogLine(record))
+        const betaLine = cacheDiagnosticBetas.capture(
+          sent.betasHash,
+          sent.betas,
+        )
+        if (betaLine) logger.debug('cache-diagnostics', betaLine)
+        if (canary)
+          logger.warn(
+            'cache-diagnostics',
+            'short-gap previous_message_not_found',
+            {
+              message_id: canary.messageId,
+              previous_message_id: canary.previousMessageId,
+            },
+          )
+      })
+    }
   }
   return response
 }
@@ -1687,8 +1892,12 @@ async function endIfCancelled(
 function quotaSnapshotIsExhausted(
   quota: Awaited<ReturnType<QuotaManager['refreshMain']>> | undefined,
 ) {
+  // A deferred poll can return the cached quota. A header percentage rounded
+  // to 100% is display evidence, not permission to switch to a paid route.
   return (['five_hour', 'seven_day'] as const).some(
-    (key) => (quota?.[key]?.remainingPercent ?? 1) <= 0,
+    (key) =>
+      quotaFieldSource(quota, key) !== 'headers' &&
+      (quota?.[key]?.remainingPercent ?? 1) <= 0,
   )
 }
 
@@ -1808,14 +2017,22 @@ export async function firstStreamingError(
   const inspected = copyStreamResponseTiming(response, replay(true))
   const dumpObserver = dumpResponseObservers.get(response)
   if (dumpObserver) dumpResponseObservers.set(inspected, dumpObserver)
+  const cacheDiagnosticsObserver = cacheDiagnosticsObservers.get(response)
+  if (cacheDiagnosticsObserver)
+    cacheDiagnosticsObservers.set(inspected, cacheDiagnosticsObserver)
   return { response: inspected, preflight: inspected }
 }
+
+// A local completion, not a provider response. Keep routing's quota-wait path
+// able to hand it back without treating a skipped lane start as a refusal.
+const skippedPaidLaneStart = new Response(null, { status: 204 })
 
 async function executeWithFallback(options: {
   model: Model<Api>
   context: Context
   streamOptions?: SimpleStreamOptions
   requestOrigin?: 'agent-loop' | 'direct'
+  laneStart?: boolean
   storagePath: string
   effortTransitions?: readonly PiEffortTransition[]
   onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
@@ -2123,6 +2340,7 @@ async function executeWithFallback(options: {
     const usableOAuthById = new Map(
       usableOAuth.map((account) => [account.id, account]),
     )
+    let sawPaidLaneRoute = false
     for (const configured of storage.accounts) {
       if (!nativeAccountCanServe(configured)) continue
       let response: Response | undefined
@@ -2153,6 +2371,11 @@ async function executeWithFallback(options: {
           !isValidApiBaseURL(account.baseURL)
         )
           continue
+        if (options.laneStart) {
+          // A paid route can end a lane start only if no OAuth route serves it.
+          sawPaidLaneRoute = true
+          continue
+        }
         response = await sendAnthropicRequest({
           ...options,
           apiAccount: account,
@@ -2169,7 +2392,7 @@ async function executeWithFallback(options: {
         return preflight
       await inspected.response.body?.cancel().catch(() => {})
     }
-    return null
+    return sawPaidLaneRoute ? skippedPaidLaneStart : null
   }
 
   const routingMode = getRoutingMode(storage)
@@ -2816,6 +3039,12 @@ export function streamCortexKitAnthropic(
     try {
       buildPiOAuthMessagesUrl(model.baseUrl)
       const storagePath = getPiAccountStoragePath()
+      const laneStart =
+        requestOrigin === 'agent-loop' &&
+        !piForkHeadSession(options) &&
+        takePiLaneStart(context.messages, options?.sessionId)
+      if (laneStart && options?.sessionId)
+        observePiUserPrompt(storagePath, options.sessionId, true)
       let toolNames: ReadonlyMap<string, string> = new Map()
       let recordCacheUsage:
         | ((usage?: Record<string, number>) => void)
@@ -2826,6 +3055,7 @@ export function streamCortexKitAnthropic(
         context,
         streamOptions: options,
         requestOrigin,
+        laneStart,
         storagePath,
         onCapacityWait: setWorkingMessage
           ? () => {
@@ -2932,6 +3162,17 @@ export function streamCortexKitAnthropic(
         }),
       )
 
+      if (response === skippedPaidLaneStart) {
+        options?.signal?.throwIfAborted()
+        output.content.push({
+          type: 'text',
+          text: 'Lane start skipped on a paid route.',
+        })
+        output.stopReason = 'stop'
+        stream.push({ type: 'done', reason: 'stop', message: output })
+        stream.end()
+        return
+      }
       if (!response.ok) {
         throw new Error(
           `Anthropic request failed: HTTP ${response.status} ${await response.text()}`,

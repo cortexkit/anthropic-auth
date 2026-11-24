@@ -6,7 +6,6 @@ import { join } from 'node:path'
 import {
   __setLogTestSink,
   type AccountStorage,
-  CACHE_KEEP_TICK_MS,
   createNativeAccountRuntime,
   custodyTombstoneOAuth,
   getLogLevel,
@@ -59,7 +58,6 @@ const fixtureEnvKeys = [
   'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',
   'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
   'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
-  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
   'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
   'CLAUDE_CONFIG_DIR',
   'OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION',
@@ -1149,11 +1147,8 @@ describe('vault-served fallback outbound token census', () => {
     ;(
       fixture.intervals as IntervalRecord[] & { clock: (now: number) => void }
     ).clock(now + 55 * 60_000)
-    const cacheKeepTick = fixture.intervals.find(
-      (interval) => interval.ms === CACHE_KEEP_TICK_MS,
-    )
-    if (!cacheKeepTick) throw new Error('missing CacheKeep interval')
-    cacheKeepTick.callback()
+    // Prime also registers a 60-second interval, so use the CacheKeep manager directly.
+    await getPluginTestHandles(fixture.plugin).cacheKeepManager.tick()
     await waitFor(
       () =>
         fixture.records.some((record) => {
@@ -1203,11 +1198,7 @@ describe('vault-served fallback outbound token census', () => {
       ;(
         fixture.intervals as IntervalRecord[] & { clock: (now: number) => void }
       ).clock(now + 55 * 60_000)
-      const cacheKeepTick = fixture.intervals.find(
-        (interval) => interval.ms === CACHE_KEEP_TICK_MS,
-      )
-      if (!cacheKeepTick) throw new Error('missing CacheKeep interval')
-      cacheKeepTick.callback()
+      await getPluginTestHandles(fixture.plugin).cacheKeepManager.tick()
       await waitFor(
         () =>
           fixture.records.some((record) => {
@@ -1453,11 +1444,7 @@ describe('scoped maintenance rotation recovery', () => {
     ;(
       fixture.intervals as IntervalRecord[] & { clock: (now: number) => void }
     ).clock(now + 55 * 60_000)
-    const interval = fixture.intervals.find(
-      (candidate) => candidate.ms === CACHE_KEEP_TICK_MS,
-    )
-    if (!interval) throw new Error('CacheKeep interval missing')
-    interval.callback()
+    await getPluginTestHandles(fixture.plugin).cacheKeepManager.tick()
     await waitFor(
       () => sent.length >= 2,
       'rotated CacheKeep prewarm was not replayed',
@@ -1564,11 +1551,7 @@ describe('scoped maintenance rotation recovery', () => {
             clock: (now: number) => void
           }
         ).clock(now + 55 * 60_000)
-        const interval = fixture.intervals.find(
-          (candidate) => candidate.ms === CACHE_KEEP_TICK_MS,
-        )
-        if (!interval) throw new Error('CacheKeep interval missing')
-        interval.callback()
+        await getPluginTestHandles(fixture.plugin).cacheKeepManager.tick()
         await waitFor(
           () => reports.length >= 1,
           'CacheKeep 401 was not reported after re-authorization failed',

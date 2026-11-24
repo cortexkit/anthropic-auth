@@ -647,6 +647,15 @@ const fixture: Record<
         'packages/core/src/commands/account.ts:AccountCommandAction:13-32; packages/pi/src/commands.ts:claude-account:272-366',
       ],
       [
+        'quota-refresh',
+        'quota',
+        'Quota',
+        [],
+        false,
+        false,
+        'packages/pi/src/native-commands.ts:createPiNativeCommands',
+      ],
+      [
         'routing-mode',
         'routing',
         'Routing',
@@ -672,6 +681,33 @@ const fixture: Record<
         false,
         false,
         'packages/core/src/routing.ts:MaxSameAccountWait',
+      ],
+      [
+        'killswitch-on',
+        'killswitch',
+        'Limits',
+        [],
+        false,
+        false,
+        'packages/pi/src/native-commands.ts:createPiNativeCommands',
+      ],
+      [
+        'killswitch-off',
+        'killswitch',
+        'Limits',
+        [],
+        false,
+        false,
+        'packages/pi/src/native-commands.ts:createPiNativeCommands',
+      ],
+      [
+        'killswitch-set',
+        'killswitch',
+        'Limits',
+        ['entries:limit-entries!=account|fh|sd|scoped?'],
+        false,
+        false,
+        'packages/pi/src/native-commands.ts:createPiNativeCommands',
       ],
       [
         'cache-on',
@@ -799,6 +835,15 @@ const fixture: Record<
         false,
         'packages/pi/src/native-commands.ts:createPiNativeCommands',
       ],
+      [
+        'start-fire',
+        'start',
+        'Extras',
+        [],
+        false,
+        false,
+        'packages/pi/src/native-commands.ts:createPiNativeCommands',
+      ],
     ],
     statuses: [
       [
@@ -827,6 +872,15 @@ const fixture: Record<
         false,
         false,
         'packages/core/src/routing.ts:RoutingCommandAction:22,25; packages/pi/src/commands.ts:claude-routing:231-256',
+      ],
+      [
+        'killswitch-status',
+        'killswitch',
+        'Limits',
+        [],
+        false,
+        false,
+        'packages/pi/src/native-commands.ts:createPiNativeCommands',
       ],
       [
         'cache-status',
@@ -887,12 +941,14 @@ const fixture: Record<
       'account',
       'quota',
       'routing',
+      'killswitch',
       'cache',
       'cachekeep',
       'dump',
       'logging',
       'fast',
       'prime',
+      'start',
     ],
     destructive: ['remove', 'enrollment-reset'],
     interactive: [
@@ -971,7 +1027,7 @@ for (const host of ['opencode', 'pi'] as const) {
     expect(actualStatuses).toEqual(
       fixture[host].statuses.map((row) => row.slice(0, 6)),
     )
-    expect(actual).toHaveLength(host === 'opencode' ? 33 : 28)
+    expect(actual).toHaveLength(33)
     const families: string[] = [
       ...new Set(
         [...allActions(host), ...statuses].map(
@@ -980,7 +1036,7 @@ for (const host of ['opencode', 'pi'] as const) {
       ),
     ]
     expect(families.sort()).toEqual([...fixture[host].families].sort())
-    expect(families).toHaveLength(host === 'opencode' ? 11 : 9)
+    expect(families).toHaveLength(11)
     for (const row of [...fixture[host].actions, ...fixture[host].statuses]) {
       expect(row[6]).toMatch(/packages\/.+\.ts:[A-Za-z]/)
     }
@@ -991,44 +1047,13 @@ for (const host of ['opencode', 'pi'] as const) {
   })
 }
 
-test('Pi offers Prime toggles but no Limits, quota refresh or start actions', () => {
-  const pi = getNativeMenuModel('pi', 'local')
-  expect(pi.groups.find((group) => group.id === 'Limits')).toEqual({
-    id: 'Limits',
-    actions: [],
-    statuses: [],
-  })
-  expect(
-    allActions('pi').filter((action) =>
-      ['quota', 'killswitch', 'start'].includes(action.command),
-    ),
-  ).toEqual([])
-  expect(
-    allActions('pi')
-      .filter((action) => action.command === 'prime')
-      .map((action) => action.id),
-  ).toEqual(['prime-on', 'prime-off'])
-  expect(
-    pi.groups
-      .flatMap((group) => group.statuses)
-      .filter((status) => ['prime', 'quota'].includes(status.command))
-      .map((status) => status.id),
-  ).toEqual(['quota-status', 'prime-status'])
-  expect(
-    allActions('opencode')
-      .filter((action) =>
-        ['quota', 'killswitch', 'prime', 'start'].includes(action.command),
-      )
-      .map((action) => action.id),
-  ).toEqual([
-    'quota-refresh',
-    'killswitch-on',
-    'killswitch-off',
-    'killswitch-set',
-    'prime-on',
-    'prime-off',
-    'start-fire',
-  ])
+test('Pi and OpenCode offer the same Quota, Limits and Extras controls in both custody modes', () => {
+  const groups = (host: NativeMenuHost, custody: 'local' | 'claustrum') =>
+    getNativeMenuModel(host, custody).groups.filter((group) =>
+      ['Quota', 'Limits', 'Extras'].includes(group.id),
+    )
+  for (const custody of ['local', 'claustrum'] as const)
+    expect(groups('pi', custody)).toEqual(groups('opencode', custody))
 })
 
 test('destructive actions require non-empty confirmation for removal and enrollment reset', () => {

@@ -69,7 +69,6 @@ const envKeys = [
   'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',
   'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
   'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
-  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
   'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
   'CLAUDE_CONFIG_DIR',
   'OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION',
@@ -279,10 +278,10 @@ async function migratedClaude() {
 
 test('does not retain a background interval unless the helper opts in', async () => {
   const claude = await migratedClaude()
-  // The helper supplies an interval mock that starts no timer. Construction
-  // schedules only the fallback-account refresh, so the mock is called once
-  // while the tracked set of active intervals remains empty.
-  expect(timerTracking.disabledIntervalCalls).toBe(1)
+  // Construction schedules fallback refresh and the Prime timer (the opt-in
+  // five-hour window starter), whose tick checks
+  // whether it is enabled. The helper's mock starts neither timer.
+  expect(timerTracking.disabledIntervalCalls).toBe(2)
   expect(activeIntervals.size).toBe(0)
 
   await timerTracking.withTrackedInterval(async () => {
@@ -290,6 +289,7 @@ test('does not retain a background interval unless the helper opts in', async ()
       setInterval: trackedSetInterval,
       clearInterval: trackedClearInterval,
     })
+    // The second instance shares the Prime timer; only its fallback refresh is new.
     expect(activeIntervals.size).toBe(1)
   })
   expect(activeIntervals.size).toBe(0)
@@ -448,7 +448,8 @@ describe('setting-change INFO logs', () => {
     expect(rec).toBeDefined()
     expect(rec!.payload?.thresholds).toEqual({ five_hour: 3, seven_day: 8 })
     const raw = await claude.settings()
-    expect(raw.killswitch?.enabled).toBe(true)
+    // Editing thresholds leaves the on/off switch alone, as on OpenCode 2 and Pi.
+    expect(raw.killswitch?.enabled).not.toBe(true)
     expect(raw.killswitch?.main?.five_hour).toBe(3)
     expect(raw.killswitch?.main?.seven_day).toBe(8)
   })

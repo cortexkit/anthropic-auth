@@ -477,7 +477,8 @@ function closedFenceHosts(
  * Display text must be a fixed remedy, the runner's unknown-argument message,
  * an OAuth metadata error matching its own integer HTTP status (100–599),
  * a shared-setup enrollment refusal matching HOST_NOT_ENROLLED_PATTERNS, or
- * a running-host list or vault grant remedy rebuilt from validated fields.
+ * a running-host list, vault grant or Windows folder remedy rebuilt from
+ * validated fields.
  */
 export function knownFailureMessage(error: unknown): string | undefined {
   try {
@@ -491,11 +492,11 @@ export function knownFailureMessage(error: unknown): string | undefined {
     )
       return message
     if (CLOSED_MESSAGES.has(message)) return message
-    // A state layout refusal's message names files; show its fixed text.
+    // Rebuild the remedy so arbitrary state-layout error text stays off screen.
     if (ownData(error, 'name') === 'StateLayoutRefusalError') {
       const code = ownData(error, 'code')
       if (isStateLayoutRefusalCode(code))
-        return stateLayoutRefusalPublicMessage(code)
+        return stateLayoutRefusalPublicMessage(code, error)
     }
     if (
       ownData(error, 'name') === 'NativeVaultActivationError' &&

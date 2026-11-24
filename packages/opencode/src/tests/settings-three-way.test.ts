@@ -36,7 +36,7 @@ function snapshotFor(
   }
 }
 
-test('createNativeWirePolicy transformOptions reads all six cache inputs and preserves excluded agents', () => {
+test('OpenCode 2 defaults to five-minute caching and preserves explicit values and excluded agents', () => {
   const policy = createNativeWirePolicy()
   const context = {
     attemptId: 'three-way-cache',
@@ -44,13 +44,17 @@ test('createNativeWirePolicy transformOptions reads all six cache inputs and pre
     agent: 'build',
     correlation: {},
   } as NativeAnthropicRequestContext<NativeSourceProvenance>
-  expect(
-    inputs.map(
-      (value) =>
-        policy.requestOptions(context, snapshotFor('claudeCache', value))
-          .cache1hEnabled,
-    ),
-  ).toEqual(enabledByDefault)
+  for (const agent of ['build', 'summary', 'prime']) {
+    expect(
+      inputs.map(
+        (value) =>
+          policy.requestOptions(
+            { ...context, agent },
+            snapshotFor('claudeCache', value),
+          ).cache1hEnabled,
+      ),
+    ).toEqual([true, false, false, true, false, false])
+  }
   for (const agent of ['compaction', 'title']) {
     expect(
       inputs.map(

@@ -1,6 +1,16 @@
 import { afterEach, expect, spyOn, test } from 'bun:test'
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import type { AccountStorage } from '../accounts.ts'
-import { CacheKeepManager } from '../cachekeep.ts'
+import {
+  CacheKeepManager,
+  type CacheKeepTarget,
+  type CacheKeepWarmReservation,
+  isCacheKeepWarmWait,
+} from '../cachekeep.ts'
+import { CacheKeepClaim, CacheKeepStore } from '../cachekeep-store.ts'
 
 const managers: CacheKeepManager[] = []
 afterEach(() => {
@@ -802,6 +812,134 @@ test('a known failed warm clears its unresolved admitted cost durably without sp
   })
   expect(settled?.pendingWarmCost).toBeUndefined()
 })
+
+test.each(['ownership-unverified', 'not-owner'] as const)(
+  'a refunded %s warm cannot leave a charged usage snapshot to drain',
+  async (veto) => {
+    const root = await mkdtemp(join(tmpdir(), 'cachekeep-refund-'))
+    const store = new CacheKeepStore({
+      root,
+      storageId: 'refund',
+      host: 'opencode1',
+      pluginVersion: 'test',
+      sessionClaims: true,
+    })
+    const peer = new CacheKeepStore({
+      root,
+      storageId: 'refund',
+      host: 'opencode1',
+      pluginVersion: 'test',
+      sessionClaims: true,
+    })
+    const reserving = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    let target!: Readonly<CacheKeepTarget>
+    let outcome: CacheKeepWarmReservation | undefined
+    let sends = 0
+    const f = plannedFixture({
+      onTargetChanged: (entry) => {
+        if (target) store.changed(entry, veto === 'not-owner')
+        target = entry
+      },
+      reserveWarm: async (entry) => {
+        const reservation = store.reserveWarm(entry)
+        if (veto === 'ownership-unverified') {
+          reserving.resolve()
+          saveUsage()
+        }
+        outcome = await reservation
+        return outcome
+      },
+      settleWarm: (entry) => store.reserveWarm(entry),
+    })
+    function saveUsage() {
+      expect(target.policyState?.warmsSinceLastRealRequest).toBe(24)
+      expect(target.policyState?.pendingWarmCost).toBeGreaterThan(0)
+      f.manager.recordAcceptedUsage(target.id, target.bodyText, {
+        cache_read_input_tokens: 2000,
+      })
+    }
+    let restoreAcquire: (() => void) | undefined
+    let warming: Promise<unknown> | undefined
+    try {
+      expect(f.track().tracked).toBe(true)
+      Object.assign(target.policyState!, {
+        warmsSinceLastRealRequest: 23,
+        prefixTokens: 1000,
+        inputTokens: 1000,
+      })
+      if (veto === 'not-owner') {
+        peer.changed({
+          ...target,
+          policyState: {
+            ...target.policyState!,
+            lastRealRequestAt: f.now - 1000,
+          },
+        })
+        await peer.drain()
+      }
+      store.changed(target)
+      await store.drain()
+      expect(store.isCommitted(target.id)).toBe(veto === 'ownership-unverified')
+      if (veto === 'not-owner') {
+        const acquire = CacheKeepClaim.prototype.acquire
+        // The first claim check must see the peer; the usage update queues
+        // another acquisition that can succeed once the peer releases.
+        const acquiring = spyOn(
+          CacheKeepClaim.prototype,
+          'acquire',
+        ).mockImplementationOnce(async function (
+          this: CacheKeepClaim,
+          ...args
+        ) {
+          const owned = await acquire.apply(this, args)
+          reserving.resolve()
+          await resume.promise
+          return owned
+        })
+        restoreAcquire = () => acquiring.mockRestore()
+      }
+      f.advance(150_000)
+      const { signal } = new AbortController()
+      warming = f.manager
+        .reserveWarmDispatch(target, async () => sends++, signal)
+        .catch((error: unknown) => error)
+      if (veto === 'not-owner') {
+        await Promise.race([reserving.promise, warming])
+        saveUsage()
+        f.manager.stop()
+        await peer.releaseClaims(() => true)
+        resume.resolve()
+      }
+      expect(isCacheKeepWarmWait(await warming)).toBe(true)
+      // A caller can stop after the store refuses the reservation, before a tick republishes its state.
+      f.manager.stop()
+      expect(outcome).toBe(veto)
+      expect(sends).toBe(0)
+      expect(target.policyState?.warmsSinceLastRealRequest).toBe(23)
+      await store.drain()
+      const [file] = (await readdir(store.directory)).filter((name) =>
+        name.endsWith('.json.gz'),
+      )
+      const saved = JSON.parse(
+        gunzipSync(await readFile(join(store.directory, file!))).toString(),
+      ).policyState
+      expect(saved).toMatchObject({
+        warmsSinceLastRealRequest: 23,
+        prefixTokens: 2000,
+      })
+      expect(saved.pendingWarmCost).toBeUndefined()
+    } finally {
+      resume.resolve()
+      await warming
+      restoreAcquire?.()
+      await store.drain()
+      await store.releaseClaims(() => true)
+      await peer.releaseClaims(() => true)
+      await rm(root, { recursive: true, force: true })
+    }
+  },
+)
 
 test('accepted JSON body and known usage persist together while duplicate observations stay quiet', () => {
   const states: Array<{ prefixTokens?: number; inputTokens?: number }> = []

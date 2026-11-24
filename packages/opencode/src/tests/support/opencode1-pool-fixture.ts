@@ -953,10 +953,6 @@ export async function useUnmigratedAccountFile(
     root,
     'cachekeep-registry',
   )
-  process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = join(
-    root,
-    'quota-header-feed',
-  )
   process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = join(root, 'rpc')
   await writeLegacyAccountFiles(
     process.env.OPENCODE_ANTHROPIC_AUTH_FILE,

@@ -21,7 +21,6 @@ export const explicitLegacySettings = {
     failClosedOnUnknownQuota: false,
     showToasts: true,
   },
-  quotaHeaderFeed: { enabled: true },
   killswitch: {
     enabled: true,
     main: { five_hour: 21, seven_day: 22, scoped: 23 },

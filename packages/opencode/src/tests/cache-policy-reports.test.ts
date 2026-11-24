@@ -339,26 +339,9 @@ describe('OC1 final response cache reports', () => {
         ])
         expect(reports[0]!.at as number).toBeGreaterThanOrEqual(before)
         expect(reports[0]!.at as number).toBeLessThanOrEqual(Date.now())
-        expect(usage).toHaveBeenCalledWith(
-          'ses_oc1_reports',
-          expect.any(String),
-          {
-            cache_read_input_tokens: 9,
-            cache_creation_input_tokens: 5,
-            input_tokens: 10_000,
-          },
-        )
-        if (ttl === 'short')
-          expect(usage).toHaveBeenCalledWith(
-            'ses_oc1_reports',
-            expect.any(String),
-            {
-              cache_read_input_tokens: 9,
-              cache_creation_input_tokens: 6,
-              input_tokens: 10_000,
-              output_tokens: 1,
-            },
-          )
+        // Cache touches are reported even when the keeper is off; usage is
+        // delivered to CacheKeep only to price an accepted warm target.
+        expect(usage).toHaveBeenCalledTimes(0)
       },
     )
     oc1Test.each(['unmarked', 'ttl-child'] as const)(

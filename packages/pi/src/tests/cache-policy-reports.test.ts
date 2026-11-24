@@ -366,11 +366,20 @@ test('Pi unmarked no-policy response retains its legacy hold and keeper lifetime
   ) as unknown as typeof fetch
   const originalTrack = CacheKeepManager.prototype.track
   let kept: ReturnType<CacheKeepManager['trackedRequest']>
+  // Tracking runs detached after the reply, once this process has confirmed it
+  // owns the session's saved keep-warm record (its claim file), so wait for
+  // the call itself.
+  let markTracked!: () => void
+  const tracked = new Promise<void>((resolve) => {
+    markTracked = resolve
+  })
   const track = spyOn(CacheKeepManager.prototype, 'track').mockImplementation(
     function (this: CacheKeepManager, input) {
       const result = originalTrack.call(this, input)
-      if (input.sessionId === 'ses_pi_reports')
+      if (input.sessionId === 'ses_pi_reports') {
         kept = this.trackedRequest(input.sessionId)
+        markTracked()
+      }
       return result
     },
   )
@@ -390,6 +399,7 @@ test('Pi unmarked no-policy response retains its legacy hold and keeper lifetime
     },
   }).result()
   expect(result.errorMessage).toBeUndefined()
+  await tracked
   await detached()
   expect(reports).toEqual([
     {

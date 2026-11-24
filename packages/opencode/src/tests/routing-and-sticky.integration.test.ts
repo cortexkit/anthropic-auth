@@ -19,7 +19,7 @@ import {
   withNativeAdmission as withNativeAdmissionWithCtx,
   withNativeBootstrap as withNativeBootstrapWithCtx,
 } from './support/opencode1-pool-fixture.ts'
-import { expectUnknownQuotaAdmissionBlocked as expectUnknownQuotaAdmissionBlockedWithCtx } from './support/opencode1-quota-feed.ts'
+import { expectUnknownQuotaAdmissionBlocked as expectUnknownQuotaAdmissionBlockedWithCtx } from './support/opencode1-quota.ts'
 import {
   readAccountStorage as readAccountStorageWithCtx,
   waitForSidebarState as waitForSidebarStateWithCtx,

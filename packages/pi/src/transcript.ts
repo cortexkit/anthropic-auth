@@ -142,3 +142,93 @@ export function collapseSystemMessages(transcript: Transcript): Transcript {
   )
   return { messages: head ? [head, ...messages] : messages }
 }
+
+const CHARS_PER_TOKEN = 3.5
+const IMAGE_CHARS = 4_800
+
+function jsonLength(value: unknown): number {
+  try {
+    return (JSON.stringify(value) ?? 'undefined').length
+  } catch {
+    return '[unserializable]'.length
+  }
+}
+
+function estimateMessageTokens(message: Message): number {
+  const tokens = (chars: number) => Math.ceil(chars / CHARS_PER_TOKEN)
+  if (message.role === 'system') {
+    return (
+      tokens(systemMessageText(message).length) +
+      (message.toolsAdded?.length
+        ? tokens(jsonLength(message.toolsAdded))
+        : 0) +
+      (message.toolsRemoved?.length
+        ? tokens(jsonLength(message.toolsRemoved))
+        : 0)
+    )
+  }
+  if (typeof message.content === 'string') return tokens(message.content.length)
+  let chars = 0
+  for (const block of message.content) {
+    if (block.type === 'text') chars += block.text.length
+    else if (block.type === 'image') chars += IMAGE_CHARS
+    else if (block.type === 'thinking') chars += block.thinking.length
+    else if (block.type === 'toolCall')
+      chars += block.name.length + jsonLength(block.arguments)
+  }
+  return tokens(chars)
+}
+
+function estimateContextTokens(messages: readonly Message[]): number {
+  let latestTimestamp = Number.NEGATIVE_INFINITY
+  let tokens = 0
+  let trailingStart = 0
+  for (const [index, message] of messages.entries()) {
+    const timestamp = message.timestamp ?? Number.NEGATIVE_INFINITY
+    if (
+      message.role === 'assistant' &&
+      timestamp >= latestTimestamp &&
+      message.stopReason !== 'error' &&
+      message.stopReason !== 'aborted' &&
+      message.usage
+    ) {
+      const { totalTokens, input, output, cacheRead, cacheWrite } =
+        message.usage
+      const usageTokens = totalTokens || input + output + cacheRead + cacheWrite
+      if (usageTokens > 0) {
+        tokens = usageTokens
+        trailingStart = index + 1
+      }
+    }
+    // An inserted prefix, such as a compaction summary, can be newer than the
+    // replies after it. Those replies' usage cannot describe the new prefix.
+    latestTimestamp = Math.max(latestTimestamp, timestamp)
+  }
+  for (const message of messages.slice(trailingStart)) {
+    tokens += estimateMessageTokens(message)
+  }
+  return tokens
+}
+
+/**
+ * Match pi-ai 1.5.2's `api/simple-options.js` clamp and `utils/estimate.js`
+ * accounting without importing runtime helpers that Pi host shims may lack.
+ */
+export function clampPiMaxTokensToContext(
+  messages: readonly Message[],
+  contextWindow: number | undefined,
+  maxTokens: number,
+): number {
+  if (!contextWindow || contextWindow < 0) return Math.max(1, maxTokens)
+  const input = estimateContextTokens(messages)
+  const fixedMargin = 4_096
+  const minimumWithRatioMargin = 32_768
+  let room =
+    contextWindow - input - Math.max(fixedMargin, Math.ceil(input * 0.15))
+  // Near a full window, keep the fixed reserve but give up the percentage
+  // margin so the reply still has room before compaction.
+  if (room < minimumWithRatioMargin) {
+    room = Math.min(minimumWithRatioMargin, contextWindow - input - fixedMargin)
+  }
+  return Math.min(maxTokens, Math.max(1, room))
+}

@@ -4,11 +4,12 @@ Prompt caching, cache keepalive and quota-window priming do different jobs. Enab
 
 ## Cache modes
 
-Use `/claude` → **Cache** to enable caching and choose `claudeCache.mode`:
+OpenCode 1, OpenCode 2 and Pi use the five-minute prompt cache by default. Use
+`/claude` → **Cache** to enable one-hour caching and choose `claudeCache.mode`:
 
 - `explicit`: use explicit prompt-cache placement.
 - `automatic`: use automatic cache behavior.
-- `hybrid`: combine placement strategies; CacheKeep tracks hybrid-cache sessions.
+- `hybrid`: combine placement strategies and let CacheKeep keep recently used sessions warm. After the fixed prompt prefix, OpenCode 1, OpenCode 2 and Pi move the system cache marker to the previous user or tool-result boundary when the latest boundary cannot reach it within Anthropic's 20-block cache lookback.
 
 Cache settings do not reduce the complete input that Anthropic receives through a relay. A relay can send smaller patches between your machine and its Worker, but Anthropic still receives the reconstructed full request. Cache hits, not those smaller uploads, determine server-side cache benefits.
 
@@ -18,7 +19,7 @@ CacheKeep keeps recently used hybrid-cache sessions warm while their host proces
 
 About five minutes before a one-hour cache lifetime expires, CacheKeep sends a `max_tokens: 0` prewarm using the selected account. Checks are scheduled for the earliest target's due time, with a one-minute interval as a backstop. Due prewarms run one at a time, earliest safe-start deadline first. Failure preserves the known expiry and can schedule a bounded retry while the cache may still be alive. A [documented session registry](cachekeep-registry.md#cachekeep-session-registry) in the CortexKit data folder aggregates session/cache timing across processes without publishing request bodies, headers or tokens. Stopped sessions retain metadata until cache expiry; missing or stale leases mean unknown, not expired. Closing the host stops that process's keepalive work.
 
-OpenCode 2 and Pi privately save accepted keep-warm targets across restarts. A restarted Pi head resumes warming its own session at session startup, even while idle and before any new request; a per-session process claim prevents duplicate warming. Only still-live caches on the same eligible login are restored. See the [private restart store](cachekeep-registry.md#location-and-permissions) for storage locations and ownership rules.
+OpenCode 1, OpenCode 2 and Pi privately save accepted keep-warm targets across restarts. OpenCode restores eligible idle sessions when its server starts, without warming them twice when multiple projects are open. A restarted Pi process resumes warming its own session at startup, even before a new request; a per-session claim prevents duplicate warming. Only still-live caches on the same eligible login are restored. See the [private restart store](cachekeep-registry.md#location-and-permissions) for storage locations and ownership rules.
 
 ### Per-session runner policy
 
@@ -47,9 +48,9 @@ When content-filter recovery switches a session to Opus 4.8 temporarily, the ori
 
 ## Prime and lane start
 
-Prime is opt-in quota-window priming. The **Extras** group in OpenCode and Pi can enable or disable it and shows each account's next due time and last result. After a confirmed five-hour reset, Prime checks fresh quota and limits, then approximately one minute after reset can send a minimal `claude-haiku-4-5` request. Cross-process claims prevent duplicate priming for the same verified Claude account/reset, even when OpenCode and Pi (or two OpenCode installs) use separate account files. Accounts without a verified identity are deduplicated only within the same account storage. This is a real request, not a quota API trick or a guarantee of free usage. Prime is stateless: it creates neither a message thread nor a keep-warm target, and stops when the host shuts down.
+Prime is opt-in quota-window priming. The **Extras** group in OpenCode and Pi can enable or disable it and shows each account's next due time and last result. In OpenCode 1 and 2, Prime runs without waiting for a chat request and picks up changes to `prime_enabled` in the shared settings file without a restart. After a confirmed five-hour reset, Prime checks fresh quota and limits, then approximately one minute after reset can send a minimal `claude-haiku-4-5` request. Cross-process claims prevent duplicate priming for the same verified Claude account/reset, even when OpenCode and Pi (or two OpenCode installs) use separate account files. Accounts without a verified identity are deduplicated only within the same account storage. This is a real request, not a quota API trick or a guarantee of free usage. Prime does not create a message thread or register a cache for keepalive. It stops when the host shuts down.
 
-OpenCode's **Fire lane start** is an explicit one-shot action. It inserts a visible synthetic lane-start marker and runs a one-token request through normal routing, custody, limits, cache shaping and transport. It is also billed usage; it neither enables Prime nor installs an automatic schedule. Pi does not expose lane start.
+In OpenCode and Pi, **Fire lane start** is an explicit one-shot action. It inserts a visible synthetic lane-start marker in the conversation and runs a one-token request through normal routing, custody, limits, cache shaping and transport. This warms the session's prompt cache for the next turn and counts as billed usage. It neither enables Prime nor installs an automatic schedule.
 
 ## Diagnostics and history analysis
 

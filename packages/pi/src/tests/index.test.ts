@@ -1258,11 +1258,27 @@ test('audit downstream refusal: Pi revokes a response aborted after raw EOF', as
 })
 
 test('audit hot path: Pi retains an unsigned full template and signs only the sent shape', async () => {
-  const track = spyOn(CacheKeepManager.prototype, 'track')
+  // Tracking runs detached after the reply, once the session's keep-warm
+  // claim is confirmed for this real turn, so wait for the call itself.
+  let sessionId: string | undefined
+  let markTracked!: () => void
+  const tracked = new Promise<void>((resolve) => {
+    markTracked = resolve
+  })
+  const original = CacheKeepManager.prototype.track
+  const track = spyOn(CacheKeepManager.prototype, 'track').mockImplementation(
+    function (this: CacheKeepManager, ...args: Parameters<typeof original>) {
+      const result = original.apply(this, args)
+      if (args[0].sessionId === sessionId) markTracked()
+      return result
+    },
+  )
   try {
     const h = await auditPiPrimaryHarness('sign-once')
+    sessionId = h.options.sessionId
     await h.start()
     await h.send(h.context)
+    await tracked
     const template =
       track.mock.calls.findLast(
         ([request]) => request.sessionId === h.options.sessionId,

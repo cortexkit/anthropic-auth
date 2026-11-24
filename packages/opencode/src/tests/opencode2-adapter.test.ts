@@ -93,6 +93,7 @@ type Data = NativeAnthropicAttemptData<Provenance>
 const ENV_KEYS = [
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_CUSTOM_HEADERS',
+  'ANTHROPIC_INSECURE',
   'ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
@@ -494,6 +495,244 @@ function hostRequest(
 
 const sse = (event: string, data: unknown) =>
   `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+
+function cacheDiagnosticsHost() {
+  const wire = createNativeWirePolicy()
+  const { source } = makeSource({
+    requestOptions: (input) =>
+      wire.requestOptions(input, {
+        policyStorage: {},
+      } as core.NativeAccountSnapshot),
+    responseOptions: wire.responseOptions,
+    forgetSession: wire.forgetSession,
+  })
+  const native = createNativeAnthropicAdapter({ source })
+  return { native, host: new Host(native.adapter) }
+}
+
+const diagnosticsMessage = (id: string) => ({
+  id,
+  type: 'message',
+  model: 'claude-sonnet-5',
+  content: [{ type: 'text', text: 'Do not include this reply in diagnostics' }],
+  usage: {
+    input_tokens: 20,
+    cache_read_input_tokens: 4,
+    cache_creation_input_tokens: 8,
+    cache_creation: {
+      ephemeral_5m_input_tokens: 8,
+      ephemeral_1h_input_tokens: 0,
+    },
+  },
+  diagnostics: null,
+})
+
+test('OpenCode 2 delivers the reply and captures its ID even while the diagnostics hash is pending', async () => {
+  const { native, host } = cacheDiagnosticsHost()
+  const hash = core.getCacheDiagnosticsBetas
+  const pending = Promise.withResolvers<void>()
+  const hashSpy = spyOn(core, 'getCacheDiagnosticsBetas').mockImplementation(
+    async (headers) => {
+      await pending.promise
+      return hash(headers)
+    },
+  )
+  const debug = spyOn(core.logger, 'debug').mockImplementation(() => {})
+  const send = () =>
+    host.run(scopeOf(), hostRequest({ ...sonnetPayload(), stream: false }))
+  let reading: Promise<unknown> | undefined
+  try {
+    const { attempt, final } = await send()
+    expect(hashSpy).toHaveBeenCalledTimes(1)
+    let delivered: unknown
+    reading = Promise.resolve(
+      native.adapter.rewriteResponse?.({
+        ...attempt,
+        attempt,
+        request: final,
+        response: Response.json(diagnosticsMessage('msg_pending_hash')),
+      }),
+    )
+      .then((response) => response?.json())
+      .then((message) => (delivered = message))
+    await until(() => delivered !== undefined)
+    expect(delivered).toHaveProperty('id', 'msg_pending_hash')
+    expect((await bodyOf((await send()).final)).diagnostics).toEqual({
+      previous_message_id: 'msg_pending_hash',
+    })
+    const logged = () =>
+      debug.mock.calls.some(
+        ([channel, line]) =>
+          channel === 'cache-diagnostics' &&
+          line.startsWith('MC-CACHE-DIAG ') &&
+          line.includes('"message_id":"msg_pending_hash"'),
+      )
+    expect(logged()).toBe(false)
+    pending.resolve()
+    await until(logged)
+  } finally {
+    pending.resolve()
+    await reading
+    hashSpy.mockRestore()
+    debug.mockRestore()
+    native.dispose()
+  }
+})
+
+test('OpenCode 2 links the next request to a reply without detailed cache usage', async () => {
+  const { native, host } = cacheDiagnosticsHost()
+  const send = () =>
+    host.run(scopeOf(), hostRequest({ ...sonnetPayload(), stream: true }))
+  const debug = spyOn(core.logger, 'debug').mockImplementation(() => {})
+  try {
+    const { attempt, final } = await send()
+    const message = diagnosticsMessage('msg_without_breakdown')
+    const { cache_creation: _omitted, ...usage } = message.usage
+    await (
+      await native.adapter.rewriteResponse?.({
+        ...attempt,
+        attempt,
+        request: final,
+        response: new Response(
+          sse('message_start', {
+            type: 'message_start',
+            message: { ...message, usage },
+          }) + sse('message_stop', { type: 'message_stop' }),
+        ),
+      })
+    )?.text()
+    expect((await bodyOf((await send()).final)).diagnostics).toEqual({
+      previous_message_id: 'msg_without_breakdown',
+    })
+    expect(
+      debug.mock.calls.some(([, line]) => line.startsWith('MC-CACHE-DIAG ')),
+    ).toBe(false)
+  } finally {
+    debug.mockRestore()
+    native.dispose()
+  }
+})
+
+test('OpenCode 2 sends null first, then the previous Claude response ID in cache diagnostics', async () => {
+  const { native, host } = cacheDiagnosticsHost()
+  const scope = scopeOf({ sessionID: 'ses_diagnostics_chain' })
+  const send = (stream: boolean) =>
+    host.run(scope, hostRequest({ ...sonnetPayload(), stream }))
+  const observe = async (
+    { attempt, final }: Awaited<ReturnType<typeof send>>,
+    response: Response,
+  ) => {
+    await (
+      await native.adapter.rewriteResponse?.({
+        ...attempt,
+        attempt,
+        request: final,
+        response,
+      })
+    )?.text()
+  }
+  try {
+    const first = await send(true)
+    expect(first.final.headers.get('anthropic-beta')?.split(',')).toContain(
+      'cache-diagnosis-2026-04-07',
+    )
+    expect((await bodyOf(first.final)).diagnostics).toEqual({
+      previous_message_id: null,
+    })
+    await observe(
+      first,
+      new Response(
+        sse('message_start', {
+          type: 'message_start',
+          message: diagnosticsMessage('msg_sse'),
+        }) + sse('message_stop', { type: 'message_stop' }),
+      ),
+    )
+    const second = await send(false)
+    expect((await bodyOf(second.final)).diagnostics).toEqual({
+      previous_message_id: 'msg_sse',
+    })
+    await observe(second, Response.json(diagnosticsMessage('msg_json')))
+    const third = await send(true)
+    expect((await bodyOf(third.final)).diagnostics).toEqual({
+      previous_message_id: 'msg_json',
+    })
+    native.forgetSession(scope.sessionID)
+    expect((await bodyOf((await send(true)).final)).diagnostics).toEqual({
+      previous_message_id: null,
+    })
+  } finally {
+    native.dispose()
+  }
+})
+
+test('OpenCode 2 logs cache diagnostics at debug level and one beta list per sent hash', async () => {
+  const { native, host } = cacheDiagnosticsHost()
+  const debug = spyOn(core.logger, 'debug').mockImplementation(() => {})
+  const scope = scopeOf({ sessionID: 'ses_diagnostics_logs' })
+  try {
+    let expectedBetas: string[] = []
+    for (const id of ['msg_first', 'msg_second']) {
+      const { attempt, final } = await host.run(
+        scope,
+        hostRequest({ ...sonnetPayload(), stream: false }),
+      )
+      const sentBetas = final.headers.get('anthropic-beta')?.split(',').sort()
+      if (!sentBetas) throw new Error('Missing sent betas')
+      if (id === 'msg_first') expectedBetas = sentBetas
+      else expect(sentBetas).toEqual(expectedBetas)
+      await (
+        await native.adapter.rewriteResponse?.({
+          ...attempt,
+          attempt,
+          request: final,
+          response: Response.json(diagnosticsMessage(id)),
+        })
+      )?.text()
+    }
+    const lines = debug.mock.calls
+      .filter(([channel]) => channel === 'cache-diagnostics')
+      .map(([, message]) => message)
+    const prefix = 'MC-CACHE-DIAG '
+    const betaPrefix = 'MC-CACHE-DIAG-BETAS '
+    const records = lines
+      .filter((line) => line.startsWith(prefix))
+      .map((line) => JSON.parse(line.slice(prefix.length)))
+    const hash = Bun.hash
+      .xxHash64(expectedBetas.join(','))
+      .toString(16)
+      .padStart(16, '0')
+    expect(records).toEqual(
+      ['msg_first', 'msg_second'].map((id, index) => ({
+        v: 2,
+        source: 'turn',
+        account_id: 'acct-local',
+        synthetic: false,
+        betas_hash: hash,
+        session_id: scope.sessionID,
+        ts_ms_received: expect.any(Number),
+        model: scope.modelID,
+        is_subagent: false,
+        // When no cache lifetime is configured, OpenCode 2 now sends five minutes.
+        ttl_sent: '5m',
+        cache_read: 4,
+        cache_creation: 8,
+        input_tokens: 20,
+        ephemeral_5m_tokens: 8,
+        ephemeral_1h_tokens: 0,
+        message_id: id,
+        previous_message_id: index === 0 ? null : 'msg_first',
+        diag_state: 'server_null',
+      })),
+    )
+    expect(lines.filter((line) => line.startsWith(betaPrefix))).toEqual([
+      `${betaPrefix}${JSON.stringify({ hash, betas: expectedBetas })}`,
+    ])
+  } finally {
+    debug.mockRestore()
+    native.dispose()
+  }
+})
 
 const PREFIXED_STREAM = [
   sse('message_start', {
@@ -1244,6 +1483,36 @@ describe('OpenCode 2 native Anthropic adapter: request shape', () => {
       }
     },
   )
+
+  test('OpenCode 2 applies custom proxy headers to API keys but not Claude sign-in', async () => {
+    const { source } = makeSource({
+      authorize: (scope) =>
+        scope.sessionID === 'ses_paid'
+          ? apiKey('sk-ant-api03-row-key', { custody: 'api', receipt: 'api' })
+          : oauth('sk-ant-oat01-local-token', {
+              custody: 'local',
+              receipt: 'local',
+            }),
+    })
+    const native = createNativeAnthropicAdapter({ source })
+    const host = new Host(native.adapter)
+    const previous = process.env.ANTHROPIC_CUSTOM_HEADERS
+    try {
+      process.env.ANTHROPIC_CUSTOM_HEADERS = 'x-proxy-metadata: configured'
+      const paid = await host.run(
+        scopeOf({ sessionID: 'ses_paid' }),
+        hostRequest(sonnetPayload()),
+      )
+      const signedIn = await host.run(scopeOf(), hostRequest(sonnetPayload()))
+      expect(paid.final.headers.get('x-proxy-metadata')).toBe('configured')
+      expect(signedIn.final.headers.get('x-proxy-metadata')).toBeNull()
+      expect(signedIn.final.headers.get('x-host-trace')).toBe('trace-7')
+    } finally {
+      if (previous === undefined) delete process.env.ANTHROPIC_CUSTOM_HEADERS
+      else process.env.ANTHROPIC_CUSTOM_HEADERS = previous
+      native.dispose()
+    }
+  })
 
   test('API route gains no OAuth persona, prefix, betas or signature', async () => {
     const { source, seen } = makeSource({
@@ -3372,12 +3641,15 @@ describe.each(['direct', 'http'] as const)(
     ])(
       '%s recovery sends at most one full create with the same request id',
       async (code) => {
+        process.env.ANTHROPIC_INSECURE = '1'
         const { source } = makeSource({ authorize })
         const resent: Request[] = []
+        const tls: (Bun.TLSOptions | undefined)[] = []
         const native = createNativeAnthropicAdapter({
           source,
           fetch: Object.assign(
             async (url: string | URL | Request, init?: RequestInit) => {
+              tls.push((init as RequestInit & { tls?: Bun.TLSOptions })?.tls)
               resent.push(
                 url instanceof Request
                   ? new Request(url, init)
@@ -3459,6 +3731,12 @@ describe.each(['direct', 'http'] as const)(
         await response?.text()
         expect(resent).toHaveLength(code === 'unrelated' ? 0 : 1)
         if (resent[0]) {
+          if (transport === 'direct') {
+            expect(resent[0].headers.get('authorization')).toBe(
+              'Bearer stable-thread-token',
+            )
+            expect(tls[0]?.rejectUnauthorized ?? true).toBe(true)
+          }
           const text = await resent[0].text()
           const secondText = await second.final.clone().text()
           expect(

@@ -6,6 +6,7 @@ import {
   createAnthropicOAuthFetch,
   createClaudeModelFetch,
   logger,
+  type RequestGzipLatch,
   requireAnthropicOAuthOrigin,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -147,6 +148,11 @@ export const fetchOAuth: typeof fetch = createAnthropicOAuthFetch(originOptions)
  */
 export function fetchOAuthModel(
   gateway: ClaudeGateway | undefined | (() => ClaudeGateway | undefined),
+  requestGzipLatch?: RequestGzipLatch,
 ): typeof fetch {
-  return createClaudeModelFetch({ origin: () => originOptions(), gateway })
+  return createClaudeModelFetch({
+    origin: () => originOptions(),
+    gateway,
+    requestGzipLatch,
+  })
 }

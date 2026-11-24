@@ -933,7 +933,7 @@ describe('OpenCode 2 published installation contract', () => {
     expect(new Set(hooks.disposed).size).toBe(hooks.disposed.length)
   })
 
-  test('partial installation failure disposes every already-registered hook', async () => {
+  test('partial installation failure disposes every already-registered hook exactly once', async () => {
     const hooks = new Hooks()
     hooks.failAt = 'http.response'
     await expect(

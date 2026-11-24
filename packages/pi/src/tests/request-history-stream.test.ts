@@ -3,17 +3,13 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TRAILING_ASSISTANT_HISTORY_MESSAGE } from '@cortexkit/anthropic-auth-core'
-import type {
-  Api,
-  AssistantMessage,
-  Context,
-  Model,
-} from '@earendil-works/pi-ai'
+import type { AssistantMessage, Context, Model } from '@earendil-works/pi-ai'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import {
   __sendPiAnthropicRequestForTest,
   streamCortexKitAnthropic,
 } from '../stream.ts'
+import { captureNativeAnthropicCacheRequest } from './native-anthropic-cache.ts'
 import { saveNativePiFixture } from './native-fixture.ts'
 
 const originalFetch = globalThis.fetch
@@ -36,7 +32,7 @@ async function cleanupFixture() {
 
 afterEach(cleanupFixture)
 
-const model: Model<Api> = {
+const model: Model<'anthropic-messages'> = {
   id: 'claude-opus-5-5',
   name: 'Opus',
   provider: 'anthropic',
@@ -237,7 +233,17 @@ test('Pi model-switch stream omits old thinking and keeps the effort change betw
   ])
 })
 
-test('Pi API-key requests never use message threads', async () => {
+test.each(['short', 'long'] as const)(
+  'Pi API-key requests preserve the host prompt and tools without Claude Code shaping (%s)',
+  expectPaidRequest,
+)
+
+async function expectPaidRequest(cacheRetention: 'short' | 'long') {
+  const previous = {
+    ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: process.env.ANTHROPIC_DEFAULT_OPUS_MODEL,
+    ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL,
+  }
   directory = await mkdtemp(join(tmpdir(), 'pi-api-thread-exclusion-'))
   const storagePath = join(directory, 'accounts.json')
   currentStoragePath = storagePath
@@ -250,7 +256,7 @@ test('Pi API-key requests never use message threads', async () => {
           id: 'api-thread',
           type: 'api',
           apiKey: 'synthetic-api-thread-key',
-          baseURL: 'https://paid.invalid',
+          baseURL: 'https://paid.invalid/proxy/v2',
         },
       ],
     },
@@ -263,44 +269,133 @@ test('Pi API-key requests never use message threads', async () => {
       (account) => account.id === 'api-thread',
     )
     if (!apiAccount) throw new Error('Missing API account fixture')
+    process.env.ANTHROPIC_BASE_URL = 'https://unused-paid.invalid'
+    // The Opus alias is itself a Claude ID, so remapping it a second time
+    // would match the generic override and lose the Opus-specific choice.
+    process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'claude-paid-opus-alias'
+    process.env.ANTHROPIC_MODEL = 'paid-generic-alias'
     let sent: RequestInit | undefined
-    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+    let url: string | undefined
+    const fetchImpl = (async (input: unknown, init?: RequestInit) => {
       sent = init
+      url = String(input)
       return new Response(
         'event: message_stop\ndata: {"type":"message_stop"}\n\n',
         { headers: { 'content-type': 'text/event-stream' } },
       )
     }) as typeof fetch
+    const context: Context = {
+      systemPrompt: 'Keep the Pi system prompt.',
+      messages: [
+        { role: 'user', content: 'Hello', timestamp: 0 },
+        {
+          ...assistant,
+          content: [
+            {
+              type: 'thinking',
+              thinking: '\u2060',
+              thinkingSignature:
+                'cortexkit-server-fallback-v1:claude-fable-5-1|claude-opus-5-5',
+            },
+            {
+              type: 'toolCall',
+              id: 'call_read',
+              name: 'read',
+              arguments: {},
+            },
+          ],
+          stopReason: 'toolUse',
+        },
+        {
+          role: 'toolResult',
+          toolCallId: 'call_read',
+          toolName: 'read',
+          content: [{ type: 'text', text: 'Result' }],
+          isError: false,
+          timestamp: 2,
+        },
+      ],
+      tools: [
+        {
+          name: 'read',
+          description: 'Read data',
+          parameters: { type: 'object', properties: {} },
+        },
+      ],
+    }
     await (
       await __sendPiAnthropicRequestForTest(
         {
           model,
-          context: {
-            messages: [{ role: 'user', content: 'Hello', timestamp: 0 }],
-            tools: [],
-          },
+          context,
           apiAccount,
           storagePath,
           streamOptions: {
             sessionId: 'pi-api-thread',
+            cacheRetention,
             onPayload: (payload) => ({
               ...(payload as Record<string, unknown>),
               service_tier: 'standard_only',
+              fallbacks: 'default',
             }),
           },
         },
         { fetch: fetchImpl },
       )
     ).text()
-    expect(JSON.parse(String(sent?.body)).thread).toBeUndefined()
-    expect(JSON.parse(String(sent?.body)).service_tier).toBe('standard_only')
-    expect(new Headers(sent?.headers).get('anthropic-beta')).not.toContain(
-      'message-threads-',
-    )
+    const body = JSON.parse(String(sent?.body))
+    const native = await captureNativeAnthropicCacheRequest(model, context, {
+      cacheRetention,
+    })
+    const nativeTail = native.body.messages.at(-1)?.content
+    if (!Array.isArray(nativeTail))
+      throw new Error('Expected tool result blocks')
+    expect(body.system).toEqual(native.body.system)
+    expect(body.tools).toMatchObject([
+      { name: 'read', cache_control: native.body.tools?.at(-1)?.cache_control },
+    ])
+    expect(body.messages).toEqual([
+      { role: 'user', content: 'Hello' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'call_read', name: 'read', input: {} },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'call_read',
+            content: 'Result',
+            is_error: false,
+            cache_control: nativeTail.at(-1)?.cache_control,
+          },
+        ],
+      },
+    ])
+    expect(body.model).toBe('claude-paid-opus-alias')
+    expect(body.thread).toBeUndefined()
+    expect(body.fallbacks).toBeUndefined()
+    expect(body.service_tier).toBe('standard_only')
+    expect(url).toBe('https://paid.invalid/proxy/v2/messages?beta=true')
+    const headers = new Headers(sent?.headers)
+    expect(headers.get('authorization')).toBe('Bearer synthetic-api-thread-key')
+    expect(headers.get('anthropic-beta')).not.toContain('message-threads-')
+    const retentionBetas = (headers: Headers) =>
+      (headers.get('anthropic-beta') ?? '')
+        .split(',')
+        .filter((beta) => beta.trim().startsWith('extended-cache-ttl'))
+    expect(retentionBetas(headers)).toEqual(retentionBetas(native.headers))
   } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
     await closePiNativeRuntime(storagePath)
   }
-})
+}
 
 test('Pi history fixture cleanup stops its native vault poll', async () => {
   directory = await mkdtemp(join(tmpdir(), 'pi-history-poll-cleanup-'))

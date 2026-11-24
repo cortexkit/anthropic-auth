@@ -186,6 +186,7 @@ export type NativeServingAdmission =
         | 'refresh-backoff'
         | 'invalid-grant'
         | 'validation-backoff'
+      validationRetryAt?: number
     }
 
 export interface NativeCommittedMaterial {
@@ -340,7 +341,12 @@ export type NativeRefreshResult =
       subject: NativeKnownCredentialSubject
       validation: NativeLocalCredentialValidation
     }
-  | { status: 'refused'; reason: string; persisted: boolean }
+  | {
+      status: 'refused'
+      reason: string
+      persisted: boolean
+      validationRetryAt?: number
+    }
   | {
       status: 'identity-contradicted'
       expectedIdentity: string
@@ -352,6 +358,7 @@ export type NativeRefreshResult =
       failure: NativeRefreshFailure
       persisted: boolean
       reconciliationFailed: boolean
+      validationRetryAt?: number
     }
 
 type JobResult =
@@ -667,7 +674,15 @@ export function createNativeRefreshCoordinator(
         credential.access === request.rejectedAccessToken
       )
     )
-      return refuse(admission.reason)
+      return {
+        status: 'refused',
+        reason: admission.reason,
+        persisted,
+        ...(admission.reason === 'validation-backoff' &&
+          admission.validationRetryAt !== undefined && {
+            validationRetryAt: admission.validationRetryAt,
+          }),
+      }
     if (credential.access === request.rejectedAccessToken)
       return refuse('rejected-access-unchanged')
     if (admission.status !== 'proven') return refuse('proof-missing')
@@ -1464,7 +1479,35 @@ export function createNativeRefreshCoordinator(
         reason: 'cancelled',
         persisted: result.persisted,
       }
-    if (result.status !== 'completed') return result
+    if (result.status !== 'completed') {
+      if (
+        (result.status === 'failed' && result.failure.kind === 'validation') ||
+        (result.status === 'refused' && result.reason === 'validation-backoff')
+      ) {
+        // A shared job can check a different row for the same account. Report
+        // a deadline only if it applies to this caller's own credential.
+        const { validationRetryAt: _jobDeadline, ...outcome } = result
+        try {
+          const row = await rowFor(request.binding)
+          const current = await admit(
+            request,
+            request.binding,
+            row,
+            'current',
+            result.persisted,
+          )
+          if (
+            current.status === 'refused' &&
+            current.validationRetryAt !== undefined
+          )
+            return { ...outcome, validationRetryAt: current.validationRetryAt }
+        } catch {
+          // A concurrent change or read failure cannot make this lookup succeed.
+        }
+        return outcome
+      }
+      return result
+    }
     try {
       const expected =
         request.binding.identity === undefined && result.source === 'rotated'

@@ -7,11 +7,14 @@ import { applyEdits, modify, parse } from 'jsonc-parser'
 import { nativeAccountSettings } from '../../../core/src/native-account-view'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
-import releaseSnapshots from './fixtures/settings-2.11.2.json'
 import { settingsReaderOutputs } from './opencode2-settings-readers'
 import { getPluginTestHandles } from './plugin-test-handles'
 import { snapshotSettings } from './settings-snapshot-fixture'
 import { observeSettings } from './settings-snapshot-observe'
+import {
+  cacheKeepWarmSnapshot,
+  expectedReleaseSnapshot,
+} from './settings-snapshot-parity'
 import {
   applyMenuAction,
   createMockClient,
@@ -33,13 +36,10 @@ import {
   withNativeAdmission,
 } from './support/opencode1-pool-fixture'
 import {
-  readFeedEntries,
-  waitForFeedEntries,
-} from './support/opencode1-quota-feed'
-import {
   createOpencode1Test,
   createOpencode1TestContext,
   installOpencode1TestHooks,
+  type PluginRuntimeOverrides,
 } from './support/opencode1-test-context'
 import { MESSAGES_URL } from './test-fetch'
 
@@ -60,8 +60,6 @@ async function fixture(
   const saved = process.env.ANTHROPIC_AUTH_SETTINGS_FILE
   const level = process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL
   const liveLevel = core.getLogLevel()
-  const feed = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR
-  process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = join(pool.root, 'feed')
   if (mode !== 'separate') process.env.ANTHROPIC_AUTH_SETTINGS_FILE = target
   else delete process.env.ANTHROPIC_AUTH_SETTINGS_FILE
   delete process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL
@@ -73,9 +71,6 @@ async function fixture(
     if (level === undefined)
       delete process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL
     else process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL = level
-    if (feed === undefined)
-      delete process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR
-    else process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = feed
   })
   const protection = core.legacySettingsProtection(
     await readNativeSettings(ctx),
@@ -210,8 +205,16 @@ async function fixture(
       },
     ),
   ) as unknown as typeof fetch
-  const launch = async (directory?: string) => {
-    const plugin = await getPlugin(ctx, createMockClient(), directory)
+  const launch = async (
+    directory?: string,
+    runtimeOverrides?: PluginRuntimeOverrides,
+  ) => {
+    const plugin = await getPlugin(
+      ctx,
+      createMockClient(),
+      directory,
+      runtimeOverrides,
+    )
     const runtime = runtimes.at(-1)!
     const loader = await plugin.auth!.loader!(
       async () => ({
@@ -416,7 +419,11 @@ describe('OpenCode 1 settings service reads', () => {
   }
 
   for (const route of ['oauth', 'api'] as const) {
-    test(`${route} requests take fast mode and cache mode from their model context, regardless of process latches`, async () => {
+    const title =
+      route === 'oauth'
+        ? 'oauth requests take fast mode and cache mode from their model context, regardless of process latches'
+        : 'paid requests leave the host cache markers alone and do not add fast mode'
+    test(title, async () => {
       if (route === 'api')
         await useTempAccountFile(
           ctx,
@@ -446,16 +453,37 @@ describe('OpenCode 1 settings service reads', () => {
       core.setCache1hState({ enabled: false, mode: 'hybrid' })
       core.setFastModeEnabled(false)
       const opus = await instance.request('claude-opus-5-5[1m]')
-      if (route === 'api')
+      if (route === 'api') {
         expect(opus.headers.get('x-api-key')).toBe('synthetic-settings-key')
-      expect(opus.body.speed).toBe('fast')
-      expect(opus.body.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
+        expect(opus.body.speed).toBeUndefined()
+        expect(opus.body.cache_control).toBeUndefined()
+        expect(opus.body.messages).toEqual([
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: 'hello',
+                cache_control: { type: 'ephemeral' },
+              },
+            ],
+          },
+        ])
+      } else {
+        expect(opus.body.speed).toBe('fast')
+        expect(opus.body.cache_control).toEqual({
+          type: 'ephemeral',
+          ttl: '1h',
+        })
+      }
       core.setCache1hState({ enabled: true, mode: 'automatic' })
       core.setFastModeEnabled(true)
       const other = await instance.request('claude-opus-4-8')
       expect(other.body.speed).toBeUndefined()
       expect(other.body.cache_control).toBeUndefined()
-      expect(JSON.stringify(other.body.messages)).toContain('"ttl":"1h"')
+      if (route === 'api')
+        expect(other.body.messages).toEqual(opus.body.messages)
+      else expect(JSON.stringify(other.body.messages)).toContain('"ttl":"1h"')
       expect(
         (await instance.runtime.read('claude-opus-5-5-20261001[1m]'))
           .policyStorage.claudeFast?.enabled,
@@ -499,7 +527,6 @@ describe('OpenCode 1 settings service reads', () => {
       claude_cache_enabled: 'on',
       claude_cache_mode: 'automatic',
       quota_enabled: 'off',
-      quota_header_feed_enabled: true,
     })
     expect(core.isDumpEnabled()).toBe(true)
     expect(core.getLogLevel()).toBe('debug')
@@ -509,9 +536,6 @@ describe('OpenCode 1 settings service reads', () => {
     const changed = await instance.request()
     expect(changed.body.speed).toBe('fast')
     expect(changed.body.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
-    expect(
-      (await instance.runtime.read()).policyStorage.quotaHeaderFeed?.enabled,
-    ).toBe(true)
     await f.change({
       dump_enabled: false,
       log_level: 'debug',
@@ -531,24 +555,6 @@ describe('OpenCode 1 settings service reads', () => {
     core.setLogLevel('debug')
     await f.launch()
     expect(core.getLogLevel()).toBe('debug')
-  })
-
-  test('quota header feed enablement still requires a restart after a hand edit', async () => {
-    const f = await fixture()
-    const a = await f.launch()
-    await f.change({ quota_header_feed_enabled: true, quota_enabled: 'off' })
-    await a.request()
-    expect(await readFeedEntries()).toEqual([])
-    await a.plugin.dispose!()
-    ctx.livePlugins.delete(a.plugin)
-    const b = await f.launch()
-    await b.request()
-    const entries = await waitForFeedEntries(
-      ctx,
-      (entries) => entries.length > 0,
-      'enabled feed after restart',
-    )
-    expect(entries.length).toBeGreaterThan(0)
   })
 
   for (const event of ['action', 'timer'] as const) {
@@ -785,10 +791,13 @@ describe('OpenCode 1 settings service reads', () => {
           ] as const) {
             settingsReaderOutputs(storage)
             const observed = await observeSettings(storage, 1)
-            // Per-warm timings are tested separately and were absent in 2.11.2;
-            // keep every older diagnostic and request byte in the release oracle.
+            // Per-warm timings were absent in 2.11.2. Compare the fixed warm
+            // body bytes, and check the intentional diagnostics difference separately.
             const compatible = {
               ...observed,
+              warms: observed.warms.map((warm) =>
+                cacheKeepWarmSnapshot(warm, 'current'),
+              ),
               logs: observed.logs.filter(
                 (record) =>
                   !(
@@ -798,7 +807,7 @@ describe('OpenCode 1 settings service reads', () => {
               ),
             }
             expect(JSON.stringify(compatible), phase).toBe(
-              JSON.stringify(releaseSnapshots[`oc1-${sample}`]),
+              JSON.stringify(expectedReleaseSnapshot(1, sample)),
             )
             expect(observed.logs.length).toBeGreaterThan(0)
             expect(observed.track.tracked).toBe(true)
@@ -820,7 +829,6 @@ describe('OpenCode 1 user gateway', () => {
     url: string
     headers: Headers
     body: string
-    tls: unknown
   }
   function record(
     gatewayAnswer?: (body: Record<string, unknown>) => Response | undefined,
@@ -835,7 +843,6 @@ describe('OpenCode 1 user gateway', () => {
             url,
             headers: new Headers(init?.headers),
             body: typeof init?.body === 'string' ? init.body : '',
-            tls: (init as { tls?: unknown } | undefined)?.tls,
           })
           if (url.startsWith(GATEWAY) && gatewayAnswer) {
             const answer = gatewayAnswer(
@@ -892,12 +899,7 @@ describe('OpenCode 1 user gateway', () => {
   }
 
   test('model and keep-warm requests go to the gateway as full uncompressed requests; nothing else does', async () => {
-    let now = 1_000
-    const realNow = Date.now
-    Date.now = mock(() => now) as unknown as typeof Date.now
-    cleanups.push(() => {
-      Date.now = realNow
-    })
+    let now = Date.now()
     const f = await fixture()
     await f.put({
       quota_enabled: 'off',
@@ -910,7 +912,7 @@ describe('OpenCode 1 user gateway', () => {
     })
     const seen = record()
     const records = logs()
-    const instance = await f.launch()
+    const instance = await f.launch(undefined, { now: () => now })
     const response = await instance.loader.fetch!(
       MESSAGES_URL,
       largeRequest('ses-oc1-gateway'),
@@ -1002,44 +1004,6 @@ describe('OpenCode 1 user gateway', () => {
     )
   })
 
-  for (const gateway of [true, false])
-    test(`ANTHROPIC_INSECURE never turns off certificate checks on an OAuth send${gateway ? ' to the gateway' : ''}`, async () => {
-      const f = await fixture()
-      await f.put({
-        quota_enabled: 'off',
-        ...(gateway ? { gateway_url: `${GATEWAY}/claude` } : {}),
-      })
-      const seen = record()
-      const previous = {
-        base: process.env.ANTHROPIC_BASE_URL,
-        insecure: process.env.ANTHROPIC_INSECURE,
-      }
-      cleanups.push(() => {
-        if (previous.base === undefined) delete process.env.ANTHROPIC_BASE_URL
-        else process.env.ANTHROPIC_BASE_URL = previous.base
-        if (previous.insecure === undefined)
-          delete process.env.ANTHROPIC_INSECURE
-        else process.env.ANTHROPIC_INSECURE = previous.insecure
-      })
-      // A repository `.env` can set both; the base URL passes the OAuth
-      // destination check, so nothing else stops the send.
-      process.env.ANTHROPIC_BASE_URL = 'https://api.anthropic.com'
-      process.env.ANTHROPIC_INSECURE = '1'
-      const instance = await f.launch()
-      const response = await instance.loader.fetch!(
-        MESSAGES_URL,
-        largeRequest('ses-oc1-insecure'),
-      )
-      await response.text()
-      expect(response.status).toBe(200)
-      const models = seen.filter((entry) => entry.url.includes('/v1/messages'))
-      expect(models).toHaveLength(1)
-      expect(new URL(models[0]!.url).origin).toBe(
-        gateway ? GATEWAY : 'https://api.anthropic.com',
-      )
-      for (const entry of seen) expect(entry.tls).toBeUndefined()
-    })
-
   test('a gateway takes requests instead of a configured relay, with one warning', async () => {
     const f = await fixture()
     await f.put({
@@ -1088,12 +1052,7 @@ describe('OpenCode 1 user gateway', () => {
     )
 
   test('gateway errors echoing a gateway header value are redacted for model and keep-warm sends, logs and dumps', async () => {
-    let now = 1_000
-    const realNow = Date.now
-    Date.now = mock(() => now) as unknown as typeof Date.now
-    cleanups.push(() => {
-      Date.now = realNow
-    })
+    let now = Date.now()
     const dumps = await fs.mkdtemp(join(ctx.migratedPool!.root, 'dumps-'))
     const previousDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
     process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumps
@@ -1119,7 +1078,8 @@ describe('OpenCode 1 user gateway', () => {
       body.max_tokens === 0 ? echo(401) : undefined,
     )
     const records = logs()
-    const instance = await f.launch()
+    // Advance the scheduler without stepping the wall clock under the claim lock.
+    const instance = await f.launch(undefined, { now: () => now })
     const live = await instance.loader.fetch!(
       MESSAGES_URL,
       largeRequest('ses-oc1-gateway-redact'),

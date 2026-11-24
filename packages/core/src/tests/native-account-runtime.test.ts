@@ -8,6 +8,7 @@ import { ClaudeOAuthRefreshError } from '../auth.ts'
 import {
   type ProviderAccountUuid,
   resetClaudeCodeIdentityCachesForTest,
+  resolveClaudeCodeIdentity,
 } from '../claude-code.ts'
 import { custodyTombstoneKey } from '../claustrum.ts'
 import { getHostClaustrumEnrollmentPaths } from '../claustrum-enrollment.ts'
@@ -2535,6 +2536,217 @@ test('supported OAuth successor with a failed account lookup keeps validation re
   const entry = metadata.state.accounts['imported-main']
   expect(entry?.validationRetry?.nextRetryAt).toBeGreaterThan(now)
   expect(entry?.credentialValidation).toBeUndefined()
+})
+
+test('post-refresh validation grows its retry intervals without changing the 2.16.6 record format', async () => {
+  const f = await fixture({
+    now: () => Date.now(),
+    refreshToken: undefined,
+    resolveIdentity: undefined,
+  })
+  const minute = 60_000
+  const expires = now + 240 * minute
+  let exchanges = 0
+  let lookups = 0
+  const responses = [403, 503, 429, 401, 'network', 'missing'] as const
+  const http = spyOn(globalThis, 'fetch').mockImplementation((async (
+    input: Parameters<typeof fetch>[0],
+  ) => {
+    const url = new URL(String(input))
+    if (url.href === TOKEN_URL) {
+      exchanges++
+      return Response.json({
+        access_token: `sk-ant-oat01-scheduled-validation-${exchanges}`,
+        refresh_token: `scheduled-validation-refresh-${exchanges}`,
+        expires_in: 4 * 3600,
+      })
+    }
+    if (url.pathname !== '/api/claude_cli/bootstrap')
+      throw new Error(`Unexpected provider request: ${url.pathname}`)
+    const response = responses[lookups++]
+    if (response === 'network') throw new TypeError('Synthetic network outage')
+    if (response === 'missing') return Response.json({ oauth_account: {} })
+    if (response !== undefined) return new Response(null, { status: response })
+    return Response.json({ oauth_account: { account_uuid: uuid } })
+  }) as typeof fetch)
+  deferCleanup(() => http.mockRestore())
+  const clock = spyOn(Date, 'now').mockReturnValue(now)
+  deferCleanup(() => clock.mockRestore())
+
+  let checkedAt = now
+  for (const [index, minutes] of [5, 15, 60, 60, 60, 60].entries()) {
+    clock.mockReturnValue(checkedAt)
+    const result = await f.runtime.authorizeLocal(
+      'main',
+      index === 0 ? { intent: 'refresh' } : undefined,
+    )
+    const nextRetryAt = checkedAt + minutes * minute
+    const validationRetryAt = Math.min(nextRetryAt, expires)
+    expect(result).toMatchObject({ validationRetryAt })
+    expect(result.status).not.toBe('usable')
+    const subject = await f.runtime.captureLocalSubject('main')
+    const bytes = JSON.parse(await readFile(f.paths.runtime, 'utf8'))
+    const saved = bytes.accounts['imported-main'].validationRetry
+    // Rollbacks to 2.16.6 must still open the pool. Its decoder rejects extra
+    // keys even inside the saved credential subject.
+    expect(saved).toEqual({ subject, checkedAt, nextRetryAt })
+    expect(Object.keys(saved.subject).sort()).toEqual([
+      'binding',
+      'credentialFingerprint',
+      'version',
+    ])
+    expect(Object.keys(saved.subject.binding).sort()).toEqual([
+      'credentialEpoch',
+      'identity',
+      'kind',
+      'rowId',
+      'storageId',
+    ])
+    expect(Object.keys(saved.subject.version).sort()).toEqual([
+      'accessFingerprint',
+      'expires',
+      'lastRefreshedAt',
+    ])
+    expect(bytes.accounts['imported-main'].credentialValidation).toBeUndefined()
+
+    clock.mockReturnValue(validationRetryAt - 1)
+    expect(await f.runtime.authorizeLocal('main')).toEqual({
+      status: 'refused',
+      persisted: false,
+      reason: 'validation-backoff',
+      validationRetryAt,
+    })
+    expect(lookups).toBe(index + 1)
+    expect(exchanges).toBe(1)
+    checkedAt = validationRetryAt
+  }
+  expect(checkedAt).toBe(expires)
+  clock.mockReturnValue(expires)
+  expect(await f.runtime.authorizeLocal('main')).toMatchObject({
+    status: 'usable',
+    access: 'sk-ant-oat01-scheduled-validation-2',
+  })
+  expect(exchanges).toBe(2)
+  expect(lookups).toBe(7)
+})
+
+test('an upgrade opens a saved 24-hour validation retry after five minutes and continues at fifteen', async () => {
+  let time = now
+  const f = await fixture({
+    now: () => time,
+    resolveIdentity: async () => ({
+      deviceId: 'synthetic-device',
+      sessionId: 'synthetic-session',
+    }),
+  })
+  await f.runtime.authorizeLocal('main', { intent: 'refresh' })
+  await runtimeWriter.updateNativeRuntime(
+    f.paths.runtime,
+    f.paths.storageId,
+    (state) => {
+      const entry = state.accounts['imported-main']
+      if (!entry?.validationRetry) throw new Error('Missing retry')
+      entry.validationRetry = {
+        ...entry.validationRetry,
+        nextRetryAt: now + 24 * 60 * 60_000,
+      }
+      return state
+    },
+  )
+  time = now + 5 * 60_000 - 1
+  expect(await f.runtime.authorizeLocal('main')).toMatchObject({
+    reason: 'validation-backoff',
+    validationRetryAt: time + 1,
+  })
+  time++
+  const next = await f.runtime.authorizeLocal('main')
+  expect(next).toMatchObject({
+    status: 'failed',
+    validationRetryAt: time + 15 * 60_000,
+  })
+  expect(f.counts.refresh).toBe(1)
+})
+
+test('reset clears only the target credential’s negative bootstrap cache', async () => {
+  const other = 'sk-ant-oat01-unrelated-negative-cache'
+  const successor = 'sk-ant-oat01-reset-negative-cache'
+  const f = await fixture({
+    resolveIdentity: undefined,
+    refreshToken: async () => ({
+      access: successor,
+      refresh: 'reset-negative-cache-successor',
+      expires: now + 3_600_000,
+      expiresIn: 3600,
+    }),
+  })
+  let healthy = false
+  const lookups: (string | null)[] = []
+  const http = spyOn(globalThis, 'fetch').mockImplementation((async (
+    _input: Parameters<typeof fetch>[0],
+    init?: RequestInit,
+  ) => {
+    lookups.push(new Headers(init?.headers).get('authorization'))
+    return healthy
+      ? Response.json({ oauth_account: { account_uuid: uuid } })
+      : new Response(null, { status: 403 })
+  }) as typeof fetch)
+  deferCleanup(() => http.mockRestore())
+  expect(
+    (await resolveClaudeCodeIdentity(other, undefined, undefined)).accountUuid,
+  ).toBeUndefined()
+  await f.runtime.authorizeLocal('main', { intent: 'refresh' })
+  const subject = await f.runtime.captureLocalSubject('main')
+  healthy = true
+  expect(await f.runtime.resetBackoff('main', subject, 'quota')).toBe(true)
+  expect(await f.runtime.authorizeLocal('main')).toMatchObject({
+    reason: 'validation-backoff',
+  })
+  expect(await f.runtime.resetBackoff('main', subject)).toBe(true)
+  expect(await f.runtime.authorizeLocal('main')).toMatchObject({
+    status: 'usable',
+    access: successor,
+  })
+  expect(
+    (await resolveClaudeCodeIdentity(other, undefined, undefined)).accountUuid,
+  ).toBeUndefined()
+  expect(lookups).toEqual([
+    `Bearer ${other}`,
+    `Bearer ${successor}`,
+    `Bearer ${successor}`,
+  ])
+})
+
+test('a contradictory post-refresh account UUID quarantines the login without scheduling validation', async () => {
+  const differentUuid =
+    'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' as ProviderAccountUuid
+  const f = await fixture({
+    resolveIdentity: async () => ({
+      deviceId: 'synthetic-device',
+      sessionId: 'synthetic-session',
+      accountUuid: differentUuid,
+    }),
+  })
+  expect(await f.runtime.authorizeLocal('main', { intent: 'refresh' })).toEqual(
+    {
+      status: 'identity-contradicted',
+      expectedIdentity: uuid,
+      returnedIdentity: differentUuid,
+      persisted: true,
+    },
+  )
+  const pool = await f.store.read()
+  if (pool.status !== 'ready') throw new Error('Missing pool')
+  expect(pool.rows.find((row) => row.id === 'imported-main')).toMatchObject({
+    enabled: false,
+    identity: uuid,
+  })
+  const saved = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  expect(
+    saved.status === 'ready' &&
+      saved.state.accounts['imported-main']?.validationRetry,
+  ).toBeFalsy()
+  expect((await f.runtime.authorizeLocal('main')).status).not.toBe('usable')
+  expect(f.counts.refresh).toBe(1)
 })
 
 test('poll general exhaustion requires a depleted standard window, not missing or scoped-only quota', () => {

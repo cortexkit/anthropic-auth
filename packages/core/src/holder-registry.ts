@@ -245,16 +245,15 @@ export function stateRefusalCause(
 }
 
 /**
- * The fixed message, naming no file or folder, to show for the relocation,
- * registration or layout refusal behind `error`, or undefined when there is
- * none. Hosts show it where their output may be shared; the refusal's own
- * message and the log name the files.
+ * The user-facing message for the relocation, registration or layout refusal
+ * behind `error`, or undefined when there is none. A Windows permissions
+ * refusal may name the folder whose access the user needs to change.
  */
 export function stateRefusalPublicMessage(error: unknown): string | undefined {
   const cause = stateRefusalCause(error)
   if (!cause) return undefined
   return cause instanceof StateLayoutRefusalError
-    ? stateLayoutRefusalPublicMessage(cause.code)
+    ? stateLayoutRefusalPublicMessage(cause.code, cause)
     : cause.message
 }
 

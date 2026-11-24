@@ -43,7 +43,7 @@ file are flat, lower-case snake_case, not the legacy nested camelCase names.
 | --- | --- |
 | Routing | `routing_mode`, `max_same_account_wait`, `fallback_on` |
 | Refresh | `refresh_enabled`, `refresh_interval_minutes`, `refresh_refresh_before_expiry_minutes` |
-| Quota | `quota_enabled`, `quota_check_interval_minutes`, `quota_refresh_every_n_requests`, `quota_minimum_remaining_five_hour`, `quota_minimum_remaining_seven_day`, `quota_minimum_remaining_scoped`, `quota_fail_closed_on_unknown_quota`, `quota_show_toasts`, `quota_header_feed_enabled` |
+| Quota | `quota_enabled`, `quota_check_interval_minutes`, `quota_refresh_every_n_requests`, `quota_minimum_remaining_five_hour`, `quota_minimum_remaining_seven_day`, `quota_minimum_remaining_scoped`, `quota_fail_closed_on_unknown_quota`, `quota_show_toasts` |
 | Killswitch | `killswitch_enabled`, `killswitch_default_five_hour`, `killswitch_default_seven_day`, `killswitch_default_scoped`, `killswitch_account_floors` |
 | Cache | `claude_cache_enabled`, `claude_cache_mode`, `cache_keep_enabled`, `cache_keep_always`, `cache_keep_window`, `cache_keep_subagents` |
 | Request features | `dump_enabled`, `prime_enabled`, `claude_fast_enabled`, `cost_zeroing_enabled` |
@@ -67,17 +67,17 @@ good window stays in effect. The error is logged and shown in Status.
 `claude_cache_enabled`, `quota_enabled` and
 `quota_fail_closed_on_unknown_quota` accept `"default"`, `"on"` and `"off"`,
 not booleans. `"on"` and `"off"` are explicit choices on every host.
-`"default"` (also the value when unset) preserves each reader's existing
-unset behavior; it does **not** unify the hosts. For cache and quota enablement:
+With `claude_cache_enabled` unset or set to `"default"`, OpenCode 1, OpenCode 2
+and Pi use the five-minute cache. Choose `"on"` for one-hour caching or `"off"`
+for five-minute caching. A [session cache policy](cache.md#per-session-runner-policy)
+can override individual cache settings for that session.
+
+For `quota_enabled`, `"default"` (also the value when unset) uses each reader's
+own default:
 
 | Setting | OpenCode 1 | OpenCode 2 | Pi |
 | --- | --- | --- | --- |
-| `claude_cache_enabled` | Off | On for request options | Off |
 | `quota_enabled` | Core quota policy, provider restriction and fallback polling are on; sidebar main-quota refresh and the host's main-quota routing check are off | Quota policy and polling are on | Core quota policy is on |
-
-Keep-warm treats `claude_cache_enabled: "default"` as off on every host,
-including OpenCode 2. To avoid the per-reader distinction, choose `"on"` or
-`"off"` explicitly.
 
 `log_level: "default"` defers to `OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL`, or `info`
 if it is unset. The environment variable retains startup precedence.
@@ -208,8 +208,7 @@ Through the gateway:
   requests the gateway does not take still use the relay as before, and a
   WebSocket relay still refuses them.
 - Redirects are refused, as for every sign-in request.
-- Certificates are always checked; `ANTHROPIC_INSECURE` never applies to
-  sign-in requests.
+- TLS certificates are always checked.
 - A loopback `http:` gateway is refused while `HTTP_PROXY` or `http_proxy` is
   set, because Bun would send those plain-text requests, with your sign-in
   token and gateway headers, through that proxy, and a repository's `.env`
@@ -267,9 +266,8 @@ the gateway's origin and path prefix and the header names only.
 
 ## Editing and Status
 
-Hand edits are watched and apply to later requests without a restart, except
-`quota_header_feed_enabled`, which still requires a restart. Requests use an
-in-memory snapshot and never wait for settings file I/O. Process-wide readers
+Hand edits are watched and apply to later requests without a restart. Requests
+use an in-memory snapshot and never wait for settings file I/O. Process-wide readers
 use the no-model values. Keep-warm tracks accepted session requests and uses
 the model of each tracked request for its three model-aware cache settings.
 

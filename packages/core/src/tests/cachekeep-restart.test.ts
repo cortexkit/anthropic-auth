@@ -980,6 +980,36 @@ test('disposing clears timers, status and slots without late warm reports or per
   expect(f.reports).toEqual([])
 })
 
+test('a throwing reservation skips a local hours warm until ownership can be verified', async () => {
+  let canVerify = false
+  const f = fixture(null, undefined, {
+    reserveWarm: async () => {
+      if (!canVerify) throw new Error('Could not read session ownership')
+      return true
+    },
+  })
+  const hour = new Date(f.now).getHours()
+  Object.assign(f.input.storage, {
+    cacheKeep: { enabled: true, startHour: hour, endHour: (hour + 4) % 24 },
+    claudeCache: { enabled: true, mode: 'hybrid' },
+  })
+  expect(f.track({ cacheMode: 'hybrid' }).tracked).toBe(true)
+  const target = f.targets.get(f.input.sessionId)!
+  f.advance(target.nextPrewarmAt - f.now)
+  await f.manager.tick()
+  expect(f.sends).toBe(0)
+  expect(f.manager.trackedCount()).toBe(1)
+  expect(target.consecutiveFailures).toBe(0)
+  expect(target.policyState?.warmsSinceLastRealRequest).toBe(0)
+  expect(target.policyState?.pendingWarmCost).toBeUndefined()
+
+  canVerify = true
+  f.advance(20_000)
+  await f.manager.tick()
+  expect(f.sends).toBe(1)
+  expect(target.policyState?.warmsSinceLastRealRequest).toBe(1)
+})
+
 test('unplanned deadline misses remain reportable in both lifecycle and billing state', async () => {
   const f = fixture(null)
   Object.assign(f.input.storage, {

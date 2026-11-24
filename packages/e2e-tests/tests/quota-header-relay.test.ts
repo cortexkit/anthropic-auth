@@ -2,7 +2,7 @@
 
 import { describe, expect } from 'bun:test'
 import { createNativeAccountRuntime, type NativeAccountSnapshot } from '@cortexkit/anthropic-auth-core'
-import { readFile, readdir, stat } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import { createTestLifetimeSuite } from '../../core/src/tests/test-lifetime.ts'
 import { join } from 'node:path'
 import { E2EHarness, type E2EHarnessOptions } from '../src/harness.ts'
@@ -105,28 +105,6 @@ async function waitForHeaderQuotaState(harness: E2EHarness) {
   )
 }
 
-async function readFeedFiles(harness: E2EHarness) {
-  try {
-    const names = await readdir(harness.opencode.env.quotaFeedDir)
-    return Promise.all(
-            names.filter((name) => name.endsWith('.json')).map(async (name) =>
-        readFile(join(harness.opencode.env.quotaFeedDir, name), 'utf8'),
-      ),
-    )
-  } catch {
-    return []
-  }
-}
-
-async function waitForFeed(harness: E2EHarness) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const values = await readFeedFiles(harness)
-    if (values.length === 1) return values
-    await Bun.sleep(50)
-  }
-  throw new Error('quota feed record did not appear')
-}
-
 const quotaHeaders = {
   'anthropic-ratelimit-unified-representative-claim': 'five_hour',
   'anthropic-ratelimit-unified-5h-utilization': '0.78',
@@ -138,7 +116,7 @@ const quotaHeaders = {
 
 describe('quota headers through relay', () => {
   it('harvests quota headers from a websocket relay response', async () => {
-    const harness = await createHarness({ relay: 'websocket', quotaFeed: true })
+    const harness = await createHarness({ relay: 'websocket' })
     harness.script([
       {
         type: 'text',
@@ -158,28 +136,18 @@ describe('quota headers through relay', () => {
     await assertNativeHeaderQuota(harness, state)
   }, 90_000)
 
-  it('writes one equivalent schema-v3 feed record for an HTTP relay response', async () => {
-    const harness = await createHarness({ relay: 'http', quotaFeed: true })
+  it('harvests quota headers from an HTTP relay response', async () => {
+    const harness = await createHarness({ relay: 'http' })
     harness.script([{ type: 'text', text: 'http relay response', headers: quotaHeaders }])
     const sessionId = await harness.createSession()
     await harness.sendPrompt(sessionId, 'return the http relay response')
     await harness.waitFor(() => (harness.relay?.acceptedRequests() ?? 0) >= 1)
     await assertNativeHeaderQuota(harness, await waitForHeaderQuotaState(harness))
-    const files = await waitForFeed(harness)
-    const record = JSON.parse(files[0]!)
-    expect(record.version).toBe(3)
-    expect(Object.values(record.entries)).toHaveLength(1)
-    expect(Object.values(record.entries)[0]).toEqual(
-      expect.objectContaining({ provider: 'anthropic', schema_version: 3 }),
-    )
-    expect(files[0]).not.toContain('authorization')
-    expect(files[0]).not.toContain('access-token')
   }, 90_000)
 
   it('does not publish optimistic websocket headers before response_start', async () => {
     const harness = await createHarness({
       relay: 'websocket',
-      quotaFeed: true,
       relayResponseStartDelayMs: 250,
     })
     harness.script([{ type: 'text', text: 'delayed relay response', headers: quotaHeaders }])
@@ -189,27 +157,14 @@ describe('quota headers through relay', () => {
     await harness.waitFor(() => (harness.relay?.acceptedRequests() ?? 0) >= 1)
     await Bun.sleep(50)
     // The optimistic envelope has no quota-bearing headers. Only genuine
-    // response_start headers may populate native metadata and the quota feed.
-    expect(await readFeedFiles(harness)).toHaveLength(0)
+    // response_start headers may populate native metadata.
+    expect(mainAccount(await readQuotaState(harness)).quota).toBeUndefined()
     await prompt
     await assertNativeHeaderQuota(harness, await waitForHeaderQuotaState(harness))
-    const files = await waitForFeed(harness)
-    expect(files).toHaveLength(1)
-    const record = JSON.parse(files[0]!)
-    expect(Object.values(record.entries)).toHaveLength(1)
-    expect(Object.values(record.entries)[0]).toEqual(
-      expect.objectContaining({
-        provider: 'anthropic',
-        schema_version: 3,
-        quota: expect.objectContaining({
-          five_hour: expect.objectContaining({ usedPercent: 78 }),
-        }),
-      }),
-    )
   }, 90_000)
 
   it('leaves quota state untouched when websocket relay headers have no quota data', async () => {
-    const harness = await createHarness({ relay: 'websocket', quotaFeed: true })
+    const harness = await createHarness({ relay: 'websocket' })
     harness.script([{ type: 'text', text: 'relay response without quota' }])
 
     const sessionId = await harness.createSession()

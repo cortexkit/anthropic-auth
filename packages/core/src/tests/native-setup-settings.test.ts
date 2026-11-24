@@ -375,7 +375,6 @@ test('setup writes every explicitly held moved field in schema form without stor
     quota_minimum_remaining_scoped: 0,
     quota_fail_closed_on_unknown_quota: 'on',
     quota_show_toasts: true,
-    quota_header_feed_enabled: true,
     killswitch_enabled: true,
     killswitch_default_five_hour: 9,
     killswitch_default_seven_day: 21,

@@ -1,4 +1,5 @@
 import { afterEach, expect, spyOn, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import {
   chmod,
   mkdir,
@@ -7,16 +8,21 @@ import {
   readFile,
   rename,
   rm,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { gunzipSync, gzipSync } from 'node:zlib'
 import {
   __setLogTestSink,
   ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
+  CACHE_KEEP_MAX_BODY_BYTES,
+  CACHE_KEEP_MAX_TARGETS,
   CACHE_KEEP_PREWARM_LEAD_MS,
   CACHE_KEEP_TTL_MS,
+  CacheKeepClaim,
   CacheKeepManager,
   CacheKeepSessionRegistry,
   type CacheKeepTarget,
@@ -57,9 +63,10 @@ import {
 import * as cacheKeepFactory from '../v2/cachekeep'
 import { createNativeCacheKeep } from '../v2/cachekeep'
 import {
-  type CacheKeepStore,
+  CacheKeepStore,
   cacheKeepStoreDirectory,
   legacyCacheKeepStoreDirectory,
+  type SavedCacheKeepTarget,
 } from '../v2/cachekeep-store'
 import { createNativeMenuCapabilities } from '../v2/menu'
 import { setupAnthropicAuth } from '../v2/setup'
@@ -135,9 +142,11 @@ function cacheKeepFailureTrace() {
     },
     observeStore(store: CacheKeepStore, label: string) {
       const removed = store.removed.bind(store)
-      const removal = spyOn(store, 'removed').mockImplementation((id) => {
+      const removal = spyOn(store, 'removed').mockImplementation((...args) => {
+        const [target] = args
+        const id = typeof target === 'string' ? target : target.id
         record(`${label} restart delete enqueued: ${id}`)
-        removed(id)
+        removed(...args)
       })
       const drain = store.drain.bind(store)
       const draining = spyOn(store, 'drain').mockImplementation(() =>
@@ -311,8 +320,8 @@ async function fixture(
     async () => {
       // Registry publication is queued after a scheduler pass. Join the writer
       // before the fixture's separate registry reader inspects the lease file.
-      const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-      await (globalThis as any)[key]?.get(paths.storageId)?.registry.list()
+
+      await keeperFor(paths.storageId)?.registry.list()
     },
   )
   const registryDirectory = join(directory, 'registry')
@@ -326,7 +335,11 @@ async function fixture(
       recursive: true,
       mode: 0o755,
     })
-  const start = async (enrollmentFile = 'enrollment.json') => {
+  const start = async (
+    enrollmentFile = 'enrollment.json',
+    waitForRestore = true,
+    deletedSession?: string,
+  ) => {
     const hooks = new Map<string, Array<(draft: any) => unknown>>()
     const registration = { dispose: async () => {} }
     const ctx = {
@@ -354,7 +367,15 @@ async function fixture(
         }),
       },
       command: { transform: async () => registration },
-      event: { subscribe: async function* () {} },
+      event: {
+        subscribe: async function* () {
+          if (deletedSession)
+            yield {
+              type: 'session.deleted',
+              data: { sessionID: deletedSession },
+            }
+        },
+      },
     } as unknown as Plugin.Context
     const sent: Request[] = []
     let send: (request: Request) => Promise<Response> = async () =>
@@ -404,6 +425,9 @@ async function fixture(
       },
     })
     cleanups.push(dispose)
+    if (waitForRestore) {
+      await keeperFor(paths.storageId)?.loading
+    }
     const prepare = async (
       url = 'https://api.anthropic.com/v1/messages',
       extra: Record<string, unknown> = {},
@@ -463,8 +487,8 @@ async function fixture(
       for (const callback of hooks.get('http.response') ?? [])
         await callback(answered)
       if (consume) await answered.response.text()
-      const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-      await (globalThis as any)[key]?.get(paths.storageId)?.registry.list()
+
+      await keeperFor(paths.storageId)?.registry.list()
       return answered.response
     }
     const live = async (...args: Parameters<typeof prepare>) => {
@@ -484,8 +508,25 @@ async function fixture(
       },
     }
   }
+  const original = await start()
+  const reload = async (waitForRestore = true, previous = original) => {
+    // OpenCode closes the folder's activation before running its replacement.
+    await previous.dispose()
+    // Other folders can still be using the previous module.
+    const path = '../v2/cachekeep.ts?reload'
+    const fresh: typeof cacheKeepFactory = await import(path)
+    const creating = spyOn(
+      cacheKeepFactory,
+      'createNativeCacheKeep',
+    ).mockImplementation(fresh.createNativeCacheKeep)
+    try {
+      return await start(undefined, waitForRestore)
+    } finally {
+      creating.mockRestore()
+    }
+  }
   return {
-    ...(await start()),
+    ...original,
     setQuota: (id: string, remainingPercent = 80) => {
       const window = {
         remainingPercent,
@@ -509,10 +550,12 @@ async function fixture(
     },
     /** Another plugin instance for the same account storage and clock. */
     start,
+    reload,
     paths,
     store,
     routingPath: join(directory, 'routing.json'),
     registry,
+    root: directory,
     disk: cacheKeepStoreDirectory(paths.storageId, directory),
     timers,
     now: () => now,
@@ -816,8 +859,8 @@ test('OpenCode 2 rejected oversized request ends its old target without evicting
       { system: 'b'.repeat(3 * 1024 * 1024) },
       `ses_healthy_${i}`,
     )
-  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  const manager = (globalThis as any)[key].get(f.paths.storageId).manager
+
+  const manager = keeperFor(f.paths.storageId).manager
   const before = manager.trackedRequest('ses_oc2_keep')
   const sessions = await f.registry.list()
   expect(sessions).toHaveLength(11)
@@ -854,8 +897,8 @@ test('OpenCode 2 rejected oversized request ends its old target without evicting
 test('OpenCode 2 accepts the oversized body at 2xx headers before streaming starts', async () => {
   const f = await fixture()
   await f.live()
-  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  const manager = (globalThis as any)[key].get(f.paths.storageId).manager
+
+  const manager = keeperFor(f.paths.storageId).manager
   const before = manager.trackedRequest('ses_oc2_keep')
   const draft = await f.prepare(
     undefined,
@@ -880,8 +923,8 @@ test('OpenCode 2 accepts the oversized body at 2xx headers before streaming star
 test('OpenCode 2 aborted attempt ends its old target even if late 2xx headers arrive', async () => {
   const f = await fixture()
   await f.live()
-  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  const manager = (globalThis as any)[key].get(f.paths.storageId).manager
+
+  const manager = keeperFor(f.paths.storageId).manager
   const before = manager.trackedRequest('ses_oc2_keep')
   const abort = new AbortController()
   const draft = await f.prepare(
@@ -902,8 +945,8 @@ test('an OC2 API-key real turn ends a live warmed prefix through the request bou
   f.due()
   await f.timers.fire()
   expect(f.sent).toHaveLength(1)
-  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  const owner = (globalThis as any)[key].get(f.paths.storageId)
+
+  const owner = keeperFor(f.paths.storageId)
   await f.live(undefined, {}, undefined, undefined, 'build', 'real-api-key')
   expect(owner.manager.trackedCount()).toBe(0)
   await owner.persistence.drain()
@@ -959,10 +1002,8 @@ test('OC2 skips a due warm while the real request is still choosing its account'
     release.resolve()
     await preparing
   }
-  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  expect(
-    (globalThis as any)[key].get(f.paths.storageId).manager.trackedCount(),
-  ).toBe(0)
+
+  expect(keeperFor(f.paths.storageId).manager.trackedCount()).toBe(0)
 })
 
 test('an older OC2 abort cannot unblock or replace a newer in-flight real turn', async () => {
@@ -982,8 +1023,8 @@ test('an older OC2 abort cannot unblock or replace a newer in-flight real turn',
   expect(f.sent).toHaveLength(0)
   await f.respond(newer)
   await f.respond(older)
-  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  const manager = (globalThis as any)[key].get(f.paths.storageId).manager
+
+  const manager = keeperFor(f.paths.storageId).manager
   expect(manager.trackedRequest('ses_oc2_keep')?.bodyText).toContain(
     'newer accepted turn',
   )
@@ -1564,12 +1605,14 @@ test('OC2 last-lease disposal aborts and joins a due-timer restored delay before
     expect(signal?.aborted).toBe(true)
     await tick
     expect(active.sent).toHaveLength(0)
-    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-    const owner = (globalThis as any)[key].get(f.paths.storageId)
-    expect(owner.manager.trackedCount()).toBe(1)
+
+    const owner = keeperFor(f.paths.storageId)
+    expect(owner.manager.trackedCount()).toBe(0)
     expect(
       (await readdir(f.disk)).filter((name) => name.endsWith('.json.gz')),
     ).toHaveLength(1)
+    await f.start()
+    expect(owner.manager.trackedCount()).toBe(1)
   } finally {
     release?.()
     await stopping
@@ -1601,6 +1644,107 @@ test('a later OpenCode 2 instance for the same storage keeps warming a session t
     'Bearer sk-ant-oat01-reloaded-first',
   )
 })
+
+test('OC2 hands off committed sessions but keeps an accepted body whose final write failed', async () => {
+  const f = await fixture()
+
+  const owner = keeperFor(f.paths.storageId) as {
+    manager: CacheKeepManager
+    persistence: CacheKeepStore
+  }
+  await f.live()
+  await owner.persistence.drain()
+  const [name] = await readdir(f.disk)
+  expect(name).toEndWith('.json.gz')
+  const record = join(f.disk, name!)
+  const old = await readFile(record)
+  await f.live(undefined, {
+    messages: [{ role: 'user', content: 'Latest accepted body' }],
+  })
+  await f.live(undefined, {}, 'ses_committed')
+  await rm(record)
+  await mkdir(record)
+  try {
+    await f.dispose()
+  } finally {
+    await rm(record, { recursive: true })
+    await writeFile(record, old, { mode: 0o600 })
+  }
+  expect(owner.manager.trackedSessions().map(({ id }) => id)).toEqual([
+    'ses_oc2_keep',
+  ])
+  const contender = new CacheKeepStore({
+    storageId: f.paths.storageId,
+    root: f.root,
+    sessionClaims: true,
+  })
+  const visible: string[] = []
+  await contender.load(f.now(), (entry) => {
+    visible.push(entry.id)
+    return undefined
+  })
+  expect(visible).toEqual(['ses_committed'])
+  await f.start()
+  expect(owner.manager.trackedRequest('ses_oc2_keep')?.bodyText).toContain(
+    'Latest accepted body',
+  )
+})
+
+test.each(['delete', 'turn'])(
+  'OC2 remembers a %s while adoption waits for the last claim release',
+  async (action) => {
+    const f = await fixture()
+    await f.live()
+
+    const owner = keeperFor(f.paths.storageId) as {
+      manager: CacheKeepManager
+      persistence: CacheKeepStore
+    }
+    const entered = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    const release = owner.persistence.releaseClaims.bind(owner.persistence)
+    const releasing = spyOn(
+      owner.persistence,
+      'releaseClaims',
+    ).mockImplementation(async (filter) => {
+      entered.resolve()
+      await resume.promise
+      await release(filter)
+    })
+    const create = cacheKeepFactory.createNativeCacheKeep
+    let next: ReturnType<typeof create> | undefined
+    const creating = spyOn(
+      cacheKeepFactory,
+      'createNativeCacheKeep',
+    ).mockImplementation((options) => (next = create(options)))
+    const stopping = f.dispose()
+    try {
+      await entered.promise
+      await f.start('enrollment.json', false)
+      expect(next).toBeDefined()
+      if (action === 'delete') {
+        next!.forgetSession('ses_oc2_keep')
+        next!.sessionDeleted('ses_oc2_keep')
+      } else
+        next!.beginRealTurn({
+          sessionID: 'ses_oc2_keep',
+          kind: 'primary',
+          agent: 'build',
+          providerID: 'anthropic',
+          modelID: 'claude-sonnet-4-6',
+        })
+      resume.resolve()
+      await stopping
+      await next!.ready
+      expect(owner.manager.trackedRequest('ses_oc2_keep')).toBeUndefined()
+    } finally {
+      resume.resolve()
+      await stopping
+      creating.mockRestore()
+      releasing.mockRestore()
+    }
+  },
+)
 
 test('retired OpenCode 2 hooks serve the next step through the successor with the session pin', async () => {
   const f = await fixture()
@@ -1751,6 +1895,55 @@ test('an OpenCode 2 instance that boots after the last one was disposed keeps wa
   )
 })
 
+test('OC2 dispatches the first request without waiting for restart restoration', async () => {
+  const f = await fixture()
+  await f.live(undefined, {
+    messages: [{ role: 'user', content: 'saved prefix' }],
+  })
+  await f.dispose()
+
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const load = CacheKeepStore.prototype.load
+  const scan = spyOn(CacheKeepStore.prototype, 'load').mockImplementation(
+    async function (this: CacheKeepStore, ...args) {
+      entered.resolve()
+      await release.promise
+      return load.apply(this, args)
+    },
+  )
+  const firstRequest = (async () => {
+    const next = await f.start(undefined, false)
+    await next.live(undefined, {
+      messages: [{ role: 'user', content: 'first live prefix' }],
+    })
+    return true
+  })()
+
+  const owner = keeperFor(f.paths.storageId)
+  let deadline: ReturnType<typeof setTimeout> | undefined
+  let finished = false
+  try {
+    await entered.promise
+    finished = await Promise.race([
+      firstRequest,
+      new Promise<boolean>((resolve) => {
+        deadline = setTimeout(() => resolve(false), 1500)
+      }),
+    ])
+  } finally {
+    clearTimeout(deadline)
+    release.resolve()
+    scan.mockRestore()
+    await firstRequest
+    await owner.loading
+  }
+  expect(finished).toBe(true)
+  expect(owner.manager.trackedRequest('ses_oc2_keep')?.bodyText).toContain(
+    'first live prefix',
+  )
+})
+
 test('OpenCode 2 restores a gzipped session after a server restart with the same cacheable prefix', async () => {
   const f = await fixture()
   const live = (await (
@@ -1770,12 +1963,7 @@ test('OpenCode 2 restores a gzipped session after a server restart with the same
     /authorization|x-api-key|sk-ant-oat01|refresh-first|placeholder/,
   )
   // A fresh server has no process-wide registry, even though its files survive.
-  for (const version of ['v1', 'v2']) {
-    const key = Symbol.for(
-      `cortexkit.anthropic-auth.opencode2.cachekeep.${version}`,
-    )
-    ;(globalThis as any)[key]?.delete(f.paths.storageId)
-  }
+  forgetCacheKeepProcess(f.paths.storageId)
   const next = await f.start()
   f.due()
   await f.timers.fire()
@@ -1790,9 +1978,26 @@ test('OpenCode 2 restores a gzipped session after a server restart with the same
   )
 })
 
+const CACHE_KEEP_SLOT = Symbol.for(
+  'cortexkit.anthropic-auth.opencode2.cachekeep.v3',
+)
+
+function keeperCopies(storageId: string) {
+  return (
+    (
+      (globalThis as any)[CACHE_KEEP_SLOT]?.get(storageId) as
+        | Map<symbol, any>
+        | undefined
+    )?.values() ?? []
+  )
+}
+
+function keeperFor(storageId: string) {
+  return [...keeperCopies(storageId)].at(-1)
+}
+
 function forgetCacheKeepProcess(storageId: string) {
-  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  ;(globalThis as any)[key]?.delete(storageId)
+  ;(globalThis as any)[CACHE_KEEP_SLOT]?.delete(storageId)
 }
 
 test('OC2 legacy migration removes its source after adopting a target and cannot resurrect a forgotten session', async () => {
@@ -1806,8 +2011,8 @@ test('OC2 legacy migration removes its source after adopting a target and cannot
   await rename(f.disk, legacy)
   forgetCacheKeepProcess(f.paths.storageId)
   const next = await f.start()
-  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  const owner = (globalThis as any)[key].get(f.paths.storageId)
+
+  const owner = keeperFor(f.paths.storageId)
   expect(owner.manager.trackedCount()).toBe(1)
   expect(await readdir(legacy)).toEqual([])
   owner.manager.untrack('ses_oc2_keep')
@@ -1815,9 +2020,7 @@ test('OC2 legacy migration removes its source after adopting a target and cannot
   await next.dispose()
   forgetCacheKeepProcess(f.paths.storageId)
   await f.start()
-  expect(
-    (globalThis as any)[key].get(f.paths.storageId).manager.trackedCount(),
-  ).toBe(0)
+  expect(keeperFor(f.paths.storageId).manager.trackedCount()).toBe(0)
 })
 
 test.each([0, 2])(
@@ -1837,8 +2040,8 @@ test.each([0, 2])(
       else globals[routingKey] = original
     })
     const f = await fixture(true, false, 'debug')
-    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-    const before = (globalThis as any)[key].get(f.paths.storageId)
+
+    const before = keeperFor(f.paths.storageId)
     for (let i = 0; i < count; i++) {
       await f.live(undefined, { model: 'claude-opus-5-5' }, `ses_restore_${i}`)
     }
@@ -1864,7 +2067,7 @@ test.each([0, 2])(
     forgetCacheKeepProcess(f.paths.storageId)
     policy = null
     const next = await f.start()
-    const owner = (globalThis as any)[key].get(f.paths.storageId)
+    const owner = keeperFor(f.paths.storageId)
     expect({
       restored: owner.manager.trackedCount(),
       logs: lines,
@@ -1917,8 +2120,8 @@ test.each(['hybrid-inactive', 'subagents-disabled', 'not-oauth'] as const)(
     forgetCacheKeepProcess(f.paths.storageId)
     policy = null
     const next = await f.start()
-    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-    const owner = (globalThis as any)[key].get(f.paths.storageId)
+
+    const owner = keeperFor(f.paths.storageId)
     expect(owner.manager.trackedCount()).toBe(1)
     if (reason === 'not-oauth') {
       const runtime = createNativeAccountRuntime({
@@ -2027,8 +2230,8 @@ test('OC2 deferred reservation wait returns skipped without retrying or removing
   const f = await fixture()
   runnerPolicyForReview({ ttl: 'long', keep_warm: 'always' })
   await f.live()
-  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  const owner = (globalThis as any)[key].get(f.paths.storageId)
+
+  const owner = keeperFor(f.paths.storageId)
   const target = owner.manager.targets.get('ses_oc2_keep') as CacheKeepTarget
   const due = target.nextPrewarmAt
   const result = await owner.manager.prewarmNow({
@@ -2072,6 +2275,33 @@ test('OpenCode 2 restores and prewarms a live format-1 record from another plugi
   expect(warm.messages).toEqual(live.messages)
   expect(warm.system.slice(1)).toEqual(live.system.slice(1))
   expect(warm.max_tokens).toBe(0)
+})
+
+test('OpenCode 2 saves a restored warm count without promoting its idle claim', async () => {
+  const f = await fixture()
+  const { id, peer, record, claim } = await seedPeer(f)
+  await peer.releaseClaims(() => true)
+  const before = JSON.parse(
+    gunzipSync(await readFile(record)).toString(),
+  ) as SavedCacheKeepTarget
+  const next = await f.start()
+  let atSend: SavedCacheKeepTarget | undefined
+  next.setSend(async () => {
+    atSend = JSON.parse(gunzipSync(await readFile(record)).toString())
+    return Response.json({ usage: { cache_read_input_tokens: 1 } })
+  })
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(1)
+  expect(atSend).toMatchObject({
+    id,
+    bodyText: before.bodyText,
+    policyState: {
+      lastRealRequestAt: before.policyState!.lastRealRequestAt,
+      warmsSinceLastRealRequest: 1,
+    },
+  })
+  expect(JSON.parse(await readFile(claim, 'utf8')).restoreOnly).toBe(true)
 })
 
 test('OpenCode 2 warm timing measures physical headers before its buffered response body', async () => {
@@ -2119,8 +2349,8 @@ test('OpenCode 2 restores a 2.6 record without policyState and durably caps its 
   expect(
     lines.find((line) => line.includes('restart records loaded')),
   ).toContain('"restored":1,"dropped":0')
-  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  const owner = (globalThis as any)[key].get(f.paths.storageId)
+
+  const owner = keeperFor(f.paths.storageId)
   expect(owner.manager.trackedPolicyState('ses_oc2_keep')).toMatchObject({
     planned: false,
     lastRealRequestAt: saved.lastTouchAt,
@@ -2151,6 +2381,53 @@ test('OpenCode 2 restores a 2.6 record without policyState and durably caps its 
   expect(owner.manager.trackedCount()).toBe(0)
 })
 
+test.each(['verified', 'unverified'] as const)(
+  'OpenCode 2 warms a live pre-2.7 record with %s initial ownership',
+  async (ownership) => {
+    const f = await fixture()
+    await f.live()
+    await f.dispose()
+    const [name] = await readdir(f.disk)
+    const path = join(f.disk, name!)
+    const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+    saved.pluginVersion = '2.6.0'
+    delete saved.policyState
+    delete saved.lastTouchAt
+    delete saved.lastTouchKind
+    await writeFile(path, gzipSync(JSON.stringify(saved)))
+    forgetCacheKeepProcess(f.paths.storageId)
+    f.advance(60_000)
+    const next = await f.start()
+    const { manager, persistence } = sharedKeeper(f)
+    const id = 'ses_oc2_keep'
+    expect(manager.trackedPolicyState(id)?.lastRealRequestAt).toBe(f.now())
+    const reserve = spyOn(persistence, 'reserveWarm')
+    try {
+      if (ownership === 'unverified')
+        reserve.mockResolvedValueOnce('ownership-unverified')
+      f.advance(saved.nextPrewarmAt - f.now())
+      await f.timers.fireTimeouts()
+      if (ownership === 'unverified') {
+        expect(reserve).toHaveBeenCalled()
+        expect(next.sent).toHaveLength(0)
+        const reservations = reserve.mock.calls.length
+        f.advance(999)
+        await f.timers.fireTimeouts()
+        expect(reserve).toHaveBeenCalledTimes(reservations)
+        expect(next.sent).toHaveLength(0)
+
+        const [target] = manager.trackedSessions()
+        f.advance(target!.nextPrewarmAt - f.now())
+        await f.timers.fireTimeouts()
+      }
+      expect(next.sent).toHaveLength(1)
+      expect(manager.trackedPolicyState(id)?.warmsSinceLastRealRequest).toBe(1)
+    } finally {
+      reserve.mockRestore()
+    }
+  },
+)
+
 test('OpenCode 2 still drops a restart record requiring a real request', async () => {
   const lines = captureStartupLogs()
   const f = await fixture(false, false, 'debug')
@@ -2174,66 +2451,53 @@ test('OpenCode 2 still drops a restart record requiring a real request', async (
   expect(next.sent).toEqual([])
 })
 
-test.each([false, true])(
-  'an OpenCode 2 adopted entry writes through the newer store (legacy callbacks: %s)',
-  async (legacy) => {
-    const f = await fixture()
-    const first = (await (await f.live()).json()) as Record<string, any>
-    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-    const owner = (globalThis as any)[key].get(f.paths.storageId)
-    const oldStore: CacheKeepStore = owner.persistence
-    if (legacy) delete owner.persistenceFollowsOwner
-    const next = await f.start()
-    const newStore: CacheKeepStore = owner.persistence
-    expect(newStore).not.toBe(oldStore)
-    await newStore.drain()
-    const [name] = await readdir(f.disk)
-    const saved = () =>
-      readFile(join(f.disk, name!)).then((bytes) =>
-        JSON.parse(gunzipSync(bytes).toString()),
-      )
-    expect(JSON.parse((await saved()).bodyText).messages).toEqual(
-      first.messages,
+test('an OpenCode 2 adopted entry writes through the newer store', async () => {
+  const f = await fixture()
+  const first = (await (await f.live()).json()) as Record<string, any>
+
+  const owner = keeperFor(f.paths.storageId)
+  const oldStore: CacheKeepStore = owner.persistence
+  const next = await f.reload()
+  const newStore = sharedKeeper(f).persistence
+  expect(newStore).not.toBe(oldStore)
+  await newStore.drain()
+  const [name] = await readdir(f.disk)
+  const saved = () =>
+    readFile(join(f.disk, name!)).then((bytes) =>
+      JSON.parse(gunzipSync(bytes).toString()),
     )
-    const notifications: Array<Readonly<CacheKeepTarget>> = []
-    const persist = newStore.changed.bind(newStore)
-    const changed = spyOn(newStore, 'changed').mockImplementation((target) => {
-      notifications.push({
-        ...target,
-        policyState: target.policyState && { ...target.policyState },
-      })
-      persist(target)
+  expect(JSON.parse((await saved()).bodyText).messages).toEqual(first.messages)
+  const notifications: Array<Readonly<CacheKeepTarget>> = []
+  const persist = newStore.changed.bind(newStore)
+  const changed = spyOn(newStore, 'changed').mockImplementation((target) => {
+    notifications.push({
+      ...target,
+      policyState: target.policyState && { ...target.policyState },
     })
-    cleanups.push(() => changed.mockRestore())
-    const latest = (await (
-      await next.live(undefined, {
-        messages: [{ role: 'user', content: 'A request after plugin reload' }],
-      })
-    ).json()) as Record<string, any>
-    // The first target notification carries no token counts; after the response
-    // drains, one later notification adds them.
-    expect(changed).toHaveBeenCalledTimes(2)
-    expect(notifications[0]!.policyState?.prefixTokens).toBeUndefined()
-    expect(notifications[0]!.policyState?.inputTokens).toBeUndefined()
-    expect(notifications[1]).toEqual({
-      ...notifications[0]!,
-      policyState: {
-        ...notifications[0]!.policyState!,
-        prefixTokens: 1,
-        inputTokens: 1,
-      },
+    persist(target)
+  })
+  cleanups.push(() => changed.mockRestore())
+  const latest = (await (
+    await next.live(undefined, {
+      messages: [{ role: 'user', content: 'A request after plugin reload' }],
     })
-    if (legacy) {
-      // Emulate an older manager's callback, which captured the first store.
-      oldStore.changed(changed.mock.calls[0]![0])
-      expect(changed).toHaveBeenCalledTimes(3)
-    }
-    await newStore.drain()
-    expect(JSON.parse((await saved()).bodyText).messages).toEqual(
-      latest.messages,
-    )
-  },
-)
+  ).json()) as Record<string, any>
+  // The first target notification carries no token counts; after the response
+  // drains, one later notification adds them.
+  expect(changed).toHaveBeenCalledTimes(2)
+  expect(notifications[0]!.policyState?.prefixTokens).toBeUndefined()
+  expect(notifications[0]!.policyState?.inputTokens).toBeUndefined()
+  expect(notifications[1]).toEqual({
+    ...notifications[0]!,
+    policyState: {
+      ...notifications[0]!.policyState!,
+      prefixTokens: 1,
+      inputTokens: 1,
+    },
+  })
+  await newStore.drain()
+  expect(JSON.parse((await saved()).bodyText).messages).toEqual(latest.messages)
+})
 
 test('OpenCode 2 startup reports restored and dropped counts, but not an empty store', async () => {
   const lines = captureStartupLogs()
@@ -2367,8 +2631,10 @@ test.each([
     )
     const droppedName =
       change === 'unfinished-write' ? `${name!}.1234.tmp` : name!
-    if (change === 'unfinished-write')
+    if (change === 'unfinished-write') {
       await rename(path, join(f.disk, droppedName))
+      await utimes(join(f.disk, droppedName), 0, 0)
+    }
     if (change === 'unsafe-file') await chmod(path, 0o644)
     forgetCacheKeepProcess(f.paths.storageId)
     lines.length = 0
@@ -2577,13 +2843,12 @@ test('a policy-refused OpenCode 2 target is also removed from restart storage', 
   const f = await trace.wait('fixture', () =>
     fixture(false, false, undefined, false, false, trace),
   )
-  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  const owner = (globalThis as any)[key].get(f.paths.storageId)
-  trace.observeStore(owner.persistence, 'original')
+
+  const owner = keeperFor(f.paths.storageId)
+  trace.observeStore(owner.persistence, 'shared')
   await trace.wait('accepted live response', () => f.live())
   await trace.wait('original dispose', () => f.dispose())
   const next = await trace.wait('successor startup', () => f.start())
-  trace.observeStore(owner.persistence, 'successor')
   await trace.wait('policy settings update', () =>
     f.store.updateSettings((settings) => ({
       ...settings,
@@ -2969,9 +3234,7 @@ function runnerPolicyForReview(
 test('hybrid-disabled request dispatch never waits on a held restart write', async () => {
   const f = await fixture()
   await f.live()
-  const owner = (globalThis as any)[
-    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  ].get(f.paths.storageId)
+  const owner = keeperFor(f.paths.storageId)
   await owner.persistence.drain()
   await f.store.updateSettings((settings) => ({
     ...settings,
@@ -3001,11 +3264,16 @@ test('hybrid-disabled request dispatch never waits on a held restart write', asy
     await owner.localCleanup
     drain.mockRestore()
     await owner.persistence.drain()
-    const retained: string[] = []
-    await owner.persistence.load(f.now(), (entry: { id: string }) => {
-      retained.push(entry.id)
-      return undefined
-    })
+    const files = (await readdir(f.disk)).filter((name) =>
+      name.endsWith('.json.gz'),
+    )
+    const retained = await Promise.all(
+      files.map(
+        async (file) =>
+          JSON.parse(gunzipSync(await readFile(join(f.disk, file))).toString())
+            .id,
+      ),
+    )
     expect(retained).toEqual(['ses_oc2_keep'])
   } finally {
     clearTimeout(timeout)
@@ -3015,7 +3283,43 @@ test('hybrid-disabled request dispatch never waits on a held restart write', asy
   }
 })
 
-test('reload onto a 2.6.0-shaped owner keeps legacy warm dispatch and accepted usage safe', async () => {
+test('the hybrid-off sweep preserves a planned peer record after a clock rollback during drain', async () => {
+  const f = await fixture()
+  runnerPolicyForReview({ ttl: 'long', keep_warm: 'always' })
+  const { id, peer, record, tracked } = await seedPeer(f)
+  expect(tracked.policyState?.planned).toBe(true)
+  const next = await f.start()
+  const current = keeperFor(f.paths.storageId)
+  expect(current.manager.trackedRequest(id)).toBeUndefined()
+  const saved = await readFile(record)
+  await peer.releaseClaims(() => true)
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    cacheKeep: { enabled: false },
+  }))
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const drain = current.persistence.drain.bind(current.persistence)
+  const draining = spyOn(current.persistence, 'drain').mockImplementationOnce(
+    async () => {
+      entered.resolve()
+      await resume.promise
+      await drain()
+    },
+  )
+  try {
+    await next.prepare(undefined, {}, 'ses_during_disable')
+    await entered.promise
+    f.advance(-10_000)
+  } finally {
+    resume.resolve()
+    await current.localCleanup
+    draining.mockRestore()
+  }
+  expect(await readFile(record)).toEqual(saved)
+})
+
+test('reload from a 2.6.0-shaped owner supports accepted usage and planned warming', async () => {
   const f = await fixture()
   const reports: unknown[] = []
   runnerPolicyForReview(null, reports)
@@ -3023,9 +3327,7 @@ test('reload onto a 2.6.0-shaped owner keeps legacy warm dispatch and accepted u
   // Drain the initial response's detached report before counting reload reports.
   await new Promise((resolve) => setTimeout(resolve, 0))
   reports.length = 0
-  const owner = (globalThis as any)[
-    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  ].get(f.paths.storageId)
+  const owner = keeperFor(f.paths.storageId)
   const original = owner.manager
   owner.manager = new Proxy(original, {
     get(target, name) {
@@ -3042,7 +3344,7 @@ test('reload onto a 2.6.0-shaped owner keeps legacy warm dispatch and accepted u
       return typeof value === 'function' ? value.bind(target) : value
     },
   })
-  const next = await f.start()
+  const next = await f.reload()
   await next.live()
   await new Promise((resolve) => setTimeout(resolve, 0))
   expect(
@@ -3051,18 +3353,12 @@ test('reload onto a 2.6.0-shaped owner keeps legacy warm dispatch and accepted u
   f.due()
   await f.timers.fire()
   expect(next.sent).toHaveLength(1)
-  const debug = spyOn(logger, 'debug')
-  cleanups.push(() => debug.mockRestore())
   runnerPolicyForReview({ ttl: 'long', keep_warm: 'always' })
   await next.live()
   f.due()
   await f.timers.fire()
-  expect(next.sent).toHaveLength(1)
-  expect(
-    debug.mock.calls.filter((call) =>
-      String(call[1]).includes('planned warming requires a server restart'),
-    ),
-  ).toHaveLength(1)
+  expect(next.sent).toHaveLength(2)
+  expect(f.sent).toHaveLength(0)
   owner.manager = original
 })
 
@@ -3073,9 +3369,7 @@ test.each(['http-relay', 'gzip'] as const)(
     await f.live(undefined, {
       system: 'Large stable cache prefix. '.repeat(10_000),
     })
-    const owner = (globalThis as any)[
-      Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-    ].get(f.paths.storageId)
+    const owner = keeperFor(f.paths.storageId)
     const captured = owner.manager.trackedRequest('ses_oc2_keep')
     expect(captured).toBeDefined()
     runnerPolicyForReview({ ttl: 'long', keep_warm: 'always' })
@@ -3171,9 +3465,7 @@ test('ttl-only policy keeps the restored OC2 subagent opt-out', async () => {
     cacheKeep: { enabled: true, always: true, subagents: true },
   }))
   await f.live()
-  const owner = (globalThis as any)[
-    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  ].get(f.paths.storageId)
+  const owner = keeperFor(f.paths.storageId)
   const captured = owner.manager.trackedRequest('ses_oc2_keep')
   expect(
     owner.manager.track({
@@ -3223,8 +3515,8 @@ test('OC2 priced auto charges every physical warm and stops at the equality boun
     draft,
     Response.json({ usage: { cache_read_input_tokens: 1_000 } }),
   )
-  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  const initial = (globalThis as any)[key].get(f.paths.storageId)
+
+  const initial = keeperFor(f.paths.storageId)
   const retained = initial.manager.targets.get(
     'ses_oc2_keep',
   ) as CacheKeepTarget
@@ -3239,7 +3531,7 @@ test('OC2 priced auto charges every physical warm and stops at the equality boun
   await f.dispose()
   forgetCacheKeepProcess(f.paths.storageId)
   const next = await f.start()
-  const owner = (globalThis as any)[key].get(f.paths.storageId)
+  const owner = keeperFor(f.paths.storageId)
   let state: CacheKeepTarget['policyState']
   expect(
     JSON.parse(owner.manager.trackedRequest('ses_oc2_keep').bodyText).model,
@@ -3301,8 +3593,8 @@ test.each(['replaced', 'retired'] as const)(
     f.advance(3_300_000)
     const warming = f.timers.fireTimeouts()
     await enteredSend
-    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-    const owner = (globalThis as any)[key].get(f.paths.storageId)
+
+    const owner = keeperFor(f.paths.storageId)
     let latest: string | undefined
     if (change === 'replaced') {
       await f.live(undefined, {
@@ -3315,9 +3607,9 @@ test.each(['replaced', 'retired'] as const)(
     await f.dispose()
     forgetCacheKeepProcess(f.paths.storageId)
     const next = await f.start()
-    const restored = (globalThis as any)[key]
-      .get(f.paths.storageId)
-      .manager.trackedRequest('ses_oc2_keep')
+    const restored = keeperFor(f.paths.storageId).manager.trackedRequest(
+      'ses_oc2_keep',
+    )
     if (change === 'replaced') expect(restored?.bodyText).toBe(latest)
     else expect(restored).toBeUndefined()
     f.advance(3_300_000)
@@ -3417,9 +3709,7 @@ test('OC2 dispatch and accepted capture do not await tracking readView or an unk
     expect(trackingReads).toBe(0)
     expect(lookups).toBe(1)
     await f.respond(draft!)
-    const owner = (globalThis as any)[
-      Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-    ].get(f.paths.storageId)
+    const owner = keeperFor(f.paths.storageId)
     expect(owner.manager.trackedRequest('ses_oc2_keep')?.bodyText).toContain(
       'Hello',
     )
@@ -3430,9 +3720,7 @@ test('OC2 dispatch and accepted capture do not await tracking readView or an unk
   }
   f.due()
   await f.timers.fireTimeouts()
-  const owner = (globalThis as any)[
-    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  ].get(f.paths.storageId)
+  const owner = keeperFor(f.paths.storageId)
   await owner.manager.tick()
   expect(f.sent).toHaveLength(1)
 })
@@ -3458,9 +3746,7 @@ test('an unknown-parent OC2 child is captured then retired as soon as lookup res
     },
   )
   await f.live()
-  const owner = (globalThis as any)[
-    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  ].get(f.paths.storageId)
+  const owner = keeperFor(f.paths.storageId)
   expect(owner.manager.trackedRequest('ses_oc2_keep')?.bodyText).toContain(
     'Hello',
   )
@@ -3500,9 +3786,7 @@ test.each(['pending', 'failed'] as const)(
       },
     )
     await f.live()
-    const owner = (globalThis as any)[
-      Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-    ].get(f.paths.storageId)
+    const owner = keeperFor(f.paths.storageId)
     f.due()
     await f.timers.fireTimeouts()
     await owner.manager.tick()
@@ -3547,8 +3831,8 @@ test.each([false, true])(
       cacheKeep: { enabled: true, always: true, subagents: false },
     }))
     await f.live()
-    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-    const owner = (globalThis as any)[key].get(f.paths.storageId)
+
+    const owner = keeperFor(f.paths.storageId)
     const first = owner.manager.targets.get('ses_oc2_keep')
     expect(first).toBeDefined()
     await f.store.updateSettings((settings) => ({
@@ -3632,9 +3916,7 @@ test('OC2 priced auto settles a same-generation known failure and charges the ne
     draft,
     Response.json({ usage: { cache_read_input_tokens: 1_000 } }),
   )
-  const owner = (globalThis as any)[
-    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  ].get(f.paths.storageId)
+  const owner = keeperFor(f.paths.storageId)
   const target = owner.manager.targets.get('ses_oc2_keep') as CacheKeepTarget
   const state = target.policyState!
   let entered!: () => void
@@ -3837,4 +4119,1378 @@ test('OC2 model-request billing reports keep-warm off when a plan or setting nev
   expect(warmingOf(localOff)).toEqual({
     on: false,
   })
+})
+
+function sharedKeeper(f: Awaited<ReturnType<typeof fixture>>) {
+  return keeperFor(f.paths.storageId) as {
+    manager: CacheKeepManager
+    persistence: CacheKeepStore
+  }
+}
+
+function failNextRestartWrite(store: CacheKeepStore) {
+  // Fail the record write, not the caller, so the real persistence path still
+  // accounts for the difference between queued and committed state.
+  const writer = store as unknown as {
+    writeEntry: (
+      entry: SavedCacheKeepTarget,
+      assertOwned?: () => Promise<void>,
+      stillLatest?: () => boolean,
+    ) => Promise<boolean>
+  }
+  const write = writer.writeEntry.bind(writer)
+  return spyOn(writer, 'writeEntry')
+    .mockImplementation(write)
+    .mockRejectedValueOnce(new Error('Temporary restart write failure'))
+}
+
+test.each([false, true])(
+  'OC2 refunds a cancelled warm copied into a newer usage snapshot (timer already flushing: %s)',
+  async (flushTimer) => {
+    runnerPolicies([])
+    const f = await fixture()
+    await f.live(undefined, { model: 'claude-opus-5-5' })
+    const { manager, persistence } = sharedKeeper(f)
+    const id = 'ses_oc2_keep'
+    const target = (
+      Reflect.get(manager, 'targets') as Map<string, CacheKeepTarget>
+    ).get(id)!
+    const state = target.policyState!
+    Object.assign(state, {
+      warmsSinceLastRealRequest: 23,
+      warmCostSoFar: 2,
+      prefixTokens: 1000,
+      inputTokens: 1000,
+      hasWarmed: true,
+    })
+    expect(await persistence.reserveWarm(target)).toBe(true)
+    const [name] = await readdir(f.disk)
+    const saved = async () =>
+      JSON.parse(gunzipSync(await readFile(join(f.disk, name!))).toString())
+        .policyState
+    const store = persistence as unknown as {
+      directoryReady(): Promise<boolean>
+      writeEntry(
+        entry: SavedCacheKeepTarget,
+        assertOwned?: () => Promise<void>,
+        stillLatest?: () => boolean,
+      ): Promise<boolean>
+    }
+    const reserving = Promise.withResolvers<void>()
+    const resumeReserve = Promise.withResolvers<void>()
+    const flushed = Promise.withResolvers<void>()
+    const resumeFlush = Promise.withResolvers<void>()
+    const ready = store.directoryReady.bind(store)
+    const checking = spyOn(store, 'directoryReady').mockImplementationOnce(
+      async () => {
+        reserving.resolve()
+        await resumeReserve.promise
+        return ready()
+      },
+    )
+    const reserve = persistence.reserveWarm.bind(persistence)
+    const returnReservation = Promise.withResolvers<void>()
+    const settling = Promise.withResolvers<void>()
+    const reservation = spyOn(persistence, 'reserveWarm')
+      .mockImplementation((entry) => {
+        const result = reserve(entry)
+        settling.resolve()
+        return result
+      })
+      .mockImplementationOnce(async (entry) => {
+        const result = await reserve(entry)
+        if (flushTimer) await returnReservation.promise
+        return result
+      })
+    const write = store.writeEntry.bind(store)
+    const countsSeenByTimer: number[] = []
+    const writing = spyOn(store, 'writeEntry').mockImplementation(
+      async (...args) => {
+        const [entry] = args
+        if (!flushTimer || entry.policyState?.warmsSinceLastRealRequest !== 24)
+          return write(...args)
+        flushed.resolve()
+        await resumeFlush.promise
+        const result = await write(...args)
+        countsSeenByTimer.push((await saved()).warmsSinceLastRealRequest)
+        return result
+      },
+    )
+    f.due()
+    const warming = f.timers.fire()
+    let reloading: ReturnType<typeof f.reload> | undefined
+    let flushing: Promise<unknown> | undefined
+    try {
+      await Promise.race([reserving.promise, warming])
+      expect(state.warmsSinceLastRealRequest).toBe(24)
+      expect(state.pendingWarmCost).toBeGreaterThan(0)
+      const timersBeforeUsage = new Set(f.timers.timeouts.keys())
+      manager.recordAcceptedUsage(id, target.bodyText, {
+        cache_read_input_tokens: 2000,
+      })
+      if (flushTimer) {
+        const timer = [...f.timers.timeouts].find(
+          ([key, timer]) => !timersBeforeUsage.has(key) && timer.at > f.now(),
+        )
+        expect(timer).toBeDefined()
+        flushing = Promise.resolve(timer![1].callback())
+      }
+      reloading = f.reload()
+      resumeReserve.resolve()
+      if (flushTimer) {
+        await Promise.race([flushed.promise, flushing!])
+        expect(writing).toHaveBeenCalledTimes(1)
+        returnReservation.resolve()
+        // Let the cancelled reservation publish the refund while the timer's
+        // already-started write is still staging its snapshot.
+        await Promise.race([settling.promise, warming])
+        resumeFlush.resolve()
+      }
+      const next = await reloading
+      expect(f.sent).toHaveLength(0)
+      expect(state.warmsSinceLastRealRequest).toBe(23)
+      expect(await saved()).toMatchObject({
+        warmsSinceLastRealRequest: 23,
+        prefixTokens: 2000,
+      })
+      expect((await saved()).pendingWarmCost).toBeUndefined()
+      expect(countsSeenByTimer).toEqual(flushTimer ? [23] : [])
+      expect(sharedKeeper(f).manager.trackedRequest(id)).toBeDefined()
+      f.advance(20_000)
+      await f.timers.fire()
+      expect(next.sent).toHaveLength(1)
+    } finally {
+      resumeReserve.resolve()
+      returnReservation.resolve()
+      resumeFlush.resolve()
+      await Promise.all([warming, reloading, flushing])
+      checking.mockRestore()
+      reservation.mockRestore()
+      writing.mockRestore()
+    }
+  },
+)
+
+test.each([false, true])(
+  'OC2 reload preserves a record when an unsent reservation is refunded (refund write fails: %s)',
+  async (failRefund) => {
+    const reports: Array<Record<string, unknown>> = []
+    runnerPolicies(reports)
+    const f = await fixture()
+    await f.live(undefined, { model: 'claude-opus-5-5' })
+    const old = sharedKeeper(f)
+    const id = 'ses_oc2_keep'
+    const target = (
+      Reflect.get(old.manager, 'targets') as Map<string, CacheKeepTarget>
+    ).get(id)!
+    Object.assign(target.policyState!, {
+      warmsSinceLastRealRequest: 23,
+      warmCostSoFar: 2,
+      prefixTokens: 1000,
+      inputTokens: 1000,
+      hasWarmed: true,
+    })
+    expect(await old.persistence.reserveWarm(target)).toBe(true)
+    const [name] = await readdir(f.disk)
+    const saved = async () =>
+      JSON.parse(gunzipSync(await readFile(join(f.disk, name!))).toString())
+    expect((await saved()).policyState.warmsSinceLastRealRequest).toBe(23)
+    const entered = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    const reserve = old.persistence.reserveWarm.bind(old.persistence)
+    const reserving = spyOn(old.persistence, 'reserveWarm').mockImplementation(
+      async (entry) => {
+        const result = await reserve(entry)
+        entered.resolve()
+        await resume.promise
+        return result
+      },
+    )
+    f.due()
+    const warming = f.timers.fire()
+    let writing: ReturnType<typeof failNextRestartWrite> | undefined
+    try {
+      await Promise.race([entered.promise, warming])
+      expect(reserving).toHaveBeenCalledTimes(1)
+      expect((await saved()).policyState.warmsSinceLastRealRequest).toBe(24)
+      expect((await saved()).policyState.pendingWarmCost).toBeGreaterThan(0)
+      if (failRefund) writing = failNextRestartWrite(old.persistence)
+      const reloading = f.reload()
+      resume.resolve()
+      await warming
+      const next = await reloading
+      const current = sharedKeeper(f)
+      expect(f.sent).toHaveLength(0)
+      expect(next.sent).toHaveLength(0)
+      expect(target.policyState?.warmsSinceLastRealRequest).toBe(23)
+      expect(target.policyState?.pendingWarmCost).toBeUndefined()
+      if (failRefund) {
+        expect(writing).toHaveBeenCalledTimes(1)
+        expect(old.persistence.isCommitted(id)).toBe(false)
+        expect(old.manager.trackedRequest(id)).toBeDefined()
+        expect(current.manager.trackedRequest(id)).toBeUndefined()
+        f.advance(20_000)
+        await f.timers.fire()
+        expect(next.sent).toHaveLength(0)
+        expect((await saved()).policyState.warmsSinceLastRealRequest).toBe(24)
+        return
+      }
+      expect((await saved()).policyState).toMatchObject({
+        warmsSinceLastRealRequest: 23,
+        warmCostSoFar: 2,
+      })
+      expect((await saved()).policyState.pendingWarmCost).toBeUndefined()
+      expect(target.consecutiveFailures).toBe(0)
+      expect(
+        reports.filter(({ kind }) => kind === 'cache_warm_stopped'),
+      ).toEqual([])
+      expect(current.manager.trackedRequest(id)).toBeDefined()
+      expect(old.manager.trackedCount()).toBe(0)
+      f.advance(20_000)
+      await f.timers.fire()
+      expect(f.sent).toHaveLength(0)
+      expect(next.sent).toHaveLength(1)
+    } finally {
+      resume.resolve()
+      await warming
+      reserving.mockRestore()
+      writing?.mockRestore()
+    }
+  },
+)
+
+test('OC2 reload keeps a live old folder working and rescans when its replacement loads', async () => {
+  const f = await fixture()
+  const second = await f.start()
+  const old = sharedKeeper(f)
+  const existing = 'ses_held_by_old_folder'
+  const latest = 'ses_accepted_by_old_folder'
+  await second.live(undefined, {}, existing)
+  await old.persistence.drain()
+  const pending = await second.prepare(
+    undefined,
+    {
+      messages: [
+        { role: 'user', content: 'Accepted by the still-live folder' },
+      ],
+    },
+    existing,
+  )
+
+  const next = await f.reload()
+  const current = sharedKeeper(f)
+  expect(current.manager).not.toBe(old.manager)
+  // A late response and a new turn on the still-live folder stay with the old manager.
+  await second.respond(pending)
+  f.advance(5_000)
+  await second.live(undefined, {}, latest)
+  await old.persistence.drain()
+  expect(old.manager.trackedRequest(existing)?.bodyText).toContain(
+    'Accepted by the still-live folder',
+  )
+  expect(old.persistence.isCommitted(existing)).toBe(true)
+  expect(old.persistence.isCommitted(latest)).toBe(true)
+  expect(current.manager.trackedCount()).toBe(0)
+
+  f.advance(CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS - 5_000)
+  await f.timers.fire()
+  expect(second.sent).toHaveLength(1)
+  f.advance(5_000)
+  await f.timers.fire()
+  expect(second.sent).toHaveLength(2)
+  expect(f.sent).toHaveLength(0)
+  expect(next.sent).toHaveLength(0)
+
+  const schedule = old.manager.trackedSessions()
+  const replacement = await f.reload(true, second)
+  expect(sharedKeeper(f).manager).toBe(current.manager)
+  expect(old.manager.trackedCount()).toBe(0)
+  expect(current.manager.trackedSessions()).toEqual(schedule)
+  for (const { nextPrewarmAt } of schedule.sort(
+    (a, b) => a.nextPrewarmAt - b.nextPrewarmAt,
+  )) {
+    f.advance(nextPrewarmAt - f.now())
+    await f.timers.fire()
+  }
+  expect(second.sent).toHaveLength(2)
+  expect(next.sent).toHaveLength(0)
+  expect(replacement.sent).toHaveLength(2)
+})
+
+test('a retried claim release prompts one rescan by a live OC2 keeper', async () => {
+  const f = await fixture()
+  await f.live()
+  const previous = sharedKeeper(f)
+  await previous.persistence.drain()
+  const id = 'ses_oc2_keep'
+  const resume = Promise.withResolvers<void>()
+  const released = Promise.withResolvers<void>()
+  const release = CacheKeepClaim.prototype.release
+  const releasing = spyOn(CacheKeepClaim.prototype, 'release')
+    .mockRejectedValueOnce(new Error('Temporary claim release failure'))
+    .mockImplementationOnce(async function (this: CacheKeepClaim) {
+      await resume.promise
+      await release.call(this)
+      released.resolve()
+    })
+  try {
+    await f.reload()
+    const current = sharedKeeper(f)
+    expect(current.manager.trackedRequest(id)).toBeUndefined()
+    const scanning = spyOn(current.persistence, 'load')
+    try {
+      resume.resolve()
+      await released.promise
+      // The notification follows claim release and removal from the old store.
+      await delay(0)
+      await keeperFor(f.paths.storageId)?.loading
+      expect(current.manager.trackedRequest(id)).toBeDefined()
+      expect(scanning).toHaveBeenCalledTimes(1)
+
+      const peer = await f.start()
+      const normal = 'ses_normally_released'
+      await peer.live(undefined, {}, normal)
+      await previous.persistence.drain()
+      expect(previous.persistence.isCommitted(normal)).toBe(true)
+      await peer.dispose()
+      expect(scanning).toHaveBeenCalledTimes(1)
+    } finally {
+      scanning.mockRestore()
+    }
+  } finally {
+    resume.resolve()
+    releasing.mockRestore()
+  }
+})
+
+test('a freshness drop prompts one rescan that adopts the newer peer record', async () => {
+  const f = await fixture()
+  const { id, peer, tracked } = await seedPeer(f)
+  const next = await f.start()
+  const current = sharedKeeper(f)
+  expect(current.manager.trackedRequest(id)).toBeUndefined()
+  await next.live(undefined, {
+    messages: [{ role: 'user', content: 'Accepted by the contender' }],
+  })
+  await current.persistence.drain()
+  expect(current.persistence.isCommitted(id)).toBe(false)
+  const older = (
+    Reflect.get(current.manager, 'targets') as Map<string, CacheKeepTarget>
+  ).get(id)!
+  expect(older.bodyText).toContain('Accepted by the contender')
+
+  const newest = 'Accepted more recently by the peer'
+  f.advance(5_000)
+  peer.changed({
+    ...tracked,
+    bodyText: tracked.bodyText.replace('Hello', newest),
+    policyState: { ...tracked.policyState!, lastRealRequestAt: f.now() },
+  })
+  await peer.drain()
+  expect(peer.isCommitted(id)).toBe(true)
+  await peer.releaseClaims(() => true)
+  const scanning = spyOn(current.persistence, 'load')
+  try {
+    expect(await current.persistence.reserveWarm(older)).toBe('not-owner')
+    await keeperFor(f.paths.storageId)?.loading
+    expect(current.manager.trackedRequest(id)?.bodyText).toContain(newest)
+    expect(scanning).toHaveBeenCalledTimes(1)
+  } finally {
+    scanning.mockRestore()
+  }
+})
+
+test('a superseded OC2 turn cannot overwrite a newer body through a restore claim', async () => {
+  const f = await fixture()
+  const { id, peer, record, claim } = await seedPeer(f)
+  await peer.releaseClaims(() => true)
+  const next = await f.start()
+  const { manager, persistence } = sharedKeeper(f)
+  await persistence.drain()
+  const saved = await readFile(record)
+  const newer = JSON.parse(gunzipSync(saved).toString()) as SavedCacheKeepTarget
+  expect(manager.trackedRequest(id)?.bodyText).toBe(newer.bodyText)
+  expect(JSON.parse(await readFile(claim, 'utf8')).restoreOnly).toBe(true)
+
+  const entered = Promise.withResolvers<void>()
+  const unblock = Promise.withResolvers<void>()
+  Reflect.get(persistence, 'enqueue').call(persistence, () => {
+    entered.resolve()
+    return unblock.promise
+  })
+  try {
+    await entered.promise
+    // Roll the clock back before accepting a different body. The real-claim
+    // request and the acceptance's coalesced write cannot run yet.
+    f.advance(-500)
+    const older = 'Accepted locally after the clock rolled back'
+    await next.live(undefined, { messages: [{ role: 'user', content: older }] })
+    expect(manager.trackedRequest(id)?.bodyText).toContain(older)
+    expect(manager.trackedPolicyState(id)!.lastRealRequestAt).toBeLessThan(
+      newer.policyState!.lastRealRequestAt,
+    )
+    const timer = Reflect.get(persistence, 'timers').get(id)
+    const flush = f.timers.timeouts.get(timer)!
+    f.advance(flush.at - f.now())
+    const flushing = flush.callback()
+
+    // The next foreground turn replaces the pending real-claim request but not
+    // the accepted body. The older flush must not write under the restore claim.
+    const turn = await next.prepare()
+    expect(manager.trackedRequest(id)?.bodyText).toContain(older)
+    unblock.resolve()
+    await flushing
+    await persistence.drain()
+    expect(await readFile(record)).toEqual(saved)
+    await next.respond(turn)
+  } finally {
+    unblock.resolve()
+    await persistence.drain()
+  }
+})
+
+test('OC2 budget eviction preserves the body adopted by the restore claim', async () => {
+  const f = await fixture()
+  const { id, peer, record, claim } = await seedPeer(f)
+  await peer.releaseClaims(() => true)
+  const next = await f.start()
+  const { manager, persistence } = sharedKeeper(f)
+  await persistence.drain()
+  const saved = await readFile(record)
+  const newer = JSON.parse(gunzipSync(saved).toString()) as SavedCacheKeepTarget
+  expect(manager.trackedRequest(id)?.bodyText).toBe(newer.bodyText)
+  expect(JSON.parse(await readFile(claim, 'utf8')).restoreOnly).toBe(true)
+
+  const imminentId = 'ses_oc2_imminent'
+  await next.live(undefined, {}, imminentId)
+  const targets = Reflect.get(manager, 'targets') as Map<
+    string,
+    CacheKeepTarget
+  >
+  const imminent = targets.get(imminentId)!
+  // Model the byte pressure without making a 64 MiB prompt. The other target
+  // is due soon and leaves just enough room for the saved body.
+  imminent.bodyBytes = CACHE_KEEP_MAX_BODY_BYTES - targets.get(id)!.bodyBytes
+  imminent.nextPrewarmAt = f.now() + 30_000
+  await persistence.drain()
+
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  Reflect.get(persistence, 'enqueue').call(persistence, () => {
+    entered.resolve()
+    return resume.promise
+  })
+  const track = spyOn(manager, 'track')
+  try {
+    await entered.promise
+    f.advance(-500)
+    expect(f.now()).toBeLessThan(newer.policyState!.lastRealRequestAt)
+    await next.live(undefined, {
+      messages: [{ role: 'user', content: 'Older, larger body. '.repeat(200) }],
+    })
+    const accepted = track.mock.lastCall![0]
+    const acceptedBytes = Buffer.byteLength(accepted.bodyText)
+    expect(accepted.sessionId).toBe(id)
+    expect(acceptedBytes).toBeLessThan(CACHE_KEEP_MAX_BODY_BYTES)
+    expect(acceptedBytes + imminent.bodyBytes).toBeGreaterThan(
+      CACHE_KEEP_MAX_BODY_BYTES,
+    )
+    expect(track.mock.results.at(-1)?.value).toEqual({
+      tracked: false,
+      reason: 'evicted by cachekeep limits',
+    })
+    expect(manager.trackedSessions().map(({ id }) => id)).toEqual([imminentId])
+
+    resume.resolve()
+    await persistence.drain()
+    await keeperFor(f.paths.storageId)?.loading
+    expect(await readFile(record)).toEqual(saved)
+  } finally {
+    track.mockRestore()
+    resume.resolve()
+    await persistence.drain()
+  }
+})
+
+test('a failed OC2 turn cannot unlink a newer body through a restore claim', async () => {
+  const f = await fixture()
+  const { id, peer, record, claim } = await seedPeer(f)
+  await peer.releaseClaims(() => true)
+  const next = await f.start()
+  const { manager, persistence } = sharedKeeper(f)
+  await persistence.drain()
+  const saved = await readFile(record)
+  const newer = JSON.parse(gunzipSync(saved).toString()) as SavedCacheKeepTarget
+  const restoreClaim = await readFile(claim, 'utf8')
+  expect(manager.trackedRequest(id)?.bodyText).toBe(newer.bodyText)
+  expect(JSON.parse(restoreClaim).restoreOnly).toBe(true)
+
+  const enqueue = Reflect.get(persistence, 'enqueue').bind(persistence)
+  const holdQueue = () => {
+    const entered = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    enqueue(() => {
+      entered.resolve()
+      return resume.promise
+    })
+    return { entered: entered.promise, resume: resume.resolve }
+  }
+  const beforeFlush = holdQueue()
+  const resumeScan = Promise.withResolvers<void>()
+  const load = persistence.load.bind(persistence)
+  const rescan = spyOn(persistence, 'load').mockImplementation(
+    async (...args) => {
+      await resumeScan.promise
+      await load(...args)
+    },
+  )
+  let afterFlush: ReturnType<typeof holdQueue> | undefined
+  try {
+    await beforeFlush.entered
+    f.advance(-500)
+    const older = 'Accepted locally after the clock rolled back'
+    await next.live(undefined, { messages: [{ role: 'user', content: older }] })
+    expect(manager.trackedPolicyState(id)!.lastRealRequestAt).toBeLessThan(
+      newer.policyState!.lastRealRequestAt,
+    )
+    const timer = Reflect.get(persistence, 'timers').get(id)
+    const flush = f.timers.timeouts.get(timer)!
+    f.advance(flush.at - f.now())
+    flush.callback()
+
+    // The next turn supersedes the older body's pending claim. Let its flush
+    // finish, but hold unrelated work ahead of the next turn's acquisition.
+    afterFlush = holdQueue()
+    const turn = await next.prepare()
+    beforeFlush.resume()
+    await afterFlush.entered
+    expect(manager.trackedRequest(id)?.bodyText).toContain(older)
+    expect(await readFile(record)).toEqual(saved)
+
+    await next.respond(turn, Response.json({}, { status: 503 }))
+    expect(manager.trackedRequest(id)).toBeUndefined()
+    afterFlush.resume()
+    await persistence.drain()
+    expect(await readFile(record)).toEqual(saved)
+    await expect(readFile(claim, 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+
+    // Let the claim-available scan finish on the same keeper, with its lease
+    // still open. Pausing the scan lets us observe the gap between claims.
+    resumeScan.resolve()
+    await keeperFor(f.paths.storageId)?.loading
+    expect(rescan).toHaveBeenCalledTimes(1)
+    expect(manager.trackedRequest(id)?.bodyText).toBe(newer.bodyText)
+    const adoptedClaim = await readFile(claim, 'utf8')
+    expect(adoptedClaim).not.toBe(restoreClaim)
+    expect(JSON.parse(adoptedClaim).restoreOnly).toBe(true)
+    expect(await readFile(record)).toEqual(saved)
+  } finally {
+    beforeFlush.resume()
+    afterFlush?.resume()
+    resumeScan.resolve()
+    rescan.mockRestore()
+    await persistence.drain()
+  }
+})
+
+test('an OC2 primary request does not reuse a restore claim queued for release', async () => {
+  const f = await fixture()
+  const { id, peer, record, claim } = await seedPeer(f)
+  await peer.releaseClaims(() => true)
+  const next = await f.start()
+  const { manager, persistence } = sharedKeeper(f)
+  const saved = await readFile(record)
+  const restoreClaim = await readFile(claim, 'utf8')
+  const restored = JSON.parse(restoreClaim)
+  expect(restored.restoreOnly).toBe(true)
+
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  Reflect.get(persistence, 'enqueue').call(persistence, () => {
+    entered.resolve()
+    return resume.promise
+  })
+  const resumeScan = Promise.withResolvers<void>()
+  const load = persistence.load.bind(persistence)
+  const rescan = spyOn(persistence, 'load').mockImplementation(
+    async (...args) => {
+      await resumeScan.promise
+      await load(...args)
+    },
+  )
+  try {
+    await entered.promise
+    f.advance(-500)
+    const older = 'Accepted locally after the clock rolled back'
+    await next.live(undefined, { messages: [{ role: 'user', content: older }] })
+    expect(manager.trackedRequest(id)?.bodyText).toContain(older)
+    const savedTarget = JSON.parse(
+      gunzipSync(saved).toString(),
+    ) as SavedCacheKeepTarget
+    expect(manager.trackedPolicyState(id)!.lastRealRequestAt).toBeLessThan(
+      savedTarget.policyState!.lastRealRequestAt,
+    )
+
+    // Retire the older body while unrelated store work still holds the queue.
+    const failing = await next.prepare()
+    await next.respond(failing, Response.json({}, { status: 503 }))
+    expect(manager.trackedRequest(id)).toBeUndefined()
+    expect(await readFile(claim, 'utf8')).toBe(restoreClaim)
+
+    // The next primary request can start without waiting for the release, but
+    // an unaccepted request must not open another claim during cleanup.
+    f.advance(1_000)
+    const accepted = 'Accepted after the restore claim retired'
+    const turn = await next.prepare(undefined, {
+      messages: [{ role: 'user', content: accepted }],
+    })
+    resume.resolve()
+    await persistence.drain()
+    expect(await readFile(record)).toEqual(saved)
+    await expect(readFile(claim, 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+
+    await next.respond(turn)
+    await persistence.drain()
+    const realClaim = JSON.parse(await readFile(claim, 'utf8'))
+    expect(realClaim.restoreOnly).toBeUndefined()
+    expect(realClaim.token).toBeTypeOf('string')
+    expect(realClaim.token).not.toBe(restored.token)
+    expect(persistence.isCommitted(id)).toBe(true)
+    const committed = await readFile(record)
+    expect(JSON.parse(gunzipSync(committed).toString()).bodyText).toContain(
+      accepted,
+    )
+
+    resumeScan.resolve()
+    await keeperFor(f.paths.storageId)?.loading
+    await next.dispose()
+    expect(await readdir(`${f.disk}.claims`)).toEqual([])
+    expect(await readFile(record)).toEqual(committed)
+  } finally {
+    resume.resolve()
+    resumeScan.resolve()
+    rescan.mockRestore()
+    await persistence.drain()
+    await keeperFor(f.paths.storageId)?.loading
+  }
+})
+
+test('a failed in-flight OC2 turn cannot delete a newer peer record on a freshness wakeup', async () => {
+  const f = await fixture()
+  const { id, peer, record, tracked } = await seedPeer(f)
+  const next = await f.start()
+  const current = sharedKeeper(f)
+  await next.live()
+  await current.persistence.drain()
+  expect(current.persistence.isCommitted(id)).toBe(false)
+  const older = (
+    Reflect.get(current.manager, 'targets') as Map<string, CacheKeepTarget>
+  ).get(id)!
+  const pending = await next.prepare()
+  const newest = 'Peer accepted this before the pending turn failed'
+  f.advance(5_000)
+  peer.changed({
+    ...tracked,
+    bodyText: tracked.bodyText.replace('Hello', newest),
+    policyState: { ...tracked.policyState!, lastRealRequestAt: f.now() },
+  })
+  await peer.drain()
+  await peer.releaseClaims(() => true)
+  const saved = await readFile(record)
+  const scanning = spyOn(current.persistence, 'load')
+  try {
+    expect(await current.persistence.reserveWarm(older)).toBe('not-owner')
+    await keeperFor(f.paths.storageId)?.loading
+    expect(scanning).toHaveBeenCalledTimes(1)
+    const adoptedWhilePending = current.manager.trackedRequest(id)
+
+    await next.respond(pending, Response.json({}, { status: 503 }))
+    await current.persistence.drain()
+    expect(await readFile(record)).toEqual(saved)
+    expect(adoptedWhilePending).toBeUndefined()
+    await keeperFor(f.paths.storageId)?.loading
+    expect(current.manager.trackedRequest(id)?.bodyText).toContain(newest)
+    expect(scanning).toHaveBeenCalledTimes(2)
+  } finally {
+    scanning.mockRestore()
+  }
+})
+
+test('an OC2 turn retiring an unowned target cannot unlink a peer record through a later scan claim', async () => {
+  const f = await fixture()
+  const { id, peer, record, tracked } = await seedPeer(f)
+  const next = await f.start()
+  const owner = keeperFor(f.paths.storageId)
+  const { manager, persistence } = sharedKeeper(f)
+  await next.live()
+  await persistence.drain()
+  expect(manager.trackedRequest(id)).toBeDefined()
+  expect(persistence.isCommitted(id)).toBe(false)
+
+  const listed = Promise.withResolvers<void>()
+  const checkRecord = Promise.withResolvers<void>()
+  const writing = Promise.withResolvers<void>()
+  const finishWrite = Promise.withResolvers<void>()
+  const claimed = Promise.withResolvers<boolean>()
+  const readRecord = Promise.withResolvers<void>()
+  const load = persistence.load.bind(persistence)
+  const key = createHash('sha256').update(id).digest('hex')
+  const scanning = spyOn(persistence, 'load').mockImplementationOnce(
+    (now, accept, claim, guard, mode) =>
+      load(
+        now,
+        accept,
+        claim,
+        async (hash) => {
+          if (hash === key) {
+            listed.resolve()
+            await checkRecord.promise
+          }
+          return guard?.(hash) ?? true
+        },
+        mode,
+      ),
+  )
+  const writer = persistence as unknown as {
+    writeEntry: (
+      entry: SavedCacheKeepTarget,
+      assertOwned?: () => Promise<void>,
+      stillLatest?: () => boolean,
+    ) => Promise<boolean>
+  }
+  const write = writer.writeEntry.bind(writer)
+  const holdingWrite = spyOn(writer, 'writeEntry').mockImplementationOnce(
+    async (...args) => {
+      writing.resolve()
+      await finishWrite.promise
+      return write(...args)
+    },
+  )
+  const scan = owner.adopt()
+  let holdingRead: { mockRestore(): void } | undefined
+  try {
+    // The scan has passed its wait on the store queue and listed the record.
+    await listed.promise
+    persistence.changed({ ...tracked, id: 'ses_unrelated' })
+    void persistence.drain()
+    await writing.promise
+    const turn = await next.prepare()
+    await next.respond(turn, Response.json({}, { status: 503 }))
+    expect(manager.trackedRequest(id)).toBeUndefined()
+
+    const newest = 'Peer accepted this after the failed turn retired its target'
+    f.advance(5_000)
+    peer.changed({
+      ...tracked,
+      bodyText: tracked.bodyText.replace('Hello', newest),
+      policyState: { ...tracked.policyState!, lastRealRequestAt: f.now() },
+    })
+    await peer.drain()
+    await peer.releaseClaims(() => true)
+    const saved = await readFile(record)
+
+    // Drain the queued removal while the scan owns the claim but has not read
+    // or adopted the peer's new record yet.
+    const isCurrent = CacheKeepClaim.prototype.isCurrent
+    holdingRead = spyOn(
+      CacheKeepClaim.prototype,
+      'isCurrent',
+    ).mockImplementationOnce(async function (this: CacheKeepClaim) {
+      const current = await isCurrent.call(this)
+      claimed.resolve(current)
+      await readRecord.promise
+      return current
+    })
+    checkRecord.resolve()
+    expect(await claimed.promise).toBe(true)
+    finishWrite.resolve()
+    await persistence.drain()
+    expect(await readFile(record)).toEqual(saved)
+    expect(manager.trackedRequest(id)).toBeUndefined()
+
+    readRecord.resolve()
+    await scan
+    expect(manager.trackedRequest(id)?.bodyText).toContain(newest)
+    expect(await readFile(record)).toEqual(saved)
+  } finally {
+    checkRecord.resolve()
+    finishWrite.resolve()
+    readRecord.resolve()
+    await scan
+    await persistence.drain()
+    holdingRead?.mockRestore()
+    holdingWrite.mockRestore()
+    scanning.mockRestore()
+  }
+})
+
+test('OC2 defers restoring an owned target until its owner’s foreground turn settles', async () => {
+  const f = await fixture()
+  const { id, peer, record, tracked } = await seedPeer(f)
+  const next = await f.start()
+  const owner = keeperFor(f.paths.storageId)
+  const parent = 'ses_owner'
+  await next.live(undefined, {}, parent)
+  const turn = await next.prepare(undefined, {}, parent)
+
+  peer.changed({
+    ...tracked,
+    policyState: { ...tracked.policyState!, ownerSessionId: parent },
+  })
+  await peer.drain()
+  await peer.releaseClaims(() => true)
+  const saved = await readFile(record)
+  await owner.adopt()
+  expect(owner.manager.trackedRequest(id)).toBeUndefined()
+
+  await next.respond(turn)
+  await owner.loading
+  expect(owner.manager.trackedRequest(parent)).toBeDefined()
+  expect(owner.manager.trackedRequest(id)?.bodyText).toBe(tracked.bodyText)
+  expect(await readFile(record)).toEqual(saved)
+})
+
+test('a queued freshness rescan can adopt after a turn finishes during the prior scan', async () => {
+  const f = await fixture()
+  const { id, peer, tracked } = await seedPeer(f)
+  const next = await f.start()
+  const current = sharedKeeper(f)
+  const owner = keeperFor(f.paths.storageId)
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const load = current.persistence.load.bind(current.persistence)
+  const scanning = spyOn(current.persistence, 'load').mockImplementationOnce(
+    async (...args) => {
+      await load(...args)
+      entered.resolve()
+      await resume.promise
+    },
+  )
+  const scan = owner.adopt()
+  try {
+    await entered.promise
+    await next.live()
+    await current.persistence.drain()
+    expect(current.persistence.isCommitted(id)).toBe(false)
+    const older = (
+      Reflect.get(current.manager, 'targets') as Map<string, CacheKeepTarget>
+    ).get(id)!
+
+    const newest = 'Peer accepted this during the first scan'
+    f.advance(5_000)
+    peer.changed({
+      ...tracked,
+      bodyText: tracked.bodyText.replace('Hello', newest),
+      policyState: { ...tracked.policyState!, lastRealRequestAt: f.now() },
+    })
+    await peer.drain()
+    await peer.releaseClaims(() => true)
+    expect(await current.persistence.reserveWarm(older)).toBe('not-owner')
+
+    resume.resolve()
+    await scan
+    await owner.loading
+    expect(current.manager.trackedRequest(id)?.bodyText).toContain(newest)
+    expect(scanning).toHaveBeenCalledTimes(2)
+  } finally {
+    resume.resolve()
+    await scan
+    scanning.mockRestore()
+  }
+})
+
+test('OC2 saves a real turn at its next warm after the old folder releases its claim', async () => {
+  const f = await fixture()
+  const second = await f.start()
+  const id = 'ses_oc2_keep'
+  const old = sharedKeeper(f)
+  await second.live()
+  await old.persistence.drain()
+  const key = createHash('sha256').update(id).digest('hex')
+  const path = join(f.disk, `${key}.json.gz`)
+  const saved = async () =>
+    JSON.parse(gunzipSync(await readFile(path)).toString())
+  const before = (await saved()).bodyText
+
+  const next = await f.reload()
+  const current = sharedKeeper(f)
+  const replacementBody = 'New real turn during the reload'
+  await next.live(undefined, {
+    messages: [{ role: 'user', content: replacementBody }],
+  })
+  await current.persistence.drain()
+  expect(current.manager.trackedRequest(id)?.bodyText).toContain(
+    replacementBody,
+  )
+  expect(current.persistence.isCommitted(id)).toBe(false)
+  expect((await saved()).bodyText).toBe(before)
+
+  const replacement = await f.reload(true, second)
+  expect(current.manager.trackedRequest(id)?.bodyText).toContain(
+    replacementBody,
+  )
+  expect((await saved()).bodyText).toBe(before)
+  let atDispatch: string | undefined
+  replacement.setSend(async () => {
+    atDispatch = (await saved()).bodyText
+    return Response.json({ usage: { cache_read_input_tokens: 1 } })
+  })
+  f.due()
+  await f.timers.fire()
+  expect(second.sent).toHaveLength(0)
+  expect(replacement.sent).toHaveLength(1)
+  expect(atDispatch).toContain(replacementBody)
+  await current.persistence.drain()
+  expect(current.persistence.isCommitted(id)).toBe(true)
+  expect((await saved()).bodyText).toContain(replacementBody)
+})
+
+test.each(['count', 'bytes'] as const)(
+  'OC2 keeps a real turn and restores the newest records within the %s budget',
+  async (budget) => {
+    const f = await fixture()
+    const templateId = 'ses_template'
+    await f.live(undefined, {}, templateId)
+    await f.dispose()
+    const recordPath = (id: string) =>
+      join(f.disk, `${createHash('sha256').update(id).digest('hex')}.json.gz`)
+    const templatePath = recordPath(templateId)
+    const template = JSON.parse(
+      gunzipSync(await readFile(templatePath)).toString(),
+    )
+    await rm(templatePath)
+    const ids = Array.from(
+      { length: CACHE_KEEP_MAX_TARGETS },
+      (_, i) => `ses_released_${i}`,
+    )
+    for (const [i, id] of ids.entries()) {
+      await writeFile(
+        recordPath(id),
+        gzipSync(
+          JSON.stringify({
+            ...template,
+            id,
+            cacheExpiresAt: template.cacheExpiresAt + i,
+            policyState: { ...template.policyState, ownerSessionId: id },
+          }),
+        ),
+        { mode: 0o600 },
+      )
+    }
+    const overflow = ids[0]!
+    const untouched = await readFile(recordPath(overflow))
+    const entered = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    const load = CacheKeepStore.prototype.load
+    const loading = spyOn(CacheKeepStore.prototype, 'load').mockImplementation(
+      async function (this: CacheKeepStore, ...args) {
+        entered.resolve()
+        await resume.promise
+        await load.apply(this, args)
+      },
+    )
+    try {
+      const next = await f.reload(false)
+      await entered.promise
+      const current = sharedKeeper(f)
+      const liveId = 'ses_new_real_turn'
+      await next.live(undefined, {}, liveId)
+      expect(current.manager.trackedRequest(liveId)).toBeDefined()
+      if (budget === 'bytes') {
+        // Leave room for one saved body without allocating a 64 MiB prompt.
+        const targets = Reflect.get(current.manager, 'targets') as Map<
+          string,
+          CacheKeepTarget
+        >
+        targets.get(liveId)!.bodyBytes =
+          CACHE_KEEP_MAX_BODY_BYTES -
+          Buffer.byteLength(template.bodyText, 'utf8')
+      }
+      const ready = Reflect.get(current, 'loading')
+      resume.resolve()
+      await ready
+      await current.persistence.drain()
+      expect(
+        current.manager
+          .trackedSessions()
+          .map(({ id }) => id)
+          .sort(),
+      ).toEqual([...ids.slice(budget === 'count' ? 1 : -1), liveId].sort())
+      expect(current.persistence.isCommitted(liveId)).toBe(true)
+      expect(await readFile(recordPath(overflow))).toEqual(untouched)
+      expect(await readdir(`${f.disk}.claims`)).not.toContain(
+        `${createHash('sha256').update(overflow).digest('hex')}.claim.json`,
+      )
+    } finally {
+      resume.resolve()
+      loading.mockRestore()
+    }
+  },
+)
+
+test('OC2 reload neither restores nor forgets an old folder’s uncommitted body', async () => {
+  const f = await fixture()
+  const id = 'ses_oc2_keep'
+  const old = sharedKeeper(f)
+  await f.live()
+  await old.persistence.drain()
+  const key = createHash('sha256').update(id).digest('hex')
+  const path = join(f.disk, `${key}.json.gz`)
+  const saved = await readFile(path)
+  const newest = 'Accepted but not committed by the old folder'
+  await f.live(undefined, { messages: [{ role: 'user', content: newest }] })
+  const writing = failNextRestartWrite(old.persistence)
+  try {
+    await f.reload()
+    const current = sharedKeeper(f)
+    expect(writing).toHaveBeenCalledTimes(1)
+    expect(old.persistence.isCommitted(id)).toBe(false)
+    expect(old.manager.trackedRequest(id)?.bodyText).toContain(newest)
+    expect(current.manager.trackedRequest(id)).toBeUndefined()
+    expect(await readdir(`${f.disk}.claims`)).toContain(`${key}.claim.json`)
+    expect(await readFile(path)).toEqual(saved)
+  } finally {
+    writing.mockRestore()
+  }
+})
+
+test('OC2 reload does not wait for a live old folder’s writer before saving a new turn', async () => {
+  const f = await fixture()
+  const second = await f.start()
+  await f.dispose()
+  await second.live(undefined, {
+    messages: [{ role: 'user', content: 'Accepted on the old module' }],
+  })
+  const old = sharedKeeper(f)
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const drain = old.persistence.drain.bind(old.persistence)
+  const draining = spyOn(old.persistence, 'drain').mockImplementation(
+    async () => {
+      entered.resolve()
+      await resume.promise
+      await drain()
+    },
+  )
+  const drainingOld = old.persistence.drain()
+  try {
+    await entered.promise
+    const next = await f.reload()
+    const current = sharedKeeper(f)
+    await next.live(
+      undefined,
+      { messages: [{ role: 'user', content: 'Accepted during reload' }] },
+      'ses_during_reload',
+    )
+    await current.persistence.drain()
+    expect(current.persistence.isCommitted('ses_during_reload')).toBe(true)
+    expect(current.manager.trackedRequest('ses_oc2_keep')).toBeUndefined()
+    resume.resolve()
+    await drainingOld
+    const bodies = new Map<string, string>()
+    for (const name of (await readdir(f.disk)).filter((file) =>
+      file.endsWith('.json.gz'),
+    )) {
+      const entry = JSON.parse(
+        gunzipSync(await readFile(join(f.disk, name))).toString(),
+      )
+      bodies.set(entry.id, entry.bodyText)
+    }
+    expect(bodies.get('ses_oc2_keep')).toContain('Accepted on the old module')
+    expect(bodies.get('ses_during_reload')).toContain('Accepted during reload')
+    expect(old.manager.trackedRequest('ses_oc2_keep')?.bodyText).toContain(
+      'Accepted on the old module',
+    )
+    expect(
+      current.manager.trackedRequest('ses_during_reload')?.bodyText,
+    ).toContain('Accepted during reload')
+    expect(current.persistence.isCommitted('ses_during_reload')).toBe(true)
+    expect(await readdir(`${f.disk}.claims`)).toContain(
+      `${createHash('sha256').update('ses_during_reload').digest('hex')}.claim.json`,
+    )
+    expect(current.manager).not.toBe(old.manager)
+  } finally {
+    resume.resolve()
+    await drainingOld
+    draining.mockRestore()
+  }
+})
+
+async function seedPeer(f: Awaited<ReturnType<typeof fixture>>) {
+  const id = 'ses_oc2_keep'
+  const key = createHash('sha256').update(id).digest('hex')
+  const peer = new CacheKeepStore({
+    storageId: f.paths.storageId,
+    root: f.root,
+    sessionClaims: true,
+  })
+  const record = join(f.disk, `${key}.json.gz`)
+  const claim = join(`${f.disk}.claims`, `${key}.claim.json`)
+  await f.live()
+  const tracked = Reflect.get(sharedKeeper(f).manager, 'targets').get(
+    id,
+  ) as CacheKeepTarget
+  await f.dispose()
+  peer.changed(tracked)
+  await peer.drain()
+  cleanups.push(() => peer.releaseClaims(() => true))
+  expect(peer.isCommitted(id)).toBe(true)
+  return { id, peer, record, claim, tracked }
+}
+
+test.each(['eviction', 'disposal'] as const)(
+  'OpenCode 2 %s does not delete a peer-owned warm record',
+  async (action) => {
+    const create = sourceFactory.createNativeAnthropicSource
+    const entered = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    let source!: NativeSource
+    const f = await fixture()
+    const peer = await seedPeer(f)
+    const record = await readFile(peer.record)
+    const claim = await readFile(peer.claim, 'utf8')
+    const capture = spyOn(
+      sourceFactory,
+      'createNativeAnthropicSource',
+    ).mockImplementation((options) => {
+      const native = create(options)
+      source =
+        action === 'disposal'
+          ? {
+              ...native,
+              async chooseAccount(input) {
+                entered.resolve()
+                await resume.promise
+                return native.chooseAccount(input)
+              },
+            }
+          : native
+      return source
+    })
+    cleanups.push(() => capture.mockRestore())
+    const next = await f.start()
+    const { persistence } = sharedKeeper(f)
+    const forget = spyOn(source, 'forgetSession')
+    cleanups.push(() => forget.mockRestore())
+    if (action === 'eviction') {
+      for (const sessionID of [
+        peer.id,
+        ...Array.from({ length: 512 }, (_, i) => `ses_fill_${i}`),
+      ])
+        await source.authorizeAccount(
+          {
+            sessionID,
+            kind: 'primary',
+            agent: 'build',
+            providerID: 'anthropic',
+            modelID: 'claude-sonnet-4-6',
+          },
+          'missing-account',
+        )
+    } else {
+      const preparing = next.prepare().catch(() => undefined)
+      try {
+        await entered.promise
+        await next.dispose()
+      } finally {
+        resume.resolve()
+        await preparing
+      }
+    }
+    expect(forget).toHaveBeenCalledWith(peer.id)
+    await persistence.drain()
+    expect(await readFile(peer.record)).toEqual(record)
+    expect(await readFile(peer.claim, 'utf8')).toBe(claim)
+  },
+)
+
+test('the OpenCode 2 host deletion event invalidates a peer-owned warm record', async () => {
+  const f = await fixture()
+  const peer = await seedPeer(f)
+  await f.start('enrollment.json', true, peer.id)
+  await sharedKeeper(f).persistence.drain()
+  expect(JSON.parse(await readFile(peer.claim, 'utf8')).deleted).toBe(true)
+  expect(await peer.peer.reserveWarm(peer.tracked)).toBe('not-owner')
+  expect(await readdir(f.disk)).toEqual([
+    `${createHash('sha256').update(peer.id).digest('hex')}.deleted`,
+  ])
+})
+
+test('OpenCode 2 sends no warm in an active local window without the session claim', async () => {
+  const f = await fixture()
+  const peer = await seedPeer(f)
+  const startHour = new Date(f.now()).getHours()
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    cacheKeep: { enabled: true, startHour, endHour: (startHour + 3) % 24 },
+  }))
+  const next = await f.start()
+  await next.live(undefined, {
+    messages: [{ role: 'user', content: 'Local accepted turn' }],
+  })
+  const owner = sharedKeeper(f)
+  await owner.persistence.drain()
+  expect(owner.manager.trackedRequest(peer.id)).toBeDefined()
+  expect(owner.persistence.isCommitted(peer.id)).toBe(false)
+
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(0)
+  expect(owner.manager.trackedRequest(peer.id)).toBeUndefined()
+  expect(await peer.peer.reserveWarm(peer.tracked)).toBe(true)
+})
+
+test('OpenCode 2 reload replaces a boolean-protocol scheduler before retrying ownership', async () => {
+  const f = await fixture()
+  const startHour = new Date(f.now()).getHours()
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    cacheKeep: { enabled: true, startHour, endHour: (startHour + 3) % 24 },
+  }))
+  await f.live()
+  const owner = sharedKeeper(f)
+  const manager = owner.manager
+  const oldWriter = owner.persistence
+  // An older scheduler treats any truthy store result as a committed count.
+  const legacyReserve = spyOn(
+    Reflect.get(manager, 'options'),
+    'reserveWarm',
+  ).mockImplementation(async (target: Readonly<CacheKeepTarget>) =>
+    Boolean(await oldWriter.reserveWarm(target)),
+  )
+  const next = await f.reload()
+  const current = sharedKeeper(f)
+  expect(current.manager).not.toBe(manager)
+  expect(current.persistence).not.toBe(oldWriter)
+  await current.persistence.drain()
+  expect(current.persistence.isCommitted('ses_oc2_keep')).toBe(true)
+
+  const check = spyOn(
+    CacheKeepClaim.prototype,
+    'withCurrent',
+  ).mockRejectedValue(new Error('Could not verify the claim'))
+  try {
+    f.due()
+    await f.timers.fire()
+    expect(check).toHaveBeenCalled()
+    expect(next.sent).toHaveLength(0)
+    expect(current.manager.trackedRequest('ses_oc2_keep')).toBeDefined()
+  } finally {
+    check.mockRestore()
+  }
+
+  f.advance(20_000)
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(1)
+  expect(f.sent).toHaveLength(0)
+  expect(legacyReserve).not.toHaveBeenCalled()
+  legacyReserve.mockRestore()
+})
+
+test('OpenCode 2 reload cancels a warm already authorizing on the older lease', async () => {
+  const create = sourceFactory.createNativeAnthropicSource
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  let paused = false
+  const source = spyOn(
+    sourceFactory,
+    'createNativeAnthropicSource',
+  ).mockImplementation((options) => {
+    const native = create(options)
+    return {
+      ...native,
+      async authorizeAccount(input, ...args) {
+        if (!paused && input.sessionID === 'oc2-cachekeep:ses_oc2_keep') {
+          paused = true
+          entered.resolve()
+          await resume.promise
+        }
+        return native.authorizeAccount(input, ...args)
+      },
+    }
+  })
+  cleanups.push(() => source.mockRestore())
+  const f = await fixture()
+  await f.live()
+  const { manager } = sharedKeeper(f)
+  f.due()
+  const warming = f.timers.fire()
+  try {
+    await Promise.race([entered.promise, warming])
+    expect(paused).toBe(true)
+    const reloading = f.reload()
+    resume.resolve()
+    await warming
+    const next = await reloading
+    const current = sharedKeeper(f)
+    expect(f.sent).toHaveLength(0)
+    expect(next.sent).toHaveLength(0)
+    expect(manager.trackedCount()).toBe(0)
+    expect(
+      Reflect.get(current.manager, 'targets').get('ses_oc2_keep'),
+    ).toMatchObject({
+      consecutiveFailures: 0,
+      policyState: { warmsSinceLastRealRequest: 0 },
+    })
+
+    f.advance(20_000)
+    await f.timers.fire()
+    expect(next.sent).toHaveLength(1)
+  } finally {
+    resume.resolve()
+    await warming
+  }
+})
+
+test('OpenCode 2 persists a successor acceptance during release of an earlier claim', async () => {
+  const f = await fixture()
+  const owner = sharedKeeper(f)
+  await f.live(undefined, {}, 'ses_release_first')
+  await f.live()
+  await owner.persistence.drain()
+  expect(owner.persistence.isCommitted('ses_release_first')).toBe(true)
+  expect(owner.persistence.isCommitted('ses_oc2_keep')).toBe(true)
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const release = CacheKeepClaim.prototype.release
+  let first = true
+  const releasing = spyOn(
+    CacheKeepClaim.prototype,
+    'release',
+  ).mockImplementation(async function (this: CacheKeepClaim) {
+    if (first) {
+      first = false
+      entered.resolve()
+      await resume.promise
+    }
+    await release.call(this)
+  })
+  const stopping = f.dispose()
+  try {
+    await entered.promise
+    const next = await f.start('enrollment.json', false)
+    await next.live(undefined, {
+      messages: [{ role: 'user', content: 'Accepted during hand-over' }],
+    })
+    expect(owner.manager.trackedRequest('ses_oc2_keep')?.bodyText).toContain(
+      'Accepted during hand-over',
+    )
+    resume.resolve()
+    await stopping
+    await owner.persistence.drain()
+    expect(owner.persistence.isCommitted('ses_oc2_keep')).toBe(true)
+    const key = createHash('sha256').update('ses_oc2_keep').digest('hex')
+    expect(
+      gunzipSync(await readFile(join(f.disk, `${key}.json.gz`))).toString(),
+    ).toContain('Accepted during hand-over')
+    expect(await readdir(`${f.disk}.claims`)).toContain(`${key}.claim.json`)
+  } finally {
+    resume.resolve()
+    await stopping
+    releasing.mockRestore()
+  }
 })

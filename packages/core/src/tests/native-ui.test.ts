@@ -83,13 +83,6 @@ const invocation = { sessionId: 'conversation-1', notify() {} }
 const localCustody = async () => 'local' as const
 /** These tests never select disconnect; return 'idle' if the callback is invoked. */
 const unusedDisconnect = async () => 'idle' as const
-const piUnavailable = [
-  'quota-refresh',
-  'killswitch-on',
-  'killswitch-off',
-  'killswitch-set',
-  'start-fire',
-]
 
 function applyFixture(
   menu: CommandMenu,
@@ -368,13 +361,7 @@ describe('native UI contract', () => {
         payload.menu.sections.flatMap((section) =>
           section.actions.map((action) => action.id),
         ),
-      ).toEqual(
-        Object.keys(fixtures).filter(
-          (id) =>
-            (host === 'opencode' || !piUnavailable.includes(id)) &&
-            id !== 'vault-disconnect',
-        ),
-      )
+      ).toEqual(Object.keys(fixtures).filter((id) => id !== 'vault-disconnect'))
       const actions = payload.menu.sections.flatMap(
         (section) => section.actions,
       )
@@ -419,7 +406,7 @@ describe('native UI contract', () => {
         'account:conversation-1',
         'quota:conversation-1',
         'routing:conversation-1',
-        ...(host === 'opencode' ? ['killswitch:conversation-1'] : []),
+        'killswitch:conversation-1',
         'cache:conversation-1',
         'cachekeep:conversation-1',
         'dump:conversation-1',
@@ -429,7 +416,6 @@ describe('native UI contract', () => {
       ])
     })
     for (const actionId of Object.keys(fixtures) as NativeMenuActionId[]) {
-      if (host === 'pi' && piUnavailable.includes(actionId)) continue
       // This loop covers local accounts. Separate disconnect tests check hosts
       // with vault enrollment and every disconnect outcome.
       if (actionId === 'vault-disconnect') continue
@@ -479,14 +465,6 @@ describe('native UI contract', () => {
     expect((await apply('add-apikey')).code).toBe('interactive-required')
     expect((await apply('add-oauth-start')).code).toBe('interactive-required')
     expect((await apply('custody-mode')).code).toBe('offline-required')
-    expect(calls).toEqual([])
-  })
-
-  test('Pi cannot dispatch OpenCode-only capabilities', async () => {
-    const { calls, apply } = setup('pi')
-    for (const action of piUnavailable as NativeMenuActionId[]) {
-      expect((await apply(action)).ok).toBe(false)
-    }
     expect(calls).toEqual([])
   })
 

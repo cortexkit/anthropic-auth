@@ -75,6 +75,8 @@ export interface NativeLocalCredentialServiceOptions {
    * loop: the next attempt is refused as 'refresh-backoff' and the result no
    * longer carries the provider failure. Return nextRetryAt equal to checkedAt
    * to record the failure without delaying the coordinator's own retries.
+   * For account-validation failures, omitting nextRetryAt uses the durable
+   * validation schedule rather than the token-exchange retry policy.
    * The service never adds retries or a retry schedule of its own, and it does
    * not treat an attempt number as proof that the failure is final.
    */

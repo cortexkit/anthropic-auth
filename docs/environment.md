@@ -14,8 +14,7 @@ Path conventions depend on the artifact. In these docs:
 
 | Variable | Effect |
 | --- | --- |
-| `ANTHROPIC_BASE_URL` | Override the Anthropic endpoint with an HTTP(S) URL on API-key routes. Claude sign-in (OAuth) requests go only to `https://api.anthropic.com` (or the [custom gateway](settings-file.md#custom-gateway) in your own settings file), so OpenCode refuses them while this points elsewhere; it never sets or widens the gateway |
-| `ANTHROPIC_INSECURE` | OpenCode 1 TLS opt-out for API-key requests: `1` or `true`, effective only with `ANTHROPIC_BASE_URL`; never applies to Claude sign-in (OAuth) requests, which always check certificates; avoid outside controlled diagnostics |
+| `ANTHROPIC_BASE_URL` | Override the Anthropic endpoint with an HTTP(S) URL on API-key requests that have no route URL. Saved paid routes use their stored URL. Claude sign-in (OAuth) requests go only to `https://api.anthropic.com` (or the [custom gateway](settings-file.md#custom-gateway) in your own settings file), so OpenCode refuses them while this points elsewhere; it never sets or widens the gateway |
 | `ANTHROPIC_CUSTOM_HEADERS` | Add proxy metadata on API-key routes; ignored for OAuth |
 | `ANTHROPIC_MODEL` | Default proxy alias for any `claude-*` model |
 | `ANTHROPIC_DEFAULT_SONNET_MODEL` | Alias for `claude-sonnet-*` |
@@ -63,14 +62,13 @@ A completed import records its routing destination in the journal; serving uses 
 | `OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK` | OpenCode 2 wire policy: `legacy` disables its server-side fallback opt-in; it does not enable OC1's client recovery |
 | `OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR` | OpenCode 1 and 2 [CacheKeep session registry](cachekeep-registry.md#location-and-permissions) directory override |
 | `PI_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR` | Pi [CacheKeep session registry](cachekeep-registry.md#location-and-permissions) directory override |
-| `OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR` | OpenCode 1 quota-header-feed lease directory; publishing still requires `quota_header_feed_enabled` |
 | `OPENCODE_ANTHROPIC_AUTH_RPC_DIR` | OpenCode TUI menu bridge's port/token directory; default is per-project under OpenCode state |
 | `OPENCODE_ANTHROPIC_AUTH_PERF` | `1` enables structural request/relay/stream performance instrumentation |
 | `CLAUDE_CODE_GZIP_REQUEST_BODIES` | Claude Code's own switch for [request-body gzip](transports.md#request-body-compression): `0` or `false` sends every OAuth body uncompressed; `1` or `true` gzips even behind a proxy, custom CA or client certificate, or while the seven-day latch is set; unset follows Claude Code's default |
 | `HTTPS_PROXY`, `HTTP_PROXY` (and lower-case), `NO_PROXY` | A proxy that applies to `api.anthropic.com` turns request-body gzip off, as in Claude Code. `HTTP_PROXY`/`http_proxy` also makes a loopback `http:` [custom gateway](settings-file.md#custom-gateway) refuse its requests unless `NO_PROXY`, and `no_proxy` when set, list the gateway host |
 | `NODE_EXTRA_CA_CERTS`, `CLAUDE_CODE_CLIENT_CERT`, `CLAUDE_CODE_CLIENT_KEY` | A custom CA or a client certificate turns request-body gzip off, as in Claude Code |
 
-The [sidebar guide](sidebar.md#tui-preferences), [quota feed](configuration.md#quota-header-feed), [safety fallback](request-rewriting.md#safety-fallback-opencode-1) and [dump guide](transports.md#diagnostics-and-dumps) explain scope and sensitive artifacts. The OpenCode TUI menu bridge accepts connections only from the local machine (`127.0.0.1`) and requires its bearer token.
+The [sidebar guide](sidebar.md#tui-preferences), [safety fallback](request-rewriting.md#safety-fallback-opencode-1) and [dump guide](transports.md#diagnostics-and-dumps) explain scope and sensitive artifacts. The OpenCode TUI menu bridge accepts connections only from the local machine (`127.0.0.1`) and requires its bearer token.
 
 ## CLI inputs
 

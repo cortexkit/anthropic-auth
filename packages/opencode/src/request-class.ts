@@ -1,4 +1,7 @@
-import type { ClaudeCodeRequestClass } from '@cortexkit/anthropic-auth-core'
+import type {
+  AnthropicBillingRequest,
+  ClaudeCodeRequestClass,
+} from '@cortexkit/anthropic-auth-core'
 
 /**
  * Plugin-internal header that carries a request's Claude Code request class
@@ -6,6 +9,7 @@ import type { ClaudeCodeRequestClass } from '@cortexkit/anthropic-auth-core'
  * the request leaves.
  */
 export const REQUEST_CLASS_REQUEST_HEADER = 'x-cortexkit-request-class'
+export const BILLING_REQUEST_KIND_HEADER = 'x-cortexkit-billing-request-kind'
 
 /**
  * Agents whose requests Claude Code would mark `auxiliary`: they run beside a
@@ -27,4 +31,12 @@ export function takeRequestClassHeader(
   const value = headers.get(REQUEST_CLASS_REQUEST_HEADER)
   headers.delete(REQUEST_CLASS_REQUEST_HEADER)
   return value === 'auxiliary' ? 'auxiliary' : 'main'
+}
+
+export function takeBillingRequestKind(
+  headers: Headers,
+): AnthropicBillingRequest['requestKind'] {
+  const kind = headers.get(BILLING_REQUEST_KIND_HEADER)
+  headers.delete(BILLING_REQUEST_KIND_HEADER)
+  return kind === 'title' || kind === 'compaction' ? kind : 'primary'
 }

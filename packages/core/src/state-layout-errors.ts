@@ -1,7 +1,9 @@
+import { win32 } from 'node:path'
+import { types as utilTypes } from 'node:util'
+
 /**
  * Why a process refuses to use a dataset while deciding or serving the
- * state-home layout. Each code has one fixed message; where a person must act
- * on a file, the message names it.
+ * state-home layout. Each code has a default public message.
  */
 export type StateLayoutRefusalCode =
   /** An old copy of the credentials or journal is back beside a moved copy. */
@@ -37,10 +39,13 @@ export type StateLayoutRefusalCode =
 export const RESTORE_LEGACY_COMMAND =
   'npx @cortexkit/opencode-anthropic-auth setup --restore-legacy'
 
+const IO_FAILED_PREFIX =
+  "anthropic-auth could not read or write a folder that decides where its state is, so it won't use either copy."
+
 /**
- * One fixed message per refusal, naming no file. Hosts show these where
- * their output may be shared (OpenCode 2's error surface, the CLI); the
- * refusal's own message, which names the files involved, goes to the log.
+ * Default messages name no files because hosts show them where their output
+ * may be shared. Only an unsafe Windows parent needs its path and the
+ * account's security identifier on screen so the user can fix its permissions.
  */
 const PUBLIC_MESSAGES: Record<StateLayoutRefusalCode, string> = {
   conflict:
@@ -58,8 +63,7 @@ const PUBLIC_MESSAGES: Record<StateLayoutRefusalCode, string> = {
   'unexpected-data':
     "anthropic-auth's state folder holds files it did not write, so it won't use them. The log names the files.",
   'restore-refused': `anthropic-auth can't restore the old layout yet. Run ${RESTORE_LEGACY_COMMAND} to see what to fix.`,
-  'io-failed':
-    "anthropic-auth could not read or write a folder that decides where its state is, so it won't use either copy. The log names the folder and the error; check its permissions, then restart.",
+  'io-failed': `${IO_FAILED_PREFIX} The log names the folder and the error; check its permissions, then restart.`,
 }
 
 /** Every refusal code, for readers that check a code they were handed. */
@@ -82,10 +86,63 @@ export const STATE_LAYOUT_REFUSAL_PUBLIC_MESSAGES: readonly string[] = [
   ...new Set(Object.values(PUBLIC_MESSAGES)),
 ]
 
-/** The fixed message, naming no file, for a refusal with `code`. */
+/** Read the Windows permissions verdict without copying raw error text or invoking getters. */
+export function stateLayoutWritableParentDetails(cause: unknown) {
+  if (cause === null || typeof cause !== 'object' || utilTypes.isProxy(cause))
+    return undefined
+  const field = (key: string): unknown =>
+    Object.getOwnPropertyDescriptor(cause, key)?.value
+  if (
+    field('code') !== 'ERR_PRIVATE_FILES_SECURITY' ||
+    field('stage') !== 'safe-parent' ||
+    field('reason') !== 'writable-by-others'
+  )
+    return undefined
+  const level = field('level')
+  const sid = field('sid')
+  if (
+    typeof level !== 'string' ||
+    !win32.isAbsolute(level) ||
+    /["\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(level) ||
+    typeof sid !== 'string' ||
+    !/^S-1-(?:\d+|0x[\dA-Fa-f]+)(?:-\d+)*$/.test(sid)
+  )
+    return undefined
+  const mask = field('mask')
+  return {
+    level,
+    sid,
+    ...(typeof mask === 'number' &&
+    Number.isInteger(mask) &&
+    mask >= 0 &&
+    mask <= 0xffffffff
+      ? { mask }
+      : {}),
+  }
+}
+
+export function stateLayoutWritableParentAdvice(cause: unknown) {
+  const details = stateLayoutWritableParentDetails(cause)
+  if (details)
+    return `Account ${details.sid} can change "${details.level}". Remove that account's change access from the folder, or set XDG_STATE_HOME to a folder only you can change.`
+}
+
+/** The default refusal text, with advice when Windows identifies a writable parent. */
 export function stateLayoutRefusalPublicMessage(
   code: StateLayoutRefusalCode,
+  refusal?: unknown,
 ): string {
+  if (
+    code === 'io-failed' &&
+    refusal !== null &&
+    typeof refusal === 'object' &&
+    !utilTypes.isProxy(refusal)
+  ) {
+    const advice = stateLayoutWritableParentAdvice(
+      Object.getOwnPropertyDescriptor(refusal, 'cause')?.value,
+    )
+    if (advice) return `${IO_FAILED_PREFIX} ${advice}`
+  }
   return PUBLIC_MESSAGES[code]
 }
 

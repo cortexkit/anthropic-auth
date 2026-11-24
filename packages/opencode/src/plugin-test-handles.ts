@@ -3,6 +3,7 @@ import type {
   acquireNativeAccountRuntime,
   CacheKeepManager,
   CustodyStatusState,
+  MessageThreadTracker,
   PrimeManager,
   ProviderAccountUuid,
   QuotaManager,
@@ -15,6 +16,7 @@ export interface PluginTestHandles {
   primeManager: PrimeManager
   quotaManager: QuotaManager
   cacheKeepManager: CacheKeepManager
+  messageThreads: MessageThreadTracker
   fableFallbackManager: FableFallbackManager
   resolveMainQuotaIdentity: (
     accessToken: string,

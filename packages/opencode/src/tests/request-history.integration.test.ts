@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import {
   __setLogTestSink,
   type AccountStorage,
+  CLAUDE_CODE_IDENTITY,
   type LogTestRecord,
   resetCache1hState,
   resetDumpState,
@@ -70,108 +71,180 @@ function readAccountStorage(): Promise<AccountStorage | null> {
   return readAccountStorageWithCtx(testContext)
 }
 
-describe('OpenCode 1 service_tier shaping', () => {
+describe('OpenCode 1 OAuth and paid request shaping', () => {
   const originalFetch = globalThis.fetch
+  const alias = process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
 
   afterEach(() => {
     globalThis.fetch = originalFetch
+    if (alias === undefined) delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
+    else process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = alias
   })
 
-  test.each(['oauth', 'api fallback'] as const)(
-    'service_tier follows the OpenCode 1 %s route',
-    async (route) => {
-      await useTempAccountFile(
-        createFallbackStorage({
-          fallbackOn: [429],
-          refresh: {
-            enabled: false,
-            intervalMinutes: 10,
-            refreshBeforeExpiryMinutes: 30,
+  async function capture(route: 'oauth' | 'api fallback') {
+    await useTempAccountFile(
+      createFallbackStorage({
+        fallbackOn: [429],
+        refresh: {
+          enabled: false,
+          intervalMinutes: 10,
+          refreshBeforeExpiryMinutes: 30,
+        },
+        quota: {
+          enabled: false,
+          checkIntervalMinutes: 5,
+          minimumRemaining: {},
+          failClosedOnUnknownQuota: false,
+        },
+        accounts: [
+          {
+            id: 'service-tier-api',
+            type: 'api',
+            apiKey: 'synthetic-service-tier-key',
+            baseURL: 'https://paid.invalid',
+            authHeader: 'x-api-key',
           },
-          quota: {
-            enabled: false,
-            checkIntervalMinutes: 5,
-            minimumRemaining: {},
-            failClosedOnUnknownQuota: false,
-          },
-          accounts: [
-            {
-              id: 'service-tier-api',
-              type: 'api',
-              apiKey: 'synthetic-service-tier-key',
-              baseURL: 'https://paid.invalid',
-              authHeader: 'x-api-key',
-            },
-          ],
-        }),
+        ],
+      }),
+    )
+    process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'paid-opus-alias'
+    const sent: Array<{
+      url: string
+      headers: Headers
+      body: string
+      tls?: Bun.TLSOptions
+    }> = []
+    globalThis.fetch = mock(
+      withNativeAdmission(
+        (input: string | URL | Request, init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url.includes('/claude_cli/bootstrap'))
+            return Promise.resolve(
+              Response.json({
+                oauth_account: { account_uuid: 'service-tier-account' },
+              }),
+            )
+          if (url.includes('/api/oauth/usage'))
+            return Promise.resolve(
+              Response.json({
+                five_hour: { utilization: 100 },
+                seven_day: { utilization: 50 },
+              }),
+            )
+          if (url.includes('/v1/messages')) {
+            const headers = new Headers(init?.headers)
+            sent.push({
+              url,
+              headers,
+              body: String(init?.body),
+              tls: (
+                init as (RequestInit & { tls?: Bun.TLSOptions }) | undefined
+              )?.tls,
+            })
+            return Promise.resolve(
+              new Response('{}', {
+                status:
+                  route === 'api fallback' && headers.has('authorization')
+                    ? 429
+                    : 200,
+              }),
+            )
+          }
+          throw new Error(`Unexpected service-tier fixture request: ${url}`)
+        },
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    try {
+      const auth = await plugin.auth.loader(
+        () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
+        { models: {} },
       )
-      const sent: Array<{ headers: Headers; body: Record<string, unknown> }> =
-        []
-      globalThis.fetch = mock(
-        withNativeAdmission(
-          (input: string | URL | Request, init?: RequestInit) => {
-            const url = extractUrl(input)
-            if (url.includes('/claude_cli/bootstrap'))
-              return Promise.resolve(
-                Response.json({
-                  oauth_account: { account_uuid: 'service-tier-account' },
-                }),
-              )
-            if (url.includes('/api/oauth/usage'))
-              return Promise.resolve(
-                Response.json({
-                  five_hour: { utilization: 100 },
-                  seven_day: { utilization: 50 },
-                }),
-              )
-            if (url.includes('/v1/messages')) {
-              const headers = new Headers(init?.headers)
-              sent.push({ headers, body: JSON.parse(String(init?.body)) })
-              return Promise.resolve(
-                new Response('{}', {
-                  status:
-                    route === 'api fallback' && headers.has('authorization')
-                      ? 429
-                      : 200,
-                }),
-              )
-            }
-            throw new Error(`Unexpected service-tier fixture request: ${url}`)
+      const payload = {
+        model: 'claude-opus-4-8',
+        max_tokens: 64,
+        service_tier: route === 'oauth' ? 'auto' : 'standard_only',
+        messages: [{ role: 'user', content: 'Hello' }],
+        system: [{ type: 'text', text: 'Keep the host prompt.' }],
+        tools: [
+          {
+            name: 'read',
+            description: 'Read data',
+            input_schema: { type: 'object' },
           },
-        ),
-      ) as unknown as typeof fetch
-      const plugin = await getPlugin()
-      try {
-        const auth = await plugin.auth.loader(
-          () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
-          { models: {} },
+        ],
+      }
+      const response = await auth.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers:
+          route === 'oauth'
+            ? {}
+            : {
+                'anthropic-beta':
+                  'host-feature-2026-01-01,oauth-2025-04-20,claude-code-20250219',
+              },
+        body: JSON.stringify(payload),
+      })
+      expect(response.status).toBe(200)
+      expect(sent).toHaveLength(route === 'oauth' ? 1 : 2)
+      return { sent, payload }
+    } finally {
+      await plugin.dispose?.()
+    }
+  }
+
+  test.each(['oauth', 'api fallback'] as const)(
+    'OpenCode 1 %s applies Claude Code shaping only on OAuth',
+    async (route) => {
+      const { sent, payload } = await capture(route)
+      expect(sent[0]?.headers.get('authorization')).toBe(
+        'Bearer sk-ant-oat01-main-access',
+      )
+      const oauthBody = sent[0]!.body
+      expect(oauthBody).toContain(CLAUDE_CODE_IDENTITY)
+      expect(oauthBody).toContain('x-anthropic-billing-header:')
+      expect(JSON.parse(oauthBody)).not.toHaveProperty('service_tier')
+      expect(JSON.parse(oauthBody).model).toBe(payload.model)
+      if (route === 'api fallback') {
+        expect(sent[1]?.headers.get('x-api-key')).toBe(
+          'synthetic-service-tier-key',
         )
-        const response = await auth.fetch(MESSAGES_URL, {
-          method: 'POST',
-          body: JSON.stringify({
-            model: 'claude-opus-4-8',
-            max_tokens: 64,
-            service_tier: route === 'oauth' ? 'auto' : 'standard_only',
-            messages: [{ role: 'user', content: 'Hello' }],
-          }),
+        expect(new URL(sent[1]!.url).origin).toBe('https://paid.invalid')
+        expect(JSON.parse(sent[1]!.body)).toEqual({
+          ...payload,
+          model: 'paid-opus-alias',
         })
-        expect(response.status).toBe(200)
-        expect(sent).toHaveLength(route === 'oauth' ? 1 : 2)
-        expect(sent[0]?.headers.get('authorization')).toBe(
-          'Bearer sk-ant-oat01-main-access',
+        expect(sent[1]!.headers.get('anthropic-beta')).toBe(
+          'host-feature-2026-01-01',
         )
-        expect(sent[0]?.body).not.toHaveProperty('service_tier')
-        if (route === 'api fallback') {
-          expect(sent[1]?.headers.get('x-api-key')).toBe(
-            'synthetic-service-tier-key',
-          )
-          expect(sent[1]?.body.service_tier).toBe('standard_only')
-        }
-      } finally {
-        await plugin.dispose?.()
       }
     },
   )
+
+  test('OpenCode 1 verifies TLS for sign-in and paid sends even with the old opt-out set', async () => {
+    const baseURL = process.env.ANTHROPIC_BASE_URL
+    const insecure = process.env.ANTHROPIC_INSECURE
+    try {
+      // The explicit paid URL wins over this environment default. Keeping the
+      // default on Anthropic lets the OAuth attempt reach the fallback decision.
+      process.env.ANTHROPIC_BASE_URL = 'https://api.anthropic.com'
+      process.env.ANTHROPIC_INSECURE = '1'
+      const { sent } = await capture('api fallback')
+      expect(sent[0]?.headers.get('authorization')).toBe(
+        'Bearer sk-ant-oat01-main-access',
+      )
+      expect(sent[0]!.tls?.rejectUnauthorized ?? true).toBe(true)
+      const paid = sent[1]!
+      expect(new URL(paid.url).origin).toBe('https://paid.invalid')
+      expect(paid.headers.get('x-api-key')).toBe('synthetic-service-tier-key')
+      expect(paid.tls?.rejectUnauthorized ?? true).toBe(true)
+    } finally {
+      if (baseURL === undefined) delete process.env.ANTHROPIC_BASE_URL
+      else process.env.ANTHROPIC_BASE_URL = baseURL
+      if (insecure === undefined) delete process.env.ANTHROPIC_INSECURE
+      else process.env.ANTHROPIC_INSECURE = insecure
+    }
+  })
 })
 
 describe('Fable 5.1 request-scoped effort history', () => {
@@ -1347,7 +1420,9 @@ describe('claude-start integration', () => {
     }
   })
 
-  test('claude-start shapes the OAuth fallback after an API-key failure', async () => {
+  test('claude-start shapes the last-resort primary OAuth send after an API-key failure', async () => {
+    // A healthy OAuth fallback would serve before the paid key. Exhausted main
+    // is the last resort here, so both sends exercise the same lane-start request.
     await useTempAccountFile(
       bindPoolAccounts(
         createFallbackStorage({
@@ -1359,25 +1434,6 @@ describe('claude-start integration', () => {
               apiKey: 'api-fails-key',
               baseURL: 'https://api.example.test',
               authHeader: 'x-api-key',
-            },
-            {
-              id: 'fallback-1',
-              type: 'oauth',
-              access: 'sk-ant-oat01-fallback-access',
-              refresh: 'fallback-refresh',
-              expires: Date.now() + 5 * 60 * 60 * 1000,
-              quota: {
-                five_hour: {
-                  usedPercent: 25,
-                  remainingPercent: 75,
-                  checkedAt: Date.now(),
-                },
-                seven_day: {
-                  usedPercent: 30,
-                  remainingPercent: 70,
-                  checkedAt: Date.now(),
-                },
-              },
             },
           ],
           quota: {
@@ -1460,19 +1516,18 @@ describe('claude-start integration', () => {
       },
       { headers },
     )
-    await result.fetch(MESSAGES_URL, {
+    const response = await result.fetch(MESSAGES_URL, {
       method: 'POST',
       headers: { 'x-session-affinity': 'ses-api-then-oauth', ...headers },
       body,
     })
 
-    const apiSend = sent.find(
-      (entry) => entry.headers.get('x-api-key') === 'api-fails-key',
-    )
-    const oauthSend = sent.find(
-      (entry) =>
-        entry.headers.get('authorization') ===
-        'Bearer sk-ant-oat01-fallback-access',
+    expect(response.status).toBe(200)
+    expect(sent).toHaveLength(2)
+    const [apiSend, oauthSend] = sent
+    expect(apiSend?.headers.get('x-api-key')).toBe('api-fails-key')
+    expect(oauthSend?.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-main-access',
     )
     expect(apiSend?.body).toMatchObject({ max_tokens: 99 })
     expect(apiSend?.body.thinking).toEqual({

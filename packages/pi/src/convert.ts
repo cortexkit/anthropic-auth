@@ -1,11 +1,15 @@
 import {
+  applyCacheDiagnosticsOptIn,
   applyClaudeCodeMetadata,
+  applyRunnerPlanNotes,
   applyRunnerTurnNotes,
   applySessionCacheTtl,
   applyThinkingBindingControls,
   applyTurnEndNotes,
   assertNoMeaningfulTrailingAssistant,
+  type BillingLineageFields,
   buildBillingHeaderValue,
+  CACHE_DIAGNOSTICS_BETA,
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
@@ -17,6 +21,7 @@ import {
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   ClaudeCodeFirstUserTextTracker,
   type ClaudeCodeIdentity,
+  countUserPrompts,
   isClaudeFableOrMythos5Model,
   isClaudeHaiku55Model,
   isClaudeOpus5Model,
@@ -26,8 +31,12 @@ import {
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
   orderClaudeCodeBody,
+  prepareApiKeyRequestBody,
+  readRunOutputCap,
   readSessionCachePolicy,
   requestCacheLifetimeMs,
+  resolveClaudeModelCapabilities,
+  selectClaudeCodeBetas,
   signRequestBody,
   stripEmptyTrailingAssistantMessages,
   type ThinkingPrefixMismatchBehavior,
@@ -36,6 +45,7 @@ import type {
   Context,
   ImageContent,
   Message,
+  Model,
   SimpleStreamOptions,
   TextContent,
   ThinkingContent,
@@ -49,7 +59,9 @@ import {
   PiForkRefusal,
   piForkHeadSession,
 } from './forks.ts'
+import { isPiLaneStartMessage, stripPiLaneStartNonce } from './lane-start.ts'
 import {
+  clampPiMaxTokensToContext,
   collapseSystemMessages,
   getCurrentSystemPrompt,
   getCurrentTools,
@@ -248,6 +260,8 @@ function convertMessages(
   targetModelId: string,
   visibleReplies: WeakMap<object, string>,
   droppedAssistants: WeakSet<object>,
+  mapToolName = toClaudeCodeToolName,
+  userTimestamps?: WeakMap<object, number>,
 ): AnthropicRequestBody['messages'] {
   const result: AnthropicRequestBody['messages'] = []
   // Effort history counts source assistant turns, including ones with nothing
@@ -263,10 +277,10 @@ function convertMessages(
     const message = messages[index]
     if (!message) continue
     if (message.role === 'user') {
+      let content: AnthropicRequestBody['messages'][number]['content']
       if (typeof message.content === 'string') {
-        if (message.content.trim()) {
-          result.push({ role: 'user', content: sanitize(message.content) })
-        }
+        if (!message.content.trim()) continue
+        content = sanitize(message.content)
       } else {
         const parts = message.content as Array<TextContent | ImageContent>
         // A text-only user message with several parts keeps them as separate
@@ -278,11 +292,11 @@ function convertMessages(
               .filter((item): item is TextContent => item.type === 'text')
               .map((item) => ({ type: 'text', text: sanitize(item.text) }))
               .filter((block) => block.text.trim())
-        result.push({
-          role: 'user',
-          content: blocks.length > 1 ? blocks : convertTextAndImages(parts),
-        })
+        content = blocks.length > 1 ? blocks : convertTextAndImages(parts)
       }
+      const converted = { role: 'user', content }
+      result.push(converted)
+      userTimestamps?.set(converted, message.timestamp)
       continue
     }
 
@@ -346,7 +360,7 @@ function convertMessages(
           blocks.push({
             type: 'tool_use',
             id: sanitizeToolId(block.id),
-            name: toClaudeCodeToolName(block.name),
+            name: mapToolName(block.name),
             input: block.arguments,
           })
         }
@@ -416,11 +430,12 @@ function convertMessages(
 
 function convertTools(
   tools: Tool[] | undefined,
+  mapToolName: (name: string) => string,
 ): AnthropicRequestBody['tools'] {
   if (!tools?.length) return undefined
   return tools.map((tool) => ({
     // Names are checked for collisions by createClaudeCodeToolNameMap first.
-    name: toClaudeCodeToolName(tool.name),
+    name: mapToolName(tool.name),
     description: tool.description,
     input_schema: {
       type: 'object',
@@ -452,6 +467,58 @@ function addEphemeralCacheControl(body: AnthropicRequestBody): void {
       }
     }
     break
+  }
+}
+
+/**
+ * Paid API-key requests get exactly the cache markers Pi's own Anthropic
+ * provider would place: the system prompt, the last tool and the last message.
+ */
+function applyPiApiKeyCache(
+  body: AnthropicRequestBody,
+  options: SimpleStreamOptions | undefined,
+  compat: Model<'anthropic-messages'>['compat'],
+): void {
+  // Same resolution as Pi's own provider (resolveCacheRetention): the
+  // environment can only ask for long retention, and no caching needs the
+  // explicit cacheRetention option. Paid requests stay as Pi would send them.
+  const retention =
+    options?.cacheRetention ??
+    ((options?.env?.PI_CACHE_RETENTION || process.env.PI_CACHE_RETENTION) ===
+    'long'
+      ? 'long'
+      : 'short')
+  if (retention === 'none') return
+  const control = {
+    type: 'ephemeral',
+    ...(retention === 'long' && compat?.supportsLongCacheRetention !== false
+      ? { ttl: '1h' }
+      : {}),
+  }
+  const system = body.system?.at(-1)
+  if (system) system.cache_control = control
+  const tool = body.tools?.at(-1)
+  if (tool && compat?.supportsCacheControlOnTools !== false)
+    tool.cache_control = control
+
+  const last = body.messages.at(-1)
+  if (last?.role !== 'user' && last?.role !== 'system') return
+  if (typeof last.content === 'string') {
+    last.content = [
+      { type: 'text', text: last.content, cache_control: control },
+    ]
+  } else if (Array.isArray(last.content)) {
+    const block = last.content.at(-1)
+    if (
+      [
+        'text',
+        'image',
+        'tool_result',
+        'tool_addition',
+        'tool_removal',
+      ].includes(block?.type)
+    )
+      block.cache_control = control
   }
 }
 
@@ -596,7 +663,8 @@ function applyForkCacheBridge(
     : blocks.findLast((block) => block.cache_control)
   const newestPosition =
     newest === body ? blocks.length - 1 : blocks.indexOf(newest ?? {})
-  if (!newest || newestPosition - blocks.indexOf(baseBlock) <= 20) return
+  // Both the new and retained boundaries count toward the 20-block window.
+  if (!newest || newestPosition - blocks.indexOf(baseBlock) < 20) return
   const control = newest.cache_control as Record<string, unknown>
   const holders: Record<string, unknown>[] = []
   walkCacheControlHolders(body, (holder) => holders.push(holder))
@@ -631,6 +699,55 @@ function applyForkCacheBridge(
   baseBlock.cache_control = { ...control }
 }
 
+/** Find the previous boundary when the latest one's lookback cannot reach it. */
+function hybridLookbackBridge(messages: unknown[]) {
+  let position = 0
+  let previous: { message: Record<string, unknown>; end: number } | undefined
+  let latest: typeof previous
+  for (const value of messages) {
+    if (!value || typeof value !== 'object') continue
+    const message = value as Record<string, unknown>
+    const content = message.content
+    // A system note inserted after a reply uses string content and consumes
+    // one lookback block, though only user messages can be bridge anchors.
+    const blocks = Array.isArray(content)
+      ? content.length
+      : content == null
+        ? 0
+        : 1
+    position += blocks
+    if (message.role === 'user' && blocks > 0) {
+      previous = latest
+      latest = { message, end: position }
+    }
+  }
+  // Pi has no fixed marker at the tail of its first user message. Count both
+  // boundaries in Anthropic's lookback, even when the earlier one is first.
+  return previous && latest && latest.end - previous.end + 1 > 20
+    ? previous.message
+    : undefined
+}
+
+function applyHybridCacheBridge(body: AnthropicRequestBody) {
+  const system = body.system?.findLast((block) => block.cache_control)
+  if (!system) return
+  const bridge = hybridLookbackBridge(body.messages)
+  if (!bridge) return
+  if (typeof bridge.content === 'string')
+    bridge.content = [{ type: 'text', text: bridge.content }]
+  if (!Array.isArray(bridge.content)) return
+  const block = bridge.content.findLast(
+    (value) =>
+      value &&
+      typeof value === 'object' &&
+      value.type !== 'thinking' &&
+      value.type !== 'redacted_thinking',
+  )
+  if (!block) return
+  block.cache_control = system.cache_control
+  delete system.cache_control
+}
+
 /**
  * Anthropic accepts at most four cache breakpoints per request. This provider
  * composes its own body and has already placed exactly four
@@ -643,40 +760,54 @@ function applyForkCacheBridge(
  * Each mode now places its own breakpoints and nothing else, as the OpenCode
  * rewrite path does (`applyAutomaticCache1h` / `applyHybridCache1h` both clear
  * every breakpoint first):
- * - `automatic`: the top-level control alone, at 1h.
- * - `hybrid`: the four block breakpoints extended to 1h, no top-level control.
- *   That is the placement OpenCode's hybrid anchors reconstruct by hand and
- *   this converter emits natively.
+ * - `automatic`: the top-level control alone.
+ * - `hybrid`: the four block breakpoints, with the system slot
+ *   available for a lookback bridge on an ordinary request.
  * - `explicit`: the same four breakpoints, TTL only.
  */
 function applyCacheMode(
   body: AnthropicRequestBody,
-  enabled: boolean,
+  long: boolean,
   mode: Cache1hMode,
 ): void {
-  if (!enabled) return
-
   if (mode === 'automatic') {
     walkCacheControlHolders(body, (holder) => {
       delete holder.cache_control
     })
-    body.cache_control = { type: 'ephemeral', ttl: '1h' }
+    body.cache_control = { type: 'ephemeral', ...(long && { ttl: '1h' }) }
     return
   }
 
-  walkCacheControlHolders(body, (holder) => {
-    ;(holder.cache_control as Record<string, unknown>).ttl = '1h'
-  })
+  if (long) applySessionCacheTtl(body, 'long')
 }
 
-/** Replace only the system cache marker, preserving the tool and message markers. */
+/** Let a full request after a thread reuse its last full-request cache boundary. */
 export function piThreadCacheSlot(
   body: Record<string, unknown>,
 ): Record<string, unknown> | undefined {
-  if (body.cache_control || !Array.isArray(body.system)) return undefined
-  return body.system.findLast(
-    (block) => block && typeof block === 'object' && block.cache_control,
-  )
+  if (body.cache_control) return undefined
+  const system = Array.isArray(body.system)
+    ? body.system.findLast(
+        (block) => block && typeof block === 'object' && block.cache_control,
+      )
+    : undefined
+  if (system) return system
+  if (!Array.isArray(body.messages)) return undefined
+  const bridge = hybridLookbackBridge(body.messages)
+  return Array.isArray(bridge?.content)
+    ? bridge.content.findLast(
+        (block) => block && typeof block === 'object' && block.cache_control,
+      )
+    : undefined
+}
+
+function fitManualThinking(body: AnthropicRequestBody): void {
+  if (body.thinking?.type !== 'enabled') return
+  // As in Pi's Anthropic provider, reserve 1,024 tokens for the reply.
+  // Omit manual thinking if its remaining budget is below Anthropic's minimum.
+  const budget = Math.min(body.thinking.budget_tokens, body.max_tokens - 1_024)
+  if (budget < 1_024) delete body.thinking
+  else body.thinking = { ...body.thinking, budget_tokens: budget }
 }
 
 export async function buildAnthropicRequest(
@@ -687,12 +818,21 @@ export async function buildAnthropicRequest(
   fastModeEnabled = false,
   identity?: ClaudeCodeIdentity,
   controls: {
+    modelLimits?: Partial<
+      Pick<Model<'anthropic-messages'>, 'maxTokens' | 'contextWindow'>
+    >
+    /** Convert Pi's typed context without adding Claude Code wire shaping. */
+    apiKey?: boolean
+    apiKeyModelCompat?: Model<'anthropic-messages'>['compat']
+    laneStart?: boolean
+    billingLineage?: BillingLineageFields
     effortTransitions?: readonly PiEffortTransition[]
     forkBaseMessageCount?: number
     /** A fork's lower answer effort, applied to its question turn only. */
     forkEffort?: PiForkEffortHint
     /** Leave the billing signature placeholder for the transport to finalize. */
     deferSigning?: boolean
+    cacheDiagnosticsPreviousMessageId?: string | null
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
     turnEndNote?: { tools: string[] }
     /**
@@ -711,6 +851,10 @@ export async function buildAnthropicRequest(
   /** Set only when `controls.forkEffort` changed the request. */
   forkEffortApplied?: PiForkEffortHint
 }> {
+  const apiKey = controls.apiKey === true
+  for (const message of context.messages)
+    stripPiLaneStartNonce(message, options?.sessionId)
+  const mapToolName = apiKey ? (name: string) => name : toClaudeCodeToolName
   const forkBase =
     controls.forkBaseMessageCount === undefined
       ? undefined
@@ -725,12 +869,22 @@ export async function buildAnthropicRequest(
   // messages can change the prompt, its named sections and the tool set. Resolve
   // them through the local replay port; raw host prompts (including ordered OMP
   // blocks) still enter through normalization.
-  const transcript = collapseSystemMessages(
-    normalizeContext({
-      ...context,
-      systemPrompt: systemPromptText(context.systemPrompt),
-    }),
+  const catalogue = resolveClaudeModelCapabilities(modelId)?.catalogue
+  const requestedMaxTokens =
+    options?.maxTokens ??
+    catalogue?.maxOutputTokens ??
+    controls.modelLimits?.maxTokens ??
+    16_384
+  const normalized = normalizeContext({
+    ...context,
+    systemPrompt: systemPromptText(context.systemPrompt),
+  })
+  const maxTokens = clampPiMaxTokensToContext(
+    normalized.messages,
+    controls.modelLimits?.contextWindow ?? catalogue?.contextWindow,
+    requestedMaxTokens,
   )
+  const transcript = collapseSystemMessages(normalized)
   context = {
     messages: transcript.messages,
     systemPrompt: getCurrentSystemPrompt(transcript.messages),
@@ -742,11 +896,16 @@ export async function buildAnthropicRequest(
   assertNoMeaningfulTrailingAssistant(context.messages)
   const visibleReplies = new WeakMap<object, string>()
   const droppedAssistants = new WeakSet<object>()
+  // Keep timestamps off the wire. Message identity survives dropped empty
+  // users, prepended documentation and inserted effort or turn-note messages.
+  const userTimestamps = new WeakMap<object, number>()
   const messages = convertMessages(
     context.messages,
     modelId,
     visibleReplies,
     droppedAssistants,
+    mapToolName,
+    userTimestamps,
   )
   stripEmptyTrailingAssistantMessages(messages)
   const baseLastMessage = forkBase
@@ -772,24 +931,37 @@ export async function buildAnthropicRequest(
     : undefined
   if (forkHead && forkFirstUserText === undefined)
     throw new PiForkRefusal('base')
-  const system = [
-    {
-      type: 'text',
-      text: buildBillingHeaderValue(
-        messages,
-        undefined,
-        CLAUDE_CODE_ENTRYPOINT,
-        options?.sessionId
-          ? forkHead
-            ? forkFirstUserText
-            : firstUserTextTracker.resolve(options.sessionId, messages)
-          : undefined,
-      ),
-    },
-    { type: 'text', text: CLAUDE_CODE_IDENTITY },
-  ]
+  const system = apiKey
+    ? []
+    : [
+        {
+          type: 'text',
+          text: buildBillingHeaderValue(
+            messages,
+            undefined,
+            CLAUDE_CODE_ENTRYPOINT,
+            options?.sessionId
+              ? forkHead
+                ? forkFirstUserText
+                : firstUserTextTracker.resolve(options.sessionId, messages)
+              : undefined,
+            identity && !forkHead && controls.billingLineage?.promptId
+              ? {
+                  ...controls.billingLineage,
+                  promptIndex:
+                    countUserPrompts(messages) -
+                    context.messages.filter(isPiLaneStartMessage).length,
+                }
+              : undefined,
+          ),
+        },
+        { type: 'text', text: CLAUDE_CODE_IDENTITY },
+      ]
   const systemPrompt = systemPromptText(context.systemPrompt)
-  if (systemPrompt.trim()) {
+  if (apiKey) {
+    if (systemPrompt.trim())
+      system.push({ type: 'text', text: sanitize(systemPrompt) })
+  } else if (systemPrompt.trim()) {
     // Pi's prompt cannot sit whole in the top-level system[] array: two lines of
     // its documentation paragraph (the docs/*.md enumeration and the "follow .md
     // cross-references" instruction) are each independently sufficient to make
@@ -823,17 +995,21 @@ export async function buildAnthropicRequest(
 
   let body: AnthropicRequestBody = {
     model: modelId,
-    max_tokens: options?.maxTokens ?? 16_384,
+    // max_tokens is not part of Anthropic's prompt-cache key, so changing the
+    // reply allowance does not invalidate a cached prefix.
+    max_tokens: maxTokens,
     stream: true,
-    system,
+    ...(system.length ? { system } : {}),
     messages,
   }
 
-  const declaredToolNames = createClaudeCodeToolNameMap(context.tools ?? [])
-  const tools = convertTools(context.tools)
+  const declaredToolNames = apiKey
+    ? new Map<string, string>()
+    : createClaudeCodeToolNameMap(context.tools ?? [])
+  const tools = convertTools(context.tools, mapToolName)
   if (tools?.length) body.tools = tools
 
-  if (fastModeEnabled && isFastModeSupportedModel(modelId)) {
+  if (!apiKey && fastModeEnabled && isFastModeSupportedModel(modelId)) {
     body.speed = 'fast'
   }
 
@@ -897,13 +1073,16 @@ export async function buildAnthropicRequest(
       }
     }
   }
+  if (maxTokens < requestedMaxTokens) fitManualThinking(body)
 
-  const forkEffortApplied = applyPiForkEffort(
-    body,
-    controls.effortTransitions ?? [],
-    controls.forkEffort,
-    baseLastMessage,
-  )
+  const forkEffortApplied = apiKey
+    ? undefined
+    : applyPiForkEffort(
+        body,
+        controls.effortTransitions ?? [],
+        controls.forkEffort,
+        baseLastMessage,
+      )
   body.messages = body.messages.filter(
     (message) => !droppedAssistants.has(message),
   )
@@ -919,13 +1098,34 @@ export async function buildAnthropicRequest(
     modelId,
     isOAuth: !!identity,
   })
-  addEphemeralCacheControl(body)
-  const cachePolicy = readSessionCachePolicy(options?.sessionId, !!identity)
-  applyCacheMode(
-    body,
-    cachePolicy?.ttl !== undefined ? cachePolicy.ttl !== 'none' : cache.enabled,
-    cache.mode,
-  )
+  applyRunnerPlanNotes(body, {
+    // A fork's own handle returns the notes from its retained base request.
+    sessionId: options?.sessionId,
+    modelId,
+    isOAuth: !!identity && !apiKey,
+    userTimestamps,
+  })
+  const cachePolicy = apiKey
+    ? undefined
+    : readSessionCachePolicy(options?.sessionId, !!identity)
+  if (apiKey) {
+    applyPiApiKeyCache(body, options, controls.apiKeyModelCompat)
+  } else {
+    addEphemeralCacheControl(body)
+    applyCacheMode(
+      body,
+      cachePolicy?.ttl === 'long' ||
+        (cachePolicy?.ttl === undefined && cache.enabled),
+      cache.mode,
+    )
+    if (
+      cache.mode === 'hybrid' &&
+      cachePolicy?.ttl !== 'none' &&
+      !forkHead &&
+      !forkBase
+    )
+      applyHybridCacheBridge(body)
+  }
   if (identity) {
     applyThinkingBindingControls(
       body,
@@ -942,8 +1142,13 @@ export async function buildAnthropicRequest(
     : undefined
   if (replaced !== undefined)
     body = { ...(replaced as AnthropicRequestBody), stream: true }
-  applySessionCacheTtl(body, cachePolicy?.ttl)
-  if (baseBoundary >= 0) applyForkCacheBridge(body, baseBoundary)
+  if (controls.laneStart) {
+    body.max_tokens = 1
+    delete body.thinking
+  }
+  if (apiKey) prepareApiKeyRequestBody(body)
+  else applySessionCacheTtl(body, cachePolicy?.ttl)
+  if (!apiKey && baseBoundary >= 0) applyForkCacheBridge(body, baseBoundary)
   // As in Pi's native adapter, replacements must still request SSE. Hooks own
   // the validity of their other edits and must not add a fifth cache breakpoint:
   // the provider's existing layout may already use Anthropic's four slots.
@@ -955,12 +1160,23 @@ export async function buildAnthropicRequest(
     throw new Error(
       `Anthropic accepts at most 4 cache breakpoints; the onPayload hook left ${breakpoints}`,
     )
-  const unsigned = JSON.stringify(
-    orderClaudeCodeBody(body, { isOAuth: !!identity }),
+  // Apply the cap after the payload hook and lane-start override so neither can
+  // bypass it. Use the request's own session, not the head that supplied fork history.
+  const cap = readRunOutputCap(options?.sessionId)
+  if (cap !== null && cap < body.max_tokens) {
+    body.max_tokens = cap
+    fitManualThinking(body)
+  }
+  if (
+    controls.cacheDiagnosticsPreviousMessageId !== undefined &&
+    selectClaudeCodeBetas(body).split(',').includes(CACHE_DIAGNOSTICS_BETA)
   )
-  const bodyText = controls.deferSigning
-    ? unsigned
-    : await signRequestBody(unsigned)
+    applyCacheDiagnosticsOptIn(body, controls.cacheDiagnosticsPreviousMessageId)
+  const unsigned = JSON.stringify(
+    apiKey ? body : orderClaudeCodeBody(body, { isOAuth: !!identity }),
+  )
+  const bodyText =
+    apiKey || controls.deferSigning ? unsigned : await signRequestBody(unsigned)
   // Translate only known host/wire pairs that survived the hook and JSON
   // serialization. Hook-added or renamed tools must not acquire an alias, and
   // response decoding must never change outgoing names or signed history.

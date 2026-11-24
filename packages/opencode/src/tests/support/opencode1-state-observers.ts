@@ -129,7 +129,7 @@ export async function waitForAccountStorage(
   throw new Error(`Account storage did not match: ${JSON.stringify(storage)}`)
 }
 
-/** Wait on pool file changes, not a cache/feed event, when asserting disk quota. */
+/** Wait on pool file changes, not an in-memory cache event, when asserting disk quota. */
 export async function waitForNativePoolQuota(
   ctx: Opencode1TestContext,
   routeId: string,

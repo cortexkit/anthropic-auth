@@ -20,7 +20,7 @@ const READ_TIMEOUT_MS = 50
 const SWEEP_INTERVAL_MS = 60_000
 const LONG_LIFETIME_MS = 3_600_000
 
-export type MessageThreadTailHost = 'opencode2' | 'pi'
+export type MessageThreadTailHost = 'opencode1' | 'opencode2' | 'pi'
 
 export interface FullCacheTail {
   identity: string

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync, gzipSync } from 'node:zlib'
 import {
+  CacheKeepClaim,
   type CacheKeepManager,
   cacheKeepStoreDirectory,
   createEmptyStorage,
@@ -12,7 +13,6 @@ import {
   type NativeAccountSnapshot,
 } from '@cortexkit/anthropic-auth-core'
 import { PiCacheKeep } from '../cachekeep.ts'
-import { PiCacheKeepClaim } from '../cachekeep-claim.ts'
 
 const cleanups: Array<() => unknown | Promise<unknown>> = []
 afterEach(async () => {
@@ -582,7 +582,7 @@ test('Pi shutdown aborts and joins Core due-timer warms before releasing their c
       ...(
         Reflect.get(active.process, 'sessions') as Map<
           string,
-          { claim: PiCacheKeepClaim }
+          { claim: CacheKeepClaim }
         >
       ).values(),
     ][0]!.claim
@@ -876,29 +876,44 @@ test('Pi still drops a restart record requiring a real request', async () => {
   expect(f.sends).toEqual([])
 })
 
-test('two live Pi processes cannot restore or track the same session', async () => {
+test('only one live Pi process at a time can restore or warm a session', async () => {
   const f = await fixture()
   const seed = f.create()
   await seed.process.trackAccepted(f.input('session-S'), f.snapshot)
   await seed.process.stop()
-  f.advance(55 * 60_000)
+  f.advance(54 * 60_000)
   const one = f.create()
   const two = f.create()
   await Promise.all([
     one.process.startSession('pi-storage', 'session-S'),
     two.process.startSession('pi-storage', 'session-S'),
   ])
-  const nonOwner = one.process.manager.trackedCount() ? two : one
-  await nonOwner.process.trackAccepted(
-    f.input('session-S', 'another accepted body'),
-    f.snapshot,
-  )
   expect(
     one.process.manager.trackedCount() + two.process.manager.trackedCount(),
   ).toBe(1)
-  f.advance(30_000)
+  const [restoring, working] = one.process.manager.trackedCount()
+    ? [one, two]
+    : [two, one]
+  await working.process.trackAccepted(
+    f.input('session-S', 'another accepted body'),
+    f.snapshot,
+  )
+  // The idle opener learns it lost its claim on its next persistence operation.
+  // A pending copy of the restored prefix must not overwrite the new owner.
+  const oldStore = await Reflect.get(restoring.process, 'store').call(
+    restoring.process,
+    'pi-storage',
+  )
+  await oldStore.drain()
+  f.advance(60_001)
   await Promise.all([one.tick(), two.tick()])
+  expect(restoring.process.manager.trackedCount()).toBe(0)
+  expect(working.process.manager.trackedCount()).toBe(1)
+  expect(f.sends).toHaveLength(0)
+  f.advance(54 * 60_000)
+  await working.tick()
   expect(f.sends).toHaveLength(1)
+  expect(JSON.stringify(f.sends[0]?.body)).toContain('another accepted body')
 })
 
 test('opening another Pi session leaves unresumed records untouched until expiry', async () => {
@@ -975,16 +990,16 @@ test('Pi drains the latest accepted body on shutdown and removes stopped targets
 test('a reused pid cannot hold a Pi session and an old release cannot remove its successor claim', async () => {
   const f = await fixture()
   const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
-  const old = new PiCacheKeepClaim(directory, 'S', {
+  const old = new CacheKeepClaim(directory, 'S', {
     liveness: { pidAlive: () => true, incarnation: async () => 'old-start' },
   })
-  const next = new PiCacheKeepClaim(directory, 'S', {
+  const next = new CacheKeepClaim(directory, 'S', {
     liveness: { pidAlive: () => true, incarnation: async () => 'new-start' },
   })
   expect(await old.acquire()).toBe(true)
   expect(await next.acquire()).toBe(true)
   await old.release()
-  const contender = new PiCacheKeepClaim(directory, 'S', {
+  const contender = new CacheKeepClaim(directory, 'S', {
     liveness: { pidAlive: () => true, incarnation: async () => 'new-start' },
   })
   expect(await contender.acquire()).toBe(false)
@@ -1001,7 +1016,7 @@ test('a Pi owner waits out a sweep and restores without another turn or request'
   f.advance(55 * 60_000)
   const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
   const hash = createHash('sha256').update('session-S').digest('hex')
-  const sweep = new PiCacheKeepClaim(directory, hash, {
+  const sweep = new CacheKeepClaim(directory, hash, {
     sessionHash: true,
     liveness: { pidAlive: () => true, incarnation: async () => 'same-start' },
   })
@@ -1049,7 +1064,7 @@ test('shutdown saves an accepted body queued before a sweep releases its claim',
   const f = await fixture()
   const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
   const hash = createHash('sha256').update('session-S').digest('hex')
-  const sweep = new PiCacheKeepClaim(directory, hash, {
+  const sweep = new CacheKeepClaim(directory, hash, {
     sessionHash: true,
     liveness: { pidAlive: () => true, incarnation: async () => 'same-start' },
   })
@@ -1208,3 +1223,153 @@ test.each(['replaced', 'retired'] as const)(
       expect(JSON.stringify(f.sends[0]!.body)).toContain('Newest Pi prefix')
   },
 )
+
+test('Pi reacquires for a real turn after a peer released its takeover claim', async () => {
+  const f = await fixture()
+  const seed = f.create().process
+  const id = 'session-S'
+  expect((await seed.trackAccepted(f.input(id), f.snapshot))?.tracked).toBe(
+    true,
+  )
+  await seed.stop()
+  const restoring = f.create().process
+  await restoring.startSession('pi-storage', id)
+  expect(restoring.manager.trackedCount()).toBe(1)
+  const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
+  const peer = new CacheKeepClaim(directory, id)
+  try {
+    expect(await peer.acquire()).toBe(true)
+    await peer.release()
+    expect(
+      (await restoring.trackAccepted(f.input(id, 'new real turn'), f.snapshot))
+        ?.tracked,
+    ).toBe(true)
+    expect(restoring.manager.trackedRequest(id)?.bodyText).toContain(
+      'new real turn',
+    )
+    expect(await peer.acquire()).toBe(false)
+  } finally {
+    await peer.release()
+  }
+})
+
+test('a queued Pi flush cannot drop the real-turn claim that replaced its restore claim', async () => {
+  const f = await fixture()
+  const seed = f.create().process
+  const id = 'session-S'
+  const storagePath = 'pi-storage'
+  expect((await seed.trackAccepted(f.input(id), f.snapshot))?.tracked).toBe(
+    true,
+  )
+  await seed.stop()
+  const restoring = f.create().process
+  await restoring.startSession(storagePath, id)
+  expect(restoring.manager.trackedCount()).toBe(1)
+  const store = await Reflect.get(restoring, 'store').call(
+    restoring,
+    storagePath,
+  )
+  const peer = new CacheKeepClaim(store.directory, id)
+  const entered = Promise.withResolvers<void>()
+  const unblock = Promise.withResolvers<void>()
+  Reflect.get(store, 'enqueue').call(store, () => {
+    entered.resolve()
+    return unblock.promise
+  })
+  try {
+    await entered.promise
+    // Drain queues the restored entry's flush under the original claim.
+    const flushing = store.drain()
+    expect(await peer.acquire()).toBe(true)
+    await peer.release()
+    restoring.realTurn(id)
+    await Promise.all(Reflect.get(restoring, 'tracking'))
+    expect(await peer.acquire()).toBe(false)
+
+    unblock.resolve()
+    await flushing
+    expect(store.isCommitted(id)).toBe(false)
+    expect(restoring.manager.trackedRequest(id)?.bodyText).toContain(
+      'original prefix',
+    )
+    // The next acceptance saves under the replacement; shutdown can release it.
+    expect(
+      (await restoring.trackAccepted(f.input(id, 'next prefix'), f.snapshot))
+        ?.tracked,
+    ).toBe(true)
+    await store.drain()
+    expect(store.isCommitted(id)).toBe(true)
+    await restoring.stop()
+    expect(await peer.acquire()).toBe(true)
+  } finally {
+    unblock.resolve()
+    await peer.release()
+  }
+})
+
+test('Pi startup cannot unlink the fresh record published during a restore takeover', async () => {
+  const f = await fixture()
+  const id = 'session-S'
+  const seed = f.create().process
+  expect((await seed.trackAccepted(f.input(id), f.snapshot))?.tracked).toBe(
+    true,
+  )
+  await seed.stop()
+  const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
+  const key = createHash('sha256').update(id).digest('hex')
+  const path = join(directory, `${key}.json.gz`)
+  const fresh = JSON.parse(gunzipSync(await readFile(path)).toString())
+  f.advance(61 * 60_000)
+  fresh.cacheExpiresAt = f.now() + 60 * 60_000
+  const peer = new CacheKeepClaim(directory, id)
+  const originalCurrent = CacheKeepClaim.prototype.isCurrent
+  const originalLocked = CacheKeepClaim.prototype.withCurrent
+  let checking = false
+  let checks = 0
+  let published = false
+  const takeOver = async () => {
+    if (published) return
+    expect(await peer.acquire()).toBe(true)
+    expect(
+      await originalLocked.call(peer, async (assertOwned) => {
+        await assertOwned()
+        await writeFile(path, gzipSync(JSON.stringify(fresh)), { mode: 0o600 })
+      }),
+    ).toBe(true)
+    published = true
+  }
+  const current = spyOn(
+    CacheKeepClaim.prototype,
+    'isCurrent',
+  ).mockImplementation(async function (this: CacheKeepClaim) {
+    checking = true
+    try {
+      const allowed = await originalCurrent.call(this)
+      // An unlocked removal used to check once more after rejecting the record.
+      if (++checks === 3 && allowed) await takeOver()
+      return allowed
+    } finally {
+      checking = false
+    }
+  })
+  const locked = spyOn(
+    CacheKeepClaim.prototype,
+    'withCurrent',
+  ).mockImplementation(async function (this: CacheKeepClaim, action) {
+    // With locked removal, let the taker publish before the unlink gets the lock.
+    if (!checking && this !== peer && checks >= 2) await takeOver()
+    return originalLocked.call(this, action)
+  })
+  try {
+    await f.create().process.startSession('pi-storage', id)
+    expect(published).toBe(true)
+    expect(await readdir(directory)).toContain(`${key}.json.gz`)
+    expect(JSON.parse(gunzipSync(await readFile(path)).toString())).toEqual(
+      fresh,
+    )
+  } finally {
+    current.mockRestore()
+    locked.mockRestore()
+    await peer.release()
+  }
+})

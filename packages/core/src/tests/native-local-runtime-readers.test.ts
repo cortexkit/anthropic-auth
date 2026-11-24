@@ -287,6 +287,7 @@ test('proof and retry preserve absent versus zero timestamp in both directions',
     expect(await f.hooks.readAdmission(stored)).toEqual({
       status: 'blocked',
       reason: 'validation-backoff',
+      validationRetryAt: 800,
     })
   }
 })
@@ -603,6 +604,7 @@ test('unproven matching validation retry fences admission but never refresh rest
   expect(await f.hooks.readAdmission(f.subject)).toEqual({
     status: 'blocked',
     reason: 'validation-backoff',
+    validationRetryAt: 800,
   })
   expect((await f.hooks.readRestrictions(f.subject)).restriction).toEqual(
     allowed,
@@ -929,6 +931,7 @@ test('actual coordinator admits only real current proof without provider work', 
     status: 'refused',
     reason: 'validation-backoff',
     persisted: false,
+    validationRetryAt: 800,
   })
   expect([providers, lookups, observations.length]).toEqual([0, 0, 0])
 })

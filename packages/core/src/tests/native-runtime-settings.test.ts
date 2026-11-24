@@ -205,13 +205,6 @@ for (const [name, values, read, expected] of [
   ['refresh', { refresh_interval_minutes: 3 }, getRefreshIntervalMs, 180_000],
   ['prime', { prime_enabled: true }, isPrimePersistentlyEnabled, true],
   [
-    'quota header feed',
-    { quota_header_feed_enabled: true },
-    (storage: ReturnType<typeof createEmptyStorage>) =>
-      storage.quotaHeaderFeed?.enabled,
-    true,
-  ],
-  [
     'keep-warm schedule',
     { cache_keep_window: [{ start_hour: 2, end_hour: 7 }] },
     getCacheKeepWindow,

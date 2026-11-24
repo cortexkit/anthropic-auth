@@ -1,22 +1,39 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
-import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import {
+  __setLogTestSink,
   type AccountStorage,
+  getLogLevel,
+  PROMPT_CACHE_DEFAULT_TTL_MS,
   PrimeManager,
   primeAccountMarkerDir,
   primeMarkerPath,
   resolveNativePoolPaths,
+  StickySessionRouter,
+  sessionCacheActivity,
+  setLogLevel,
   signRequestBody,
+  stickyRouteFamilyForModel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import {
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  SessionManager,
+} from '@earendil-works/pi-coding-agent'
 import cortexKitPiAnthropicAuth from '../index.ts'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import { createPiNativeCommands } from '../native-commands.ts'
-import { getPiTrackedCacheKeepSessions, sendPiPrimeRequest } from '../stream.ts'
+import {
+  beginPiPrimaryTurn,
+  endPiPrimaryTurn,
+  getPiTrackedCacheKeepSessions,
+  sendPiPrimeRequest,
+  streamCortexKitAnthropic,
+} from '../stream.ts'
 import { saveNativePiFixture } from './native-fixture.ts'
 
 const originalFetch = globalThis.fetch
@@ -94,13 +111,44 @@ beforeEach(async () => {
       )
       expect(request.redirect).toBe('error')
       const bytes = Buffer.from(await request.arrayBuffer())
-      sends.push({
-        headers: request.headers,
-        text: (request.headers.get('content-encoding') === 'gzip'
+      const text = (
+        request.headers.get('content-encoding') === 'gzip'
           ? gunzipSync(bytes)
           : bytes
-        ).toString(),
-      })
+      ).toString()
+      sends.push({ headers: request.headers, text })
+      if (JSON.parse(text).stream) {
+        return new Response(
+          [
+            {
+              type: 'message_start',
+              message: {
+                id: `msg_pi_lane_${sends.length}`,
+                model: JSON.parse(text).model,
+                diagnostics: null,
+                usage: {
+                  input_tokens: 1,
+                  cache_read_input_tokens: 0,
+                  cache_creation_input_tokens: 0,
+                  cache_creation: {
+                    ephemeral_5m_input_tokens: 0,
+                    ephemeral_1h_input_tokens: 0,
+                  },
+                },
+              },
+            },
+            { type: 'message_stop' },
+          ]
+            .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+            .join(''),
+          {
+            headers: {
+              'content-type': 'text/event-stream',
+              'request-id': `req_lane_test_${sends.length}`,
+            },
+          },
+        )
+      }
       return Response.json({ usage: { input_tokens: 17, output_tokens: 1 } })
     },
     { preconnect: originalFetch.preconnect },
@@ -206,6 +254,330 @@ test('Pi Prime enabled with a due account fires once through the signed model tr
   ).toMatchObject({ count: 1, inputTokens: 17, outputTokens: 1 })
   expect([...timeouts.values()].map((timer) => timer.ms)).toEqual([90_000])
 })
+
+test.each(['string', 'single-block'] as const)(
+  'Pi /claude queues lane start as a visible turn that warms the session cache (%s)',
+  (shape) => runLaneStart(shape),
+)
+
+test('Pi answers a lane delivery with other content as a normal turn', () =>
+  runLaneStart('mixed'))
+
+test('Pi lane stays out of the thread and predecessor when a human prompt arrives during routing', () =>
+  runLaneStart('single-block', true))
+
+async function runLaneStart(
+  shape: 'string' | 'single-block' | 'mixed',
+  interleaveHumanPrompt = false,
+) {
+  const native = await fixture(false, {
+    routing: { mode: 'sticky-balanced' },
+    accounts: [
+      {
+        id: 'fallback',
+        type: 'oauth',
+        access: 'sk-ant-oat01-fallback-access',
+        refresh: 'fallback-refresh',
+        expires: now + 3_600_000,
+      },
+    ],
+  })
+  const modelId = 'claude-sonnet-5-5'
+  const transcript = SessionManager.create(
+    directory,
+    join(directory, 'transcripts'),
+  )
+  const sessionId = transcript.getSessionId()
+  const router = new StickySessionRouter({ path: await native.routingPath() })
+  expect(
+    await router.resolve({
+      sessionId,
+      modelId,
+      family: stickyRouteFamilyForModel(modelId),
+      affinityModelId: modelId,
+      candidates: [
+        { accountId: 'fallback', order: 1, quota: { kind: 'unknown' } },
+      ],
+      retainAccountIds: new Set(['fallback']),
+      inputBytes: 1,
+      storage: (await native.view()).policyStorage,
+    }),
+  ).toMatchObject({ accountId: 'fallback' })
+  await router.drain()
+
+  const commands = new Map<
+    string,
+    Parameters<ExtensionAPI['registerCommand']>[1]
+  >()
+  const queued: Parameters<ExtensionAPI['sendUserMessage']>[] = []
+  const handlers = new Map<
+    string,
+    (event: unknown, context: unknown) => Promise<void>
+  >()
+  await cortexKitPiAnthropicAuth({
+    on: (
+      name: string,
+      handler: (event: unknown, context: unknown) => Promise<void>,
+    ) => handlers.set(name, handler),
+    registerProvider() {},
+    registerCommand: (
+      name: string,
+      definition: Parameters<ExtensionAPI['registerCommand']>[1],
+    ) => commands.set(name, definition),
+    sendUserMessage: (...args: Parameters<ExtensionAPI['sendUserMessage']>) => {
+      queued.push(args)
+    },
+  } as unknown as ExtensionAPI)
+  async function invoke(model?: ExtensionCommandContext['model']) {
+    const notices: string[] = []
+    let picked = false
+    await commands.get('claude')?.handler('', {
+      model,
+      hasUI: true,
+      sessionManager: transcript,
+      ui: {
+        notify: (text: string) => notices.push(text),
+        async select(title: string, choices: string[]) {
+          if (picked) return undefined
+          if (title === 'Claude')
+            return choices.find((choice) => choice.startsWith('Extras'))
+          picked = true
+          return choices.find((choice) => choice === 'Fire lane start')
+        },
+      },
+    } as unknown as ExtensionCommandContext)
+    return notices.join('\n')
+  }
+
+  const refusal = await invoke()
+  expect(refusal).toBeTruthy()
+  expect(refusal).not.toContain('Claude lane start queued in this session.')
+  expect(queued).toHaveLength(0)
+  expect(sends).toHaveLength(0)
+
+  const model: NonNullable<ExtensionCommandContext['model']> = {
+    id: modelId,
+    name: 'Claude Sonnet 5.5',
+    api: 'anthropic-messages',
+    provider: 'anthropic',
+    baseUrl: 'https://api.anthropic.com',
+    reasoning: true,
+    input: ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200_000,
+    maxTokens: 64_000,
+  }
+  const notice = await invoke(model)
+  const marker = '[lane start] — automated cache warm; no response needed.'
+  expect(queued).toEqual([
+    [
+      expect.stringMatching(
+        /^\[lane start\].*\n\[cortexkit lane start: [\da-f-]+\]$/,
+      ),
+      { deliverAs: 'followUp' },
+    ],
+  ])
+  expect(sends).toHaveLength(0)
+  expect(notice).toContain('Claude lane start queued in this session.')
+
+  const first = {
+    role: 'user',
+    content: 'Earlier session prompt',
+    timestamp: now,
+  } as const
+  const extra =
+    shape === 'mixed' ? [{ type: 'text' as const, text: 'Other content' }] : []
+  const raw = queued[0]![0] as string
+  const lane = {
+    role: 'user',
+    content: shape === 'string' ? raw : [...extra, { type: 'text', text: raw }],
+    timestamp: now + 2,
+  } satisfies Parameters<typeof streamCortexKitAnthropic>[1]['messages'][number]
+  const typed = { role: 'user', content: marker, timestamp: now + 1 } as const
+  const next = {
+    role: 'user',
+    content: 'Now answer my question',
+    timestamp: now + 3,
+  } as const
+  async function runTurn(
+    messages: Parameters<typeof streamCortexKitAnthropic>[1]['messages'],
+    newUser = messages.at(-1) ?? null,
+    canThread = false,
+  ) {
+    if (newUser?.role === 'user') {
+      await handlers.get('message_start')?.(
+        { message: newUser },
+        { sessionManager: transcript },
+      )
+      transcript.appendMessage(newUser)
+    }
+    const result = await streamCortexKitAnthropic(
+      model,
+      { messages: structuredClone(messages) },
+      {
+        sessionId,
+        maxTokens: 123,
+        ...(canThread && {
+          onPayload: () => {},
+          onResponse: () => {},
+          onProviderStreamEvent: () => {},
+        }),
+      },
+      undefined,
+      undefined,
+      'agent-loop',
+    ).result()
+    expect(result.stopReason).toBe('stop')
+  }
+  const records: string[] = []
+  const level = getLogLevel()
+  setLogLevel('debug')
+  __setLogTestSink(({ message }) => records.push(message))
+  beginPiPrimaryTurn(storagePath, sessionId)
+  try {
+    await runTurn([first, typed])
+    const human = JSON.parse(sends[0]!.text)
+    expect(human.max_tokens).toBe(123)
+    expect(human.thinking).toBeDefined()
+    expect(human.system[0].text).toContain('cc_prompt_index=2;')
+
+    if (interleaveHumanPrompt) {
+      const routingKey = Symbol.for('cortexkit.routing')
+      const globals = globalThis as Record<symbol, unknown>
+      const previousRouting = globals[routingKey]
+      let prompts = 0
+      globals[routingKey] = () => ({
+        accountFor: async () => {
+          prompts++
+          await handlers.get('message_start')?.(
+            { message: next },
+            { sessionManager: transcript },
+          )
+        },
+      })
+      try {
+        await runTurn([first, typed, lane], lane, true)
+        expect(prompts).toBe(1)
+      } finally {
+        if (previousRouting === undefined) delete globals[routingKey]
+        else globals[routingKey] = previousRouting
+      }
+    } else {
+      await runTurn([first, typed, lane], lane, true)
+    }
+    expect(sends).toHaveLength(2)
+    const sent = sends[1]!
+    expect(sent.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-fallback-access',
+    )
+    const body = JSON.parse(sent.text)
+    expect(body.model).toBe(modelId)
+    expect(body.messages).toHaveLength(3)
+    expect(body.messages[0]).toMatchObject({
+      role: 'user',
+      content: first.content,
+    })
+    expect(body.messages[1]).toMatchObject({
+      role: 'user',
+      content: marker,
+    })
+    expect(body.messages[2]).toMatchObject({
+      role: 'user',
+      content: [
+        ...extra,
+        { type: 'text', text: marker, cache_control: { type: 'ephemeral' } },
+      ],
+    })
+    // Pi appends the live message after message_start and clones it for the provider.
+    const persisted = await readFile(transcript.getSessionFile()!, 'utf8')
+    expect(persisted).not.toContain('cortexkit lane start:')
+    expect(
+      JSON.parse(persisted.trimEnd().split('\n').at(-1)!).message.content,
+    ).toEqual(
+      shape === 'string' ? marker : [...extra, { type: 'text', text: marker }],
+    )
+    expect(sent.text).not.toContain('cortexkit lane start:')
+    // A lane start whose message carries other content is answered as a normal turn.
+    if (shape === 'mixed') {
+      expect(body.max_tokens).toBe(123)
+      expect(body.thinking).toEqual(human.thinking)
+      expect(body.system[0].text).toMatch(/cc_prompt_id=[\da-f-]{36};/)
+      expect(body.system[0].text).toContain('cc_prev_req=req_lane_test_1;')
+      expect(body.system[0].text).toContain('cc_prompt_index=3;')
+    } else {
+      expect(body.max_tokens).toBe(1)
+      expect(body.thread).toBeUndefined()
+      expect(body.system[0].text).not.toMatch(/cc_(?:prompt_id|prev_req)=/)
+      expect(body.thinking).toBeUndefined()
+    }
+    expect(await signRequestBody(sent.text)).toBe(sent.text)
+    expect(sessionCacheActivity.ttlMs(sessionId)).toBe(
+      PROMPT_CACHE_DEFAULT_TTL_MS,
+    )
+    if (shape === 'mixed') return
+
+    if (interleaveHumanPrompt) {
+      // The routing callback already delivered this prompt's message_start.
+      await runTurn([first, typed, lane, next], null)
+      expect(sends).toHaveLength(3)
+      const following = JSON.parse(sends[2]!.text)
+      expect(following.diagnostics.previous_message_id).toBe('msg_pi_lane_1')
+      expect(following.system[0].text).toContain('cc_prev_req=req_lane_test_1;')
+      return
+    }
+
+    await runTurn([
+      first,
+      typed,
+      lane,
+      {
+        role: 'assistant',
+        content: [
+          { type: 'toolCall', id: 'tool_lane', name: 'read', arguments: {} },
+        ],
+      } as Parameters<typeof streamCortexKitAnthropic>[1]['messages'][number],
+      {
+        role: 'toolResult',
+        toolCallId: 'tool_lane',
+        toolName: 'read',
+        content: [{ type: 'text', text: 'Tool reply' }],
+        isError: false,
+        timestamp: now + 3,
+      },
+    ])
+    const toolStep = JSON.parse(sends[2]!.text)
+    expect(toolStep.diagnostics.previous_message_id).toBe('msg_pi_lane_1')
+    expect(toolStep.max_tokens).toBe(123)
+    expect(toolStep.thinking).toBeDefined()
+    expect(toolStep.system[0].text).not.toMatch(/cc_(?:prompt_id|prev_req)=/)
+
+    await runTurn([first, typed, lane, next])
+    expect(sends).toHaveLength(4)
+    const following = JSON.parse(sends[3]!.text)
+    expect(following.diagnostics.previous_message_id).toBe('msg_pi_lane_1')
+    expect(following.max_tokens).toBe(123)
+    expect(following.thinking).toBeDefined()
+    expect(following.messages[0]).toEqual(body.messages[0])
+    expect(following.messages[2]).toMatchObject({
+      role: 'user',
+      content: marker,
+    })
+    expect(following.system[0].text).toContain('cc_prev_req=req_lane_test_1;')
+    expect(following.system[0].text).toContain('cc_prompt_index=3;')
+    expect(
+      records
+        .filter((message) => message.startsWith('MC-CACHE-DIAG '))
+        .map((message) => JSON.parse(message.slice('MC-CACHE-DIAG '.length)))
+        .find((record) => record.message_id === 'msg_pi_lane_2'),
+    ).toMatchObject({ source: 'start', synthetic: true })
+  } finally {
+    endPiPrimaryTurn(storagePath, sessionId, true)
+    __setLogTestSink(null)
+    setLogLevel(level)
+    sessionCacheActivity.forget(sessionId)
+  }
+  expect((await native.view()).policyStorage.prime?.enabled).toBe(false)
+}
 
 test('Pi Prime disabled never polls or sends, and the menu enables it live', async () => {
   const native = await fixture(false)

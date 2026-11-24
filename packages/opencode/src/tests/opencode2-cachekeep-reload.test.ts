@@ -1,12 +1,13 @@
 import { afterEach, expect, spyOn, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import {
   CacheKeepManager,
   CacheKeepSessionRegistry,
-  logger,
+  type CacheKeepTarget,
   type NativeAccountRuntime,
 } from '@cortexkit/anthropic-auth-core'
 import { createNativeCacheKeep } from '../v2/cachekeep'
@@ -19,24 +20,12 @@ afterEach(async () => {
 })
 
 test.each([false, true])(
-  'OpenCode 2 reload tracks a response through a 2.5.3 shared owner (retained: %s)',
+  'OpenCode 2 reload never accesses a 2.16.6 keeper in the old slot (retained: %s)',
   async (retained) => {
-    const globals = globalThis as Record<symbol, unknown>
-    const diagnostic = Symbol.for(
-      'cortexkit.anthropic-auth.opencode2.legacy-turn-rules',
-    )
-    const previous = globals[diagnostic]
-    delete globals[diagnostic]
-    const logging = spyOn(logger, 'info').mockImplementation(() => {})
-    cleanups.push(() => {
-      logging.mockRestore()
-      if (previous === undefined) delete globals[diagnostic]
-      else globals[diagnostic] = previous
-    })
     const directory = await mkdtemp(join(tmpdir(), 'oc2-cachekeep-reload-'))
     cleanups.push(() => rm(directory, { recursive: true, force: true }))
     const storageId = randomUUID()
-    let now = Date.now()
+    const now = Date.now()
     const policy: Awaited<
       ReturnType<NativeAccountRuntime['read']>
     >['policyStorage'] = {
@@ -50,7 +39,15 @@ test.each([false, true])(
     const runtime = {
       read: async () => ({
         policyStorage: policy,
-        accounts: [{ id: 'first', accountIdentity, binding }],
+        accounts: [
+          {
+            id: 'first',
+            type: 'oauth',
+            source: 'local',
+            accountIdentity,
+            binding,
+          },
+        ],
       }),
     } as unknown as NativeAccountRuntime
     const disk = new CacheKeepSessionRegistry({
@@ -62,7 +59,6 @@ test.each([false, true])(
       cacheExpiresAt: number
       nextPrewarmAt: number
     }
-    // The published 2.5.3 registry knows only the original three fields.
     const registry = {
       publish: (sessions: readonly LegacySession[]) =>
         disk.publish(
@@ -77,14 +73,9 @@ test.each([false, true])(
     }
     const persistence = new CacheKeepStore({ storageId, root: directory })
     const timers = new Set<object>()
-    let sends = 0
     const manager = new CacheKeepManager({
       now: () => now,
       loadStorage: async () => policy,
-      fetchImpl: (async () => {
-        sends++
-        return Response.json({})
-      }) as unknown as typeof fetch,
       setIntervalImpl: (() => {
         const timer = { unref() {} }
         timers.add(timer)
@@ -94,7 +85,7 @@ test.each([false, true])(
         timers.delete(timer)
       }) as unknown as typeof clearInterval,
       onTargetChanged: (target) => owner.persistence.changed(target),
-      onTargetRemoved: (id) => owner.persistence.removed(id),
+      onTargetRemoved: (_id, target) => owner.persistence.removed(target),
     })
     cleanups.push(() => manager.stop())
     const target = {
@@ -106,23 +97,24 @@ test.each([false, true])(
       storage: policy,
       cacheMode: 'hybrid' as const,
       oauthAccountId: 'first',
-      oauthAccountIdentity: accountIdentity,
+      oauthAccountIdentity: JSON.stringify([
+        'local',
+        accountIdentity,
+        null,
+        storageId,
+        'first',
+        0,
+      ]),
     }
-    // Expose the old manager surface, not its new registrySessions method or
-    // reason-aware untrack signature, even though the backing scheduler is current.
-    const legacyManager = {
-      track: manager.track.bind(manager),
-      trackedSessions: manager.trackedSessions.bind(manager),
-      untrack: (id: string) => manager.untrack(id),
-    }
+    const lease = { stopped: false }
     const owner = {
-      manager: legacyManager,
+      manager,
       registry,
       persistence,
-      persistenceFollowsOwner: true,
       prepared: new Map(),
-      leases: new Map(retained ? [] : [[0, { stopped: false }]]),
+      leases: new Map(retained ? [] : [[0, lease]]),
       nextGeneration: 1,
+      persistenceFollowsOwner: true,
       retain: () => manager.stop(),
       adopt: async () => {
         manager.start()
@@ -130,25 +122,50 @@ test.each([false, true])(
       },
     }
     expect(manager.track(target).tracked).toBe(true)
+    await persistence.drain()
+    if (retained) manager.stop()
     if (!retained) manager.start()
     const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-    const scope = globalThis as any
-    scope[key] ??= new Map()
-    const shared = scope[key]
-    shared.set(storageId, owner)
-    cleanups.push(() => shared.delete(storageId))
+    const original = Object.getOwnPropertyDescriptor(globalThis, key)
+    const legacy = new Map([[storageId, owner]])
+    const touches: string[] = []
+    Object.defineProperty(globalThis, key, {
+      configurable: true,
+      get: () => {
+        touches.push('read')
+        return legacy
+      },
+      set: () => {
+        touches.push('write')
+      },
+    })
+    cleanups.push(() => {
+      if (original) Object.defineProperty(globalThis, key, original)
+      else Reflect.deleteProperty(globalThis, key)
+    })
     const keep = createNativeCacheKeep({
       storageId,
       runtime,
       source: {} as NativeSource,
       persistence: { root: directory },
+      registryDirectory: join(directory, 'registry'),
       now: () => now,
     })
     cleanups.push(() => keep.dispose())
     await keep.ready
-    expect(shared.get(storageId)).toBe(owner)
-    expect(keep.registry === (registry as unknown)).toBe(true)
-    expect(timers.size).toBe(1)
+    expect(touches).toEqual([])
+    const current = [
+      ...(globalThis as any)[
+        Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v3')
+      ]
+        .get(storageId)
+        .values(),
+    ][0]
+    expect(keep.registry).not.toBe(
+      registry as unknown as CacheKeepSessionRegistry,
+    )
+    expect(legacy.get(storageId)).toBe(owner)
+    expect(timers.size).toBe(retained ? 0 : 1)
     await keep.track({
       sessionID: 'ses_after_reload',
       attemptId: 'after-reload',
@@ -164,22 +181,28 @@ test.each([false, true])(
       keep.onResponseHeaders({ attemptId: 'after-reload', status: 200 })
         ?.tracked,
     ).toBe(true)
-    expect(await registry.list()).toEqual(
+    expect(
+      (await keep.registry.list()).map(
+        ({ id, cacheExpiresAt, nextPrewarmAt }) => ({
+          id,
+          cacheExpiresAt,
+          nextPrewarmAt,
+        }),
+      ),
+    ).toEqual(
       ['ses_after_reload', 'ses_before_reload'].map((id) => ({
         id,
         cacheExpiresAt: now + 3_600_000,
         nextPrewarmAt: now + 3_300_000,
       })),
     )
-    expect(timers.size).toBe(1)
+    expect(timers.size).toBe(retained ? 0 : 1)
+    expect(lease.stopped).toBe(false)
+    expect(touches).toEqual([])
     keep.forgetSession('ses_before_reload')
-    expect(manager.trackedSessions().map(({ id }) => id)).toEqual([
-      'ses_after_reload',
-    ])
-    now += 3_300_000
-    await manager.tick()
-    expect(sends).toBe(1)
-    expect(manager.trackedCount()).toBe(1)
+    expect(
+      current.manager.trackedSessions().map(({ id }: LegacySession) => id),
+    ).toEqual(['ses_after_reload'])
     policy.cacheKeep = { enabled: false }
     await keep.track({
       sessionID: 'ses_disabled',
@@ -188,26 +211,18 @@ test.each([false, true])(
       agent: 'build',
       kind: 'primary',
     } as Parameters<typeof keep.track>[0])
-    expect(manager.trackedSessions()).toEqual([])
-    await Reflect.get(owner, 'localCleanup')
-    await owner.persistence.drain()
-    expect(await readdir(owner.persistence.directory)).toEqual([])
-    expect(
-      logging.mock.calls.filter(
-        ([channel, message]) =>
-          channel === 'cachekeep' &&
-          message ===
-            'new real-turn warming rules apply after a server restart',
-      ),
-    ).toHaveLength(1)
+    expect(current.manager.trackedSessions()).toEqual([])
+    await current.localCleanup
+    await current.persistence.drain()
+    expect(await readdir(current.persistence.directory)).toEqual([])
   },
 )
 
-test('OpenCode 2 hybrid disable removes local records but preserves a mixed store runner target', async () => {
+test('OpenCode 2 hybrid disable preserves a planned record written while the sweep waits', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'oc2-cachekeep-mixed-'))
   cleanups.push(() => rm(directory, { recursive: true, force: true }))
   const storageId = randomUUID()
-  const now = Date.now()
+  let now = Date.now()
   const policy: Awaited<
     ReturnType<NativeAccountRuntime['read']>
   >['policyStorage'] = {
@@ -253,9 +268,14 @@ test('OpenCode 2 hybrid disable removes local records but preserves a mixed stor
   })
   cleanups.push(() => keep.dispose())
   await keep.ready
-  const shared = (globalThis as any)[
-    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  ].get(storageId)
+  const shared = [
+    ...(globalThis as any)[
+      Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v3')
+    ]
+      .get(storageId)
+      .values(),
+  ][0]
+  const persistence: CacheKeepStore = shared.persistence
   const input = {
     attemptId: 'local',
     sessionID: 'ses_local',
@@ -280,26 +300,59 @@ test('OpenCode 2 hybrid disable removes local records but preserves a mixed stor
       name.endsWith('.json.gz'),
     ),
   ).toHaveLength(2)
-  policy.cacheKeep = { enabled: false }
-  await keep.track({ ...input, attemptId: 'disabled' })
-  await shared.localCleanup
-  await shared.persistence.drain()
+  const runner = (
+    Reflect.get(shared.manager, 'targets') as Map<string, CacheKeepTarget>
+  ).get('ses_runner')!
+  const peer = new CacheKeepStore({
+    storageId,
+    root: directory,
+    sessionClaims: true,
+  })
+  await persistence.releaseClaims(() => true)
+  cleanups.push(() => peer.releaseClaims(() => true))
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const drain = persistence.drain.bind(persistence)
+  const draining = spyOn(persistence, 'drain').mockImplementationOnce(
+    async () => {
+      entered.resolve()
+      await resume.promise
+      await drain()
+    },
+  )
+  const peerCommit = now + 10_000
+  try {
+    policy.cacheKeep = { enabled: false }
+    await keep.track({ ...input, attemptId: 'disabled' })
+    await entered.promise
+    now = peerCommit
+    peer.changed({
+      ...runner,
+      policyState: { ...runner.policyState!, lastRealRequestAt: peerCommit },
+    })
+    await peer.drain()
+    expect(peer.isCommitted(runner.id)).toBe(true)
+    await peer.releaseClaims(() => true)
+  } finally {
+    resume.resolve()
+    await shared.localCleanup
+    draining.mockRestore()
+  }
+  await persistence.drain()
   expect(
     shared.manager.trackedSessions().map(({ id }: { id: string }) => id),
   ).toEqual(['ses_runner'])
-  const retained: string[] = []
-  let saved: any
-  await shared.persistence.load(now, (entry: { id: string }) => {
-    retained.push(entry.id)
-    saved = entry
-    return undefined
-  })
-  expect(retained).toEqual(['ses_runner'])
-  expect(
-    (await readdir(shared.persistence.directory)).filter((name) =>
-      name.endsWith('.json.gz'),
-    ),
-  ).toHaveLength(1)
+  const files = (await readdir(shared.persistence.directory)).filter((name) =>
+    name.endsWith('.json.gz'),
+  )
+  expect(files).toHaveLength(1)
+  const saved = JSON.parse(
+    gunzipSync(
+      await readFile(join(shared.persistence.directory, files[0]!)),
+    ).toString(),
+  )
+  expect(saved.id).toBe('ses_runner')
+  expect(saved.policyState.lastRealRequestAt).toBe(peerCommit)
   const reports: unknown[] = []
   shared.manager.track({
     sessionId: 'ses_runner',

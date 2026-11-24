@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import {
+  applyAnthropicApiBaseUrl,
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
   applyRunnerTurnNotes,
@@ -154,12 +155,39 @@ export async function cancelUnsafeToolNameResponse(
   }
 }
 
-function responseToolNames(tools: unknown): ToolNameMap {
+function nativeToolUpdateName(block: unknown) {
+  if (!isRecord(block) || !isRecord(block.tool)) return undefined
+  const addition = block.type === 'tool_addition'
+  const field =
+    addition && block.tool.type === 'tool_definition'
+      ? block.tool.definition
+      : block.type === 'tool_removal' && block.tool.type === 'tool_reference'
+        ? block.tool
+        : undefined
+  if (isRecord(field) && typeof field.name === 'string' && field.name) {
+    return { field, name: field.name, addition }
+  }
+  return undefined
+}
+
+function responseToolNames(tools: unknown, messages: unknown): ToolNameMap {
   const names = new Set<string>()
   if (Array.isArray(tools)) {
     for (const tool of tools) {
       if (isRecord(tool) && typeof tool.name === 'string' && tool.name) {
         names.add(tool.name)
+      }
+    }
+  }
+  if (Array.isArray(messages)) {
+    // Only tools still declared at the end of history can name a new reply call.
+    for (const message of messages) {
+      if (!isRecord(message) || !Array.isArray(message.content)) continue
+      for (const block of message.content) {
+        const update = nativeToolUpdateName(block)
+        if (!update) continue
+        if (update.addition) names.add(update.name)
+        else names.delete(update.name)
       }
     }
   }
@@ -289,8 +317,7 @@ export function setOAuthHeaders(
 }
 
 /**
- * Add TOOL_PREFIX to tool names in the request body.
- * Prefixes both tool definitions and tool_use blocks in messages.
+ * Apply one wire spelling to tool declarations, choices, calls, and updates.
  */
 export function prefixToolNames(
   parsed: Record<string, unknown>,
@@ -329,6 +356,8 @@ export function prefixToolNames(
             if (block.type === 'tool_use' && block.name) {
               return { ...block, name: prefixName(block.name) }
             }
+            const update = nativeToolUpdateName(block)
+            if (update) update.field.name = prefixName(update.name)
             return block
           })
         }
@@ -523,43 +552,6 @@ function createToolNameRewriter(
 }
 
 /**
- * Check if TLS verification should be skipped for custom API endpoints.
- * Only effective when ANTHROPIC_BASE_URL is also set, and only on API-key
- * routes: Claude OAuth sends always check certificates.
- */
-export function isInsecure(): boolean {
-  if (!process.env.ANTHROPIC_BASE_URL?.trim()) return false
-  const raw = process.env.ANTHROPIC_INSECURE?.trim()
-  return raw === '1' || raw === 'true'
-}
-
-/**
- * Parse ANTHROPIC_BASE_URL from the environment.
- * Returns a valid HTTP(S) URL or null if unset/invalid.
- */
-function parseBaseUrl(raw: string | undefined): URL | null {
-  const value = raw?.trim()
-  if (!value) return null
-  try {
-    const baseUrl = new URL(value)
-    if (
-      (baseUrl.protocol !== 'http:' && baseUrl.protocol !== 'https:') ||
-      baseUrl.username ||
-      baseUrl.password
-    ) {
-      return null
-    }
-    return baseUrl
-  } catch {
-    return null
-  }
-}
-
-function resolveBaseUrl(): URL | null {
-  return parseBaseUrl(process.env.ANTHROPIC_BASE_URL)
-}
-
-/**
  * Rewrite the request URL to add ?beta=true for /v1/messages requests.
  * When ANTHROPIC_BASE_URL is set, overrides the origin (protocol + host)
  * for all API requests flowing through the fetch wrapper.
@@ -587,37 +579,7 @@ export function rewriteUrl(
 
   const originalHref = requestUrl.href
 
-  const baseUrl = options.baseURL
-    ? parseBaseUrl(options.baseURL)
-    : resolveBaseUrl()
-  if (baseUrl) {
-    const basePath = baseUrl.pathname.replace(/\/$/, '')
-    const inputPath = requestUrl.pathname
-    requestUrl.protocol = baseUrl.protocol
-    requestUrl.host = baseUrl.host
-
-    const alreadyUnderBase =
-      inputPath === basePath ||
-      (basePath !== '' && inputPath.startsWith(`${basePath}/`))
-    if (!alreadyUnderBase) {
-      const baseEndsInVersion = /\/v\d[^/]*$/.test(basePath)
-      if (inputPath === '/messages') {
-        requestUrl.pathname = baseEndsInVersion
-          ? `${basePath}/messages`
-          : `${basePath}/v1/messages`
-      } else if (inputPath === '/v1/messages' && baseEndsInVersion) {
-        requestUrl.pathname = `${basePath}/messages`
-      } else {
-        requestUrl.pathname = `${basePath}${inputPath}`
-      }
-    } else if (inputPath === `${basePath}/messages`) {
-      // Repair only the exact SDK form under a non-versioned base. Do not
-      // rewrite sibling resources or explicit /v2 (and later) proxy paths.
-      if (!/\/v\d[^/]*$/.test(basePath)) {
-        requestUrl.pathname = `${basePath}/v1/messages`
-      }
-    }
-  }
+  applyAnthropicApiBaseUrl(requestUrl, options.baseURL)
 
   if (
     requestUrl.pathname.endsWith('/v1/messages') &&
@@ -1938,7 +1900,7 @@ export async function rewriteRequestBody(
 
     const prefixStart = rewriteNowMs()
     if (options.modelRemapEnabled === true) remapRequestBodyModel(parsed)
-    const toolNameMap = responseToolNames(parsed.tools)
+    const toolNameMap = responseToolNames(parsed.tools, parsed.messages)
     let prefixed = prefixToolNames(parsed, { isOAuth: options.isOAuth })
     let sourceAnchorRestored = false
     if (

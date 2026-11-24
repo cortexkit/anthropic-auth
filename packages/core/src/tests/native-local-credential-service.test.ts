@@ -1035,6 +1035,7 @@ async function unresolvedScenario(module: ServiceModule) {
         status: 'refused',
         reason: 'validation-backoff',
         persisted: true,
+        validationRetryAt: start + 1_000,
       })
       expect(await f.entry()).toEqual({
         binding: committed.binding,

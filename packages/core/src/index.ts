@@ -35,8 +35,11 @@ export {
   setupUsage,
 } from '@cortexkit/common-auth/setup'
 export * from './accounts.ts'
+export * from './api-key-request.ts'
+export { applyAnthropicApiBaseUrl } from './api-route-url.ts'
 export * from './auth.ts'
 export * from './billing.ts'
+export * from './cache-diagnostics.ts'
 export * from './cache1h.ts'
 export * from './cachekeep.ts'
 export * from './cachekeep-failure.ts'
@@ -327,6 +330,7 @@ export {
 } from './owner-only.ts'
 export * from './path-options.ts'
 export * from './pkce.ts'
+export { applyRunnerPlanNotes } from './plan-notes.ts'
 export type {
   NativeEmptyInitJournal,
   NativeLegacyMigrationJournal,
@@ -356,7 +360,6 @@ export {
   summarizePrewarmProviderError,
 } from './provider-error.ts'
 export { renameWithWindowsSharingRetry } from './publication-rename.ts'
-export * from './quota-header-feed.ts'
 export * from './quota-headers.ts'
 export * from './quota-manager.ts'
 export * from './quota-refusal.ts'
@@ -372,6 +375,7 @@ export * from './routing-peek.ts'
 export * from './routing-relay.ts'
 export * from './routing-reports.ts'
 export { startRoutingWait } from './routing-wait.ts'
+export { readRunOutputCap } from './run-output-cap.ts'
 export * from './server-fallback-usage.ts'
 export * from './session-cache-activity.ts'
 export * from './session-cache-policy.ts'

@@ -22,6 +22,7 @@ import {
   sessionCacheActivity,
   setLogLevel,
   signRequestBody,
+  stripBillingLineageFields,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -73,6 +74,7 @@ import {
   stopPiCacheKeep,
   streamCortexKitAnthropic,
 } from '../stream.ts'
+import planNotes from './fixtures/plan-notes.json'
 import {
   fixtureAccountIdentity,
   readNativePiFixture,
@@ -218,10 +220,22 @@ function forkContext(base: Context, branchLength = 0): Context {
 }
 
 function normalizedForkBody(text: string) {
-  return JSON.parse(
-    text.replace(/cch=[a-f0-9]+/g, 'cch=SIGNATURE'),
-    (key, value) => (key === 'cache_control' ? undefined : value),
-  )
+  return JSON.parse(text, (key, value) => {
+    if (key === 'cache_control') return undefined
+    if (
+      typeof value === 'string' &&
+      key === 'text' &&
+      value.startsWith('x-anthropic-billing-header:')
+    )
+      return value.replace(/ cch=[a-f0-9]+;/, ' cch=SIGNATURE;')
+    return value
+  })
+}
+
+function forkSystemSnapshot(body: ReturnType<typeof normalizedForkBody>) {
+  const { diagnostics: _diagnostics, messages: _messages, ...prefix } = body
+  prefix.system[0].text = stripBillingLineageFields(prefix.system[0].text)
+  return JSON.stringify(prefix)
 }
 
 function stateBytes(value: unknown) {
@@ -243,11 +257,18 @@ for (const mode of [
   'turn notes',
   'head TTL',
   'long branch',
+  'bridged head at the lookback limit',
 ] as const) {
   test(`Pi fork preserves the head cache prefix: ${mode}`, async () => {
     const f = await fixture()
     const head = `fork-prefix-${mode}-${f.path}`
     const fork = `${head}-fork`
+    const bridged = mode === 'bridged head at the lookback limit'
+    if (bridged)
+      await (await f.native.service()).updateSettings((settings) => ({
+        ...settings,
+        claudeCache: { enabled: false, mode: 'hybrid' },
+      }))
     const note = { after_tool_use_id: 'tool-1', text: 'Runner base note' }
     const notesReads: string[] = []
     const policyReads: string[] = []
@@ -277,7 +298,7 @@ for (const mode of [
           : null
       },
     }))
-    const base: Context =
+    let base: Context =
       mode === 'multi-turn'
         ? forkContext(context)
         : mode === 'long branch'
@@ -318,6 +339,23 @@ for (const mode of [
                 ],
               }
             : context
+    if (bridged) {
+      const [first, answer, latest] = forkContext(context).messages
+      base = {
+        ...context,
+        messages: [
+          first!,
+          {
+            ...(answer as AssistantMessage),
+            content: Array.from({ length: 20 }, (_, i) => ({
+              type: 'text' as const,
+              text: `Head answer block ${i}`,
+            })),
+          },
+          latest!,
+        ],
+      }
+    }
     const bodies: string[] = []
     const server = Bun.serve({
       hostname: '127.0.0.1',
@@ -381,7 +419,7 @@ for (const mode of [
     const before = JSON.stringify(await getPiTrackedCacheKeepSessions())
     const result = await streamCortexKitAnthropic(
       model,
-      forkContext(base, mode === 'long branch' ? 30 : 0),
+      forkContext(base, mode === 'long branch' ? 30 : bridged ? 9 : 0),
       forkOptions(head),
       mode === 'plain'
         ? history
@@ -400,6 +438,19 @@ for (const mode of [
     ).toEqual([])
     const rawHead = JSON.parse(bodies[0]!)
     const rawFork = JSON.parse(bodies.at(-1)!)
+    if (bridged) {
+      expect(
+        rawHead.system.some(
+          (block: Record<string, unknown>) => block.cache_control,
+        ),
+      ).toBe(false)
+      expect(rawHead.messages[0].content.at(-1)).toHaveProperty('cache_control')
+    }
+    expect(rawHead.diagnostics).toEqual({ previous_message_id: null })
+    expect(rawFork).not.toHaveProperty('diagnostics')
+    expect(rawFork.system[0].text).not.toMatch(
+      /cc_(?:prompt_id|prev_req|prompt_index|turn_index|turn_origin)=/,
+    )
     const blocks = rawFork.messages.flatMap(
       (message: { content: unknown[] }) => message.content,
     ) as Record<string, unknown>[]
@@ -411,10 +462,12 @@ for (const mode of [
     )
     expect(
       markerPositions.some(
-        (position) => position >= basePosition && position - basePosition <= 20,
+        (position) => position >= basePosition && position - basePosition < 20,
       ),
     ).toBe(true)
-    expect(Boolean(baseBlock.cache_control)).toBe(mode === 'long branch')
+    expect(Boolean(baseBlock.cache_control)).toBe(
+      mode === 'long branch' || bridged,
+    )
     if (mode === 'long branch')
       expect(rawFork.messages[0].content[0].cache_control).toBeUndefined()
     if (mode === 'turn notes') expect(bodies[0]).toContain(note.text)
@@ -433,9 +486,7 @@ for (const mode of [
         ),
       ].filter((holder) => holder.cache_control).length
     expect(countMarkers(rawFork)).toBeLessThanOrEqual(4)
-    delete headBody.messages
-    delete forkBody.messages
-    expect(JSON.stringify(forkBody)).toBe(JSON.stringify(headBody))
+    expect(forkSystemSnapshot(forkBody)).toBe(forkSystemSnapshot(headBody))
     expect(JSON.stringify(await getPiTrackedCacheKeepSessions())).toBe(before)
     expect(sessionCacheActivity.ttlMs(head)).toBe(
       mode === 'head TTL' ? 3_600_000 : 300_000,
@@ -993,18 +1044,49 @@ test('Pi fork leaves head leases, keep-warm tracking and effort provenance untou
   expect(sessionCacheActivity.holdUntil(`${head}-fork`, 'main')).toBeUndefined()
 })
 
-test('Pi fork never reads or replaces a head thread anchor, even with primary-turn hooks', async () => {
+test('Pi fork never reads or replaces a head thread anchor, even with primary-turn hooks', () =>
+  expectForkThreadAnchor())
+test('Pi plan notes from the fork handle replay the base request bytes', () =>
+  expectForkThreadAnchor('fork'))
+test('Pi plan notes remain fixed history through thread continuation', () =>
+  expectForkThreadAnchor('thread'))
+
+async function expectForkThreadAnchor(checkPlanNotes?: 'fork' | 'thread') {
   // Finish saving the head's keep-warm target before the fixture restores the
   // registry directory, or a late save can leave a target in the next test.
   deferCleanup(() => stopPiCacheKeep())
   const f = await fixture()
   const head = `fork-thread-${f.path}`
   const fork = `${head}-fork`
-  forkRouting(undefined, () => ({
+  const plan = planNotes[0]!
+  const base: Context = checkPlanNotes
+    ? {
+        ...context,
+        messages: [
+          {
+            role: 'user',
+            content: 'Hello',
+            timestamp: plan.after_user_timestamp,
+          },
+        ],
+      }
+    : context
+  const expected = plan.texts.map((content) => ({ role: 'system', content }))
+  let changeHeadNotes = false
+  const planReads: string[] = []
+  forkRouting(undefined, (sessionId) => ({
     cache: () => ({ ttl: 'long', keep_warm: 'always' }),
+    ...(checkPlanNotes && {
+      plan_notes: () => {
+        planReads.push(sessionId)
+        return changeHeadNotes && sessionId === head
+          ? [{ ...plan, texts: ['Edited head instructions'] }]
+          : structuredClone(planNotes)
+      },
+    }),
   }))
   await startPiCacheKeepSession(f.path, head)
-  const sent: Array<Record<string, unknown>> = []
+  const sent: Array<{ thread?: unknown; messages?: unknown[] }> = []
   const response = () =>
     new Response(
       'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_head","content":[]}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Head answer"}}\n\nevent: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
@@ -1040,7 +1122,17 @@ test('Pi fork never reads or replaces a head thread anchor, even with primary-tu
       return leaseOriginal.call(this, sessionId)
     },
   )
-  const track = spyOn(PiCacheKeep.prototype, 'trackAccepted')
+  const tracked =
+    Promise.withResolvers<Awaited<ReturnType<PiCacheKeep['trackAccepted']>>>()
+  const trackOriginal = PiCacheKeep.prototype.trackAccepted
+  const track = spyOn(
+    PiCacheKeep.prototype,
+    'trackAccepted',
+  ).mockImplementation(function (this: PiCacheKeep, ...args) {
+    const tracking = trackOriginal.apply(this, args)
+    if (args[0].sessionId === head) tracked.resolve(tracking)
+    return tracking
+  })
   deferCleanup(() => {
     thread.mockRestore()
     lease.mockRestore()
@@ -1057,14 +1149,14 @@ test('Pi fork never reads or replaces a head thread anchor, even with primary-tu
   beginPiPrimaryTurn(f.path, head)
   const answer = await streamCortexKitAnthropic(
     model,
-    context,
+    base,
     { sessionId: head, ...hooks },
     undefined,
     undefined,
     'agent-loop',
   ).result()
   expect(answer.stopReason).toBe('stop')
-  await Promise.all(track.mock.results.map((result) => result.value))
+  await tracked.promise
   expect(sent[0]?.thread).toEqual({ type: 'create' })
   expect(threadTracker).toBeDefined()
   expect(cacheKeep).toBeDefined()
@@ -1085,9 +1177,10 @@ test('Pi fork never reads or replaces a head thread anchor, even with primary-tu
   const beforeThread = stateBytes(threadTracker)
   thread.mockClear()
   lease.mockClear()
+  changeHeadNotes = true
   const result = await streamCortexKitAnthropic(
     model,
-    forkContext(context),
+    forkContext(base),
     { ...forkOptions(head), ...hooks },
     undefined,
     undefined,
@@ -1095,36 +1188,77 @@ test('Pi fork never reads or replaces a head thread anchor, even with primary-tu
   ).result()
   expect(result.stopReason).toBe('stop')
   expect(sent.at(-1)?.thread).toBeUndefined()
+  if (checkPlanNotes === 'fork') {
+    const actual = sent.at(-1)?.messages?.slice(1, 3)
+    expect(actual).toEqual(expected)
+    expect(planReads).toEqual([head, fork])
+    expect(JSON.stringify(actual)).toBe(
+      JSON.stringify(sent[0]?.messages?.slice(1)),
+    )
+  }
   expect(thread).not.toHaveBeenCalled()
   expect(lease).not.toHaveBeenCalled()
   expect(targetState()).toBe(beforeTarget)
   expect(leaseState()).toBe(beforeLease)
   expect(stateBytes(threadTracker)).toBe(beforeThread)
   const continued = {
-    ...context,
+    ...base,
     messages: [
-      ...context.messages,
+      ...base.messages,
       answer,
       { role: 'user' as const, content: 'Next head turn', timestamp: 2 },
     ],
   }
-  expect(
-    (
-      await streamCortexKitAnthropic(
-        model,
-        continued,
-        { sessionId: head, ...hooks },
-        undefined,
-        undefined,
-        'agent-loop',
-      ).result()
-    ).stopReason,
-  ).toBe('stop')
+  changeHeadNotes = false
+  const next = await streamCortexKitAnthropic(
+    model,
+    continued,
+    { sessionId: head, ...hooks },
+    undefined,
+    undefined,
+    'agent-loop',
+  ).result()
+  expect(next.stopReason).toBe('stop')
   expect(sent.at(-1)?.thread).toEqual({
     type: 'continue',
     previous_message_id: 'msg_head',
   })
-})
+  if (checkPlanNotes === 'thread') {
+    expect(sent[0]?.messages).toEqual([
+      expect.objectContaining({ role: 'user' }),
+      ...expected,
+    ])
+    expect(sent.at(-1)?.messages).toEqual([
+      expect.objectContaining({ role: 'user' }),
+    ])
+    // Editing an earlier note is a history change, not a continuation delta.
+    changeHeadNotes = true
+    expect(
+      (
+        await streamCortexKitAnthropic(
+          model,
+          {
+            ...continued,
+            messages: [
+              ...continued.messages,
+              next,
+              { role: 'user', content: 'Third head turn', timestamp: 3 },
+            ],
+          },
+          { sessionId: head, ...hooks },
+          undefined,
+          undefined,
+          'agent-loop',
+        ).result()
+      ).stopReason,
+    ).toBe('stop')
+    expect(sent.at(-1)?.thread).toEqual({ type: 'create' })
+    expect(sent.at(-1)?.messages?.[1]).toEqual({
+      role: 'system',
+      content: 'Edited head instructions',
+    })
+  }
+}
 
 for (const transport of ['direct', 'relay fallback'] as const) {
   test(`Pi fork allows a vault-newer-record retry on ${transport} without changing admission`, async () => {
@@ -1523,6 +1657,158 @@ const success = () =>
     'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
     { headers: { 'content-type': 'text/event-stream' } },
   )
+
+test('Pi billing lineage follows the user turn across tool iterations and retries', async () => {
+  const f = await fixture()
+  const hooks = new Map<string, (event: unknown, ctx: unknown) => unknown>()
+  await cortexKitPiAnthropicAuth(
+    {
+      registerCommand() {},
+      registerProvider() {},
+      on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) =>
+        hooks.set(name, handler),
+    } as unknown as ExtensionAPI,
+    { connectScoped: f.connect },
+  )
+  const sessionId = `pi-lineage-${f.path}`
+  const hookContext = {
+    hasUI: false,
+    sessionManager: { getSessionId: () => sessionId, getBranch: () => [] },
+  }
+  const emit = (name: string, fields: Record<string, unknown> = {}) =>
+    hooks.get(name)?.({ type: name, ...fields }, hookContext)
+  deferCleanup(async () => {
+    await emit('session_shutdown')
+  })
+
+  const nextContext = forkContext(context)
+  const toolHistory: Context = {
+    ...context,
+    messages: [
+      ...context.messages,
+      {
+        ...nextContext.messages.find(
+          (message): message is AssistantMessage =>
+            message.role === 'assistant',
+        )!,
+        content: [
+          { type: 'toolCall', id: 'call_read', name: 'read', arguments: {} },
+        ],
+        stopReason: 'toolUse',
+      },
+      {
+        role: 'toolResult',
+        toolCallId: 'call_read',
+        toolName: 'read',
+        content: [{ type: 'text', text: 'read result' }],
+        isError: false,
+        timestamp: 2,
+      },
+    ],
+  }
+  const sent: { text: string; line: string; promptHeader: string | null }[] = []
+  const send = async (
+    requestContext: Context,
+    responseId: string,
+    {
+      status = 200,
+      origin = 'agent-loop' as 'agent-loop' | 'direct',
+      alternateHeader = false,
+    } = {},
+  ) => {
+    const response = await __sendPiAnthropicRequestForTest(
+      {
+        model,
+        context: requestContext,
+        storagePath: f.path,
+        oauthAccountId: 'main',
+        requestOrigin: origin,
+        streamOptions: { sessionId },
+      },
+      {
+        native: f.native,
+        fetch: (async (_input: unknown, init?: RequestInit) => {
+          const text =
+            init?.body instanceof Uint8Array
+              ? gunzipSync(init.body).toString()
+              : String(init?.body)
+          sent.push({
+            text,
+            line: JSON.parse(text).system[0].text,
+            promptHeader: new Headers(init?.headers).get(
+              'x-claude-code-prompt-id',
+            ),
+          })
+          return new Response(status === 200 ? success().body : '{}', {
+            status,
+            headers: {
+              'content-type':
+                status === 200 ? 'text/event-stream' : 'application/json',
+              [alternateHeader ? 'x-request-id' : 'request-id']: responseId,
+            },
+          })
+        }) as typeof fetch,
+      },
+    )
+    expect(response.status).toBe(status)
+    await response.text()
+  }
+
+  await emit('turn_start', { turnIndex: 0 })
+  await emit('message_start', { message: context.messages[0] })
+  await send(context, 'req_pi_lineage_first')
+  await emit('turn_start', { turnIndex: 1 })
+  await send(toolHistory, 'req_pi_lineage_rejected', { status: 429 })
+  await send(toolHistory, 'req_pi_lineage_tool', { alternateHeader: true })
+  await send(context, 'req_pi_lineage_aux', { origin: 'direct' })
+  await emit('turn_start', { turnIndex: 2 })
+  await emit('message_start', { message: nextContext.messages.at(-1) })
+  await send(nextContext, 'invalid-upstream-id')
+  await emit('agent_settled')
+  await emit('turn_start', { turnIndex: 0 })
+  const lastContext: Context = {
+    ...nextContext,
+    messages: [
+      ...nextContext.messages,
+      { role: 'user', content: 'Third user prompt', timestamp: 101 },
+    ],
+  }
+  await send(lastContext, 'req_pi_lineage_next')
+
+  const [first, rejected, retried, auxiliary, queued, next] = sent
+  const promptId = first?.promptHeader
+  expect(promptId).toMatch(/^[a-f0-9-]{36}$/)
+  for (const attempt of [first, rejected, retried]) {
+    expect(attempt?.promptHeader).toBe(promptId!)
+    expect(attempt?.line).toContain(
+      `cc_prompt_id=${promptId}; cc_turn_origin=human; cc_prompt_index=1; cc_turn_index=1;`,
+    )
+  }
+  expect(first?.line).not.toContain('cc_prev_req=')
+  expect(rejected?.line).toContain('cc_prev_req=req_pi_lineage_first;')
+  expect(retried?.line).toContain('cc_prev_req=req_pi_lineage_rejected;')
+  expect(auxiliary?.promptHeader).toBeNull()
+  expect(auxiliary?.line).not.toMatch(/cc_(?:prev_req|prompt_id|turn_index)=/)
+  const prewarm = await buildCacheKeepPrewarmBody(retried!.text)
+  expect(prewarm.ok).toBe(true)
+  if (prewarm.ok)
+    expect(prewarm.bodyText).not.toMatch(
+      /cc_(?:prev_req|prompt_id|turn_index)=/,
+    )
+  expect(queued?.promptHeader).toMatch(/^[a-f0-9-]{36}$/)
+  expect(queued?.promptHeader).not.toBe(promptId!)
+  expect(queued?.line).toContain('cc_prev_req=req_pi_lineage_tool;')
+  expect(queued?.line).toContain(
+    `cc_prompt_id=${queued?.promptHeader}; cc_turn_origin=human; cc_prompt_index=2; cc_turn_index=2;`,
+  )
+  expect(next?.promptHeader).toMatch(/^[a-f0-9-]{36}$/)
+  expect(next?.promptHeader).not.toBe(queued?.promptHeader ?? null)
+  expect(next?.line).toContain('cc_prev_req=req_pi_lineage_tool;')
+  expect(next?.line).toContain(
+    `cc_prompt_id=${next?.promptHeader}; cc_turn_origin=human; cc_prompt_index=3; cc_turn_index=3;`,
+  )
+})
+
 const row = (id: string, accountId: string): ScopedInventoryRow => ({
   id,
   accountId,
@@ -4759,10 +5045,12 @@ for (const [transport, credentialSource] of [
     expect(first.tools.at(-1)?.cache_control).toEqual(oneHourControl)
     expect(first.system.at(-1)?.cache_control).toEqual(oneHourControl)
     expect(JSON.stringify(second.tools)).toBe(JSON.stringify(first.tools))
-    // The body signature (cch) changes when history is sliced. All other system
-    // bytes, including cache controls, must remain identical.
+    // The signature and lineage can change between user prompts. The fixed
+    // system bytes, including cache controls and the first-user version suffix, cannot.
     const systemBytes = (system: unknown) =>
-      JSON.stringify(system).replace(/cch=[a-f0-9]{5}/g, 'cch=00000')
+      stripBillingLineageFields(
+        JSON.stringify(system).replace(/cch=[a-f0-9]{5}/g, 'cch=00000'),
+      )
     expect(systemBytes(second.system)).toBe(systemBytes(first.system))
     expect(second.system[0].text.match(/cc_version=[^;]+/)?.[0]).toBe(
       first.system[0].text.match(/cc_version=[^;]+/)?.[0],
@@ -4786,6 +5074,7 @@ for (const [transport, credentialSource] of [
     const prewarm = JSON.parse(warm.ok ? warm.bodyText : '{}')
     expect(prewarm.thread).toBeUndefined()
     expect(prewarm.messages).toHaveLength(3)
+    expect(prewarm.system?.[0]?.text).not.toContain('cc_prompt_id=')
     const replay = history.messages.find(
       (message) => message.role === 'assistant',
     )
@@ -5356,6 +5645,52 @@ async function sendPrimary(
   )
   await response.text()
 }
+
+test('Pi gzips eligible prewarms and rescues them with the same signed body outside the diagnostics chain', async () => {
+  const f = await fixture()
+  const sent: Array<{ encoding: string | null; body: string }> = []
+  globalThis.fetch = Object.assign(
+    async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const encoding = new Headers(init?.headers).get('content-encoding')
+      const body =
+        encoding === 'gzip'
+          ? gunzipSync(init?.body as Uint8Array).toString()
+          : String(init?.body)
+      sent.push({ encoding, body })
+      if (encoding === 'gzip')
+        return new Response('Unsupported content-encoding: gzip', {
+          status: 415,
+        })
+      return Response.json({ usage: { cache_read_input_tokens: 1 } })
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  const result = await __prewarmPiCacheKeepForTest({
+    sessionId: 'pi-gzip-warm',
+    url: 'https://api.anthropic.com/v1/messages?beta=true',
+    headers: new Headers(),
+    bodyText: JSON.stringify({
+      model: model.id,
+      max_tokens: 128,
+      diagnostics: { previous_message_id: 'msg_pi_conversation' },
+      system: [
+        {
+          type: 'text',
+          text: 'stable prefix '.repeat(500),
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      messages: [{ role: 'user', content: 'warm' }],
+    }),
+    oauthAccountId: 'main',
+    oauthAccountIdentity: fixtureAccountIdentity('main'),
+    accountStoragePath: f.path,
+  })
+  expect(result.ok).toBe(true)
+  expect(sent.map(({ encoding }) => encoding)).toEqual(['gzip', null])
+  expect(JSON.parse(sent[0]!.body)).not.toHaveProperty('diagnostics')
+  expect(sent[0]?.body.trimEnd()).toBe(sent[1]?.body)
+})
 
 test('Pi sends model and keep-warm requests to the gateway as full uncompressed requests', async () => {
   const f = await fixture()

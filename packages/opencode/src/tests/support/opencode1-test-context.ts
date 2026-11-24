@@ -21,6 +21,7 @@ export type PoolLogin = { access: string; refresh: string; identity: string }
 
 export type PluginRuntimeOverrides = Partial<{
   authorize: typeof import('@cortexkit/anthropic-auth-core').authorize
+  now: () => number
   setTimeout: typeof globalThis.setTimeout
   clearTimeout: typeof globalThis.clearTimeout
   setInterval: typeof globalThis.setInterval
@@ -49,7 +50,6 @@ export const nativeEnvKeys = [
   'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',
   'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
   'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
-  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
   'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
   'CLAUDE_CONFIG_DIR',
   'OPENCODE_AUTH_CONTENT',

@@ -1,4 +1,10 @@
 import {
+  buildCacheDiagnosticsRecord,
+  CacheDiagnosticsBetaTracker,
+  CacheDiagnosticsTracker,
+  cacheDiagnosticsMessageId,
+  formatCacheDiagnosticsLogLine,
+  logger,
   type NativeAccountSnapshot,
   readThreeWayBoolean,
   remapModelId,
@@ -37,11 +43,14 @@ function serverSideFallbackEnabled() {
  * chain per user turn with OpenCode's message IDs: one session spans many
  * turns, so a session ID alone cannot tell which turn a request serves.
  */
-export function createNativeWirePolicy() {
+export function createNativeWirePolicy(
+  options: { isSubagent?: (sessionID: string) => boolean | undefined } = {},
+) {
   const billing = new BillingLineageTracker()
   const latest = new Map<string, string>()
   const contexts = new Map<string, BillingLineageContext>()
-  const messageIDs = new Map<string, string>()
+  const cacheDiagnostics = new CacheDiagnosticsTracker()
+  const cacheDiagnosticBetas = new CacheDiagnosticsBetaTracker()
   const laneStarts = new Set<string>()
   const laneAttempts = new Set<string>()
   const attemptSessions = new Map<string, string>()
@@ -130,7 +139,10 @@ export function createNativeWirePolicy() {
       }
     },
     requestOptions(
-      input: NativeAnthropicRequestContext<NativeSourceProvenance>,
+      input: Pick<
+        NativeAnthropicRequestContext<NativeSourceProvenance>,
+        'agent' | 'attemptId' | 'correlation' | 'sessionID'
+      >,
       snapshot: NativeAccountSnapshot,
     ) {
       const lineage = billing.resolveHeader(
@@ -144,13 +156,14 @@ export function createNativeWirePolicy() {
       bound(attemptSessions)
       const laneStart = input.correlation[LANE_START_REQUEST_HEADER] === '1'
       if (laneStart) laneAttempts.add(input.attemptId)
+      const previous = cacheDiagnostics.previousFor(input.sessionID)
       return {
         cache1hEnabled:
           input.agent !== 'compaction' &&
           input.agent !== 'title' &&
           readThreeWayBoolean(
             snapshot.policyStorage.claudeCache?.enabled,
-            true,
+            false,
           ),
         cache1hMode: snapshot.policyStorage.claudeCache?.mode ?? 'explicit',
         fastModeEnabled: snapshot.policyStorage.claudeFast?.enabled === true,
@@ -173,13 +186,20 @@ export function createNativeWirePolicy() {
               previousRequestId: lineage.previousRequestId,
             }
           : undefined,
-        cacheDiagnosticsPreviousMessageId: messageIDs.get(input.sessionID),
+        cacheDiagnosticsPreviousMessageId: previous?.messageId ?? null,
+        cacheDiagnosticsPreviousMessageReceivedAt: previous?.receivedAt,
       }
     },
     responseOptions(
       input: Pick<
         NativeAnthropicResponseContext<NativeSourceProvenance>,
-        'attemptId' | 'modelID' | 'sessionID' | 'kind'
+        | 'accountId'
+        | 'attemptId'
+        | 'cacheDiagnostics'
+        | 'kind'
+        | 'modelID'
+        | 'sessionID'
+        | 'status'
       >,
     ) {
       const model = remapModelId(input.modelID)
@@ -187,18 +207,82 @@ export function createNativeWirePolicy() {
       const canFallback =
         serverSideFallbackEnabled() &&
         resolveClaudeModelCapabilities(model)?.serverSideFallback === true
+      const laneStart = laneAttempts.has(input.attemptId)
+      const sent = input.cacheDiagnostics
+      const observe = (message: Record<string, unknown>) => {
+        if (!sent || attemptSessions.get(input.attemptId) !== input.sessionID)
+          return
+        const receivedAt = Date.now()
+        const messageId = cacheDiagnosticsMessageId(message)
+        // The next request needs the ID even when the reply has no detailed usage.
+        if (
+          messageId &&
+          input.kind === 'primary' &&
+          input.status >= 200 &&
+          input.status < 300
+        ) {
+          cacheDiagnostics.capture(input.sessionID, messageId, receivedAt)
+        }
+        const request = {
+          previousMessageId: sent.previousMessageId,
+          previousMessageReceivedAt: sent.previousMessageReceivedAt,
+          ttlSent: sent.ttlSent,
+          sessionId: input.sessionID,
+          isSubagent: options.isSubagent?.(input.sessionID) ?? false,
+        }
+        // Only the optional log needs the hash; the host can consume the reply now.
+        void sent.betaInfo
+          .then((betaInfo) => {
+            if (!betaInfo) return
+            const { record, canary } = buildCacheDiagnosticsRecord({
+              request,
+              source: laneStart ? 'start' : 'turn',
+              accountId: input.accountId,
+              synthetic: laneStart,
+              betasHash: betaInfo.betasHash,
+              requestedModel: sent.requestedModel,
+              message,
+              receivedAt,
+            })
+            if (!record) {
+              logger.debug(
+                'cache-diagnostics',
+                'skipped invalid response envelope',
+                {
+                  status: input.status,
+                },
+              )
+              return
+            }
+            logger.debug(
+              'cache-diagnostics',
+              formatCacheDiagnosticsLogLine(record),
+            )
+            const betaLine = cacheDiagnosticBetas.capture(
+              betaInfo.betasHash,
+              betaInfo.betas,
+            )
+            if (betaLine) logger.debug('cache-diagnostics', betaLine)
+            if (canary)
+              logger.warn(
+                'cache-diagnostics',
+                'short-gap previous_message_not_found',
+                {
+                  message_id: canary.messageId,
+                  previous_message_id: canary.previousMessageId,
+                },
+              )
+          })
+          .catch(() => {})
+      }
       return {
         serverSideFallbackModel: model,
         onServerSideFallbackOutcome(outcome: ServerSideFallbackOutcome) {
           if (canFallback) logServedServerFallback(input.sessionID, outcome)
         },
-        laneStart: laneAttempts.has(input.attemptId),
-        onMessageStart(message: Record<string, unknown>) {
-          if (input.kind === 'primary' && typeof message.id === 'string') {
-            messageIDs.set(input.sessionID, message.id)
-            bound(messageIDs)
-          }
-        },
+        laneStart,
+        onMessageStart: observe,
+        onMessageResponse: observe,
         onStreamEnd() {
           contexts.delete(input.attemptId)
           laneAttempts.delete(input.attemptId)
@@ -215,7 +299,7 @@ export function createNativeWirePolicy() {
     forgetSession(sessionID: string) {
       billing.clearSession(sessionID)
       latest.delete(sessionID)
-      messageIDs.delete(sessionID)
+      cacheDiagnostics.forgetSession(sessionID)
       laneStarts.delete(sessionID)
       for (const [attempt, session] of attemptSessions)
         if (session === sessionID) {

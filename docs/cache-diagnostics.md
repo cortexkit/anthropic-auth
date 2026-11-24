@@ -2,7 +2,9 @@
 
 ## Measure-only beta
 
-The Anthropic API opt-in `cache-diagnosis-2026-04-07` (sent in the `anthropic-beta` header) asks for cache diagnostics; it does not change cache controls or routing. OpenCode captures the response's opaque top-level message ID and sends it as `diagnostics.previous_message_id` on the next request in that session. The first request sends `null`.
+The Anthropic API opt-in `cache-diagnosis-2026-04-07` (sent in the `anthropic-beta` header) asks for cache diagnostics; it does not change cache controls or routing. OpenCode 1, OpenCode 2 and Pi capture the response's opaque top-level message ID and send it as `diagnostics.previous_message_id` on the next eligible request in that session. The first eligible request sends `null`. On Pi, session-associated Claude sign-in requests can use the preceding ID, but only the main conversation advances it. Paid API-key requests, forks, Prime and keep-warm do not advance that chain or write its diagnostic records.
+
+Keep-warm requests on OpenCode do not opt in to cache diagnostics or change the previous-message ID. In older OpenCode 1 logs, `prewarm_cachekeep` identifies a keep-warm response.
 
 `MC-CACHE-DIAG ` records and the beta-list side channel are emitted only at debug level. Choose **Logging level** → `debug` in `/claude` → **Diagnostics**. An empty stream can mean no activity or a lower log level: compare it with an independent activity witness such as usage rows, billing or dumps before drawing conclusions.
 
@@ -18,7 +20,7 @@ Each record is one JSON line after the exact prefix `MC-CACHE-DIAG `, including 
 | `account_id` | Opaque persisted routing/account identifier; do not validate its string shape |
 | `betas_hash` | 16-character lowercase xxHash64 (seed 0) of the sorted sent beta list |
 | `requested_model` | Optional sent model, only when different from the response model |
-| `session_id` | OpenCode session affinity |
+| `session_id` | Identifier of the host conversation this record belongs to |
 | `ts_ms_received` | Integer local receipt time |
 | `model` | Anthropic response model |
 | `is_subagent` | Original request context |
@@ -58,4 +60,4 @@ A short-gap `previous_message_not_found` reason is also captured as a canary whe
 
 When dumps are enabled, `.response.json` holds status and parsed response metadata without response content. Lane-start filenames include `-start-`; CacheKeep uses `-prewarm-cachekeep-`. Treat related request bodies as sensitive local data. See [dump handling](transports.md#diagnostics-and-dumps) and [the OpenCode history analyzer](cache.md#diagnostics-and-history-analysis) for retrospective estimates.
 
-Implementation: [schema and record validation](../packages/opencode/src/cache-diagnostics.ts), [OpenCode emission](../packages/opencode/src/index.ts), and [wire opt-in](../packages/opencode/src/transform.ts).
+Implementation: [schema and record validation](../packages/core/src/cache-diagnostics.ts), with host integrations in [OpenCode 1](../packages/opencode/src/index.ts), [OpenCode 2](../packages/opencode/src/v2/wire.ts) and [Pi](../packages/pi/src/stream.ts).

@@ -1,7 +1,10 @@
 import {
+  type AccountStorage,
   CLAUDE_MODEL_CAPABILITIES,
   type ClaudeModelPricing,
+  isCostZeroingEnabled,
   resolveClaudeModelCapabilities,
+  type SettingsService,
 } from '@cortexkit/anthropic-auth-core'
 import type { Model, Plugin } from '@opencode/plugin'
 
@@ -17,7 +20,12 @@ function effortVariants(
   }))
 }
 
-function modelCost(pricing: ClaudeModelPricing): Model.Info['cost'][number] {
+function modelCost(
+  pricing: Pick<
+    ClaudeModelPricing,
+    'input' | 'output' | 'cacheRead' | 'cacheWrite5m'
+  >,
+): Model.Info['cost'][number] {
   // OC2, like OC1, has one cache-write price; use the five-minute price.
   return {
     input: pricing.input,
@@ -73,8 +81,65 @@ function nativeCatalogueModels(): Model.Info[] {
 }
 
 /** Supply missing catalogue rows and adaptive-thinking effort variants. */
-export function createNativeClaudeModelRules() {
+export function createNativeClaudeModelRules(
+  readPricingSettings: () => Pick<AccountStorage, 'costZeroing'> = () => ({}),
+) {
   const ids = new Map<string, string>()
+  let oauth = false
+  const zeroCosts = () => oauth && isCostZeroingEnabled(readPricingSettings())
+  const watchPricing = (
+    ctx: Pick<Plugin.Context, 'model' | 'integration' | 'event'>,
+    settings?: Pick<SettingsService, 'watch'>,
+  ) => {
+    const connection = ctx.integration.connection
+    if (!connection) return { dispose: async () => {} }
+    const abort = new AbortController()
+    let read = 0
+    let lastZeroing = zeroCosts()
+    const reloadIfChanged = () => {
+      if (abort.signal.aborted) return
+      const zeroing = zeroCosts()
+      if (zeroing === lastZeroing) return
+      lastZeroing = zeroing
+      void ctx.model.reload().catch(() => {})
+    }
+    const refresh = async () => {
+      const generation = ++read
+      // Only the connection kind is needed. Never resolve its secret.
+      try {
+        const active = await connection.active('anthropic')
+        if (abort.signal.aborted || generation !== read) return
+        oauth = active?.type === 'credential' && active.method === 'oauth'
+      } catch {
+        // Keep the last confirmed pricing until a credential event prompts another read.
+        return
+      }
+      reloadIfChanged()
+    }
+    const unwatch = settings?.watch(reloadIfChanged)
+    const events = (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({
+          types: ['credential.updated', 'credential.switched'],
+          signal: abort.signal,
+        })) {
+          // Older OpenCode versions publish credential.updated without an ID.
+          const id = event.data.integrationID
+          if (id === undefined || id === 'anthropic') void refresh()
+        }
+      } catch {
+        // The host closes the event stream on unload.
+      }
+    })()
+    void refresh()
+    return {
+      async dispose() {
+        abort.abort()
+        unwatch?.()
+        await events
+      },
+    }
+  }
   const installProviderModels = (ctx: Pick<Plugin.Context, 'provider'>) =>
     ctx.provider.transform((editor) => {
       const provider = editor.get('anthropic')
@@ -96,12 +161,18 @@ export function createNativeClaudeModelRules() {
   const install = (ctx: Pick<Plugin.Context, 'model'>) =>
     ctx.model.transform((editor) => {
       ids.clear()
+      const zeroing = zeroCosts()
       for (const candidate of editor.list('anthropic')) {
         ids.set(String(candidate.id), String(candidate.modelID))
         const efforts = resolveClaudeModelCapabilities(candidate.modelID)
           ?.efforts.variants
-        if (!efforts) continue
+        if (!efforts && !zeroing) continue
         editor.update('anthropic', String(candidate.id), (model) => {
+          if (zeroing)
+            model.cost = [
+              modelCost({ input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0 }),
+            ]
+          if (!efforts) return
           const retained = model.variants.filter(
             (variant) =>
               !efforts.some((effort) => effort === String(variant.id)),
@@ -113,6 +184,7 @@ export function createNativeClaudeModelRules() {
   return {
     install,
     installProviderModels,
+    watchPricing,
     modelId: (id: string) => ids.get(id) ?? id,
   }
 }

@@ -92,6 +92,7 @@ test.each(['expired', 'account-gone', 'foreign-identity'] as const)(
       const store = new CacheKeepStore({
         storageId: 'silent-disk-drop',
         root: await root(),
+        now: () => now,
       })
       await store.reserveWarm({
         ...target,
@@ -122,6 +123,7 @@ test('restart writers omit old stop markers and readers ignore them', async () =
   const store = new CacheKeepStore({
     storageId: 'ignored-old-marker',
     root: await root(),
+    now: () => now,
   })
   await store.reserveWarm({
     ...target,
@@ -165,6 +167,7 @@ test.each(['live-target', 'no-lease'] as const)(
       const current = new CacheKeepStore({
         storageId: 'guarded-expired',
         root: await root(),
+        now: () => now,
       })
       const expired = {
         ...target,

@@ -59,7 +59,6 @@ const nativeEnvKeys = [
   'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',
   'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
   'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
-  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
   'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
   'CLAUDE_CONFIG_DIR',
   'OPENCODE_AUTH_CONTENT',
@@ -1348,7 +1347,9 @@ describe('account command INFO logs (via plugin)', () => {
   test('does not retain a background interval unless the helper opts in', async () => {
     const fixture = await migrate(baseStorage())
     await fixture.getPlugin()
-    expect(timerTracking.disabledIntervalCalls).toBe(1)
+    // The Prime timer (the opt-in five-hour window starter) registers at
+    // startup alongside fallback refresh, even when Prime is off.
+    expect(timerTracking.disabledIntervalCalls).toBe(2)
     expect(activeIntervals.size).toBe(0)
 
     await timerTracking.withTrackedInterval(async () => {
@@ -1356,6 +1357,7 @@ describe('account command INFO logs (via plugin)', () => {
         setInterval: trackedSetInterval,
         clearInterval: trackedClearInterval,
       })
+      // The second instance shares the Prime timer; only its fallback refresh is new.
       expect(activeIntervals.size).toBe(1)
     })
     expect(activeIntervals.size).toBe(0)

@@ -7,6 +7,7 @@ import {
   isClaudeGatewayUrl,
   warnClaudeGatewayProxyRefused,
 } from './gateway.ts'
+import { type RequestGzipLatch, sendWithRequestGzip } from './request-gzip.ts'
 import { copyStreamResponseTiming } from './stream-completion.ts'
 
 /**
@@ -191,6 +192,8 @@ export interface ClaudeModelFetchOptions {
     | ClaudeGateway
     | undefined
     | (() => ClaudeGateway | undefined)
+  /** Opt in for hosts whose CacheKeep transport owns the physical direct send. */
+  readonly requestGzipLatch?: RequestGzipLatch
 }
 
 /**
@@ -218,12 +221,28 @@ export function createClaudeModelFetch(
     ) => {
       const gateway = gatewayNow()
       const url = fetchInputUrl(input)
-      const target =
-        gateway &&
+      const post =
         (init?.method ?? requestMethod(input)).toUpperCase() === 'POST'
-          ? claudeGatewayModelUrl(url, gateway)
-          : undefined
-      if (!gateway || !target) return direct(input, init)
+      const target =
+        gateway && post ? claudeGatewayModelUrl(url, gateway) : undefined
+      if (!gateway || !target) {
+        if (
+          options.requestGzipLatch &&
+          post &&
+          typeof init?.body === 'string'
+        ) {
+          return sendWithRequestGzip({
+            url,
+            body: init.body,
+            headers: new Headers(
+              init.headers ?? (input instanceof Request ? input.headers : {}),
+            ),
+            latch: options.requestGzipLatch,
+            send: (body, headers) => direct(input, { ...init, body, headers }),
+          })
+        }
+        return direct(input, init)
+      }
       const headers = applyClaudeGatewayHeaders(
         new Headers(
           init?.headers ?? (input instanceof Request ? input.headers : {}),

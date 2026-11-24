@@ -1,8 +1,7 @@
 import { afterEach, describe, expect, mock } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { readFile } from 'node:fs/promises'
 import {
   __setLogTestSink,
   type AccountStorage,
@@ -51,11 +50,8 @@ import {
 import {
   expectNonOatMainRefused as expectNonOatMainRefusedWithCtx,
   expectUnknownQuotaAdmissionBlocked as expectUnknownQuotaAdmissionBlockedWithCtx,
-  loadMainAndFetch as loadMainAndFetchWithCtx,
-  readFeedEntries,
-  waitForFeedEntries as waitForFeedEntriesWithCtx,
   waitForLogRecord as waitForLogRecordWithCtx,
-} from './support/opencode1-quota-feed.ts'
+} from './support/opencode1-quota.ts'
 import {
   readAccountStorage as readAccountStorageWithCtx,
   waitForAccountStorage as waitForAccountStorageWithCtx,
@@ -175,25 +171,12 @@ function waitForNativePoolQuota(
 ) {
   return waitForNativePoolQuotaWithCtx(testContext, routeId, predicate, options)
 }
-function waitForFeedEntries(
-  predicate: (entries: Awaited<ReturnType<typeof readFeedEntries>>) => boolean,
-  description: string,
-) {
-  return waitForFeedEntriesWithCtx(testContext, predicate, description)
-}
 function waitForLogRecord(
   records: LogTestRecord[],
   predicate: (record: LogTestRecord) => boolean,
   description: string,
 ) {
   return waitForLogRecordWithCtx(testContext, records, predicate, description)
-}
-function loadMainAndFetch(
-  storage: AccountStorage,
-  response: Response | (() => Response),
-  requestHeaders?: Record<string, string>,
-) {
-  return loadMainAndFetchWithCtx(testContext, storage, response, requestHeaders)
 }
 function expectNonOatMainRefused(access: string) {
   return expectNonOatMainRefusedWithCtx(testContext, access)
@@ -351,7 +334,7 @@ describe('fallback quota persistence ordering', () => {
   })
 })
 
-describe('quota header feed integration', () => {
+describe('quota header harvest and persistence', () => {
   const originalFetch = globalThis.fetch
 
   afterEach(async () => {
@@ -369,12 +352,12 @@ describe('quota header feed integration', () => {
     'non-OAT compatibility identity stays a local quota key without a provider uuid',
     async () => {
       // OAuth records without Anthropic's access-token prefix are no longer served natively: the request is
-      // refused with guidance and nothing reaches the model or the quota feed.
+      // refused with guidance before a model request is sent.
       await expectNonOatMainRefused('local-adapter-access')
     },
   )
 
-  async function publishFallbackUuid({
+  async function persistFallbackUuid({
     fallbackUuid,
     persistedUuid,
     bootstrapResponse,
@@ -392,7 +375,6 @@ describe('quota header feed integration', () => {
           minimumRemaining: { five_hour: 10, seven_day: 20 },
           failClosedOnUnknownQuota: true,
         },
-        quotaHeaderFeed: { enabled: true },
         accounts: [
           {
             id: 'fallback-1',
@@ -487,13 +469,6 @@ describe('quota header feed integration', () => {
     const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
     await response.text()
 
-    const [published] = await waitForFeedEntries(
-      (entries) =>
-        entries.some(
-          (entry: any) => entry.anthropic_account_uuid === fallbackUuid,
-        ),
-      'a fallback UUID feed entry',
-    )
     const persisted = await waitForAccountStorage(
       (candidate) =>
         (
@@ -502,123 +477,33 @@ describe('quota header feed integration', () => {
           ) as any
         )?.anthropicAccountUuid === fallbackUuid,
     )
-    return { published, persisted }
+    return persisted
   }
 
-  test('does not treat a complete but uncommitted .tmp lease as a published feed entry', async () => {
-    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
-    const directory = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR!
-    await mkdir(directory, { recursive: true })
-    await writeFile(
-      join(directory, 'pretend.json.uncommitted.tmp'),
-      JSON.stringify({
-        version: 3,
-        entries: { a: { account_ref: 'not-yet-published' } },
-      }),
-      { mode: 0o600 },
-    )
-    expect(await readFeedEntries()).toEqual([])
-  })
-
-  test('non-oat main feed leaves provider UUID null while retaining its quota slot', async () => {
+  test('refuses a main login with a non-OAuth access token', async () => {
     // OAuth records without Anthropic's access-token prefix are no longer served natively: the request is
-    // refused with guidance and nothing reaches the model or the quota feed.
+    // refused with guidance before a model request is sent.
     await expectNonOatMainRefused('main-access')
   })
 
-  test('oat main feed preserves its bootstrapped Anthropic account UUID', async () => {
-    const mainAccountId = 'main-oat-slot'
-    const providerAccountUuid = '33333333-3333-3333-3333-333333333333'
-    await useTempAccountFile(
-      createFallbackStorage({
-        mainAccountId,
-        quotaHeaderFeed: { enabled: true },
-        accounts: [],
-      }),
-      {
-        access: 'sk-ant-oat-main-feed',
-        refresh: 'main-refresh',
-        expires: Date.now() + 100_000,
-      },
-    )
-    globalThis.fetch = mock(
-      withNativeTokenExchange((input: any) => {
-        const url = extractUrl(input)
-        if (url.includes('/claude_cli/bootstrap')) {
-          return Promise.resolve(
-            Response.json({
-              oauth_account: { account_uuid: providerAccountUuid },
-            }),
-          )
-        }
-        return Promise.resolve(
-          new Response('{}', {
-            status: 200,
-            headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
-          }),
-        )
-      }),
-    ) as unknown as typeof fetch
-
-    const plugin = await getPlugin()
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'sk-ant-oat-main-feed',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
-        }),
-      { models: {} },
-    )
-    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
-    await response.text()
-
-    const [published] = await waitForFeedEntries(
-      (entries) =>
-        entries.some(
-          (entry: any) => entry.anthropic_account_uuid === providerAccountUuid,
-        ),
-      'a bootstrapped main UUID feed entry',
-    )
-    // The native feed keys the main account by its stable Claude account
-    // UUID; the configured slot id stays a local name only.
-    expect(published).toEqual(
-      expect.objectContaining({
-        account_ref: providerAccountUuid,
-        anthropic_account_uuid: providerAccountUuid,
-      }),
-    )
-    expect((published as { account_ref?: unknown }).account_ref).not.toBe(
-      mainAccountId,
-    )
+  test('refuses the non-OAuth replacement token', async () => {
+    // OAuth records without Anthropic's access-token prefix are no longer served natively: the request is
+    // refused with guidance before a model request is sent.
+    await expectNonOatMainRefused('main-non-oat-after-rotation')
   })
 
-  test('main feed drops a cached oat UUID after the current credential becomes non-oat', async () => {
+  test('refuses a fresh install with a non-OAuth access token', async () => {
     // OAuth records without Anthropic's access-token prefix are no longer served natively: the request is
-    // refused with guidance and nothing reaches the model or the quota feed.
-    await expectNonOatMainRefused('main-feed-non-oat-after-rotation')
-  })
-
-  test('fresh non-oat main install persists a quota slot and publishes no provider UUID', async () => {
-    // OAuth records without Anthropic's access-token prefix are no longer served natively: the request is
-    // refused with guidance and nothing reaches the model or the quota feed.
+    // refused with guidance before a model request is sent.
     await expectNonOatMainRefused('fresh-main-non-oat')
   })
 
-  test('publishes and persists a fallback Anthropic account UUID', async () => {
+  test('persists a fallback Anthropic account UUID', async () => {
     const fallbackUuid = '11111111-1111-1111-1111-111111111111'
-    const { published, persisted } = await publishFallbackUuid({
+    const persisted = await persistFallbackUuid({
       fallbackUuid,
       bootstrapResponse: { oauth_account: { account_uuid: fallbackUuid } },
     })
-    expect(published).toEqual(
-      expect.objectContaining({
-        identity_source: 'account_ref',
-        account_ref: 'fallback-1',
-        anthropic_account_uuid: fallbackUuid,
-      }),
-    )
     expect(
       (
         persisted?.accounts.find(
@@ -630,17 +515,11 @@ describe('quota header feed integration', () => {
 
   test('uses a persisted fallback Anthropic account UUID before bootstrap resolves it', async () => {
     const fallbackUuid = '22222222-2222-2222-2222-222222222222'
-    const { published, persisted } = await publishFallbackUuid({
+    const persisted = await persistFallbackUuid({
       fallbackUuid,
       persistedUuid: fallbackUuid as ProviderAccountUuid,
       bootstrapResponse: {},
     })
-    expect(published).toEqual(
-      expect.objectContaining({
-        account_ref: 'fallback-1',
-        anthropic_account_uuid: fallbackUuid,
-      }),
-    )
     expect(
       (
         persisted?.accounts.find(
@@ -650,9 +529,9 @@ describe('quota header feed integration', () => {
     ).toBe(fallbackUuid)
   })
 
-  test('cache-seeded poll fields survive a later header harvest into the feed', async () => {
+  test('cache-seeded poll fields survive a later header harvest', async () => {
     const originalNow = Date.now
-    let clock = 1_000_000
+    const clock = 1_000_000
     Date.now = () => clock
     try {
       const mainAccountId = syntheticMainAccountUuid
@@ -695,7 +574,6 @@ describe('quota header feed integration', () => {
       const storage = bindMainQuotaToAccount(
         createFallbackStorage({
           mainAccountId,
-          quotaHeaderFeed: { enabled: true },
           accounts: [],
           quota: {
             ...createFallbackStorage().quota,
@@ -819,49 +697,9 @@ describe('quota header feed integration', () => {
         expect((await readAccountStorage())?.quota?.mainQuota?.scoped).toEqual(
           scoped,
         )
-        // Storage acceptance does not wait for the detached feed write.
-        await waitForFeedEntries(
-          (entries) =>
-            entries.some(
-              (entry) =>
-                entry !== null &&
-                typeof entry === 'object' &&
-                'observed_at_ms' in entry &&
-                entry.observed_at_ms === clock,
-            ),
-          'first header observation',
-        )
-        clock += 1_000
-        const secondResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
-        expect(secondResponse.status).toBe(200)
-        await secondResponse.text()
-        const secondEntry = (
-          await waitForFeedEntries(
-            (entries) =>
-              entries.length === 1 &&
-              entries[0] !== null &&
-              typeof entries[0] === 'object' &&
-              'observed_at_ms' in entries[0] &&
-              entries[0].observed_at_ms === clock,
-            'second header observation',
-          )
-        )[0]
-        if (
-          secondEntry === null ||
-          typeof secondEntry !== 'object' ||
-          !('quota' in secondEntry)
-        )
-          throw new Error('Published feed entry has no quota')
-        const quota = secondEntry.quota
-        if (quota === null || typeof quota !== 'object')
-          throw new Error('Published quota is not an object')
-        expect('scoped' in quota ? quota.scoped : undefined).toEqual(scoped)
-        expect('extraUsage' in quota ? quota.extraUsage : undefined).toEqual(
-          extraUsage,
-        )
-        expect('bindingWindow' in quota ? quota.bindingWindow : undefined).toBe(
-          'claude-weekly-scoped-fable',
-        )
+        expect(persisted?.scoped).toEqual(scoped)
+        expect(persisted?.extraUsage).toEqual(extraUsage)
+        expect(persisted?.bindingWindow).toBe('claude-weekly-scoped-fable')
       } finally {
         release.open()
         await Promise.allSettled([pollWriter, firstRequest])
@@ -998,7 +836,7 @@ describe('quota header feed integration', () => {
     }
   })
 
-  test('stale fallback headers do not persist or publish after re-login', async () => {
+  test('stale fallback headers do not persist after re-login', async () => {
     const fallbackAccess = 'sk-ant-oat01-fallback-lineage-a-access'
     const fallbackCheckedAt = Date.now()
     const responseGate = bodyLifetime().gate()
@@ -1014,7 +852,6 @@ describe('quota header feed integration', () => {
     await useTempAccountFile(
       bindPoolAccounts(
         createFallbackStorage({
-          quotaHeaderFeed: { enabled: true },
           quota: {
             ...createFallbackStorage().quota,
             checkIntervalMinutes: 60,
@@ -1220,7 +1057,6 @@ describe('quota header feed integration', () => {
       )
       expect(settledAccount?.quota?.five_hour?.usedPercent).toBe(60)
       expect(settledAccount?.quota?.seven_day?.usedPercent).toBe(70)
-      expect(await readFeedEntries()).toEqual([])
     } finally {
       responseGate.open()
       await Promise.allSettled([responsePromise, fallbackResponse])
@@ -1444,7 +1280,7 @@ describe('quota header feed integration', () => {
     }
   })
 
-  test('cross-account reload cannot retime a published main observation', async () => {
+  test('cross-account reload preserves the account-bound main quota timestamp', async () => {
     const originalNow = Date.now
     const requestCheckedAt = 1_000_000
     Date.now = () => requestCheckedAt
@@ -1455,7 +1291,6 @@ describe('quota header feed integration', () => {
       const storage = bindMainQuotaToAccount(
         createFallbackStorage({
           mainAccountId: 'main-slot',
-          quotaHeaderFeed: { enabled: true },
           accounts: [],
           quota: {
             ...createFallbackStorage().quota,
@@ -1525,32 +1360,21 @@ describe('quota header feed integration', () => {
       const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
       expect(response.status).toBe(200)
       await response.text()
-      const entries = await waitForFeedEntries(
-        (entries) => entries.length === 1,
-        'one account-bound header observation',
-      )
-      expect(entries[0]).toMatchObject({
-        account_ref: accountIdentity,
-        anthropic_account_uuid: accountIdentity,
-        observed_at_ms: requestCheckedAt,
-      })
-      expect(entries[0]).not.toMatchObject({ observed_at_ms: otherCheckedAt })
     } finally {
       Date.now = originalNow
     }
   })
 
-  test('withholds the main feed entry when bootstrap cannot identify the account', async () => {
+  test('refuses the model request when bootstrap cannot identify the main account', async () => {
     let modelCalls = 0
     let bootstrapCalls = 0
     await useTempAccountFile(
       createFallbackStorage({
         mainAccountId: 'unknown-main',
-        quotaHeaderFeed: { enabled: true },
         accounts: [],
       }),
       {
-        access: 'sk-ant-oat01-unknown-feed',
+        access: 'sk-ant-oat01-unknown-account',
         refresh: 'unknown-refresh',
         expires: Date.now() + 8 * 60 * 60_000,
       },
@@ -1561,7 +1385,7 @@ describe('quota header feed integration', () => {
         if (url.includes('/v1/oauth/token'))
           return Promise.resolve(
             Response.json({
-              access_token: 'sk-ant-oat01-unknown-feed-successor',
+              access_token: 'sk-ant-oat01-unknown-account-successor',
               refresh_token: 'unknown-refresh-successor',
               expires_in: 28800,
             }),
@@ -1585,7 +1409,7 @@ describe('quota header feed integration', () => {
       () =>
         Promise.resolve({
           type: 'oauth' as const,
-          access: 'sk-ant-oat01-unknown-feed',
+          access: 'sk-ant-oat01-unknown-account',
           refresh: 'unknown-refresh',
           expires: Date.now() + 100000,
         }),
@@ -1596,18 +1420,17 @@ describe('quota header feed integration', () => {
     )
     expect(bootstrapCalls).toBeGreaterThan(0)
     expect(modelCalls).toBe(0)
-    expect(await readFeedEntries()).toEqual([])
   })
 
   test('coalesces concurrent main identity resolution for the same token', async () => {
     // OAuth records without Anthropic's access-token prefix are no longer served natively: the request is
-    // refused with guidance and nothing reaches the model or the quota feed.
+    // refused with guidance before a model request is sent.
     await expectNonOatMainRefused('compat-main-access')
   })
 
   test('aborts a request whose main identity becomes stale during resolution', async () => {
     // OAuth records without Anthropic's access-token prefix are no longer served natively: the request is
-    // refused with guidance and nothing reaches the model or the quota feed.
+    // refused with guidance before a model request is sent.
     await expectNonOatMainRefused('compat-a')
   })
 })
@@ -1714,7 +1537,7 @@ describe('main identity boot order', () => {
   })
 })
 
-describe('quota header feed extended integration', () => {
+describe('quota persistence and admission', () => {
   const originalFetch = globalThis.fetch
 
   afterEach(async () => {
@@ -1728,38 +1551,12 @@ describe('quota header feed extended integration', () => {
     deferModelRequestUntilTeardown,
   )
 
-  test('disabled quota header feed publishes nothing by default or when explicitly false', async () => {
-    for (const enabled of [undefined, false]) {
-      const storage = createFallbackStorage({
-        quotaHeaderFeed: enabled === undefined ? undefined : { enabled },
-        accounts: [],
-      })
-      const { response } = await loadMainAndFetch(
-        storage,
-        new Response('{}', {
-          status: 200,
-          headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
-        }),
-      )
-      expect(await response.text()).toBe('{}')
-      expect(await readFeedEntries()).toEqual([])
-    }
-  })
-
-  test('feed publication failure does not affect response, quota persistence, or sidebar update', async () => {
-    const feedDirectory = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR!
+  test('response headers update persisted quota and the sidebar when polling is off', async () => {
     await useTempAccountFile(
       createFallbackStorage({
-        quotaHeaderFeed: { enabled: true },
         accounts: [],
         quota: { enabled: false },
       }),
-    )
-    const feedParentFile = join(dirname(feedDirectory), 'feed-parent-file')
-    await Bun.write(feedParentFile, 'not a directory')
-    process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = join(
-      feedParentFile,
-      'quota-header-feed',
     )
     globalThis.fetch = mock(
       withNativeAdmission(() =>
@@ -1798,7 +1595,6 @@ describe('quota header feed extended integration', () => {
       (state) => state.main.quota?.five_hour?.usedPercent === 25,
     )
     expect(sidebar.main.quota?.five_hour?.usedPercent).toBe(25)
-    expect(await readFeedEntries()).toEqual([])
   })
 
   test('sidebar quota refresh preserves rotated account metadata without acquiring credentials', async () => {
@@ -1887,79 +1683,6 @@ describe('quota header feed extended integration', () => {
     expect(resolved.storage?.quota?.mainQuota?.five_hour?.usedPercent).toBe(25)
     expect(fetchSpy.mock.calls.length).toBe(requestsBeforeDisplay)
     await plugin.dispose?.()
-  })
-
-  test('deduplicates main feed observations across access-token rotation', async () => {
-    await useTempAccountFile(
-      createFallbackStorage({
-        mainAccountId: 'stable-main-account',
-        quotaHeaderFeed: { enabled: true },
-        accounts: [],
-        quota: { enabled: false },
-      }),
-      {
-        access: 'sk-ant-oat01-main-access-a',
-        refresh: 'main-refresh',
-        expires: Date.now() + 100000,
-      },
-    )
-    let requestCount = 0
-    globalThis.fetch = mock(
-      withNativeAdmission(() => {
-        requestCount += 1
-        return Promise.resolve(
-          new Response('{}', {
-            status: 200,
-            headers: {
-              'anthropic-ratelimit-unified-5h-utilization': String(
-                requestCount / 100,
-              ),
-            },
-          }),
-        )
-      }),
-    ) as unknown as typeof fetch
-    const plugin = await getPlugin()
-
-    for (const access of [
-      'sk-ant-oat01-main-access-a',
-      'sk-ant-oat01-main-access-b',
-    ]) {
-      // The second generation is a refresh of the same account in another
-      // OpenCode process, which rotates the pool's main access token.
-      if (access !== 'sk-ant-oat01-main-access-a')
-        await refreshPoolMainElsewhere({
-          access,
-          refresh: `main-refresh-${access}`,
-          expires: Date.now() + 100000,
-        })
-      const result = await plugin.auth.loader(
-        () =>
-          Promise.resolve({
-            type: 'oauth' as const,
-            access: 'sk-ant-oat01-main-access-a',
-            refresh: 'main-refresh',
-            expires: Date.now() + 100000,
-          }),
-        { models: {} },
-      )
-      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
-      await response.text()
-    }
-
-    const entries = await waitForFeedEntries(
-      (candidate) => candidate.length === 1,
-      'one published entry',
-    )
-    expect(entries).toHaveLength(1)
-    expect(entries[0]).toEqual(
-      // Quota uses Anthropic's account UUID, not the local identifier used
-      // to keep the main login's device identity stable across token rotation.
-      expect.objectContaining({
-        identity_source: 'account_ref',
-        account_ref: poolMainIdentity(),
-      }),
-    )
   })
 
   test('ordered fallback admission sends an unknown-quota OAuth account', async () => {
@@ -2268,141 +1991,5 @@ describe('quota header feed extended integration', () => {
     expect(response.status).toBe(200)
     expect(messageRequests).toHaveLength(1)
     expect(messageRequests[0]).toContain(MESSAGES_URL)
-  })
-
-  test('selects account_ref for main and fallback without leaking credential_id', async () => {
-    const main = await loadMainAndFetch(
-      createFallbackStorage({
-        quotaHeaderFeed: { enabled: true },
-        accounts: [],
-      }),
-      new Response('{}', {
-        status: 200,
-        headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
-      }),
-    )
-    await main.response.text()
-    const mainEntries = await waitForFeedEntries(
-      (entries) => entries.length === 1,
-      'one main published entry',
-    )
-    const mainAccountId = (await readAccountStorage())?.mainAccountId
-    expect(mainEntries[0]).toEqual(
-      expect.objectContaining({
-        identity_source: 'account_ref',
-        account_ref: mainAccountId,
-      }),
-    )
-    expect(mainEntries[0]).not.toHaveProperty('credential_id')
-
-    const fallback = await loadMainAndFetch(
-      bindPoolAccounts(
-        createFallbackStorage({
-          quotaHeaderFeed: { enabled: true },
-          routing: { mode: 'fallback-first' },
-        }),
-      ),
-      new Response('{}', {
-        status: 200,
-        headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
-      }),
-    )
-    await fallback.response.text()
-    const fallbackEntry = (
-      await waitForFeedEntries(
-        (entries) =>
-          entries.length === 1 &&
-          entries.some((entry: any) => entry.account_ref === 'fallback-1'),
-        'one fallback-1 published entry',
-      )
-    ).find((entry: any) => entry.identity_source === 'account_ref') as any
-    expect(fallbackEntry).toEqual(
-      expect.objectContaining({
-        identity_source: 'account_ref',
-        account_ref: 'fallback-1',
-      }),
-    )
-    expect(fallbackEntry).not.toHaveProperty('credential_id')
-  })
-
-  test('published configured account count uses live main OAuth plus every OAuth fallback and excludes API keys', async () => {
-    const { response } = await loadMainAndFetch(
-      createFallbackStorage({
-        quotaHeaderFeed: { enabled: true },
-        accounts: [
-          {
-            id: 'disabled-oauth',
-            type: 'oauth',
-            access: 'sk-ant-oat01-disabled-access',
-            refresh: 'disabled-refresh',
-            expires: Date.now() + 8 * 60 * 60_000,
-            enabled: false,
-          },
-          {
-            id: 'enabled-oauth',
-            type: 'oauth',
-            access: 'sk-ant-oat01-enabled-access',
-            refresh: 'enabled-refresh',
-            expires: Date.now() + 8 * 60 * 60_000,
-            enabled: true,
-          },
-          {
-            id: 'api-key',
-            type: 'api',
-            apiKey: 'key',
-            baseURL: 'https://example.test',
-          },
-        ] as AccountStorage['accounts'],
-      }),
-      new Response('{}', {
-        status: 200,
-        headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
-      }),
-    )
-    expect(response.status).toBe(200)
-    await response.text()
-    const entries = await waitForFeedEntries(
-      (candidate) => candidate.length === 1,
-      'one configured-account-count entry',
-    )
-    expect(entries[0]).toEqual(
-      expect.objectContaining({ configured_account_count: 3 }),
-    )
-  })
-
-  test('publishes genuine relay response headers through onResponseHeaders', async () => {
-    const { response } = await loadMainAndFetch(
-      createFallbackStorage({
-        quotaHeaderFeed: { enabled: true },
-        relay: {
-          enabled: true,
-          url: 'https://relay.example.test',
-          token: 'relay-token',
-          transport: 'http',
-        },
-      }),
-      () =>
-        new Response('{}', {
-          status: 200,
-          headers: {
-            'anthropic-ratelimit-unified-5h-utilization': '0.5',
-            'x-cortexkit-relay-optimistic': 'true',
-          },
-        }),
-      { 'x-session-affinity': 'feed-relay-session' },
-    )
-    await response.text()
-    const entries = await waitForFeedEntries(
-      (candidate) => candidate.length === 1,
-      'one relay published entry',
-    )
-    expect(entries).toHaveLength(1)
-    expect(entries[0]).toEqual(
-      expect.objectContaining({
-        quota: expect.objectContaining({
-          five_hour: expect.objectContaining({ usedPercent: 50 }),
-        }),
-      }),
-    )
   })
 })

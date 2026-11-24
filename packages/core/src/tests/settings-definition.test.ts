@@ -90,7 +90,6 @@ test('all shared settings are flat, user-only and have exactly the allowed overr
       'quota_minimum_remaining_scoped',
       'quota_fail_closed_on_unknown_quota',
       'quota_show_toasts',
-      'quota_header_feed_enabled',
       'killswitch_enabled',
       'killswitch_default_five_hour',
       'killswitch_default_seven_day',
@@ -350,12 +349,6 @@ const defaultReaders = {
     !hostPredicate(
       /function showQuotaToastFromCache\(\) \{\s*if \(([^\n]+)\) return/,
       'showQuotaToastFromCache',
-      s,
-    ),
-  quota_header_feed_enabled: (s: AccountStorage) =>
-    hostPredicate(
-      /const quotaHeaderFeedRegistry =\s*(initialStorage[\s\S]*?)\s*\? new QuotaHeaderFeedRegistry/,
-      'quotaHeaderFeedRegistry',
       s,
     ),
   killswitch_enabled: isKillswitchEnabled,

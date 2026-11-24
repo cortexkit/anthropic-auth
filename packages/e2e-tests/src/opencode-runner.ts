@@ -52,7 +52,6 @@ export type IsolatedEnv = {
   dataDir: string
   cacheDir: string
   workdir: string
-  quotaFeedDir: string
 }
 
 function isExpectedE2ETempDir(path: string, root: string) {
@@ -239,7 +238,6 @@ export type SpawnOptions = {
   beforeSpawn?: (env: IsolatedEnv) => void | Promise<void>
   childEnv?: Record<string, string | undefined>
   childTmpDir?: string
-  quotaFeed?: boolean
   /** Defaults to `{ kind: 'local' }`. */
   nativeAccounts?: NativeAccountFixture
 }
@@ -316,7 +314,6 @@ export function createIsolatedEnv(root = tmpdir()): IsolatedEnv {
     dataDir: join(base, 'data'),
     cacheDir: join(base, 'cache'),
     workdir: join(base, 'work'),
-    quotaFeedDir: join(base, 'quota-header-feed'),
   }
   try {
     for (const dir of Object.values(env)) mkdirSync(dir, { recursive: true })
@@ -394,7 +391,6 @@ function writeConfigs(env: IsolatedEnv, options: SpawnOptions) {
         accounts: [],
         quota: { enabled: false },
         refresh: { enabled: false },
-        ...(options.quotaFeed ? { quotaHeaderFeed: { enabled: true } } : {}),
         ...(options.hybridCache
           ? { claudeCache: { enabled: true, mode: 'hybrid' } }
           : {}),
@@ -684,9 +680,6 @@ async function prepareNativeAccounts(input: {
         ...settings,
         quota: { enabled: false },
         refresh: { enabled: false },
-        ...(input.options.quotaFeed
-          ? { quotaHeaderFeed: { enabled: true } }
-          : {}),
         ...(input.options.hybridCache
           ? { claudeCache: { enabled: true, mode: 'hybrid' } }
           : {}),
@@ -1029,11 +1022,6 @@ export async function spawnOpencode(
       env.tempDir,
       'opencode-anthropic-auth.log',
     )
-    if (options.quotaFeed) {
-      childEnv.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = env.quotaFeedDir
-    } else {
-      delete childEnv.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR
-    }
     childEnv.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
     if (options.fallbackMode) {
       childEnv.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = options.fallbackMode

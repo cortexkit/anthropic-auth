@@ -7,6 +7,7 @@ import {
   createQuotaRefusalResponse,
   decideStickyQuotaFailure,
   effectiveRelayTransport,
+  formatNativeValidationBackoffMessage,
   getClaudeCodeIdentityForVerifiedAccount,
   getMaxSameAccountWait,
   getQuotaCheckIntervalMs,
@@ -35,6 +36,7 @@ import {
   nativeLocalAccountRefusal,
   nativeLocalQuotaLineage,
   nativePollQuotaGenerallyExhausted,
+  nativeValidationRetryAt,
   normalizeQuotaHeaders,
   type OAuthQuotaSnapshot,
   type ProviderAccountUuid,
@@ -45,6 +47,7 @@ import {
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
   RELAY_PROXY_REFUSAL,
+  type RoutingWaitClock,
   readNativeAccountsForRequest,
   readSessionCachePolicy,
   readThreeWayBoolean,
@@ -83,6 +86,7 @@ import {
   routingChoiceMatches,
   routingWarmCredential,
 } from '../routing-relay'
+import { formatPrimeTime } from '../sidebar-state'
 import {
   type NativeAnthropicAttemptContext,
   type NativeAnthropicAuthorization,
@@ -142,6 +146,7 @@ const quotaSnapshotIsExhausted = (quota: OAuthQuotaSnapshot | undefined) =>
 
 // Match common-auth: the ten retry labels are 2 through 11, inclusive.
 const HOST_RETRY_LIMIT = 10
+const CAPACITY_WAIT_BUDGET_MS = 240_000
 
 const remainingHostRetries = (input: ChooseAccountInput) =>
   HOST_RETRY_LIMIT + 2 - (input.hostAttempt ?? 2)
@@ -323,6 +328,7 @@ export interface NativeSourceOptions {
     route: string
   }) => AnthropicBillingWarming | undefined
   readonly fetch?: typeof fetch
+  readonly routingWaitClock?: RoutingWaitClock
   /** Resolve a host model alias to the upstream ID before request-local policy. */
   readonly resolveModelId?: (scope: RequestScope) => Promise<string>
 }
@@ -372,7 +378,7 @@ export function createNativeAnthropicSource(
         row.accountIdentity === subject.accountIdentity &&
         (!subject.credentialId || row.credentialId === subject.credentialId),
     )?.quota
-  })
+  }, options.routingWaitClock)
   const servedTurns = new Set<string>()
   const stickyQuotaRetries = new StickyQuotaRetryCounter()
   // The latest same-account hold granted for confirmed exhaustion, by session:
@@ -667,6 +673,8 @@ export function createNativeAnthropicSource(
   ) => {
     const oauth: NativeAccountView[] = []
     const policies = new Map<string, NativeAccountPolicy>()
+    const validationWaits: { account: NativeAccountView; retryAt: number }[] =
+      []
     for (const account of snapshot.accounts) {
       if (account.type !== 'oauth') continue
       const policy = routingRelay.policy(
@@ -685,11 +693,15 @@ export function createNativeAnthropicSource(
             routingRelay.policy(input.sessionID, row, view, modelID),
         })
         active.signal.throwIfAborted()
-        if (admission.status !== 'usable') continue
+        if (admission.status !== 'usable') {
+          const retryAt = nativeValidationRetryAt(admission)
+          if (retryAt !== undefined) validationWaits.push({ account, retryAt })
+          continue
+        }
       }
       oauth.push(account)
     }
-    return { oauth, policies }
+    return { oauth, policies, validationWaits }
   }
   const paidFallback = async (
     input: ChooseAccountInput,
@@ -1115,7 +1127,16 @@ export function createNativeAnthropicSource(
         modelID,
         routingCandidates(snapshot.accounts),
         {
-          capacityWait: 'wait',
+          // OpenCode times this middleware without aborting it and offers no
+          // pre-send retry. Waiting longer leaves the routing wait running
+          // after the host returns a generic header timeout.
+          capacityWait:
+            input.phase === 'retry'
+              ? { maxInRequestMs: 0 }
+              : {
+                  maxInRequestMs: CAPACITY_WAIT_BUDGET_MS,
+                  stopWithinBudget: true,
+                },
           signal: active.signal,
           warmCredentialId: routingWarmCredential(
             snapshot.accounts,
@@ -1129,7 +1150,7 @@ export function createNativeAnthropicSource(
         active.signal.throwIfAborted()
         assertTransport(snapshot, gateway())
       }
-      const { oauth, policies } = await oauthPool(
+      const { oauth, policies, validationWaits } = await oauthPool(
         input,
         snapshot,
         modelID,
@@ -1405,21 +1426,39 @@ export function createNativeAnthropicSource(
               getRoutingMode(snapshot.policyStorage) === 'sticky-balanced',
           })
         } catch (error) {
-          // The vault refusal finds no quota policy at work when the accounts
-          // left out are confirmed exhausted yet not below a quota floor.
+          // The vault's no-route builder explains a refusal only by the user's
+          // own quota policy, such as the quota floor (the minimum remaining
+          // quota they set), and throws when none applies. Accounts left out
+          // because they're confirmed out of quota get the plain exhausted
+          // refusal instead, unless a sign-in failure explains it.
           if (!(error instanceof NativeVaultNoAccountError)) throw error
           if (!quotaExplainsRefusal) throw error
           response = exhaustedRefusal()
         }
         throw await refusal(response)
       }
-      if (advice) return undefined
-      const api = await paidFallback(input, snapshot, active)
-      if (api) return api
-      const holdForPool = poolHold()
-      if (holdForPool) return holdForPool
-      // Local mode explains a pool that is out of quota as the vault does.
-      if (quotaExplainsRefusal) throw await refusal(exhaustedRefusal())
+      if (!advice) {
+        const api = await paidFallback(input, snapshot, active)
+        if (api) return api
+        const holdForPool = poolHold()
+        if (holdForPool) return holdForPool
+        // Local mode explains a pool that is out of quota as the vault does.
+        if (quotaExplainsRefusal) throw await refusal(exhaustedRefusal())
+      }
+      // Explain the earliest check only for a login that could otherwise serve.
+      let earliestCheck = Infinity
+      for (const { account, retryAt } of validationWaits)
+        if (
+          account.id !== lastRefuser &&
+          !blockerFor(account) &&
+          routingRelay.policy(input.sessionID, account, snapshot, modelID)
+            .status === 'allowed'
+        )
+          earliestCheck = Math.min(earliestCheck, retryAt)
+      if (Number.isFinite(earliestCheck))
+        throw new Error(
+          formatNativeValidationBackoffMessage(formatPrimeTime(earliestCheck)),
+        )
       return undefined
     },
     dropChoice() {
@@ -1650,6 +1689,11 @@ export function createNativeAnthropicSource(
       })
       active.signal.throwIfAborted()
       if (material.status !== 'usable') {
+        const retryAt = nativeValidationRetryAt(material)
+        if (!onRefusal && retryAt !== undefined)
+          throw new Error(
+            formatNativeValidationBackoffMessage(formatPrimeTime(retryAt)),
+          )
         const refusal = nativeLocalAccountRefusal(material)
         if (refusal) onRefusal?.(refusal.reason)
         return undefined

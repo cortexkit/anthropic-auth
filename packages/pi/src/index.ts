@@ -36,6 +36,11 @@ import { registerCommands } from './commands.ts'
 import { collectPiRequestEffortHistory } from './effort-history.ts'
 import { piForkEffortSnapshots, piForkHeadSession } from './forks.ts'
 import {
+  forgetPiLaneStarts,
+  isPiLaneStartMessage,
+  stripPiLaneStartNonce,
+} from './lane-start.ts'
+import {
   closePiNativeRuntime,
   getPiNativeRuntime,
   isNativeMigrationRequired,
@@ -52,6 +57,7 @@ import {
   clearPiStickyQuotaRetries,
   endPiPrimaryTurn,
   forgetPiMessageThread,
+  observePiUserPrompt,
   startPiCacheKeepSession,
   stopPiCacheKeep,
   streamCortexKitAnthropic,
@@ -203,6 +209,17 @@ export default async function cortexKitPiAnthropicAuth(
       }
     }
   })
+  pi.on('message_start', async (event, ctx) => {
+    if (event.message.role !== 'user') return
+    const sessionId = ctx.sessionManager.getSessionId()
+    stripPiLaneStartNonce(event.message, sessionId)
+    if (sessionId)
+      observePiUserPrompt(
+        storagePath,
+        sessionId,
+        isPiLaneStartMessage(event.message),
+      )
+  })
   pi.on('agent_settled', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
     endPiPrimaryTurn(storagePath, sessionId)
@@ -211,11 +228,12 @@ export default async function cortexKitPiAnthropicAuth(
   pi.on('session_shutdown', async (_event, ctx) => {
     native.prime?.stop()
     const sessionId = ctx.sessionManager.getSessionId()
-    endPiPrimaryTurn(storagePath, sessionId)
+    endPiPrimaryTurn(storagePath, sessionId, true)
     if (sessionId) {
       clearPiStickyQuotaRetries(storagePath, sessionId)
       effortSessionManagers.delete(sessionId)
       piForkEffortSnapshots.forget(sessionId)
+      forgetPiLaneStarts(sessionId)
       workingMessageBySession.delete(sessionId)
       sessionCacheActivity.forget(sessionId)
       forgetPiMessageThread(sessionId, 'session_closed')

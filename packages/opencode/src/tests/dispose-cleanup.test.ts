@@ -44,7 +44,6 @@ const envKeys = [
   'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',
   'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
   'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
-  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
   'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
   'CLAUDE_CONFIG_DIR',
   'OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION',
@@ -242,40 +241,32 @@ async function migratedPool(options: { hostAuth?: Record<string, unknown> }) {
 }
 
 describe('dispose stops per-instance background services', () => {
-  // The plugin starts the fallback-account refresh interval after loading the
-  // shared native account pool. Injected timer functions let this test verify
-  // that dispose clears the same interval handle.
+  // Use injected timers to verify dispose clears the actual handles.
   lifetimes.test(
-    'dispose clears the native fallback refresh interval it started',
+    'dispose clears the native fallback refresh and Prime intervals it started',
     async () => {
       const pool = await migratedPool({})
 
-      // With the disabled interval mock, count the intervals this instance
-      // schedules. The default overrides from timer-tracking disable
-      // CacheKeep's aggregate refresh, so the fallback-account refresh is the
-      // only interval started here.
+      // The fixture disables CacheKeep's aggregate refresh. Construction
+      // schedules fallback refresh and the Prime timer (the opt-in five-hour
+      // window starter), even while Prime is off.
       const counted = await pool.getPlugin()
-      expect(timerTracking.disabledIntervalCalls).toBe(1)
+      expect(timerTracking.disabledIntervalCalls).toBe(2)
       await pool.dispose(counted)
       // Disposing must not schedule any additional intervals for this instance.
-      expect(timerTracking.disabledIntervalCalls).toBe(1)
+      expect(timerTracking.disabledIntervalCalls).toBe(2)
 
-      // With real tracked intervals, the handle construction created is the
-      // one dispose clears. The tracked clear removes only handles passed to it.
       const tracked = await pool.getPlugin({
         setInterval: timerTracking.trackedSetInterval,
         clearInterval: timerTracking.trackedClearInterval,
       })
-      expect(activeIntervals.size).toBe(1)
-      const [fallbackRefresh] = activeIntervals
-      if (fallbackRefresh === undefined)
-        throw new Error('Plugin started no tracked interval')
-      // Nothing has cleared the construction interval before dispose.
-      expect(activeIntervals.has(fallbackRefresh)).toBe(true)
+      expect(activeIntervals.size).toBe(2)
+      const handles = [...activeIntervals]
 
       await pool.dispose(tracked)
 
-      expect(activeIntervals.has(fallbackRefresh)).toBe(false)
+      for (const handle of handles)
+        expect(activeIntervals.has(handle)).toBe(false)
       expect(activeIntervals.size).toBe(0)
     },
   )
@@ -313,14 +304,14 @@ describe('dispose stops per-instance background services', () => {
   })
 
   lifetimes.test(
-    'dispose clears tracked fallback and main refresh intervals',
+    'dispose clears tracked fallback refresh, main refresh and Prime intervals',
     async () => {
       const pool = await migratedPool({ hostAuth: syntheticHostAuth() })
       const plugin = await pool.getPlugin({
         setInterval: timerTracking.trackedSetInterval,
         clearInterval: timerTracking.trackedClearInterval,
       })
-      expect(activeIntervals.size).toBe(1)
+      expect(activeIntervals.size).toBe(2)
 
       // Offline migration replaces OpenCode's OAuth credentials with a
       // non-secret activation marker. Pass that stored marker to the loader,
@@ -334,9 +325,9 @@ describe('dispose stops per-instance background services', () => {
       const options = await loader(() => Promise.resolve(activation), provider)
       expect(options.fetch).toBeFunction()
 
-      // The loader adds a second interval, the main account's OAuth refresh,
-      // beside the fallback-account refresh started during construction.
-      expect(activeIntervals.size).toBe(2)
+      // The loader adds main's OAuth refresh beside fallback refresh and
+      // Prime, which both start during construction.
+      expect(activeIntervals.size).toBe(3)
 
       await pool.dispose(plugin)
 

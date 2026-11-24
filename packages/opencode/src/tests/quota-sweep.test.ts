@@ -70,7 +70,6 @@ const envKeys = [
   'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',
   'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
   'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
-  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
   'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
   'OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION',
   'OPENCODE_AUTH_CONTENT',
@@ -450,17 +449,15 @@ async function startBody(options: BodyOptions) {
   stopPlugin = stop
   lifetimes.trackDetached(stopping.wait.then(stop))
   const plugin = await creation
-  // Only the background fallback sweep is registered while the plugin is
-  // created; its period is one minute plus up to one minute of jitter.
-  const sweepTicks = intervals.filter(
-    (interval) => interval.ms >= 60_000 && interval.ms <= 120_000,
-  )
-  if (intervals.length !== 1 || sweepTicks.length !== 1)
-    throw new Error(
-      `Expected one background sweep interval, saw ${JSON.stringify(intervals.map((interval) => interval.ms))}`,
-    )
-  const backgroundSweep = sweepTicks[0]?.run
-  if (!backgroundSweep) throw new Error('Missing background sweep interval')
+  // Construction registers the jittered fallback sweep first, then the Prime
+  // timer (the opt-in five-hour window starter).
+  // Prime has an interval even when disabled and can share the sweep's delay.
+  expect(intervals).toHaveLength(2)
+  const [sweep, prime] = intervals
+  expect(sweep!.ms).toBeGreaterThanOrEqual(60_000)
+  expect(sweep!.ms).toBeLessThanOrEqual(120_000)
+  expect(prime!.ms).toBe(Core.PRIME_TICK_MS)
+  const backgroundSweep = sweep!.run
   const startupSweep = getPluginTestHandles(plugin).fallbackRefreshReady
   if (!startupSweep) throw new Error('Plugin exposed no startup sweep')
   const loader: AuthLoader | undefined = plugin.auth?.loader

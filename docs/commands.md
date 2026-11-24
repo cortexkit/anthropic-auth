@@ -7,16 +7,16 @@ Both hosts register one `/claude` command. It opens a menu whose actions collect
 | Group | What it offers | Host differences |
 | --- | --- | --- |
 | Accounts | Account status, enable/disable, remove/reorder, reset backoff, OAuth/API-key additions, custody guidance and disconnect | Actions depend on custody |
-| Quota | Quota summary and refresh | Pi shows summary only |
+| Quota | Quota summary and refresh | Both hosts |
 | Routing | Mode selection and reset current session | Both hosts |
-| Limits | Killswitch enable/disable and thresholds | OpenCode only |
+| Limits | Killswitch enable/disable and thresholds | Both hosts |
 | Cache | Cache mode, enable/disable, keepalive schedule and subagent setting | Both hosts |
 | Diagnostics | Request dumps and logging level | Both hosts |
-| Extras | Fast mode, Prime status/toggle and lane start | Both hosts have fast mode and Prime status/toggles; Pi has no lane start |
+| Extras | Fast mode, Prime status/toggle and **Fire lane start** to warm the current session | Both hosts |
 
 In local custody, Accounts offers local management and enrollment reset, not disconnect. While enrolled, only enable/disable, reset backoff and disconnect remain. Unreadable enrollment keeps that reduced set so disconnect is available. **Custody setup guidance** explains the stopped-host requirement without changing custody.
 
-Remove, reset-enrollment and disconnect actions require confirmation. Sign-in, API-key additions, guidance and disconnect require an interactive session. In the OpenCode TUI the command opens a dialog; Desktop/headless OpenCode posts a text summary, and Pi without a UI prints status sections only.
+Remove, reset-enrollment and disconnect actions require confirmation. Sign-in, API-key additions, guidance and disconnect require an interactive session. In OpenCode's terminal UI the command opens a dialog. Without the terminal UI, OpenCode 1 posts a text summary and OpenCode 2 does not. Pi without a UI prints status sections only.
 
 ## OpenCode CLI
 

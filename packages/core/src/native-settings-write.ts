@@ -37,7 +37,6 @@ const paths = {
   quota_minimum_remaining_scoped: ['quota', 'minimumRemaining', 'scoped'],
   quota_fail_closed_on_unknown_quota: ['quota', 'failClosedOnUnknownQuota'],
   quota_show_toasts: ['quota', 'showToasts'],
-  quota_header_feed_enabled: ['quotaHeaderFeed', 'enabled'],
   killswitch_enabled: ['killswitch', 'enabled'],
   killswitch_default_five_hour: ['killswitch', 'main', 'five_hour'],
   killswitch_default_seven_day: ['killswitch', 'main', 'seven_day'],

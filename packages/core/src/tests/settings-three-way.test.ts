@@ -378,6 +378,19 @@ function unlistedReads(source: string, file: string) {
       if (parent?.type === 'VariableDeclarator') owner = propertyName(parent.id)
       if (parent?.type === 'ObjectProperty') owner = propertyName(parent.key)
     }
+    // A property whose value wraps its function in a call, such as
+    // `fetch: withRefusalOwner(async (...) => ...)`, still names that
+    // function: the wrapper adds behaviour around it, not a new reader.
+    if (
+      node.type === 'ObjectProperty' &&
+      isNode(node.value) &&
+      node.value.type === 'CallExpression' &&
+      Array.isArray(node.value.arguments) &&
+      node.value.arguments.some(
+        (argument) => isNode(argument) && argument.type.includes('Function'),
+      )
+    )
+      owner = propertyName(node.key)
     if (node.type === 'BlockStatement' || node.type.includes('Function'))
       aliases = new Map(aliases)
     if (Array.isArray(node.params)) {

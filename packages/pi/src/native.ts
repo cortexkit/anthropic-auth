@@ -6,11 +6,13 @@ import {
   type ClaudeGateway,
   createNativeUsagePublisher,
   decidePiStateLayout,
+  formatNativeValidationBackoffMessage,
   getAccountStatePath,
   getHostClaustrumEnrollmentPaths,
   getPersistedLogLevel,
   getSettingsFilePath,
   isKillswitchEnabled,
+  isQuotaBearingHeaderFrame,
   isVaultHosted,
   killswitchPassesPolicy,
   LEGACY_STATE_LAYOUT,
@@ -32,6 +34,8 @@ import {
   nativeLocalAccountRefusal,
   nativeMigrationAuthorityPhase,
   nativeRuntimeOptionIdentity,
+  nativeValidationRetryAt,
+  normalizeQuotaHeaders,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
@@ -56,6 +60,7 @@ import {
   type PiPrimeLease,
   type PiPrimeOptions,
 } from './prime.ts'
+import { formatPiQuotaTime } from './quota-wait.ts'
 import { openPiSettings, type PiSettingsOptions } from './settings.ts'
 
 export type PiNativeAttempt =
@@ -503,6 +508,13 @@ export class PiNativeRuntime {
     if (admission.status !== 'usable') {
       const refusal = background && nativeLocalAccountRefusal(admission)
       if (refusal) throw refusal
+      const retryAt = nativeValidationRetryAt(admission)
+      if (retryAt !== undefined)
+        throw new Error(
+          formatNativeValidationBackoffMessage(
+            `${formatPiQuotaTime(retryAt)} UTC`,
+          ),
+        )
       throw new Error('Pi native OAuth admission refused')
     }
     if (!admission.binding.identity)
@@ -623,6 +635,32 @@ export class PiNativeRuntime {
         patch,
         this.usagePublications.signal,
       )
+  }
+
+  observeQuotaHeaders(
+    served: PiNativeAttempt,
+    headers: Headers,
+    runtime: NativeAccountRuntime,
+  ): void {
+    if (!isQuotaBearingHeaderFrame(headers)) return
+    const quota = {
+      ...normalizeQuotaHeaders(headers),
+      accountIdentity: served.accountIdentity,
+    }
+    // The store accepts updates only for the account that served the request.
+    // It merges against the latest quota so poll-owned windows and credits stay.
+    this.usagePublications.publish(async (signal) => {
+      const kept =
+        served.source === 'vault'
+          ? await runtime.vault.publish(served.receipt, { quota }, signal)
+          : await runtime.publishLocal(
+              served.admission.subject,
+              { quota },
+              signal,
+            )
+      if (!kept)
+        logger.debug('quota', 'Native header quota publication refused')
+    })
   }
 
   close(): Promise<void> {

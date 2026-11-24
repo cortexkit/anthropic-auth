@@ -49,6 +49,8 @@ import {
   RESTORE_LEGACY_COMMAND,
   StateLayoutRefusalError,
   stateLayoutMovedElsewhere,
+  stateLayoutWritableParentAdvice,
+  stateLayoutWritableParentDetails,
 } from './state-layout-errors.ts'
 import {
   defaultStateLayoutFs,
@@ -252,8 +254,8 @@ function logRefusal(message: string, error: StateLayoutRefusalError): void {
     typeof cause === 'object' &&
     !utilTypes.isProxy(cause)
   ) {
-    // Only known filesystem identifiers belong in the log. Do not invoke
-    // getters or copy the exception's message, path, or other details.
+    // Only known identifiers and the validated Windows permissions verdict belong
+    // in the log. Never copy arbitrary error text or invoke getters.
     const stringField = (key: string) => {
       const descriptor = Object.getOwnPropertyDescriptor(cause, key)
       return typeof descriptor?.value === 'string' ? descriptor.value : ''
@@ -268,6 +270,7 @@ function logRefusal(message: string, error: StateLayoutRefusalError): void {
       fields.errorCode = errorCode
     if (privateFileStages.has(stage)) fields.stage = stage
     if (privateFileReasons.has(reason)) fields.reason = reason
+    Object.assign(fields, stateLayoutWritableParentDetails(cause))
   }
   logger.error('state-layout', message, fields)
 }
@@ -1181,8 +1184,7 @@ export async function decideOpenCodeStateLayout(
 
 /**
  * Create the state-home folder, owner-only, and make its entry durable. A
- * folder that can't be created or flushed refuses with the fixed text of
- * `io-failed`.
+ * folder that can't be created or flushed refuses as `io-failed`.
  */
 async function ensureSubfolder(sub: string, fs: StateLayoutFs): Promise<void> {
   try {
@@ -1203,9 +1205,11 @@ async function ensureSubfolder(sub: string, fs: StateLayoutFs): Promise<void> {
     // Rethrow a test's simulated crash unchanged, so the test stops at the
     // point where it injected the failure.
     if (error instanceof StateLayoutCrash) throw error
+    const message = "anthropic-auth can't create its state folder"
+    const advice = stateLayoutWritableParentAdvice(error)
     refuse(
       'io-failed',
-      "anthropic-auth can't create its state folder",
+      advice ? `${message}: ${advice}` : message,
       [sub],
       error,
     )

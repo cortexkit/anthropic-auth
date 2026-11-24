@@ -10,10 +10,13 @@ import {
   runPiCommandMenu,
 } from '@cortexkit/anthropic-auth-core'
 import { type ExtensionAPI, getAgentDir } from '@earendil-works/pi-coding-agent'
+import { queuePiLaneStart } from './lane-start.ts'
 
 /** Backend callbacks use native authority; the renderer never receives credentials. */
 export interface PiNativeCommands {
-  dispatch: NativeMenuDispatch
+  dispatch: (
+    ...args: [...Parameters<NativeMenuDispatch>, queueLaneStart?: () => void]
+  ) => ReturnType<NativeMenuDispatch>
   readStatus: (
     command: Exclude<NativeMenuCommandId, 'start'>,
     invocation: { sessionId?: string },
@@ -60,9 +63,21 @@ export function registerCommands(pi: ExtensionAPI, backend: PiNativeCommands) {
         return
       }
       const disconnect = backend.disconnectVault ?? disconnectPi
+      const sessionId = ctx.sessionManager.getSessionId()
+      const queueLaneStart = () => {
+        if (
+          ctx.model?.provider !== 'anthropic' ||
+          ctx.model.api !== 'anthropic-messages'
+        )
+          throw new Error('Lane start requires an active Claude model')
+        pi.sendUserMessage(queuePiLaneStart(sessionId), {
+          deliverAs: 'followUp',
+        })
+      }
       const menu = createNativeUi({
         host: 'pi',
-        dispatch: backend.dispatch,
+        dispatch: (request, options) =>
+          backend.dispatch(request, options, queueLaneStart),
         readStatus: backend.readStatus,
         readAccounts: backend.readAccounts,
         readMode:
@@ -87,7 +102,6 @@ export function registerCommands(pi: ExtensionAPI, backend: PiNativeCommands) {
         },
         interactive: ctx.hasUI,
       })
-      const sessionId = ctx.sessionManager.getSessionId()
       if (ctx.hasUI) {
         await runPiCommandMenu(menu, ctx.ui, { sessionId })
       } else {

@@ -7,6 +7,7 @@ import {
   rename,
   rm,
   symlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -30,10 +31,16 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
 })
 
-async function fixture(ownerOnly?: OwnerOnlyOptions) {
+async function fixture(ownerOnly?: OwnerOnlyOptions, sessionClaims = false) {
   const root = await mkdtemp(join(tmpdir(), 'cachekeep-store-'))
   cleanups.push(() => rm(root, { recursive: true, force: true }))
-  const store = new CacheKeepStore({ storageId: 'store', root, ownerOnly })
+  const store = new CacheKeepStore({
+    storageId: 'store',
+    root,
+    ownerOnly,
+    sessionClaims,
+  })
+  if (sessionClaims) cleanups.push(() => store.releaseClaims(() => true))
   const target: CacheKeepTarget = {
     id: 'private-session',
     bodyText: JSON.stringify({
@@ -71,6 +78,33 @@ test('restart storage defaults to a hashed private data folder, never the config
   expect(basename(path)).toMatch(/^[a-f0-9]{16}$/)
   expect(path).not.toContain('my-account')
   expect(cacheKeepStoreDirectory('another-account')).not.toBe(path)
+})
+
+test('a restart scan preserves a writer’s new temporary file but removes old leftovers', async () => {
+  const f = await fixture()
+  f.store.changed(f.target)
+  await f.store.drain()
+  const [name] = await readdir(f.store.directory)
+  const published = join(f.store.directory, name!)
+  const writing = `${published}.1234.tmp`
+  const abandoned = `${published}.5678.tmp`
+  await rename(published, writing)
+  await writeFile(abandoned, 'abandoned', { mode: 0o600 })
+  await utimes(abandoned, 0, 0)
+
+  const scanning = new CacheKeepStore({ storageId: 'store', root: f.root })
+  const restored: string[] = []
+  const scan = () =>
+    scanning.load(Date.now(), (entry) => {
+      restored.push(entry.id)
+      return true
+    })
+  await scan()
+  expect(await readdir(f.store.directory)).toEqual([basename(writing)])
+  expect(restored).toEqual([])
+  await rename(writing, published)
+  await scan()
+  expect(restored).toEqual([f.target.id])
 })
 
 test('restart files exclude headers and credential fields, use gzip and owner-only modes', async () => {
@@ -145,7 +179,7 @@ test('a replacement restart store drains the old pending body before loading or 
 test('removal and policy-off cancel queued writes without resurrecting a file', async () => {
   const f = await fixture()
   f.store.changed(f.target)
-  f.store.removed(f.target.id)
+  f.store.removed(f.target)
   await f.store.drain()
   expect(await readdir(f.store.directory)).toEqual([])
   f.store.changed(f.target)
@@ -320,7 +354,7 @@ test.each([
       hasWarmed: false,
     }
     f.target.policyState[field] =
-      field === 'lastRealRequestAt' ? Date.now() + 60_000 : -1
+      field === 'lastRealRequestAt' ? Date.now() + 3 * 60 * 60 * 1000 : -1
     f.store.changed(f.target)
     await f.store.drain()
     let restored = 0
@@ -333,7 +367,33 @@ test.each([
   },
 )
 
-test('a transient private reservation write failure does not turn enabled persistence into memory-only mode', async () => {
+test('a restart scan leaves a record one minute ahead untouched', async () => {
+  const f = await fixture()
+  f.store.changed({
+    ...f.target,
+    policyState: {
+      ownerSessionId: f.target.id,
+      planned: true,
+      lastRealRequestAt: Date.now() + 60_000,
+      warmsSinceLastRealRequest: 0,
+      warmCostSoFar: 0,
+      hasWarmed: false,
+    },
+  })
+  await f.store.drain()
+  const [name] = await readdir(f.store.directory)
+  const path = join(f.store.directory, name!)
+  const saved = await readFile(path)
+  let restored = 0
+  await f.store.load(Date.now(), () => {
+    restored++
+    return true
+  })
+  expect(restored).toBe(0)
+  expect(await readFile(path)).toEqual(saved)
+})
+
+test('a transient write failure after verifying the claim does not turn enabled persistence into memory-only mode', async () => {
   let failWrites = false
   const privateFiles = {
     verifySafeParent: async () => ({ ok: true }),
@@ -347,7 +407,7 @@ test('a transient private reservation write failure does not turn enabled persis
       await writeFile(path, bytes, { flag: 'wx', mode: 0o600 })
     },
   } as unknown as OwnerOnlyOptions['privateFiles']
-  const f = await fixture({ platform: 'win32', privateFiles })
+  const f = await fixture({ platform: 'win32', privateFiles }, true)
   f.target.policyState = {
     ownerSessionId: f.target.id,
     planned: true,
@@ -361,6 +421,7 @@ test('a transient private reservation write failure does not turn enabled persis
   failWrites = true
   f.target.policyState.warmsSinceLastRealRequest = 1
   expect(await f.store.reserveWarm(f.target)).toBe(false)
+  expect(f.store.isMemoryOnly).toBe(false)
   expect((await f.saved()).policyState.warmsSinceLastRealRequest).toBe(0)
   failWrites = false
   f.target.policyState.warmsSinceLastRealRequest = 2

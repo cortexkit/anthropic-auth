@@ -28,6 +28,15 @@ export function markPiAccountHold(response: Response, hold: PiAccountHold) {
   return response
 }
 
+export function formatPiQuotaTime(when: number): string {
+  return new Date(when).toLocaleTimeString('en-GB', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    timeZone: 'UTC',
+  })
+}
+
 async function waitForReset(
   delayMs: number,
   resetAt: number | undefined,
@@ -38,12 +47,7 @@ async function waitForReset(
   const set = options.setTimeout ?? globalThis.setTimeout
   const clear = options.clearTimeout ?? globalThis.clearTimeout
   const when = resetAt ?? (options.now?.() ?? Date.now()) + delayMs
-  const time = new Date(when).toLocaleTimeString('en-GB', {
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-    timeZone: 'UTC',
-  })
+  const time = formatPiQuotaTime(when)
   try {
     options.setWorkingMessage?.(
       `Checking account availability in ${Math.max(1, Math.ceil(delayMs / 60_000))} min (reset at ${time} UTC) · Esc to cancel`,

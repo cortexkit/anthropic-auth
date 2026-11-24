@@ -15,7 +15,6 @@ import {
   placeholderSecret,
 } from '@cortexkit/common-auth/opencode2'
 import type { Plugin } from '@opencode/plugin'
-import type { Registration } from '@opencode/plugin/promise/registration'
 import {
   createNativeAnthropicAdapter,
   type NativeAnthropicAdapterDeps,
@@ -40,7 +39,9 @@ export interface NativeAnthropicInstallation<Q, P> {
  */
 export async function installNativeAnthropic<Q, P>(
   ctx: OpenCode2HookContext,
-  deps: NativeAnthropicAdapterDeps<Q, P>,
+  deps: NativeAnthropicAdapterDeps<Q, P> & {
+    onSessionDeleted?: (sessionID: string) => void
+  },
   ownership: NonNullable<InstallOpenCode2AuthOptions['gateOnPlaceholder']>,
 ): Promise<NativeAnthropicInstallation<Q, P>> {
   const native = createNativeAnthropicAdapter(deps)
@@ -129,14 +130,9 @@ export async function installNativeAnthropic<Q, P>(
   const drain = async () => {
     await Promise.allSettled([...endings])
   }
-  const registrations: Registration[] = []
   const requestTurns = new WeakMap<Request, () => void>()
-  const hook: Plugin.Context['session']['hook'] = async (
-    name,
-    callback,
-    options,
-  ) => {
-    const registration = await ctx.session.hook(
+  const hook: Plugin.Context['session']['hook'] = (name, callback, options) => {
+    return ctx.session.hook(
       name,
       async (draft) => {
         if (name === 'http.response') {
@@ -282,8 +278,6 @@ export async function installNativeAnthropic<Q, P>(
       },
       options,
     )
-    registrations.push(registration)
-    return registration
   }
   const abort = new AbortController()
   let installation: OpenCode2AuthInstallation<Q, NativeAnthropicAttemptData<P>>
@@ -297,10 +291,8 @@ export async function installNativeAnthropic<Q, P>(
       },
     )
   } catch (error) {
+    // The shared installer rolls back its hooks; the adapter owns its callbacks.
     native.dispose()
-    await Promise.allSettled(
-      registrations.map((registration) => registration.dispose()),
-    )
     throw error
   }
 
@@ -318,8 +310,10 @@ export async function installNativeAnthropic<Q, P>(
           for await (const event of events.subscribe({
             signal: abort.signal,
           })) {
-            if (event.type === 'session.deleted')
+            if (event.type === 'session.deleted') {
               forgetSession(event.data.sessionID)
+              deps.onSessionDeleted?.(event.data.sessionID)
+            }
             if (
               event.type === 'session.idle' ||
               (event.type === 'session.status' &&

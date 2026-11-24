@@ -20,7 +20,10 @@ import {
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
 } from './accounts.ts'
-import { resolveClaudeCodeIdentity } from './claude-code.ts'
+import {
+  clearClaudeCodeBootstrapFailure,
+  resolveClaudeCodeIdentity,
+} from './claude-code.ts'
 import type { ClaudeGateway } from './gateway.ts'
 import { type LogLevel, logger } from './logger.ts'
 import {
@@ -1394,6 +1397,8 @@ function buildNativeAccountRuntime(
         failurePolicy:
           options.local?.failurePolicy ??
           ((input) => {
+            if (input.attribution.kind === 'validation-retry')
+              return { checkedAt: now() }
             const failure =
               input.observation.status === 'failed'
                 ? input.observation.failure
@@ -1987,7 +1992,7 @@ function buildNativeAccountRuntime(
       if ('accessToken' in fence) return vault.resetBackoff(fence, kind)
       if ((await authority()) !== 'local') return false
       if ((await physicalId(routeId)) !== fence.binding.rowId) return false
-      return localWrite(
+      const reset = await localWrite(
         fence,
         (old) => {
           const clear = Math.max(
@@ -2012,6 +2017,11 @@ function buildNativeAccountRuntime(
         },
         false,
       )
+      // Clearing a durable deadline must also let bootstrap contact Claude on
+      // the next turn, without evicting other credentials' results or proof.
+      if (reset && kind !== 'quota' && fence.version.accessFingerprint)
+        clearClaudeCodeBootstrapFailure(fence.version.accessFingerprint)
+      return reset
     },
     async getOrCreateAuthLineage(routeId, fence) {
       if ('accessToken' in fence) return vault.getOrCreateAuthLineage(fence)

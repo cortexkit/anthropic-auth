@@ -7,6 +7,16 @@
 - **Generation-2 `setup --login` refuses:** this is intentional. Run [empty initialization](opencode-2.md#empty-initialization), start OpenCode and choose **Claude Pro / Max (native account pool)**. If Pi is also found, `--yes` selects both; use interactive host deselection for a Pi-only login.
 - **A dry run succeeds but the real run refuses:** previews execute no callbacks. Real-run authority, consent, path-alias and vault-inventory checks can still refuse; see [setup options](installation.md#recommended-setup).
 
+### Windows: the plugin can't create its state folder
+
+If the refusal names a folder and an account security identifier (SID), that account can change the named folder, which may be a parent of the plugin's state folder. Remove that account's change access from the named folder, or point `XDG_STATE_HOME` at a folder only you can change. For example, in Command Prompt:
+
+```bat
+setx XDG_STATE_HOME "%LOCALAPPDATA%\cortexkit-state"
+```
+
+Restart OpenCode and your terminals, then run setup again. This moves only the plugin's state folder; OpenCode's configuration stays where it is.
+
 ## Local accounts and migration
 
 `migration-required` means local authority has not been established. Stop the hosts and run setup for the selected generation. `migration-incomplete` means a pre-commit journal must be resumed with the matching inputs; do not delete it to force fresh setup. Version-5 journals have no rollback path.
@@ -46,6 +56,8 @@ For a fresh installation, complete the [main-account connection](opencode-2.md#e
 **Moving from OpenCode 1 to OpenCode 2.3 or later:** on its first start with a new database, OpenCode 2.3 imports OpenCode 1's `auth.json`. After OpenCode 1 setup, the Anthropic entry there is the plugin's inert marker: an OAuth entry with an empty access token and a `claustrum-tombstone:` refresh value. OpenCode 2 imports it as an ordinary Anthropic sign-in and can make it the active connection. That connection does not route to the plugin, so model requests fail even though `/claude` shows your accounts. To fix it, connect once with the plugin's own method as in step 1 above and make sure that connection is the active Anthropic account. Your accounts and settings are not affected.
 
 ### Other request failures
+
+If a request says Claude couldn't confirm which account your login belongs to, the local account check failed after a token refresh. The plugin won't send model requests with that token until Claude confirms the account. Try again at the time shown, or use `/claude` → **Accounts** → **Reset account backoff** to check on your very next turn. Checks retry after 5 minutes, then 15 minutes, then hourly, unless the token expires sooner. You don't need to restart the host.
 
 Check `/claude` for custody, account, routing and quota status first. Unknown quota, positive remaining-quota floors and model-scoped exhaustion can block an account even when it has a token. Resetting a session pin is not a way to bypass limits.
 

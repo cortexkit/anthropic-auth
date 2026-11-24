@@ -1054,6 +1054,7 @@ test('failure validation retry readers deny matching unexpired access but permit
   expect(await readers.readAdmission(result.subject)).toEqual({
     status: 'blocked',
     reason: 'validation-backoff',
+    validationRetryAt: 200,
   })
   const expired = createNativeLocalRuntimeReaders({
     paths: f.paths,

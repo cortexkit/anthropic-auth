@@ -1,19 +1,33 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
   CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
+  LANE_START_TEXT,
   MessageThreadTracker,
   type ProviderAccountUuid,
   signRequestBody,
   TrailingAssistantHistoryError,
 } from '@cortexkit/anthropic-auth-core'
-import type { Context, Message } from '@earendil-works/pi-ai'
+import type {
+  Context,
+  Message,
+  Model,
+  SimpleStreamOptions,
+} from '@earendil-works/pi-ai'
 import { buildAnthropicRequest, piThreadCacheSlot } from '../convert'
 import { collectPiEffortHistory } from '../effort-history.ts'
 import { PiForkEffortSnapshots } from '../forks.ts'
+import {
+  forgetPiLaneStarts,
+  isPiLaneStartMessage,
+  queuePiLaneStart,
+  stripPiLaneStartNonce,
+  takePiLaneStart,
+} from '../lane-start.ts'
 import { normalizeContext } from '../transcript.ts'
+import { captureNativeAnthropicCacheRequest } from './native-anthropic-cache.ts'
 
 function userMsg(text: string): Message {
   return { role: 'user', content: text, timestamp: 0 }
@@ -51,6 +65,94 @@ function toolResultMsg(toolCallId: string, text: string): Message {
 const defaultCache = { enabled: false, mode: 'hybrid' as const }
 const TEST_MODEL_ID = 'claude-sonnet-4-20250514'
 
+describe('Pi request output limits', () => {
+  const context: Context = { messages: [userMsg('Write the whole file.')] }
+
+  test('defaults Opus 5.5 to the catalogue output limit over Pi metadata', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5-5',
+      context,
+      undefined,
+      defaultCache,
+      false,
+      undefined,
+      { modelLimits: { maxTokens: 32_000 } },
+    )
+    expect(body.max_tokens).toBe(128_000)
+  })
+
+  test('an explicit maxTokens wins over the catalogue output limit', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5-5',
+      context,
+      { maxTokens: 25_000 },
+      defaultCache,
+    )
+    expect(body.max_tokens).toBe(25_000)
+  })
+
+  test('defaults an unlisted model to the output limit supplied by Pi', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-unlisted',
+      context,
+      undefined,
+      defaultCache,
+      false,
+      undefined,
+      { modelLimits: { maxTokens: 42_000 } },
+    )
+    expect(body.max_tokens).toBe(42_000)
+  })
+
+  test('fits the reply to a near-full context using the last reply usage', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5-5',
+      {
+        messages: [
+          userMsg('Earlier question'),
+          {
+            ...assistantMsg('Earlier reply'),
+            stopReason: 'stop',
+            usage: {
+              input: 989_900,
+              output: 100,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 990_000,
+              cost: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                total: 0,
+              },
+            },
+          } as Message,
+          userMsg('Continue'),
+        ],
+      },
+      undefined,
+      defaultCache,
+    )
+    // Pi's near-full rule leaves 4,096 tokens of headroom after the 3-token follow-up.
+    expect(body.max_tokens).toBe(5_901)
+  })
+
+  test('uses the host context window and fits manual thinking when the context clamp binds', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-unlisted',
+      { messages: [userMsg('Continue')] },
+      { maxTokens: 25_000, reasoning: 'high' },
+      defaultCache,
+      false,
+      undefined,
+      { modelLimits: { contextWindow: 10_000 } },
+    )
+    expect(body.max_tokens).toBe(5_901)
+    expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 4_877 })
+  })
+})
+
 // Mirrors the shape of Pi's real prompt: instruction paragraphs followed by the
 // documentation paragraph, which is the only part Anthropic rejects in system[].
 const PI_PROMPT = [
@@ -58,6 +160,308 @@ const PI_PROMPT = [
   'KEEP TWO: available tools.',
   'Pi documentation (read only when the user asks about pi itself):\n- MOVE THIS',
 ].join('\n\n')
+
+test('conversion strips a lane delivery nonce when the host hook did not run', async () => {
+  const sessionId = 'lane-converter-backstop'
+  const user = userMsg(queuePiLaneStart(sessionId))
+  try {
+    const { bodyText } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      { messages: [user] },
+      { sessionId },
+      defaultCache,
+    )
+    expect(user).toMatchObject({ role: 'user', content: LANE_START_TEXT })
+    expect(bodyText).not.toContain('cortexkit lane start:')
+    expect(bodyText).toContain(LANE_START_TEXT)
+  } finally {
+    forgetPiLaneStarts(sessionId)
+  }
+})
+
+test('lane nonce stripping preserves pasted markers not pending in this session', async () => {
+  const sessionId = 'lane-issued-here'
+  const raw = queuePiLaneStart(sessionId)
+  const invented = `${LANE_START_TEXT}\n[cortexkit lane start: 12345678-1234-1234-1234-123456789abc]`
+  try {
+    for (const [content, id] of [
+      [invented, sessionId],
+      [raw, 'lane-other-session'],
+    ] as const) {
+      const user = userMsg(content)
+      stripPiLaneStartNonce(user, id)
+      expect(user).toEqual(userMsg(content))
+      const { body } = await buildAnthropicRequest(
+        TEST_MODEL_ID,
+        { messages: [user] },
+        { sessionId: id },
+        defaultCache,
+      )
+      expect(JSON.stringify(body.messages)).toContain(JSON.stringify(content))
+    }
+    const delivered = userMsg(raw)
+    stripPiLaneStartNonce(delivered, sessionId)
+    expect(delivered).toMatchObject({ content: LANE_START_TEXT })
+    const replay = userMsg(raw)
+    stripPiLaneStartNonce(replay, sessionId)
+    expect(replay).toEqual(userMsg(raw))
+  } finally {
+    forgetPiLaneStarts(sessionId)
+  }
+})
+
+test('conversion strips an issued delivery nonce from a later text block', async () => {
+  const sessionId = 'lane-converter-multipart'
+  const user: Message = {
+    role: 'user',
+    timestamp: 0,
+    content: [
+      { type: 'text', text: 'Other content' },
+      { type: 'text', text: queuePiLaneStart(sessionId) },
+    ],
+  }
+  try {
+    const { bodyText } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      { messages: [user] },
+      { sessionId },
+      defaultCache,
+    )
+    expect(bodyText).not.toContain('cortexkit lane start:')
+    expect(bodyText).toContain('Other content')
+    expect(bodyText).toContain(LANE_START_TEXT)
+    expect({
+      marked: isPiLaneStartMessage(user),
+      ready: takePiLaneStart([user], sessionId),
+    }).toEqual({ marked: false, ready: false })
+  } finally {
+    forgetPiLaneStarts(sessionId)
+  }
+})
+
+test('a lane delivery survives queuing more than 128 sessions', async () => {
+  const sessionId = 'lane-oldest-pending'
+  const user = userMsg(queuePiLaneStart(sessionId))
+  const others = Array.from({ length: 128 }, (_, i) => `lane-pending-${i}`)
+  try {
+    for (const id of others) queuePiLaneStart(id)
+    const { body } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      { messages: [user] },
+      { sessionId },
+      defaultCache,
+    )
+    expect(user.content).toBe(LANE_START_TEXT)
+    expect(body.messages).toEqual([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: LANE_START_TEXT,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      },
+    ])
+  } finally {
+    for (const id of [sessionId, ...others]) forgetPiLaneStarts(id)
+  }
+})
+
+test('a ready lane delivery survives queuing another session before dispatch', () => {
+  const sessionId = 'lane-ready-under-pressure'
+  const other = 'lane-queue-before-dispatch'
+  const others = Array.from(
+    { length: 128 },
+    (_, i) => `lane-ready-pending-${i}`,
+  )
+  try {
+    for (const id of others) queuePiLaneStart(id)
+    const user: Message = {
+      role: 'user',
+      timestamp: 0,
+      content: [{ type: 'text', text: queuePiLaneStart(sessionId) }],
+    }
+    stripPiLaneStartNonce(user, sessionId)
+    expect(user.content).toEqual([{ type: 'text', text: LANE_START_TEXT }])
+    expect(isPiLaneStartMessage(user)).toBe(true)
+
+    queuePiLaneStart(other)
+    expect(takePiLaneStart([user], sessionId)).toBe(true)
+    expect(takePiLaneStart([user], sessionId)).toBe(false)
+  } finally {
+    for (const id of [sessionId, other, ...others]) forgetPiLaneStarts(id)
+  }
+})
+
+test.each([false, true])(
+  'a ready lane delivery expires after one day (another queue: %s)',
+  (queueAnother) => {
+    const sessionId = 'lane-expiring-ready'
+    const other = 'lane-queue-after-ready-expiry'
+    const day = 24 * 60 * 60 * 1000
+    const clock = spyOn(Date, 'now').mockReturnValue(day)
+    try {
+      const user = userMsg(queuePiLaneStart(sessionId))
+      stripPiLaneStartNonce(user, sessionId)
+      expect(isPiLaneStartMessage(user)).toBe(true)
+
+      clock.mockReturnValue(2 * day)
+      if (queueAnother) queuePiLaneStart(other)
+      expect(takePiLaneStart([user], sessionId)).toBe(false)
+    } finally {
+      clock.mockRestore()
+      forgetPiLaneStarts(sessionId)
+      forgetPiLaneStarts(other)
+    }
+  },
+)
+
+test('queuing a lane start expires old nonces without dropping newer ones in the same session', () => {
+  const sessionId = 'lane-expiring-nonces'
+  const other = 'lane-queue-after-expiry'
+  const day = 24 * 60 * 60 * 1000
+  const clock = spyOn(Date, 'now').mockReturnValue(day)
+  try {
+    const old = queuePiLaneStart(sessionId)
+    clock.mockReturnValue(day + 1000)
+    const fresh = queuePiLaneStart(sessionId)
+    clock.mockReturnValue(2 * day + 1)
+    queuePiLaneStart(other)
+
+    const user = userMsg(`${old}\n${fresh}`)
+    stripPiLaneStartNonce(user, sessionId)
+    expect(user.content).toBe(`${old}\n${LANE_START_TEXT}`)
+  } finally {
+    clock.mockRestore()
+    forgetPiLaneStarts(sessionId)
+    forgetPiLaneStarts(other)
+  }
+})
+
+test('a lane delivery scrubs embedded envelopes without changing surrounding text', async () => {
+  const sessionId = 'lane-embedded-envelope'
+  const raw = queuePiLaneStart(sessionId)
+  const raw2 = queuePiLaneStart(sessionId)
+  const pasted = `${LANE_START_TEXT}\n[cortexkit lane start: 12345678-1234-1234-1234-123456789abc]`
+  const user = userMsg(`prefix\n${raw}\n${pasted}\n${raw2}\n${raw}\nsuffix`)
+  const clean = `prefix\n${LANE_START_TEXT}\n${pasted}\n${LANE_START_TEXT}\n${LANE_START_TEXT}\nsuffix`
+  try {
+    const { body } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      { messages: [user] },
+      { sessionId },
+      defaultCache,
+    )
+    expect(user.content).toBe(clean)
+    expect(body.messages).toEqual([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: clean, cache_control: { type: 'ephemeral' } },
+        ],
+      },
+    ])
+    expect({
+      marked: isPiLaneStartMessage(user),
+      ready: takePiLaneStart([user], sessionId),
+    }).toEqual({ marked: false, ready: false })
+  } finally {
+    forgetPiLaneStarts(sessionId)
+  }
+})
+
+test.each([
+  'default',
+  'short',
+  'long',
+  'none',
+  'env long',
+  'env none',
+  'compat short',
+] as const)(
+  'paid Pi cache markers match the native request (%s)',
+  async (retention) => {
+    const tools = ['read', 'write'].map((name) => ({
+      name,
+      description: name,
+      parameters: { type: 'object', properties: {} },
+    }))
+    const context = {
+      systemPrompt: PI_PROMPT,
+      tools,
+      messages: [userMsg('First'), assistantMsg('Reply'), userMsg('Latest')],
+    }
+    const model: Model<'anthropic-messages'> = {
+      id: 'claude-sonnet-5',
+      name: 'Sonnet',
+      api: 'anthropic-messages',
+      provider: 'anthropic',
+      baseUrl: 'https://api.anthropic.com',
+      reasoning: false,
+      input: ['text'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200_000,
+      maxTokens: 4096,
+      ...(retention === 'compat short' && {
+        compat: {
+          supportsLongCacheRetention: false,
+          supportsCacheControlOnTools: false,
+        },
+      }),
+    }
+    const options: SimpleStreamOptions = {
+      env: {
+        PI_CACHE_RETENTION:
+          retention === 'env long'
+            ? 'long'
+            : retention === 'env none'
+              ? 'none'
+              : 'short',
+      },
+      ...(retention === 'compat short'
+        ? { cacheRetention: 'long' }
+        : retention === 'short' || retention === 'long' || retention === 'none'
+          ? { cacheRetention: retention }
+          : {}),
+    }
+    const { body: native } = await captureNativeAnthropicCacheRequest(
+      model,
+      context,
+      // Pi's resolveCacheRetention reads only "long" from the environment,
+      // so an environment "none" gets Pi's short markers on both sides.
+      options,
+    )
+    const { body, bodyText, cacheTtlMs } = await buildAnthropicRequest(
+      model.id,
+      context,
+      options,
+      { enabled: true, mode: 'automatic' },
+      false,
+      undefined,
+      { apiKey: true, apiKeyModelCompat: model.compat },
+    )
+    const toolMarkers = (request: typeof body) =>
+      request.tools?.map(({ name, cache_control }) => [name, cache_control])
+    expect(body.system).toEqual(native.system)
+    expect(toolMarkers(body)).toEqual(toolMarkers(native))
+    expect(body.messages[0]?.content).toBe('First')
+    expect(body.messages.at(-1)?.content).toEqual(
+      native.messages.at(-1)?.content,
+    )
+    expect(body.cache_control).toBeUndefined()
+    expect(bodyText).not.toContain('x-anthropic-billing-header')
+    const control = native.system?.at(-1)?.cache_control
+    expect(cacheTtlMs).toBe(
+      control && typeof control === 'object'
+        ? 'ttl' in control && control.ttl === '1h'
+          ? 3_600_000
+          : 300_000
+        : 0,
+    )
+  },
+)
 
 test('Pi full-after-thread trades only its system slot for the accepted full tail', async () => {
   const messages = [
@@ -1864,6 +2268,92 @@ describe('buildAnthropicRequest — cache breakpoint budget', () => {
     expect(newestUserBlocks[0]?.cache_control).toEqual(oneHourControl)
   })
 
+  test('Pi hybrid replaces the system slot at the 20-block lookback with a tool-result bridge', async () => {
+    const build = async (
+      blocks: number,
+      mode: 'hybrid' | 'explicit' = 'hybrid',
+    ) =>
+      (
+        await buildAnthropicRequest(
+          TEST_MODEL_ID,
+          {
+            messages: [
+              userMsg('first prompt'),
+              toolCallMsg('call_1', 'read'),
+              toolResultMsg('call_1', 'earlier boundary'),
+              {
+                ...assistantMsg('response'),
+                content: Array.from({ length: blocks }, (_, index) => ({
+                  type: 'text' as const,
+                  text: `response block ${index}`,
+                })),
+              },
+              userMsg('latest prompt'),
+            ],
+            systemPrompt: PI_PROMPT,
+            tools: [{ name: 'read', description: 'Read', parameters: {} }],
+          },
+          undefined,
+          { enabled: true, mode },
+        )
+      ).body
+
+    const nearby = await build(18)
+    const distant = await build(19)
+    const explicit = await build(19, 'explicit')
+    const control = { type: 'ephemeral', ttl: '1h' }
+    const bridgeBlock = (body: typeof distant) =>
+      (body.messages[2]?.content as Record<string, unknown>[] | undefined)?.at(
+        -1,
+      )
+    const bridge = bridgeBlock(distant)
+    expect(bridge).toMatchObject({
+      type: 'tool_result',
+      cache_control: control,
+    })
+    expect(piThreadCacheSlot(distant)).toBe(bridge)
+    expect(distant.system?.some((block) => block.cache_control)).toBe(false)
+    expect(distant.messages[0]).toEqual(nearby.messages[0])
+    expect(distant.messages.at(-1)).toEqual(nearby.messages.at(-1))
+    expect(distant.tools).toEqual(nearby.tools)
+    expect(countBreakpoints(distant)).toBe(4)
+    for (const body of [nearby, explicit]) {
+      expect(body.system?.at(-1)?.cache_control).toEqual(control)
+      expect(bridgeBlock(body)).not.toHaveProperty('cache_control')
+      expect(countBreakpoints(body)).toBe(4)
+    }
+  })
+
+  test('Pi hybrid anchors the tail of the first user message beyond the lookback', async () => {
+    const { body } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      {
+        systemPrompt: PI_PROMPT,
+        tools: [{ name: 'read', description: 'Read', parameters: {} }],
+        messages: [
+          userMsg('Long first prompt'),
+          {
+            ...assistantMsg('response'),
+            content: Array.from({ length: 20 }, (_, index) => ({
+              type: 'text' as const,
+              text: `response block ${index}`,
+            })),
+          },
+          userMsg('second prompt'),
+        ],
+      },
+      undefined,
+      { enabled: true, mode: 'hybrid' },
+    )
+    expect(piThreadCacheSlot(body)).toEqual({
+      type: 'text',
+      text: 'Long first prompt',
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+    })
+    expect(body.system?.some((block) => block.cache_control)).toBe(false)
+    expect(countBreakpoints(body)).toBe(4)
+  })
+
   test('leaves the full body for an image-bearing array user message unchanged', async () => {
     const firstUserText = 'earlier user message'
     const text = 'look at this'
@@ -1887,13 +2377,16 @@ describe('buildAnthropicRequest — cache breakpoint budget', () => {
       } satisfies Context,
       undefined,
       defaultCache,
+      false,
+      undefined,
+      { modelLimits: { maxTokens: 64_000 } },
     )
     const billingHeader =
       `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.` +
       `${computeCcVersionSuffix(firstUserText)}; cc_entrypoint=${CLAUDE_CODE_ENTRYPOINT}; cch=00000;`
     const expected = {
       model: TEST_MODEL_ID,
-      max_tokens: 16_384,
+      max_tokens: 64_000,
       stream: true,
       system: [
         {

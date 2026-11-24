@@ -234,6 +234,24 @@ test('an unknown model uses the no-model values and unknown override keys are re
   })
 })
 
+test('an old quota header feed setting is ignored without losing other settings', async () => {
+  const source = '{"quota_header_feed_enabled":true,"dump_enabled":true}'
+  const f = await fixture(source)
+  const service = await f.open()
+  for (const host of ['opencode', 'pi'] as const) {
+    expect(service.resolve(host).dump_enabled).toBe(true)
+    expect(service.resolve(host)).not.toHaveProperty(
+      'quota_header_feed_enabled',
+    )
+  }
+  expect(service.snapshot().report).toContainEqual({
+    file: { kind: 'user', path: f.file },
+    keyPath: ['quota_header_feed_enabled'],
+    reason: 'unknown-key',
+  })
+  expect(await readFile(f.file, 'utf8')).toBe(source)
+})
+
 for (const restore of [false, true]) {
   test(`a change between two gets${restore ? ' restored with the same size and timestamps' : ''} never publishes mixed values`, async () => {
     const old =

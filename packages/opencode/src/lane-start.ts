@@ -1,7 +1,7 @@
+import { LANE_START_TEXT } from '@cortexkit/anthropic-auth-core'
 import { resolvePromptContext } from './prompt-context'
 
-export const LANE_START_TEXT =
-  '[lane start] — automated cache warm; no response needed.'
+export { LANE_START_TEXT }
 export const LANE_START_REQUEST_HEADER = 'x-cortexkit-lane-start'
 
 const MAX_PENDING_MESSAGE_IDS = 1_000

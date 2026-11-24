@@ -366,6 +366,8 @@ export async function buildCacheKeepPrewarmBody(
       reason: 'a thread continuation is not a full cache prefix',
     }
 
+  // Keep-warm refreshes the cache without advancing the conversation's previous-message ID.
+  delete body.diagnostics
   if (!hasExplicitCacheControl(body)) {
     return { ok: false, reason: 'body has no explicit cache breakpoints' }
   }
@@ -718,10 +720,16 @@ export class CacheKeepWarmRefusal extends Error {
   }
 }
 
+/** False means the warm count could not be stored, not that a peer owns it. */
+export type CacheKeepWarmReservation =
+  | boolean
+  | 'not-owner'
+  | 'ownership-unverified'
+
 const CACHE_KEEP_WARM_WAIT = Symbol.for(
   'cortexkit.anthropic-auth.cachekeep.wait',
 )
-class CacheKeepWarmWait extends Error {
+export class CacheKeepWarmWait extends Error {
   readonly [CACHE_KEEP_WARM_WAIT] = true
 }
 
@@ -833,6 +841,8 @@ export class CacheKeepManager {
         headers: Headers,
         target: CacheKeepTarget,
         attempt: CacheKeepPrewarmAttempt,
+        /** Check the original target after waiting; `target` carries the rewritten body. */
+        isTargetCurrent: () => boolean,
       ) => Promise<Headers | undefined> | Headers | undefined
       /** Pure in-memory route lookup; an unknown answer keeps the target. */
       peekRoutingAccount?: (
@@ -853,11 +863,17 @@ export class CacheKeepManager {
       ) => Promise<void> | void
       /** Hosts may mirror targets without delaying a live request on storage I/O. */
       onTargetChanged?: (target: Readonly<CacheKeepTarget>) => void
-      onTargetRemoved?: (id: string) => void
+      onTargetRemoved?: (id: string, target: Readonly<CacheKeepTarget>) => void
+      /** Called after the session's last real turn and its cleanup settle. */
+      onRealTurnsSettled?: (id: string) => void
       /** Persistent hosts must commit the reservation before any physical send. */
-      reserveWarm?: (target: Readonly<CacheKeepTarget>) => Promise<boolean>
+      reserveWarm?: (
+        target: Readonly<CacheKeepTarget>,
+      ) => Promise<CacheKeepWarmReservation>
       /** Persist a known failed dispatch so restore need not charge its cost. */
-      settleWarm?: (target: Readonly<CacheKeepTarget>) => Promise<boolean>
+      settleWarm?: (
+        target: Readonly<CacheKeepTarget>,
+      ) => Promise<CacheKeepWarmReservation>
       /** Native hosts authorize asynchronously inside fetchImpl and reserve there. */
       deferWarmReservation?: boolean
       /** A native host may rewrite the final physical warm after fetchImpl starts. */
@@ -1024,8 +1040,12 @@ export class CacheKeepManager {
           )
       } catch {
       } finally {
-        if (turns.pending === 0 && this.realTurns.get(sessionId) === turns)
+        if (turns.pending === 0 && this.realTurns.get(sessionId) === turns) {
           this.realTurns.delete(sessionId)
+          try {
+            this.options.onRealTurnsSettled?.(sessionId)
+          } catch {}
+        }
         try {
           if (lifetime === this.lifetime) this.scheduleDueTimer()
         } catch {}
@@ -1110,6 +1130,11 @@ export class CacheKeepManager {
       finish: () => release(),
       pause: () => release(true),
     }
+  }
+
+  /** Includes late responses that can still track or retire a restart target. */
+  hasRealTurn(sessionId: string) {
+    return this.realTurns.has(sessionId)
   }
 
   private realTurnBusy(sessionId: string) {
@@ -1212,9 +1237,19 @@ export class CacheKeepManager {
     this.reportStop(target, reason, this.options.now?.() ?? Date.now())
     this.retainStopped(target, reason, this.options.now?.() ?? Date.now())
     this.targets.delete(id)
-    this.options.onTargetRemoved?.(id)
+    this.options.onTargetRemoved?.(id, target)
     this.publishTrackedSessions()
     return true
+  }
+
+  /** Hand a target to another live host instance without reporting a stop. */
+  releaseTarget(id: string) {
+    this.immediateTargets.delete(id)
+    if (!this.targets.delete(id)) return
+    for (const [controller, sessionId] of this.warmControllers)
+      if (sessionId === id) controller.abort()
+    this.publishTrackedSessions()
+    this.scheduleDueTimer()
   }
 
   trackedCount(): number {
@@ -1226,6 +1261,10 @@ export class CacheKeepManager {
     return current
       ? current.policyState === target.policyState
       : this.immediateTargets.get(target.id) === target
+  }
+
+  isRestoredTarget(target: Readonly<CacheKeepTarget>): boolean {
+    return this.restoredTargets.has(target)
   }
 
   /**
@@ -1423,7 +1462,17 @@ export class CacheKeepManager {
   }
 
   /** Called at the physical boundary, after authorization and before fetch. */
-  async reserveWarmDispatch(target: Readonly<CacheKeepTarget>): Promise<void> {
+  async reserveWarmDispatch(target: Readonly<CacheKeepTarget>): Promise<void>
+  async reserveWarmDispatch<T>(
+    target: Readonly<CacheKeepTarget>,
+    dispatch: () => Promise<T>,
+    signal: AbortSignal,
+  ): Promise<T>
+  async reserveWarmDispatch<T>(
+    target: Readonly<CacheKeepTarget>,
+    dispatch?: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T | undefined> {
     const generation = this.schedulerGeneration
     const current = this.targets.get(target.id)
     if (!current || !this.isCurrentTarget(target))
@@ -1432,7 +1481,9 @@ export class CacheKeepManager {
     if (this.realTurnBusy(state?.ownerSessionId ?? target.id))
       throw new CacheKeepWarmWait()
     const loaded = await this.options.loadStorage()
-    if (generation !== this.schedulerGeneration) throw new CacheKeepWarmWait()
+    const cancelled = () =>
+      generation !== this.schedulerGeneration || signal?.aborted
+    if (cancelled()) throw new CacheKeepWarmWait()
     const storage =
       loaded && this.options.resolveSettings
         ? this.targetSettings(
@@ -1456,18 +1507,48 @@ export class CacheKeepManager {
       state.warmsSinceLastRealRequest++
       state.pendingWarmCost = (pendingCost ?? 0) + admittedCost
     }
+    const refund = () => {
+      if (!state) return
+      state.warmsSinceLastRealRequest--
+      state.pendingWarmCost = pendingCost
+      // A same-body update can copy the charge before the reservation returns.
+      // Supersede that snapshot even if the warm cannot prove ownership.
+      if (this.isCurrentTarget(target))
+        return this.options.settleWarm?.(current)
+    }
     // Process-only keepers have no restart replay. Persistent hosts must prove
     // the new count is stored before sending; a failed attempt keeps its slot.
     if (this.options.reserveWarm) {
-      let committed = false
+      let reservation: CacheKeepWarmReservation = false
       try {
-        committed = await this.options.reserveWarm(current)
-      } catch {}
-      if (generation !== this.schedulerGeneration) throw new CacheKeepWarmWait()
-      if (!committed && (state?.planned || isCacheKeepAlways(storage))) {
-        if (state) {
-          state.warmsSinceLastRealRequest--
-          state.pendingWarmCost = pendingCost
+        reservation = await this.options.reserveWarm(current)
+      } catch {
+        // A memory-only store returns success without I/O. An exception from
+        // the reservation cannot establish ownership of a persisted session.
+        reservation = 'ownership-unverified'
+      }
+      if (cancelled()) {
+        // Only the caller that hands us dispatch can tie the reservation to
+        // the send. Keep the conservative charge for a standalone reservation.
+        if (dispatch) await refund()
+        throw new CacheKeepWarmWait()
+      }
+      if (
+        reservation === 'not-owner' ||
+        reservation === 'ownership-unverified' ||
+        (!reservation && (state?.planned || isCacheKeepAlways(storage)))
+      ) {
+        await refund()
+        if (reservation === 'not-owner') {
+          if (this.isCurrentTarget(target)) this.releaseTarget(target.id)
+          throw new CacheKeepWarmRefusal('stopped')
+        }
+        if (reservation === 'ownership-unverified') {
+          // An unverified claim can become usable again, but retrying a still
+          // due target immediately would spin the due timer until expiry.
+          if (!cancelled() && this.targets.get(target.id) === current)
+            this.scheduleRetry(current, true, 'ownership-unverified')
+          throw new CacheKeepWarmWait()
         }
         throw new CacheKeepPrewarmError('authorization', undefined)
       }
@@ -1479,14 +1560,13 @@ export class CacheKeepManager {
       : this.policyDecision(current, this.options.now?.() ?? Date.now(), true)
     if (fresh?.action === 'stop') throw new CacheKeepWarmRefusal(fresh.reason)
     if (fresh?.action === 'wait') {
-      if (state) {
-        state.warmsSinceLastRealRequest--
-        state.pendingWarmCost = pendingCost
-        this.admittedWarmCosts.delete(state)
-        await this.options.settleWarm?.(current)
-      }
+      if (state) this.admittedWarmCosts.delete(state)
+      await refund()
       throw new CacheKeepWarmWait()
     }
+    // Do not yield between the cancellation check and dispatch: either the
+    // cancelled reservation is refunded or the charge is for a real send.
+    return dispatch?.()
   }
 
   private scheduleDueTimer() {
@@ -1541,6 +1621,15 @@ export class CacheKeepManager {
     }
   }
 
+  /** Restart scans can fill spare capacity without evicting a live target. */
+  hasRoomForRestore(bodyText: string) {
+    return (
+      this.targets.size < CACHE_KEEP_MAX_TARGETS &&
+      this.totalBodyBytes() + Buffer.byteLength(bodyText, 'utf8') <=
+        CACHE_KEEP_MAX_BODY_BYTES
+    )
+  }
+
   private totalBodyBytes() {
     return [...this.targets.values()].reduce(
       (sum, target) => sum + target.bodyBytes,
@@ -1576,7 +1665,7 @@ export class CacheKeepManager {
     })
     this.retainStopped(target, stopReason(reason), now)
     this.targets.delete(target.id)
-    this.options.onTargetRemoved?.(target.id)
+    this.options.onTargetRemoved?.(target.id, target)
   }
 
   private retainStopped(
@@ -1662,7 +1751,7 @@ export class CacheKeepManager {
         })
         this.reportStop(target, reason, now)
         this.targets.delete(id)
-        this.options.onTargetRemoved?.(id)
+        this.options.onTargetRemoved?.(id, target)
       }
     }
     while (this.targets.size > CACHE_KEEP_MAX_TARGETS)
@@ -2174,7 +2263,11 @@ export class CacheKeepManager {
     )
   }
 
-  private scheduleRetry(target: CacheKeepTarget, transient: boolean) {
+  private scheduleRetry(
+    target: CacheKeepTarget,
+    transient: boolean,
+    wait?: 'ownership-unverified',
+  ) {
     const now = this.options.now?.() ?? Date.now()
     const deadline = this.lastPrewarmStart(target)
     if (now >= deadline) {
@@ -2184,16 +2277,21 @@ export class CacheKeepManager {
       })
       return
     }
-    target.consecutiveFailures += 1
-    const backoff = cacheKeepRetryDelayMs(target.id, target.consecutiveFailures)
+    const failures = target.consecutiveFailures + 1
+    // A reservation wait has not attempted a provider request.
+    if (!wait) target.consecutiveFailures = failures
+    const backoff = cacheKeepRetryDelayMs(target.id, failures)
     const delay = transient
       ? Math.min(
           backoff,
-          CACHE_KEEP_TRANSIENT_RETRY_STEP_MS * target.consecutiveFailures,
+          CACHE_KEEP_TRANSIENT_RETRY_STEP_MS * failures,
           CACHE_KEEP_TRANSIENT_RETRY_MAX_MS,
         )
       : backoff
-    target.nextPrewarmAt = Math.min(now + delay, deadline)
+    target.nextPrewarmAt = Math.max(
+      wait ? now + 1000 : now,
+      Math.min(now + delay, deadline),
+    )
   }
 
   private async sendPrewarm(
@@ -2377,6 +2475,7 @@ export class CacheKeepManager {
             new Headers(target.headers),
             prewarmTarget,
             attempt,
+            () => this.isCurrentTarget(target),
           )
         : new Headers(target.headers)
       ensureActive()

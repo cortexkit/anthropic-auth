@@ -1,6 +1,6 @@
 # Architecture
 
-anthropic-auth lets coding agents use a Claude Pro, Max or Ultra subscription the way Claude Code does. It signs in with Claude's OAuth flow and keeps the tokens fresh. It reshapes each model request into the shape Claude Code 2.1.302 sends, and it spreads sessions across several subscription accounts while respecting their quota. Beyond that, it keeps the provider's prompt cache stable and warm, because on a long session the cached prefix is most of the cost.
+anthropic-auth lets coding agents use a Claude Pro, Max or Ultra subscription the way Claude Code does. It signs in with Claude's OAuth flow and keeps the tokens fresh. It reshapes each subscription request into the shape Claude Code 2.1.302 sends, and it spreads sessions across several subscription accounts while respecting their quota. Beyond that, it keeps the provider's prompt cache stable and warm, because on a long session the cached prefix is most of the cost.
 
 It runs in three hosts and shares one core:
 
@@ -16,6 +16,7 @@ Accounts are kept either in a **local pool** on disk or in the **Claustrum vault
 - **Route:** one place a request can go: an OAuth account, or (local mode only) a paid API key.
 - **Custody:** who holds the credentials. **Local** means the native pool files on this machine. **Vault** means Claustrum, reached through an enrollment approved once per host kind. While a host is enrolled, local credentials never serve, refresh, poll or warm (the exclusive-vault rule).
 - **Placeholder:** a non-secret entry in the host's own auth slot that makes the host route Anthropic requests to this plugin without holding a real token. OpenCode 1 uses an expired OAuth tombstone (`claustrum-tombstone:v1:anthropic`). OpenCode 2 uses common-auth's `common-auth-placeholder.anthropic`. Pi uses common-auth's move-aside slot, with an inert API-key placeholder.
+- **Body signature (`cch`):** the hash Claude Code writes into its billing line (`cch=`), computed over the final request body. Any later change to the body needs a new signature.
 - **Sticky session:** in `sticky-balanced` routing, a session stays on the account it was given, so its prompt cache stays valid.
 - **Hold:** keeping a session on its exhausted account and asking the host to retry later, instead of moving it and paying for a cache rebuild.
 - **Killswitch / quota floor:** a user-set minimum remaining quota below which an account is refused locally.
@@ -36,21 +37,21 @@ Accounts are kept either in a **local pool** on disk or in the **Claustrum vault
 | OpenCode 1 entry | `packages/opencode/src/index.ts` | Plugin factory: auth loader with custom `fetch`, message and header hooks, `/claude` command, background services, dispose. |
 | OpenCode 1 request shaping | `packages/opencode/src/transform.ts` | Rewrites URL and body, and rewrites the SSE stream on the way back. |
 | OpenCode 2 | `packages/opencode/src/v2/` | `setup.ts` installs common-auth's OpenCode 2 adapter. `source.ts` chooses accounts and retries. `adapter.ts` shapes and sends requests. Also menus, sidebar projection, keep-warm and Prime. |
-| OpenCode shared | `packages/opencode/src/` | Server fallback, OpenCode 1 recovery rounds, effort plan transport, billing lineage, cache diagnostics, sidebar state, RPC for the TUI, setup CLI. |
+| OpenCode shared | `packages/opencode/src/` | Server fallback, OpenCode 1 recovery rounds, effort plan transport, billing lineage, cache-diagnostics integration, sidebar state, RPC for the TUI, setup CLI. |
 | TUI | `packages/opencode/src/tui/`, `src/tui.tsx` | Sidebar (shared common-auth frame) and `/claude` dialogs, precompiled to `src/tui-compiled/` at build time. |
 | Pi | `packages/pi/src/` | Provider registration, request conversion (`convert.ts`), streaming and transport (`stream.ts`, `transport.ts`), commands, keep-warm. |
 | Core accounts | `packages/core/src/native-*.ts`, `pool-*.ts` | Native account runtime, local credential service and refresh coordinator, vault runtime and custody, enrollment authority, migration, host auth slots, menus. |
-| Core request | `packages/core/src/` | `cch.ts` and `claude-code.ts` (billing header and body signature), `model-capabilities.ts` (per-model handling), `message-threads.ts`, `request-gzip.ts`, `relay.ts`, `thinking-binding.ts`, `mid-conversation-output-config.ts`, `turn-end-note.ts`, `oauth-origin.ts`. |
+| Core request | `packages/core/src/` | `cch.ts` and `claude-code.ts` (billing header and body signature), `api-key-request.ts` and `api-route-url.ts` (paid routes), `cache-diagnostics.ts`, `model-capabilities.ts` (per-model handling), `message-threads.ts`, `request-gzip.ts`, `relay.ts`, `thinking-binding.ts`, `mid-conversation-output-config.ts`, `turn-end-note.ts`, `oauth-origin.ts`. |
 | Core policy | `packages/core/src/` | `routing.ts`, `sticky-routing.ts`, `killswitch.ts`, `quota-manager.ts`, `quota-headers.ts`, `insula-quota.ts`, `quota-refusal.ts`, `session-cache-activity.ts`. |
 | Core cache | `packages/core/src/` | `cache1h.ts`, `cachekeep.ts` (keep-warm manager), `cachekeep-store.ts` (restart store), `cachekeep-registry.ts` (cross-process session list), `prime.ts`. |
-| State layout | `packages/core/src/state-layout-*.ts`, `holder-registry.ts`, `layout-fence.ts` | Moving machine-written state out of OpenCode's config folder. Written, with the move switched off. |
+| State layout | `packages/core/src/state-layout-*.ts`, `holder-registry.ts`, `layout-fence.ts` | Fenced relocation of OpenCode's machine-written state out of its config folder. Pi registers holders but keeps its legacy layout. |
 | End-to-end | `packages/e2e-tests/` | Real OpenCode processes against mock Anthropic, relay and Claustrum servers. |
 
 `STRUCTURE.md` has the directory map and where to add code.
 
 ## Request lifecycle
 
-The order is the same on every host. Only the hook that runs each step differs (see the host sections).
+The OAuth order is the same on every host. Only the hook that runs each step differs (see the host sections). Paid API-key routes use the separate policy under Transport.
 
 1. **Admission.** Choose an account for the session (see Routing) and check it against quota policy. A request blocked by the user's own floor or killswitch is refused locally, with a message naming the limit and when it resets.
 2. **Authorization.** Get a valid access token for that account. In local mode this goes through the refresh coordinator. In vault mode each send asks the vault for a fresh scoped receipt. A healthy request (valid token, known identity, ready roster) takes **no lock** before it is sent; per-host tests count lock acquisitions to enforce this.
@@ -58,17 +59,19 @@ The order is the same on every host. Only the hook that runs each step differs (
    - **Identity and billing:** sanitize OpenCode's identity out of the system prompt and prepend Claude Code's identity. Add the billing header with its `cc_version` suffix (pinned per session from the first user message) and request lineage (`cc_prompt_id`, `cc_prev_req`).
    - **Tools:** prefix tool names with `mcp_`.
    - **Cache:** place cache breakpoints for the chosen strategy (explicit, automatic or hybrid; at most four) and set the cache lifetime.
-   - **Per-model handling** from `model-capabilities.ts`: thinking mode, rejected forced tool choice, effort markers, thinking-binding controls, turn-end notes, server-side fallback, fast mode, beta lists.
+   - **Per-model handling** from `model-capabilities.ts`: thinking mode, rejected forced tool choice, effort markers, thinking-binding controls, turn-end notes, server-side fallback, fast mode, beta lists. Per-message effort covers Fable 5.1/5.2 and Mythos 5.1/5.2, plus Opus 5/5.5, Sonnet 5.5 and Haiku 5.5 with adaptive thinking.
    - **History checks:** refuse locally, before anything is signed, a history that ends on a meaningful assistant turn or carries effort markers that don't match the session's plan.
-4. **Message thread.** On the final body, decide `create`, `continue` or stateless (see Message threads), then compute the `cch` body signature once.
+4. **Message thread.** On the final OAuth body, decide `create`, `continue` or stateless (see Message threads), then compute the `cch` body signature once.
 5. **Transport.**
-   - **Destination:** OAuth requests go only to `https://api.anthropic.com`. Neither the provider `baseURL` nor `ANTHROPIC_BASE_URL` moves them; the latter applies to API-key routes only.
-   - **Direct sends:** large direct bodies are gzipped the way Claude Code does, with one uncompressed resend if a proxy rejects them.
+   - **Destination:** OAuth requests go only to `https://api.anthropic.com` or the custom gateway in the user's settings file. Neither the provider `baseURL` nor `ANTHROPIC_BASE_URL` moves them. A saved paid-route URL takes precedence over `ANTHROPIC_BASE_URL`; the environment variable applies only when the API-key route has no saved URL.
+   - **Paid API-key routes:** the plugin adds no Claude Code identity, `mcp_` tool prefix or `cch` body signature. It still checks history. It removes internal fallback state and OAuth-only betas. It applies model aliases. `ANTHROPIC_CUSTOM_HEADERS` applies only to these routes. HTTPS certificates are always verified.
+   - **Direct sends:** large direct OAuth bodies, including eligible CacheKeep warms, are gzipped the way Claude Code does. OpenCode 1 and Pi resend an eligible rejected body once uncompressed. OpenCode 2 cannot resend its host-owned initial request. An eligible rejection turns gzip off for later sends.
    - **Relay:** the optional Cloudflare Worker relay supports HTTP and WebSocket on OpenCode 1 and Pi, and HTTP only on OpenCode 2. A relay failure falls back to a direct send at most once per request.
    - **Abort:** the caller's abort signal ends the request at every step, including pre-send quota, profile and refresh work, which also have their own 30-second limits.
 6. **Response.**
-   - **Stream:** the stream is rewritten on the way back: `mcp_` prefixes are stripped, server-fallback blocks are turned into storable markers, and in-stream API errors become retryable connection errors.
+   - **Stream:** the OAuth stream is rewritten on the way back: `mcp_` prefixes are stripped, server-fallback blocks are turned into storable markers, and in-stream API errors become retryable connection errors.
    - **Bookkeeping:** rate-limit headers are read as quota evidence, the thread anchor is recorded, and the request is tracked for keep-warm once Anthropic accepts it. Bookkeeping writes never delay the response. At shutdown they get a one-second grace before pending lock waits are cancelled.
+   - **Cache diagnostics:** eligible OAuth conversation requests link to the previous response's opaque message ID. Every host emits cache-result and beta-list debug records for them. Paid requests, forks, Prime and keep-warm do not advance that chain.
 
 ### OpenCode 1
 
@@ -81,14 +84,17 @@ The order is the same on every host. Only the hook that runs each step differs (
 - **Placeholder:** OpenCode 2 routes to the plugin only when the selected Anthropic connection is the plugin's exact placeholder. Stock API keys, OpenCode's own Anthropic login and custom proxies pass through untouched.
 - **Holds:** OpenCode 2 holds by returning a retry delay from the installer, capped at 15 minutes per hold.
 - **No WebSocket relay:** a selected WebSocket relay is refused before dispatch.
+- **Pricing:** OAuth models show zero token prices by default. `cost_zeroing_enabled: false` restores catalogue prices. API-key prices are unchanged.
+- **Command:** `/claude` emits a menu-open event. Without a TUI subscriber it posts no text fallback.
 
 ### Pi
 
 - **Provider:** `registerProvider('anthropic', …)` with `streamSimple`.
 - **Conversion:** `convert.ts` builds the body. Pi's documentation paragraph is moved out of the top-level system prompt into a cached block before the first user text, because its text can trigger OAuth billing rejection. Signed thinking is replayed only when it came from the same API and model.
-- **Effort history:** rebuilt from the session branch on each `turn_start`.
+- **Effort history:** rebuilt from the session branch on each `turn_start`, including compaction. Top-level effort stays at its baseline when per-message effort applies. Changes are inserted at the dispatched history boundaries.
 - **Threads:** a whole-turn lease keeps tool-loop steps on one thread.
 - **Server fallback:** Pi does not opt into server-side fallback.
+- **Command:** `/claude` can refresh quota. It can edit quota floors and killswitch thresholds. It can fire a lane start: a visible marker turn with a one-token request that warms the session's prompt cache before the next real turn.
 
 ## Shared user settings
 
@@ -128,7 +134,9 @@ Modes are `main-first` (default), `fallback-first` and `sticky-balanced` (`routi
 - **Unconfirmed 429:** the session stays on its account, with waits of at most 60 seconds each, up to `MAX_UNCONFIRMED_SAME_ACCOUNT_RETRIES` (2) per turn. The third unconfirmed 429 moves it.
 - **No route:** a complete pool with no eligible route returns an explicit refusal (sign in again, or a quota 429, or a non-retryable 412 when waiting is off). An incomplete pool fails retryably.
 
-**Shared routing.** When Thalamus provides the `cortexkit.routing` accessor, the plugin asks it once per account choice (OpenCode 1 sticky resolve, OpenCode 2 `chooseAccount`), with a 2-second limit. The answer is only advice: the local rules above still apply. The plugin also sends detached `served` and `exhausted` reports.
+**Shared routing.** When Thalamus provides the `cortexkit.routing` accessor, all three hosts ask it for advice with a 2-second limit. OpenCode 1 asks in every routing mode, including account switches on retry. OpenCode 2 asks when choosing or retrying an account. Pi asks once per model request, including each step of a tool loop, and keeps the answer across that request's retries. The answer is only advice: the local rules above still apply. The plugin also sends detached `served` and `exhausted` reports. OpenCode reports when a host-owned routing or quota wait starts; Pi reports both ends of waits it owns and the start of host-owned retries.
+
+**Thalamus billing.** Ordinary model sends and CacheKeep warms report their payer, request kind and token usage on every host. Prime does not emit a session billing report. Agent Runner bills Pi fork answers itself.
 
 ## Quota
 
@@ -141,9 +149,10 @@ Modes are `main-first` (default), `fallback-first` and `sticky-balanced` (`routi
 ## Prompt cache
 
 - **Strategy:** set per account (`cache1h.ts`): explicit breakpoints, automatic, or hybrid. Hybrid keeps a stable system anchor. When the last two user or tool-result boundaries are more than 20 content blocks apart, it moves that marker to a bridge anchor on the earlier boundary, so the latest marker's 20-block lookback still reaches a cache entry. A full request after accepted thread continuations may use that slot for the previous full request's cache boundary, as described below. Markers that reconnect caches when a session switches between Fable and Opus take priority.
+- **Lifetime:** an unset or `default` `claude_cache_enabled` selects the 5-minute cache on every host. `on` selects 1 hour. `off` selects 5 minutes. A Thalamus session policy can override the choice.
 - **Keep-warm:** `CacheKeepManager` (`cachekeep.ts`) tracks up to 32 sessions, within a 64 MiB body budget, once Anthropic has accepted their request.
   - **Timing:** it sends the prewarm 5 minutes before expiry, on the account that served the session. Transient failures retry at about 20, 40 and 60 seconds until the cache would expire. A refusal a retry cannot fix (killswitch floor, account disabled or signed out, changed login, vault refusal) stops warming that session with one warning.
-  - **Restarts:** OpenCode 2 and Pi save the latest accepted body per session, gzipped and owner-only, under `cortexkit/anthropic-auth/cachekeep-restore/` in the data folder. A restarted host warms again from there.
+  - **Restarts:** every host saves the latest accepted body per session, gzipped and owner-only, under `cortexkit/anthropic-auth/cachekeep-restore/` in the data folder. A restarted host warms again from there. OpenCode 1 assigns one project instance to each restored session. Pi restores only its own session.
   - **Session list:** each process publishes session ids and cache timing, never bodies or tokens, to `cortexkit/anthropic-auth/cachekeep-sessions/` (documented in `docs/cachekeep-registry.md`).
 - **Per-session policy (Thalamus):** `session-cache-policy.ts` reads a session's `{ttl, keep_warm, hours}` through common-auth's `sessionCachePolicy`, synchronously, on every OAuth request and before every warm. No policy, or an invalid one, leaves the plugin's own settings in charge, field by field.
   - **Lifetime:** `none` strips every cache marker from the final body (after Pi's `onPayload`), and `short` and `long` set 5-minute or 1-hour markers. The applied lifetime is read from the body actually sent.
@@ -151,7 +160,7 @@ Modes are `main-first` (default), `fallback-first` and `sticky-balanced` (`routi
   - **Durability:** each attempt's count and admitted cost are written owner-only before the warm is sent, so a restart cannot reset the cap. An unusable restart folder keeps every bound in memory instead.
   - **Reports:** an accepted response or a successful warm sends a detached `cache_touch` with the applied lifetime, and a warmed session's retirement sends `cache_warm_stopped` with a shared reason. Neither can delay a request. Opus 4.8 source warms send no touch, because the runner tracks one cache per session.
 - **Activity:** `session-cache-activity.ts` records when each session's cache was last refreshed by an accepted response or a successful prewarm. The sticky hold rule uses it.
-- **Prime:** an opt-in five-hour window starter. On OpenCode 1, OpenCode 2 and Pi it sends one `max_tokens: 1` Haiku request per account when the window's reset has passed. A marker keyed by the verified Claude account makes sure only one process fires per reset, even across separate account files and hosts.
+- **Prime:** an opt-in five-hour window starter. On OpenCode 1, OpenCode 2 and Pi it sends one `max_tokens: 1` Haiku request per account when the window's reset has passed. On OpenCode 1 and 2 its scheduler starts with the plugin and follows `prime_enabled` changes without a restart. A marker keyed by the verified Claude account makes sure only one process fires per reset, even across separate account files and hosts.
 
 ## Message threads
 
@@ -166,24 +175,27 @@ Anything else sends a full `create` request. Title, summary, compaction, keep-wa
 
 **Full-after-thread cache boundary:** after at least one continuation has been accepted since the last full request, a new full request may reuse that full request's last message marker, including one nested inside a tool result. Core retains only the marker's position, lifetime, accepted time and hashes of its prefix and account/credential identity. The prefix, beta list and speed must still match, and the entry must not have expired. The marker replaces OpenCode's ordinary system/lookback marker or Pi's system marker, never exceeding four markers. It cannot replace an Opus standby bridge (anchoring the cache kept ready for an Opus recovery turn) or a Fable return marker (anchoring the Fable prefix when returning from Opus). If no slot is offered, Core skips the prefix hash and body clone. Every failed condition leaves the ordinary full body untouched and logs one content-free tail reason such as `prefix_changed`, `slot_taken` or `layout_unrecordable`. A create directly after a create, and a session that has only sent stateless requests, never gets this extra boundary.
 
+All three hosts persist the full-after-thread cache-boundary metadata across restarts. A restart does not preserve a live continuation anchor.
+
 **Wire safety:** 1-hour markers must precede every 5-minute marker. Core checks the final continuation after restoring fixed fields and budgeting message markers; invalid order falls back to the untouched full request rather than repairing the accepted fixed fields. Every accepted create records the fingerprint and last message marker from the body actually sent. Fixed annotation layouts must be recordable before a tail marker can replace another marker.
 
 **Recovery:** if Anthropic rejects a continue, the plugin resends once with the full conversation as a new thread. If that create is rejected for using threads, it resends once more statelessly and turns threads off for that account until restart. Removing the thread beta for that last retry changes the cache-prefix identity, so the retry keeps the ordinary full body's cache markers. A thread problem never reaches the user as an error when a stateless send would work.
 
 ## Content-filter fallback
 
-- **Opt-in:** OAuth Fable 5, Fable 5.1, Opus 5 and Opus 5.5 requests opt into server-side fallback on OpenCode 1 and 2.
+- **Opt-in:** OAuth Fable 5, Fable 5.1, Fable 5.2, Opus 5 and Opus 5.5 requests opt into server-side fallback on OpenCode 1 and 2.
 - **Boundary marker:** OpenCode cannot store Anthropic's `fallback` block, so the stream turns it into a signed hidden thinking marker (`cortexkit-server-fallback-v1:`). The next request turns it back into the exact `fallback` block before signing.
 - **Usage marker:** a fallback step's usage is the billed sum of both attempts. A second hidden marker (`cortexkit-server-fallback-usage-v1:`) carries the per-attempt breakdown for tools that size the context. It is stripped from every outgoing request.
-- **Tool call before a refusal:** if a served fallback completes a tool call and then refuses, the finish becomes `tool_use`, so the tool doesn't run twice.
-- **Recovery rounds (OpenCode 1 only):** a refusal the server fallback did not absorb starts a recovery round on Opus 4.8. During the round, keep-warm also keeps the original model's cache alive from its last sent body, so returning to it doesn't rebuild the prompt. `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` skips server fallback and uses recovery rounds only.
+- **Tool call before a refusal (OpenCode 1 only):** in server-first recovery, if a served fallback completes a tool call and then refuses, the finish becomes `tool_use`, so the tool doesn't run twice.
+- **Recovery rounds (OpenCode 1 only):** a refusal the server fallback did not absorb starts a recovery round on Opus 4.8. During the round, keep-warm also keeps the original model's cache alive from its last accepted body, so returning to it doesn't rebuild the prompt. `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy` skips server fallback and uses recovery rounds only. OpenCode 2 relies on server-side fallback alone. Pi has neither server-side fallback nor client recovery.
 
 ## State layout
 
-OpenCode 2 watches its config folder, so machine-written state should move out of it, into the user's state folder.
+OpenCode 2 watches its config folder, so OpenCode's machine-written state moves into the user's state folder when the relocation fences allow it.
 
-- **Release N (shipped in 2.4.0):** every process registers itself in `anthropic-auth-holders.json` beside the account files, and the relocation guards run inside the locks a move must hold.
-- **The mover and restore:** both are written (`state-layout-move.ts`, `state-layout-restore.ts`), but `RELOCATION_MOVE_ENABLED` is `false`. Until that switch flips in its own release, every install keeps the legacy layout, and no code path may refuse an install that 2.4.x serves.
+- **Decision:** OpenCode 1 and 2 run `decideOpenCodeStateLayout` before pool reads. They serve an already moved dataset, recover an unfinished transition, or move a legacy dataset after the holder and version fences find no older live writer. Explicit path overrides stay legacy. A start that creates the config folder does not move it on that start.
+- **Move and restore:** `state-layout-move.ts` copies and verifies the closed file set under locks, installs legacy barriers, commits the move, then cleans old copies. A failure before commit rolls back; after commit the state folder serves and cleanup retries. `state-layout-restore.ts` restores the legacy layout.
+- **Pi:** `decidePiStateLayout` registers and fences holders but keeps Pi's files in the legacy layout. They do not move.
 - **Storage id:** it is always derived from the legacy-layout path, so a move never changes it.
 
 ## Concurrency rules
@@ -196,7 +208,8 @@ OpenCode 2 watches its config folder, so machine-written state should move out o
 
 - **Parse failures:** request bodies that can't be parsed pass through unchanged. Structural history errors and effort-plan mismatches refuse locally with a non-retryable 400, before cache shaping, signing, dumping or sending.
 - **Stream errors:** a transient `api_error` inside a 200 SSE stream becomes a connection-reset error, so the host retries it instead of storing it.
-- **Redaction:** logs, dumps, sidebar state, RPC and menus never carry tokens, raw provider bodies or prompt text. Errors use fixed messages and closed codes. Dumps (`OPENCODE_ANTHROPIC_AUTH_DUMP_DIR`, default `opencode-anthropic-auth-dumps` in the temp folder) keep only an allowlisted response summary.
+- **Redaction:** logs, sidebar state, RPC and menus never carry tokens, raw provider bodies or prompt text. Errors use fixed messages and a fixed set of error codes.
+- **Dumps:** request `.body.json` files contain the outgoing request body and can contain prompts and tool content. Response `.response.json` files keep an allowlisted summary without response text. `OPENCODE_ANTHROPIC_AUTH_DUMP_DIR` overrides the default `opencode-anthropic-auth-dumps` folder in the temp directory.
 - **Logging:** the log goes to `opencode-anthropic-auth.log` in the temp folder, or to `OPENCODE_ANTHROPIC_AUTH_LOG_FILE`.
 
 ## Testing and gates

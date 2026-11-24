@@ -413,7 +413,6 @@ const settingFields: Readonly<Record<string, readonly string[]>> = {
     'failClosedOnUnknownQuota',
     'showToasts',
   ],
-  quotaHeaderFeed: ['enabled'],
   claudeCache: ['enabled', 'mode'],
   dump: ['enabled'],
   logging: ['level'],

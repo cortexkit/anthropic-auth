@@ -33,7 +33,6 @@ export function snapshotSettings(absent: boolean): core.AccountStorage {
       failClosedOnUnknownQuota: false,
       showToasts: true,
     },
-    quotaHeaderFeed: { enabled: true },
     killswitch: {
       enabled: true,
       main: { five_hour: 9, seven_day: 11, scoped: 3 },
@@ -117,7 +116,6 @@ export function snapshotReaderOutputs(storage: core.AccountStorage) {
     ).scoped,
     quota_fail_closed_on_unknown_quota: core.failClosedOnUnknownQuota(storage),
     quota_show_toasts: storage.quota?.showToasts === true,
-    quota_header_feed_enabled: storage.quotaHeaderFeed?.enabled === true,
     killswitch_enabled: core.isKillswitchEnabled(storage),
     killswitch_default_five_hour: main.five_hour,
     killswitch_default_seven_day: main.seven_day,

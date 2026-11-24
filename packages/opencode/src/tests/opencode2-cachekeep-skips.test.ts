@@ -118,8 +118,11 @@ async function fixture() {
     policy,
     account,
     manager: (globalThis as any)[
-      Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-    ].get(binding.storageId).manager as CacheKeepManager,
+      Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v3')
+    ]
+      .get(binding.storageId)
+      .values()
+      .next().value.manager as CacheKeepManager,
     accept: async () => {
       keep.onResponseHeaders({ attemptId: input.attemptId, status: 200 })
       await keep.registry.list()

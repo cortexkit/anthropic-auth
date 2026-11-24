@@ -2,18 +2,20 @@ import {
   logger,
   normalizeAnthropicModelId,
   resolveClaudeModelCapabilities,
+  SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_FALLBACK_USAGE_MARKER_TEXT,
   SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
+  SERVER_SIDE_FALLBACK_BETA,
   stripServerFallbackUsageMarkers,
 } from '@cortexkit/anthropic-auth-core'
 import { recoverableRefusalFamily } from './fable-fallback'
 
-export const SERVER_SIDE_FALLBACK_BETA = 'server-side-fallback-2026-07-01'
 export const SERVER_FALLBACK_MARKER_TEXT = '\u2060'
-export const SERVER_FALLBACK_SIGNATURE_PREFIX = 'cortexkit-server-fallback-v1:'
 export {
+  SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_FALLBACK_USAGE_MARKER_TEXT,
   SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
+  SERVER_SIDE_FALLBACK_BETA,
 }
 
 type ServerSideFallbackIteration = {

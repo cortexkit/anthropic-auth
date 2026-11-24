@@ -4,12 +4,67 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Windows: when the plugin refuses to create its state folder because another account can change a folder above it, the message now names that folder and the account, and says how to fix it: remove that account's change access, or set `XDG_STATE_HOME` to a folder only you can change (#881).
+- Uses common-auth 0.59.0. On OpenCode 2, if sign-in setup fails partway, the hooks it had already registered are removed once, by common-auth. When OpenCode 2 abandons a message that is waiting for a free Claude account slot, the plugin also cancels its pending request to routing, so the slot is handed back at once.
+- OpenCode 1, OpenCode 2 and Pi: when Claude can't confirm which account a freshly refreshed login belongs to, the plugin checks again after 5 minutes, then 15, then hourly, instead of blocking the login for up to a day. The refusal says when it will check again, and Reset account backoff in `/claude` checks on the next turn (#880).
+- Pi: Agent Runner's mid-run instruction changes are placed right after the message they belong to, so the prompt cache holds, including when a session continues or forks.
+- Pi: honours Agent Runner's per-run reply length cap, for Claude subscriptions and paid API keys.
+- Pi: replies may be as long as the model allows (128,000 tokens on Opus 5.5 and Fable 5.2), as on OpenCode, instead of 16,384, still fitted to the context window.
 - Setup: when it can't read or write a folder that decides where its state is, the log now names the folder or lock and the filesystem error code, as the error message says it does.
-- OpenCode 1, OpenCode 2 and Pi: when shared routing reports that every account is at its concurrent-request limit, requests wait for a free slot instead of ending the turn.
+- OpenCode 1, OpenCode 2 and Pi: when shared routing reports that every account is at its concurrent-request limit, requests wait for a free slot instead of ending the turn. OpenCode 2 waits at most four minutes, because it times plugin work out at five; after that the turn stops and says to send the message again in a few minutes.
+- OpenCode: tools that OpenCode adds or removes in the middle of a session keep the same names in Claude requests as their declarations.
 - OpenCode: the one-time state move no longer treats a running older plugin as gone after the system clock is corrected forward. A start with a different XDG_STATE_HOME no longer moves the state while an earlier move under another state folder is unfinished; it stops and says to start again with the setting used then.
 - An invalid sticky-routing state file is now set aside as a private backup and replaced, with one warning, instead of failing and logging on every routing write (#876).
 - After a revoked vault enrollment is replaced at the same path, the plugin uses the new enrollment without a restart (#877).
 - OpenCode 2: after a rate limit with no reset time, a newer quota check showing room again lets the session send again, instead of refusing until the session is forgotten (#878).
+- OpenCode 1 CacheKeep can run a one-off prewarm again without dropping its normal account and destination checks.
+- Pi keep-warms no longer send the conversation's previous message ID to Claude.
+- OpenCode 1: idle sessions can keep warming a still-live Claude prompt cache after a server restart without resetting their budgets; `auto` keep-warm now uses the accepted prefix's token counts to price warms, even without a restart.
+- OpenCode 1: after a server restart, a threaded session's first full request can reuse the previous full request's cache boundary, as on OpenCode 2 and Pi.
+- OpenCode 1 and Pi: eligible direct CacheKeep requests now use gzip, like OpenCode 2, and resend uncompressed if gzip is rejected.
+- OpenCode 1: keep-warm requests no longer appear in cache diagnostics or replace the previous real response, as on OpenCode 2.
+- OpenCode 1 and Pi now send paid API-key requests like OpenCode 2, without adding a Claude Code prompt or billing signature or renaming tools. Claude subscription requests are unchanged.
+- OpenCode 1, OpenCode 2 and Pi always verify TLS for API-key requests to custom HTTPS addresses. The `ANTHROPIC_INSECURE` environment variable is gone.
+- OpenCode 2 now keeps custom proxy headers off Claude sign-in requests, like OpenCode 1 and Pi, while still sending them on API-key routes.
+- For conversation requests, OpenCode 2 now matches OpenCode 1: the first eligible request sends a null previous message ID, and cache results and beta lists appear in debug logs.
+- OpenCode 2: Claude subscription models now show zero token prices by default, like OpenCode 1. You can opt out to display catalogue prices; API-key prices are unchanged.
+- OpenCode 1 and 2: opt-in Prime can start a quota window without a first chat request, and enabling Prime in the settings file takes effect without restarting OpenCode.
+- Pi now links Claude subscription requests to the same user turn across tool calls and retries, matching OpenCode 1 and 2.
+- Pi's hybrid prompt cache now reuses an earlier conversation boundary after long replies or tool exchanges, matching OpenCode 1 and 2.
+- OpenCode 1 on Thalamus now asks for the shared login choice in every routing mode and when switching logins on a retry, like OpenCode 2.
+- OpenCode 1 on Thalamus now reports when a request starts waiting for routing or quota, like OpenCode 2; OpenCode still handles the wait.
+- OpenCode 1 on Thalamus now reports which login paid for each Claude send and how many tokens it used, including relayed sends and keep-warm requests, like OpenCode 2.
+- Pi: `/claude` can now refresh quota and edit quota floors, like OpenCode 1 and 2.
+- Pi: `/claude` can now start a five-hour quota window with a one-time request, like OpenCode 1 and 2.
+- Pi, like OpenCode 1 and 2, now updates each subscription account's quota from Claude's replies without waiting for the next quota poll.
+- Pi's paid API-key route now honors the same model aliases as OpenCode 1 and 2 and keeps its configured endpoint.
+- Pi now links cache diagnostics across conversation replies like OpenCode 1 and 2, with cache results and beta lists in the debug log.
+- OpenCode 2 now uses the five-minute Claude prompt cache by default, like OpenCode 1 and Pi. An explicit cache setting or Agent Runner session policy still takes precedence.
+- OpenCode 1 no longer publishes the optional quota header feed; quota readings still reach the vault. The `quota_header_feed_enabled` setting is gone and can be deleted from your settings file.
+- OpenCode 1 on Thalamus honors Claude's own wait before using the main login, even when shared routing picks it, and tries another eligible login when a routing pick can't authenticate.
+- OpenCode 1 no longer switches to a paid API key on a retry where shared routing picked a login, retries an earlier login once when nothing untried can serve, and asks shared routing before sending one-shot request bodies.
+- OpenCode 1 and 2 no longer wait for saved keep-warm sessions before starting or sending the first request.
+- OpenCode 1 and 2 servers sharing an account store no longer warm the same saved session twice or overwrite its warm budget; all three hosts now use one keep-warm session claim.
+- Pi's paid API-key requests keep Pi's own prompt-cache markers.
+- Pi's hybrid cache keeps the same layout at five minutes and one hour, can reuse a long first prompt's cache after a long tool exchange, and lets forks reach the head's cache at the 20-block lookback limit.
+- Pi: only the cache-warming request queued from `/claude` is cut to one token (a prompt with the same text is sent normally), and it no longer joins the conversation's request chain.
+- Pi: `/claude` quota refresh continues when one account fails, and editing killswitch thresholds no longer turns the killswitch on.
+- OpenCode 2 and Pi no longer wait for optional cache diagnostics before delivering replies, and keep diagnostics linked to the latest reply when detailed cache usage is missing.
+- OpenCode 2 keeps subscription prices at zero when a credential lookup fails temporarily.
+- OpenCode 1 never takes a paid API key on a routing check where shared routing gave advice, as on OpenCode 2. A later check with no advice can still use an eligible paid backup after confirmed subscription exhaustion.
+- OpenCode 1 switches to another subscription when a routed login becomes unavailable mid-request, and keeps Anthropic's original refusal if none takes over.
+- OpenCode 1 no longer waits for abandoned responses to cancel or for cache diagnostics before sending, and editing killswitch thresholds no longer turns the killswitch on.
+- Keep-warm follows the process where you actually work: a session restored by another OpenCode or Pi process at startup is handed over on your next turn, and a session deleted in one process no longer comes back from another's saved state.
+- Keep-warm recovers from temporary lock contention when claiming or releasing a session, and OpenCode 2 keeps the newest cache body in memory if its final save fails.
+- Pi: `/claude` lane start (a one-token turn that warms the session's cache) tags its queued message with a one-time marker. A user who pastes that marker keeps their text, the marker never reaches Anthropic or the session file, a lane start no longer joins the conversation's request chain, and a lane start that would go to a paid API key is skipped with a short message.
+- Pi: when the session's cache is off, earlier messages are no longer reshaped for a cache marker.
+- OpenCode 1 returns Anthropic's original refusal when no other route can serve, instead of a refusal it made up locally or a response whose body it had already discarded. It tries every eligible Claude subscription before a paid API key, tries each paid key at most once per request, and checks quota before a paid fallback only when a paid key can actually serve.
+- OpenCode 2 no longer clears another server's keep-warm state when it drops old sessions from memory or shuts down, and a deleted session can't be brought back by a request that was still in flight.
+- Keep-warm requests are sent only by the process that owns the session, and a real turn can resume keep-warm after another process took over a restored session and then let it go.
+- Pi: a queued lane start keeps its marker hidden even with many sessions open or text after it, stays out of the conversation's request chain if you type while it routes, and can still use a subscription listed after a paid key.
+- Keep-warm retries after a temporary lock failure instead of forgetting the session, and keeps a saved session when it can't check whether it was deleted. OpenCode 2 runs a plugin copy for each open project and reloads them one after another. During a plugin reload, projects still on the old version keep warming their sessions, and reloaded projects pick up each saved session once the old version stops warming it. On the first upgrade from 2.16.6, both versions can briefly warm the same session, and the old version may remove one saved record. Keep-warm also keeps saved sessions through brief storage errors, keeps the newest saved request when two plugin copies overlap, and no longer counts a cancelled warm against a session's limit. Saved sessions also survive a brief Windows file-check error, a failed request during restart recovery, or the system clock being set back (a session dated slightly ahead is picked up once the clock catches up), and a failed folder listing no longer stops a plugin copy from warming the sessions it already owns.
+- OpenCode 1 never falls back to a paid API key when Thalamus's shared routing becomes unavailable mid-request, in any routing mode, and retries with a refreshed login without waiting for the rejected response to close.
+- Pi answers a message that carries a `/claude` lane start together with other content as a normal turn.
 
 ## 2.16.6
 

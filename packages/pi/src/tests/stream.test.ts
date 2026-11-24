@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -734,6 +734,263 @@ test.each([
     }
   },
 )
+
+async function piCacheDiagnosticsFixture({
+  withoutDetailsOn,
+  fastOpus = false,
+}: {
+  withoutDetailsOn?: number
+  fastOpus?: boolean
+} = {}) {
+  tempDir = await mkdtemp(join(tmpdir(), 'pi-cache-diagnostics-'))
+  const storagePath = join(tempDir, 'accounts.json')
+  const sessionId = 'ses_pi_cache_diagnostics'
+  const model = fastOpus
+    ? { ...anthropicModel, id: 'claude-opus-5-5' }
+    : anthropicModel
+  process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+  await saveNativePiFixture(
+    {
+      version: 1,
+      accounts: [],
+      logging: { level: 'debug' },
+      quota: { enabled: false },
+      claudeFast: { enabled: fastOpus },
+    },
+    storagePath,
+  )
+  const sent: Array<{
+    diagnostics?: unknown
+    betas: string[]
+    authorization: string | null
+    tls?: Bun.TLSOptions
+  }> = []
+  const records: LogTestRecord[] = []
+  const level = core.getLogLevel()
+  await getPiNativeRuntime(storagePath).service()
+  core.setLogLevel('debug')
+  __setLogTestSink((record) => records.push(record))
+  globalThis.fetch = mock(
+    async (input: string | URL | Request, init?: RequestInit) => {
+      if (!String(input).includes('/v1/messages'))
+        throw new Error('unexpected request')
+      const body = JSON.parse(String(init?.body)) as { diagnostics?: unknown }
+      const headers = new Headers(init?.headers)
+      sent.push({
+        diagnostics: body.diagnostics,
+        betas: (headers.get('anthropic-beta') ?? '').split(','),
+        authorization: headers.get('authorization'),
+        tls: (init as RequestInit & { tls?: Bun.TLSOptions })?.tls,
+      })
+      return new Response(
+        [
+          {
+            type: 'message_start',
+            message: {
+              id: `msg_pi_diag_${sent.length}`,
+              model: model.id,
+              diagnostics: null,
+              usage: {
+                input_tokens: 24,
+                output_tokens: 0,
+                cache_read_input_tokens: 12,
+                cache_creation_input_tokens: 4,
+                ...(sent.length !== withoutDetailsOn && {
+                  cache_creation: {
+                    ephemeral_5m_input_tokens: 4,
+                    ephemeral_1h_input_tokens: 0,
+                  },
+                }),
+              },
+            },
+          },
+          { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+          { type: 'message_stop' },
+        ]
+          .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+          .join(''),
+        { headers: { 'content-type': 'text/event-stream' } },
+      )
+    },
+  ) as unknown as typeof fetch
+
+  const send = (
+    origin: 'agent-loop' | 'direct' = 'agent-loop',
+    maxTokens?: number,
+  ) =>
+    streamCortexKitAnthropic(
+      model,
+      anthropicContext,
+      {
+        sessionId,
+        maxTokens,
+        onPayload: (payload) => payload,
+        onResponse: () => {},
+        onProviderStreamEvent: () => {},
+      },
+      undefined,
+      undefined,
+      origin,
+    ).result()
+  beginPiPrimaryTurn(storagePath, sessionId)
+  const close = () => {
+    endPiPrimaryTurn(storagePath, sessionId)
+    forgetPiMessageThread(sessionId)
+    __setLogTestSink(null)
+    core.setLogLevel(level)
+  }
+  return { send, sent, records, sessionId, close }
+}
+
+test('Pi verifies TLS for sign-in sends even with the old opt-out set', async () => {
+  const { send, sent, close } = await piCacheDiagnosticsFixture()
+  const insecure = process.env.ANTHROPIC_INSECURE
+  try {
+    process.env.ANTHROPIC_INSECURE = '1'
+    expect((await send()).stopReason).toBe('stop')
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.authorization).toMatch(/^Bearer \S+$/)
+    expect(sent[0]!.tls?.rejectUnauthorized ?? true).toBe(true)
+  } finally {
+    if (insecure === undefined) delete process.env.ANTHROPIC_INSECURE
+    else process.env.ANTHROPIC_INSECURE = insecure
+    close()
+  }
+})
+
+test('Pi delivers the reply and captures its ID even while the diagnostics hash is pending', async () => {
+  const { send, sent, close } = await piCacheDiagnosticsFixture()
+  const hash = core.getCacheDiagnosticsBetas
+  const started = Promise.withResolvers<void>()
+  const pending = Promise.withResolvers<void>()
+  const hashSpy = spyOn(core, 'getCacheDiagnosticsBetas').mockImplementation(
+    async (headers) => {
+      started.resolve()
+      await pending.promise
+      return hash(headers)
+    },
+  )
+  const reading = send()
+  try {
+    await Promise.race([reading, started.promise])
+    expect(hashSpy).toHaveBeenCalledTimes(1)
+    const result = await Promise.race([reading, Bun.sleep(150)])
+    expect(result).toMatchObject({
+      stopReason: 'stop',
+      responseId: 'msg_pi_diag_1',
+    })
+    expect((await send()).stopReason).toBe('stop')
+    expect(sent[1]?.diagnostics).toEqual({
+      previous_message_id: 'msg_pi_diag_1',
+    })
+  } finally {
+    pending.resolve()
+    await reading
+    hashSpy.mockRestore()
+    close()
+  }
+})
+
+test('Pi links the next request to a reply without detailed cache usage', async () => {
+  const { send, sent, records, close } = await piCacheDiagnosticsFixture({
+    withoutDetailsOn: 1,
+  })
+  try {
+    expect((await send()).stopReason).toBe('stop')
+    expect((await send()).stopReason).toBe('stop')
+    expect(sent[1]?.diagnostics).toEqual({
+      previous_message_id: 'msg_pi_diag_1',
+    })
+    expect(
+      records.some(
+        ({ message }) =>
+          message.startsWith('MC-CACHE-DIAG ') &&
+          message.includes('"message_id":"msg_pi_diag_1"'),
+      ),
+    ).toBe(false)
+  } finally {
+    close()
+  }
+})
+
+test('Pi keeps one-token SDK warms out of cache diagnostics', async () => {
+  const { send, sent, records, close } = await piCacheDiagnosticsFixture()
+  try {
+    expect((await send()).stopReason).toBe('stop')
+    expect((await send('agent-loop', 1)).stopReason).toBe('stop')
+    expect((await send()).stopReason).toBe('stop')
+    expect(sent.map((request) => request.diagnostics)).toEqual([
+      { previous_message_id: null },
+      undefined,
+      { previous_message_id: 'msg_pi_diag_1' },
+    ])
+    const lines = records.filter(({ message }) =>
+      message.startsWith('MC-CACHE-DIAG '),
+    )
+    expect(
+      lines.map(
+        ({ message }) =>
+          JSON.parse(message.slice('MC-CACHE-DIAG '.length)).message_id,
+      ),
+    ).toEqual(['msg_pi_diag_1', 'msg_pi_diag_3'])
+  } finally {
+    close()
+  }
+})
+
+test('Pi conversation cache diagnostics link replies and log one beta list per hash', async () => {
+  // Use a distinct beta set because the reporter deduplicates across sessions.
+  const { send, sent, records, sessionId, close } =
+    await piCacheDiagnosticsFixture({ fastOpus: true })
+  try {
+    expect((await send()).stopReason).toBe('stop')
+    expect((await send('direct')).stopReason).toBe('stop')
+    expect((await send()).stopReason).toBe('stop')
+    expect(sent[0]?.betas).toContain(core.CACHE_DIAGNOSTICS_BETA)
+    expect(sent[0]?.betas).toContain(core.FAST_MODE_BETA)
+    expect(sent.map((request) => request.diagnostics)).toEqual([
+      { previous_message_id: null },
+      { previous_message_id: 'msg_pi_diag_1' },
+      { previous_message_id: 'msg_pi_diag_1' },
+    ])
+    const lines = records.filter(({ message }) =>
+      message.startsWith('MC-CACHE-DIAG '),
+    )
+    expect(lines.map(({ level }) => level)).toEqual(['debug', 'debug', 'debug'])
+    const [first, auxiliary, second] = lines.map(({ message }) =>
+      JSON.parse(message.slice('MC-CACHE-DIAG '.length)),
+    )
+    expect(first).toMatchObject({
+      source: 'turn',
+      session_id: sessionId,
+      message_id: 'msg_pi_diag_1',
+      previous_message_id: null,
+      diag_state: 'server_null',
+      cache_read: 12,
+    })
+    expect(auxiliary).toMatchObject({
+      message_id: 'msg_pi_diag_2',
+      previous_message_id: 'msg_pi_diag_1',
+    })
+    expect(auxiliary.betas_hash).toMatch(/^[0-9a-f]{16}$/)
+    expect(auxiliary.betas_hash).not.toBe(first.betas_hash)
+    expect(second).toMatchObject({
+      message_id: 'msg_pi_diag_3',
+      previous_message_id: 'msg_pi_diag_1',
+      betas_hash: first.betas_hash,
+    })
+    const betaLines = records.filter(({ message }) =>
+      message.startsWith('MC-CACHE-DIAG-BETAS '),
+    )
+    expect(betaLines.map(({ level }) => level)).toEqual(['debug', 'debug'])
+    expect(betaLines.map(({ message }) => message)).toEqual([
+      `MC-CACHE-DIAG-BETAS ${JSON.stringify({ hash: first.betas_hash, betas: [...sent[0]!.betas].sort() })}`,
+      `MC-CACHE-DIAG-BETAS ${JSON.stringify({ hash: auxiliary.betas_hash, betas: [...sent[1]!.betas].sort() })}`,
+    ])
+  } finally {
+    close()
+  }
+})
 
 describe('Pi stream stop reasons', () => {
   const refusal = 'Claude refused this request (stop_reason: refusal).'
