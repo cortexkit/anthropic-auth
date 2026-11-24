@@ -5,6 +5,8 @@ import { delimiter, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { isolatedEnvironment } from '../../../scripts/windows/harness.mjs'
 
+const HOLDER_REGISTRY_FILE = 'anthropic-auth-holders.json'
+
 const exec = promisify(execFile)
 const readJson = async (path) => JSON.parse(await readFile(path, 'utf8'))
 
@@ -86,7 +88,9 @@ export async function verifyWindowsOpenCode2Setup({
         join(config, 'anthropic-auth-state.json'),
         precreateConfig ? { kind: 'state-home', dir } : { kind: 'legacy' },
       )
-      const holders = await readJson(join(dir, core.HOLDER_FILE_NAME))
+      // The holder registry's file name is part of the stored layout older
+      // releases read, so the check names it literally rather than asking Core.
+      const holders = await readJson(join(dir, HOLDER_REGISTRY_FILE))
       assert.equal(holders.version, 1)
       const journal = await core.readNativeMigrationJournal(paths)
       assert.equal(journal?.version, 5)
@@ -97,7 +101,7 @@ export async function verifyWindowsOpenCode2Setup({
         config: 'opencode.jsonc',
         plugin: registered.plugins[0],
         layout: precreateConfig ? 'state-home' : 'legacy',
-        holderRegistry: core.HOLDER_FILE_NAME,
+        holderRegistry: HOLDER_REGISTRY_FILE,
         journal: 'committed empty-init',
       }
     })
