@@ -639,7 +639,6 @@ describe('createServerSideFallbackStreamRewriter', () => {
   })
 
   test('does not absorb a refusal while a tool call is incomplete', () => {
-    let handled = 0
     const stream = [
       sse('message_start', {
         type: 'message_start',
@@ -650,6 +649,17 @@ describe('createServerSideFallbackStreamRewriter', () => {
         index: 0,
         content_block: {
           type: 'tool_use',
+          id: 'toolu_complete',
+          name: 'mcp_Bash',
+          input: {},
+        },
+      }),
+      sse('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 1,
+        content_block: {
+          type: 'tool_use',
           id: 'toolu_incomplete',
           name: 'mcp_Bash',
           input: {},
@@ -657,7 +667,7 @@ describe('createServerSideFallbackStreamRewriter', () => {
       }),
       sse('content_block_delta', {
         type: 'content_block_delta',
-        index: 0,
+        index: 1,
         delta: { type: 'input_json_delta', partial_json: '{"command":' },
       }),
       sse('message_delta', {
@@ -672,21 +682,16 @@ describe('createServerSideFallbackStreamRewriter', () => {
     ].join('')
     const rewriter = createServerSideFallbackStreamRewriter({
       requestedModel: 'claude-fable-5',
-      onRefusalAfterToolUse: () => {
-        handled++
-        return true
-      },
+      serverSideFallbackSent: true,
     })
 
     const output = rewriter.push(stream) + rewriter.flush()
 
-    expect(handled).toBe(0)
     expect(output).toContain('"stop_reason":"refusal"')
     expect(output).not.toContain('"stop_reason":"tool_use"')
   })
 
   test('preserves a completed tool call when its fallback turn later refuses', () => {
-    let handled = 0
     const outcomes: ServerSideFallbackOutcome[] = []
     const stream = [
       sse('message_start', {
@@ -721,16 +726,12 @@ describe('createServerSideFallbackStreamRewriter', () => {
     ].join('')
     const rewriter = createServerSideFallbackStreamRewriter({
       requestedModel: 'claude-fable-5',
+      serverSideFallbackSent: true,
       onOutcome: (outcome) => outcomes.push(outcome),
-      onRefusalAfterToolUse: () => {
-        handled++
-        return true
-      },
     })
 
     const output = rewriter.push(stream) + rewriter.flush()
 
-    expect(handled).toBe(1)
     expect(output).toContain('"stop_reason":"tool_use"')
     expect(output).not.toContain('"stop_reason":"refusal"')
     expect(output).not.toContain('"stop_details"')
@@ -742,10 +743,10 @@ describe('createServerSideFallbackStreamRewriter', () => {
       }),
     ])
 
-    const withoutCallback = createServerSideFallbackStreamRewriter({
+    const withoutOptIn = createServerSideFallbackStreamRewriter({
       requestedModel: 'claude-fable-5',
     })
-    expect(withoutCallback.push(stream) + withoutCallback.flush()).toBe(output)
+    expect(withoutOptIn.push(stream) + withoutOptIn.flush()).toBe(stream)
   })
 
   test.each([
@@ -754,7 +755,6 @@ describe('createServerSideFallbackStreamRewriter', () => {
   ])(
     'resyncs after an oversized frame ending in a split %s boundary',
     (_name, delimiter, splitAt) => {
-      let handled = 0
       const skipped = `data: ${'x'.repeat(256)}`
       const later = [
         sse('content_block_start', {
@@ -784,11 +784,8 @@ describe('createServerSideFallbackStreamRewriter', () => {
       ].join('')
       const rewriter = createServerSideFallbackStreamRewriter({
         requestedModel: 'claude-fable-5',
+        serverSideFallbackSent: true,
         maxPendingBytes: 64,
-        onRefusalAfterToolUse: () => {
-          handled++
-          return true
-        },
       })
 
       const output =
@@ -802,7 +799,6 @@ describe('createServerSideFallbackStreamRewriter', () => {
       expect(output).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
       expect(output).toContain('"stop_reason":"tool_use"')
       expect(output).not.toContain('"stop_reason":"refusal"')
-      expect(handled).toBe(1)
     },
   )
 })

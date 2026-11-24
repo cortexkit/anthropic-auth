@@ -4,6 +4,7 @@ import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
   applyRunnerTurnNotes,
+  applyServerSideFallbackToBody,
   applySessionCacheTtl,
   applyThinkingBindingControls,
   applyTurnEndNotes,
@@ -24,6 +25,7 @@ import {
   type ClaudeCodeRequestClass,
   countUserPrompts,
   createAnthropicStreamCompletion,
+  createServerSideFallbackStreamRewriter,
   createSseFramer,
   FAST_MODE_BETA,
   type IncompleteStreamDiagnostics,
@@ -45,6 +47,8 @@ import {
   readSessionCachePolicy,
   remapRequestBodyModel,
   resolveClaudeModelCapabilities,
+  SERVER_SIDE_FALLBACK_BETA,
+  type ServerSideFallbackOutcome,
   SseFrameTooLargeError,
   selectClaudeCodeBetas,
   signRequestBody,
@@ -72,12 +76,6 @@ import {
 } from './effort-history'
 import { stripRecoveryRoundThinking } from './recovery-thinking'
 import { makeByteBoundedMemo } from './sanitize-memo'
-import {
-  applyServerSideFallbackToBody,
-  createServerSideFallbackStreamRewriter,
-  SERVER_SIDE_FALLBACK_BETA,
-  type ServerSideFallbackOutcome,
-} from './server-fallback'
 
 export const NON_STREAMING_DIAGNOSTICS_MAX_BYTES = 8 * 1024 * 1024
 /**
@@ -2193,10 +2191,6 @@ type SseFinishState = {
   resyncCarry: string
 }
 
-type SseFinishUpdate =
-  | { type: 'content-filter' }
-  | { type: 'complete'; finishReason: string }
-
 function createSseFinishState(): SseFinishState {
   return { pending: '', completed: false, disabled: false, resyncCarry: '' }
 }
@@ -2205,35 +2199,36 @@ function updateSseFinishState(
   state: SseFinishState,
   text: string,
   maxPendingBytes: number,
-): SseFinishUpdate | null {
-  if (!text || state.completed) return null
+): string | undefined {
+  if (!text || state.completed) return
   if (state.disabled) {
     const window = state.resyncCarry + text
     const boundary = findSseBoundary(window)
     if (!boundary) {
       state.resyncCarry = window.slice(-3)
-      return null
+      return
     }
     state.disabled = false
     state.resyncCarry = ''
     text = window.slice(boundary.index + boundary.length)
-    if (!text) return null
+    if (!text) return
   }
   state.pending += text
-  let update: SseFinishUpdate | null = null
-
+  let finishReason: string | undefined
   while (true) {
     const boundary = findSseBoundary(state.pending)
     if (!boundary) break
     const rawEvent = state.pending.slice(0, boundary.index)
     state.pending = state.pending.slice(boundary.index + boundary.length)
     const summary = summarizeSseEvent(rawEvent)
-    if (summary?.type !== 'message_delta' || !summary.stopReason) continue
+    if (
+      state.completed ||
+      summary?.type !== 'message_delta' ||
+      !summary.stopReason
+    )
+      continue
     state.completed = true
-    update ??=
-      summary.stopReason === 'refusal'
-        ? { type: 'content-filter' }
-        : { type: 'complete', finishReason: summary.stopReason }
+    if (summary.stopReason !== 'refusal') finishReason = summary.stopReason
   }
   if (new TextEncoder().encode(state.pending).byteLength > maxPendingBytes) {
     const tail = state.pending
@@ -2241,7 +2236,7 @@ function updateSseFinishState(
     state.disabled = true
     state.resyncCarry = tail.slice(-3)
   }
-  return update
+  return finishReason
 }
 
 type SseLaneStartFinishRewriteState = {
@@ -2338,19 +2333,6 @@ function retryableAnthropicStreamError(
   error.code = 'ECONNRESET'
   error.syscall = 'anthropic-sse'
   if (errorType) error.providerErrorType = errorType
-  return error
-}
-
-function retryableFableContentFilterError(
-  model: unknown,
-): RetryableAnthropicStreamError {
-  const label = isClaudeOpus5Model(model) ? 'Opus 5' : 'Fable'
-  const error = new Error(
-    `${label} response was blocked by the provider content filter; retrying with Opus 4.8`,
-  ) as RetryableAnthropicStreamError
-  error.code = 'ECONNRESET'
-  error.syscall = 'anthropic-sse'
-  error.providerErrorType = 'refusal'
   return error
 }
 
@@ -2508,12 +2490,9 @@ export function createStrippedStream(
     onToolNameRefusal?: () => void
     onResponseFailure?: () => void
     perf?: RewritePerfCallback
-    onContentFilter?: (context?: {
-      completedToolUse: boolean
-    }) => boolean | undefined
     onComplete?: (finishReason: string) => void
-    contentFilterModel?: unknown
     serverSideFallbackModel?: string
+    serverSideFallbackSent?: boolean
     onServerSideFallbackOutcome?: (outcome: ServerSideFallbackOutcome) => void
     onMessageStart?: (message: Record<string, unknown>) => void
     onMessageDelta?: (delta: {
@@ -2580,50 +2559,28 @@ export function createStrippedStream(
     } catch {}
   }
   const sseErrors = createSseErrorState()
-  const sseFinish =
-    options.onContentFilter || options.onComplete
-      ? createSseFinishState()
-      : undefined
+  const sseFinish = options.onComplete ? createSseFinishState() : undefined
   const laneStartFinish =
     options.laneStart && options.laneStartOAuthServed !== false
       ? createSseLaneStartFinishRewriteState()
       : undefined
-  let contentFilterInvoked = false
-  let contentFilterHandled = false
-  const invokeContentFilter = (completedToolUse = false) => {
-    if (!options.onContentFilter) return false
-    if (!contentFilterInvoked) {
-      contentFilterInvoked = true
-      contentFilterHandled =
-        options.onContentFilter({ completedToolUse }) !== false
-    }
-    return contentFilterHandled
-  }
   const serverSideFallback = options.serverSideFallbackModel
     ? createServerSideFallbackStreamRewriter({
         requestedModel: options.serverSideFallbackModel,
+        serverSideFallbackSent: options.serverSideFallbackSent,
         maxPendingBytes: NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
         onOutcome: options.onServerSideFallbackOutcome,
-        onRefusalAfterToolUse: options.onContentFilter
-          ? () => invokeContentFilter(true)
-          : undefined,
       })
     : undefined
 
   const updateFinish = (text: string) => {
-    if (!sseFinish) return null
-    const update = updateSseFinishState(
+    if (!sseFinish) return
+    const finishReason = updateSseFinishState(
       sseFinish,
       text,
       NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
     )
-    if (update?.type === 'content-filter' && options.onContentFilter) {
-      return invokeContentFilter()
-        ? retryableFableContentFilterError(options.contentFilterModel)
-        : null
-    }
-    if (update?.type === 'complete') options.onComplete?.(update.finishReason)
-    return null
+    if (finishReason) options.onComplete?.(finishReason)
   }
   const rewriteLaneStartFinish = (text: string, flush = false) =>
     laneStartFinish
@@ -2751,13 +2708,13 @@ export function createStrippedStream(
               true,
             )
             const retryableStreamError = jsonMode
-              ? updateFinish(laneStartRewritten)
-              : (updateSseErrorState(
+              ? null
+              : updateSseErrorState(
                   sseErrors,
                   finalDecoded,
                   NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
                   options.onRelayUpstreamError,
-                ) ?? updateFinish(laneStartRewritten))
+                )
             if (retryableStreamError) {
               // The provider's message stays out of logs; its type is enough.
               logProgress('stream_tool_prefix_retryable_error', {
@@ -2766,6 +2723,7 @@ export function createStrippedStream(
               await cancelReader(retryableStreamError)
               throw retryableStreamError
             }
+            updateFinish(laneStartRewritten)
             const flushed = toolNames.push(laneStartRewritten, true)
             rewriteMs += rewriteNowMs() - rewriteStart
             if (flushed || preamble) {
@@ -2839,13 +2797,13 @@ export function createStrippedStream(
             : decoded
           const laneStartRewritten = rewriteLaneStartFinish(serverRewritten)
           const retryableStreamError = jsonMode
-            ? updateFinish(laneStartRewritten)
-            : (updateSseErrorState(
+            ? null
+            : updateSseErrorState(
                 sseErrors,
                 decoded,
                 NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
                 options.onRelayUpstreamError,
-              ) ?? updateFinish(laneStartRewritten))
+              )
           if (retryableStreamError) {
             logProgress('stream_tool_prefix_retryable_error', {
               providerErrorType: retryableStreamError.providerErrorType,
@@ -2855,6 +2813,7 @@ export function createStrippedStream(
             releaseReader()
             throw retryableStreamError
           }
+          updateFinish(laneStartRewritten)
           const rewritten = toolNames.push(laneStartRewritten)
           rewriteMs += rewriteNowMs() - rewriteStart
           if (rewritten) {

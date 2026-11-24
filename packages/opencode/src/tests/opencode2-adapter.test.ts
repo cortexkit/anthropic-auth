@@ -520,12 +520,92 @@ test('OpenCode 2 ignores the removed fallback environment switch on each request
       attemptId,
       kind: 'primary',
       accountId: 'main',
-      modelID: 'claude-fable-5',
+      serverSideFallbackModel: 'claude-fable-5',
       status: 200,
     })
   expect(response('server').serverSideFallbackModel).toBe('claude-fable-5')
   expect(response('off').serverSideFallbackModel).toBeUndefined()
 })
+
+test.each([
+  ['server', 'claude-fable-5', true, 'tool_use'],
+  ['server', 'claude-fable-5', false, 'refusal'],
+  ['server', 'claude-opus-4-8', true, 'refusal'],
+  ['off', 'claude-fable-5', true, 'refusal'],
+  ['client', 'claude-fable-5', true, 'refusal'],
+] as const)(
+  'OpenCode 2 in %s with sent model %s and closed call %s delivers %s',
+  async (mode, model, closedCall, stopReason) => {
+    const wire = createNativeWirePolicy()
+    const { source } = makeSource({
+      requestOptions: (input) =>
+        wire.requestOptions(input, {
+          policyStorage: {},
+          refusalFallbackMode: mode,
+        } as core.NativeAccountSnapshot),
+      responseOptions: wire.responseOptions,
+    })
+    const native = createNativeAnthropicAdapter({ source })
+    const host = new Host(native.adapter)
+    try {
+      const { attempt, final } = await host.run(
+        scopeOf({ modelID: 'claude-fable-5' }),
+        hostRequest({ ...sonnetPayload(), model, stream: true }),
+      )
+      const enabled = mode === 'server' && model === 'claude-fable-5'
+      const sentBody = (await final.clone().json()) as Record<string, unknown>
+      expect(sentBody.fallbacks).toBe(enabled ? 'default' : undefined)
+      const stopDetails = { type: 'refusal', category: 'test' }
+      const frames = [
+        sse('message_start', {
+          type: 'message_start',
+          message: { id: 'msg_refusal', model },
+        }),
+        ...(closedCall
+          ? [
+              sse('content_block_start', {
+                type: 'content_block_start',
+                index: 0,
+                content_block: {
+                  type: 'tool_use',
+                  id: 'toolu_closed',
+                  name: 'mcp_Bash',
+                  input: {},
+                },
+              }),
+              sse('content_block_stop', {
+                type: 'content_block_stop',
+                index: 0,
+              }),
+            ]
+          : []),
+        sse('message_delta', {
+          type: 'message_delta',
+          delta: { stop_reason: 'refusal', stop_details: stopDetails },
+        }),
+        sse('message_stop', { type: 'message_stop' }),
+      ]
+      const response = await native.adapter.rewriteResponse?.({
+        ...attempt,
+        attempt,
+        request: final,
+        response: sseResponse(frames.join('')),
+      })
+      const text = await response?.text()
+      const delta =
+        stopReason === 'tool_use'
+          ? { stop_reason: 'tool_use' }
+          : { stop_reason: 'refusal', stop_details: stopDetails }
+      expect(text).toContain(
+        sse('message_delta', { type: 'message_delta', delta }),
+      )
+      expect(text).toEndWith(frames.at(-1)!)
+      expect(host.sent).toHaveLength(1)
+    } finally {
+      native.dispose()
+    }
+  },
+)
 
 function cacheDiagnosticsHost() {
   const wire = createNativeWirePolicy()

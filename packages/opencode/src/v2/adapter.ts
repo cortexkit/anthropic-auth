@@ -292,6 +292,7 @@ export type NativeAnthropicResponseOptions = Pick<
   | 'perf'
   | 'onComplete'
   | 'serverSideFallbackModel'
+  | 'serverSideFallbackSent'
   | 'onServerSideFallbackOutcome'
   | 'onMessageStart'
   | 'onMessageDelta'
@@ -321,6 +322,8 @@ export interface NativeAnthropicResponseContext<P>
   extends NativeAnthropicAttemptContext<P> {
   readonly status: number
   readonly cacheDiagnostics?: CacheDiagnosticsSend
+  /** Model of the OAuth request as sent, only when its body enabled fallback. */
+  readonly serverSideFallbackModel?: string
 }
 
 type CacheDiagnosticsSend = Omit<
@@ -860,6 +863,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     NonNullable<StrippedStreamOptions['toolNameMap']>
   >()
   const cacheDiagnosticsSends = new WeakMap<Data, CacheDiagnosticsSend>()
+  const serverFallbackSends = new WeakMap<Data, string>()
   // Each sent request privately holds its own credentials, so errors about
   // it can be scrubbed after rewriteSend has dropped the pending credential:
   // a response scope for the one response the request gets, and a redactor
@@ -1808,11 +1812,12 @@ export function createNativeAnthropicAdapter<Q, P>(
 
     function observeFinalWire(prepared: Request, bodyText: string | undefined) {
       let billingSend: BillingSend | undefined
+      const payload =
+        messages && bodyText !== undefined ? parseJson(bodyText) : undefined
       if (data && messages && bodyText !== undefined) {
         try {
           const metadata = source.billingRequest?.(contextOf(attempt, data))
           if (metadata) {
-            const payload = parseJson(bodyText)
             const ttlMs = requestShortestCacheLifetimeMs(bodyText)
             billingSend = {
               input: {
@@ -1834,9 +1839,15 @@ export function createNativeAnthropicAdapter<Q, P>(
       }
       if (data?.route !== 'oauth' || !messages || bodyText === undefined)
         return billingSend
+      serverFallbackSends.delete(data)
+      if (
+        isRecord(payload) &&
+        payload.fallbacks === 'default' &&
+        typeof payload.model === 'string'
+      )
+        serverFallbackSends.set(data, payload.model)
       if (diagnosticsOptIn) {
         cacheDiagnosticsSends.delete(data)
-        const payload = parseJson(bodyText)
         // For a relay, these are the upstream headers inside the envelope,
         // not the headers on the outer Request to the relay itself.
         if (
@@ -2096,10 +2107,13 @@ export function createNativeAnthropicAdapter<Q, P>(
       }
       const diagnostics = cacheDiagnosticsSends.get(data)
       cacheDiagnosticsSends.delete(data)
+      const serverSideFallbackModel = serverFallbackSends.get(data)
+      serverFallbackSends.delete(data)
       const context = {
         ...contextOf(attempt, data),
         status: response.status,
         ...(diagnostics ? { cacheDiagnostics: diagnostics } : {}),
+        ...(serverSideFallbackModel ? { serverSideFallbackModel } : {}),
       }
       const options = source.responseOptions?.(context) ?? {}
       const json = data

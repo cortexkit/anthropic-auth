@@ -6,11 +6,11 @@ import {
   DEFAULT_REFUSAL_FALLBACK_MODE,
   formatCacheDiagnosticsLogLine,
   logger,
+  logServedServerFallback,
   type NativeAccountSnapshot,
   type RefusalFallbackMode,
   readThreeWayBoolean,
-  remapModelId,
-  resolveClaudeModelCapabilities,
+  type ServerSideFallbackOutcome,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode/plugin'
 import type { Registration } from '@opencode/plugin/promise/registration'
@@ -20,10 +20,6 @@ import {
   BillingLineageTracker,
 } from '../billing-lineage'
 import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start'
-import {
-  logServedServerFallback,
-  type ServerSideFallbackOutcome,
-} from '../server-fallback'
 import type {
   NativeAnthropicRequestContext,
   NativeAnthropicResponseContext,
@@ -198,16 +194,15 @@ export function createNativeWirePolicy(
         | 'attemptId'
         | 'cacheDiagnostics'
         | 'kind'
-        | 'modelID'
+        | 'serverSideFallbackModel'
         | 'sessionID'
         | 'status'
       >,
     ) {
-      const model = remapModelId(input.modelID)
-      // A dated model alias can differ from the requested ID without a fallback.
-      const canFallback =
-        attempts.get(input.attemptId)?.refusalFallbackMode === 'server' &&
-        resolveClaudeModelCapabilities(model)?.serverSideFallback === true
+      const fallbackModel =
+        attempts.get(input.attemptId)?.refusalFallbackMode === 'server'
+          ? input.serverSideFallbackModel
+          : undefined
       const laneStart = laneAttempts.has(input.attemptId)
       const sent = input.cacheDiagnostics
       const observe = (message: Record<string, unknown>) => {
@@ -280,9 +275,10 @@ export function createNativeWirePolicy(
           .catch(() => {})
       }
       return {
-        serverSideFallbackModel: canFallback ? model : undefined,
+        serverSideFallbackModel: fallbackModel,
+        serverSideFallbackSent: fallbackModel !== undefined,
         onServerSideFallbackOutcome(outcome: ServerSideFallbackOutcome) {
-          if (canFallback) logServedServerFallback(input.sessionID, outcome)
+          if (fallbackModel) logServedServerFallback(input.sessionID, outcome)
         },
         laneStart,
         onMessageStart: observe,

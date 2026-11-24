@@ -146,6 +146,7 @@ import {
   localMessageThreadCredential,
   log,
   logger,
+  logServedServerFallback,
   type MessageThreadRequest,
   MessageThreadTracker,
   markResetWaitResponse,
@@ -372,7 +373,6 @@ import {
   adoptRpcServer,
   type RpcServerAdoption,
 } from './rpc/server-registry.ts'
-import { logServedServerFallback } from './server-fallback.ts'
 import { getOpenCodeAuthPath } from './setup/paths.ts'
 import {
   formatPrimeTime,
@@ -9893,6 +9893,7 @@ const anthropicAuthPlugin = async (
                   ...(serverFallbackModel
                     ? {
                         serverSideFallbackModel: serverFallbackModel,
+                        serverSideFallbackSent: true,
                         onServerSideFallbackOutcome: (outcome) =>
                           logServedServerFallback(sessionId, outcome),
                       }

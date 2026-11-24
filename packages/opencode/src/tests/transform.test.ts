@@ -1886,8 +1886,7 @@ describe('createStrippedStream', () => {
     expect(finishReasons).toEqual(['max_tokens'])
   })
 
-  test('preserves lane-start refusal handling', async () => {
-    let refusals = 0
+  test('leaves a lane-start refusal unchanged', async () => {
     const body = sse('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: 'refusal' },
@@ -1895,14 +1894,9 @@ describe('createStrippedStream', () => {
 
     const text = await createStrippedStream(new Response(body), {
       laneStart: true,
-      onContentFilter: () => {
-        refusals++
-        return false
-      },
     }).text()
 
     expect(text).toBe(body)
-    expect(refusals).toBe(1)
   })
 
   test('observes a split message_start envelope exactly once', async () => {
@@ -2141,8 +2135,8 @@ describe('createStrippedStream', () => {
     expect(outcomes).toHaveLength(1)
   })
 
-  test('drains an over-cap refusal terminal frame before disabling the tail', async () => {
-    const contentFilters: boolean[] = []
+  test('does not count an over-cap refusal as a successful finish', async () => {
+    const completed: string[] = []
     const perf: Array<Record<string, unknown>> = []
     const terminal = sse('message_delta', {
       type: 'message_delta',
@@ -2159,16 +2153,13 @@ describe('createStrippedStream', () => {
         }),
       ),
       {
-        onContentFilter: () => {
-          contentFilters.push(true)
-          return false
-        },
+        onComplete: (finishReason) => completed.push(finishReason),
         perf: (_stage, stats) => perf.push(stats ?? {}),
       },
     )
 
     expect(await response.text()).toBe(body)
-    expect(contentFilters).toEqual([true])
+    expect(completed).toEqual([])
     expect(perf.at(-1)).toMatchObject({
       sseFinishPending: 0,
       sseFinishDisabled: true,
@@ -2584,8 +2575,7 @@ describe('createStrippedStream', () => {
     expect(text).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
   })
 
-  test('preserves a completed fallback tool call instead of retrying its terminal refusal', async () => {
-    const filterContexts: boolean[] = []
+  test('rewrites a closed-call refusal only for an opted-in OpenCode 1 server send', async () => {
     const completions: string[] = []
     const outcomes: ServerSideFallbackOutcome[] = []
     const payload = [
@@ -2614,7 +2604,10 @@ describe('createStrippedStream', () => {
       sse('content_block_stop', { type: 'content_block_stop', index: 0 }),
       sse('message_delta', {
         type: 'message_delta',
-        delta: { stop_reason: 'refusal' },
+        delta: {
+          stop_reason: 'refusal',
+          stop_details: { type: 'refusal', category: 'test' },
+        },
         usage: {
           output_tokens: 1,
           iterations: [{ type: 'fallback_message', model: 'claude-opus-4-8' }],
@@ -2624,10 +2617,7 @@ describe('createStrippedStream', () => {
     ].join('')
     const response = createStrippedStream(new Response(payload), {
       serverSideFallbackModel: 'claude-fable-5',
-      onContentFilter: (context) => {
-        filterContexts.push(context?.completedToolUse === true)
-        return true
-      },
+      serverSideFallbackSent: true,
       onComplete: (finishReason) => completions.push(finishReason),
       onServerSideFallbackOutcome: (outcome) => outcomes.push(outcome),
     })
@@ -2636,7 +2626,7 @@ describe('createStrippedStream', () => {
 
     expect(text).toContain('"stop_reason":"tool_use"')
     expect(text).not.toContain('"stop_reason":"refusal"')
-    expect(filterContexts).toEqual([true])
+    expect(text).not.toContain('"stop_details"')
     expect(completions).toEqual(['tool_use'])
     expect(outcomes).toEqual([
       expect.objectContaining({
@@ -2645,17 +2635,22 @@ describe('createStrippedStream', () => {
         stopReason: 'refusal',
       }),
     ])
+
+    for (const options of [{}, { serverSideFallbackModel: 'claude-fable-5' }]) {
+      const unchanged = createStrippedStream(new Response(payload), options)
+      expect(await unchanged.text()).toBe(payload)
+    }
   })
 
-  test('turns Fable refusal finishes into retryable errors and signals once', async () => {
+  test('passes a split server refusal through without a stream retry or successful finish', async () => {
     const encoder = new TextEncoder()
     const chunks = [
       'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n',
       'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_',
       'reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
     ]
-    let filtered = 0
-    let completed = 0
+    const completions: string[] = []
     const stream = new ReadableStream({
       start(controller) {
         for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
@@ -2663,93 +2658,14 @@ describe('createStrippedStream', () => {
       },
     })
     const response = createStrippedStream(new Response(stream), {
-      onContentFilter: () => {
-        filtered++
-      },
-      onComplete: () => {
-        completed++
-      },
+      serverSideFallbackModel: 'claude-fable-5',
+      serverSideFallbackSent: true,
+      requireMessageStop: true,
+      onComplete: (finishReason) => completions.push(finishReason),
     })
-    const reader = response.body!.getReader()
-    expect((await reader.read()).done).toBe(false)
 
-    let caught: unknown
-    try {
-      while (!(await reader.read()).done) {}
-    } catch (error) {
-      caught = error
-    }
-
-    expect((caught as { code?: string }).code).toBe('ECONNRESET')
-    expect((caught as { providerErrorType?: string }).providerErrorType).toBe(
-      'refusal',
-    )
-    expect(filtered).toBe(1)
-    expect(completed).toBe(0)
-  })
-
-  test('refusal error message names Opus 5 when contentFilterModel is set', async () => {
-    const encoder = new TextEncoder()
-    const chunks = [
-      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_',
-      'reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
-    ]
-    const stream = new ReadableStream({
-      start(controller) {
-        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
-        controller.close()
-      },
-    })
-    const response = createStrippedStream(new Response(stream), {
-      onContentFilter: () => true,
-      contentFilterModel: 'claude-opus-5',
-    })
-    const reader = response.body!.getReader()
-    expect((await reader.read()).done).toBe(false)
-
-    let caught: unknown
-    try {
-      while (!(await reader.read()).done) {}
-    } catch (error) {
-      caught = error
-    }
-
-    expect((caught as { code?: string }).code).toBe('ECONNRESET')
-    expect((caught as { providerErrorType?: string }).providerErrorType).toBe(
-      'refusal',
-    )
-    expect((caught as Error).message).toContain('Opus 5')
-    expect((caught as Error).message).not.toContain('Fable')
-  })
-
-  test('refusal error message uses Fable when contentFilterModel not set', async () => {
-    const encoder = new TextEncoder()
-    const chunks = [
-      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_',
-      'reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
-    ]
-    const stream = new ReadableStream({
-      start(controller) {
-        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
-        controller.close()
-      },
-    })
-    const response = createStrippedStream(new Response(stream), {
-      onContentFilter: () => true,
-    })
-    const reader = response.body!.getReader()
-    expect((await reader.read()).done).toBe(false)
-
-    let caught: unknown
-    try {
-      while (!(await reader.read()).done) {}
-    } catch (error) {
-      caught = error
-    }
-
-    expect((caught as Error).message).toContain('Fable')
+    expect(await response.text()).toBe(chunks.join(''))
+    expect(completions).toEqual([])
   })
 
   test('signals successful Anthropic finishes exactly once', async () => {
@@ -2768,20 +2684,11 @@ describe('createStrippedStream', () => {
     expect(finishes).toEqual(['tool_use'])
   })
 
-  test('does not intercept refusals when no Fable callback is installed', async () => {
+  test('passes refusal bytes through when the request did not opt in', async () => {
     const payload =
       'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"}}\n\n'
     const response = createStrippedStream(new Response(payload))
-    await expect(response.text()).resolves.toContain('refusal')
-  })
-
-  test('preserves a refusal when Fable recovery declines a non-OAuth route', async () => {
-    const payload =
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"}}\n\n'
-    const response = createStrippedStream(new Response(payload), {
-      onContentFilter: () => false,
-    })
-    await expect(response.text()).resolves.toContain('refusal')
+    await expect(response.text()).resolves.toBe(payload)
   })
 
   test('does not mark non-transient Anthropic stream errors retryable', async () => {
