@@ -24,6 +24,7 @@ import {
   sweepDumpDirectory,
   writeDumpFile,
 } from '../dump'
+import { FALLBACK_CREDIT_PLACEHOLDER } from '../fallback-credit.ts'
 
 const dumpDirs: string[] = []
 const dumpLinks: string[] = []
@@ -91,6 +92,46 @@ test('request dumps return response handles only when enabled', async () => {
   expect(direct?.responsePath).toMatch(/\.response\.json$/)
   expect(relay?.responsePath).toMatch(/\.response\.json$/)
   expect(await lstat(direct!.responsePath).catch(() => null)).toBeNull()
+})
+
+test('credited request dumps replace the token in bytes, relay envelopes, and failure text', async () => {
+  const dumpDir = await mkdtemp(join(tmpdir(), 'credited-request-dump-'))
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+  const sentinel = 'sentinel_dump_credit_42fca7'
+  const bodyText = JSON.stringify({
+    fallback_credit_token: sentinel,
+    messages: ['private content stays in opt-in dumps'],
+  })
+  const direct = await dumpDirectRequest({
+    bodyText,
+    error: `rejected: ${sentinel}`,
+  })
+  const relay = await dumpRelayRequest({
+    affinity: 'session',
+    transport: 'http',
+    protocol: 1,
+    mode: 'full_sync',
+    bodyText,
+    payload: { body: bodyText },
+    relayBytes: bodyText.length,
+  })
+  expect(direct).not.toBeNull()
+  expect(relay).not.toBeNull()
+  const all = (
+    await Promise.all(
+      (
+        await readdir(dumpDir)
+      ).map((file) => readFile(join(dumpDir, file), 'utf8')),
+    )
+  ).join('\n')
+  expect(all).not.toContain(sentinel)
+  expect(all).toContain(`rejected: ${FALLBACK_CREDIT_PLACEHOLDER}`)
+  expect(all).toContain(
+    `"fallback_credit_token":"${FALLBACK_CREDIT_PLACEHOLDER}"`,
+  )
+  expect(all).toContain('private content stays in opt-in dumps')
 })
 
 test('seeds a direct-request diff from the latest same-session dump after restart', async () => {

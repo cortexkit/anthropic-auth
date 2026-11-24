@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
+import { fallbackCreditRequestDumpView } from './fallback-credit.ts'
 import { isClaudeGatewaySecretHeader } from './gateway.ts'
 import { parseJsonRedacted } from './json.ts'
 import { isSecretKey, logger, relayLog } from './logger.ts'
@@ -629,6 +630,7 @@ async function dumpRequest(input: {
   error?: string
   bodyText: string
   previousBodyText?: string
+  directPreviousKey?: string
   payload?: unknown
   relayBytes?: number
   tag?: DumpTag
@@ -660,10 +662,16 @@ async function dumpRequest(input: {
   if (input.request !== undefined) files.request = `${prefix}.request.json`
 
   try {
+    const view = fallbackCreditRequestDumpView(input.bodyText)
+    const bodyText = view?.bodyText ?? input.bodyText
+    const json = (value: unknown) => {
+      const text = JSON.stringify(value, null, 2)
+      return `${view ? view.json(text) : text}\n`
+    }
     await mkdir(dumpDir, { recursive: true })
     const previousBodyText =
       input.previousBodyText ?? (await loadLatestDumpBody(input))
-    const bodySummary = bodyStructureSummary(input.bodyText)
+    const bodySummary = bodyStructureSummary(bodyText)
     const metadata = {
       thread: 'thread' in bodySummary ? bodySummary.thread : undefined,
       id,
@@ -674,27 +682,24 @@ async function dumpRequest(input: {
       mode: input.mode,
       route: input.route,
       status: input.status,
-      error: input.error,
+      error: view ? view.text(input.error) : input.error,
       tag: input.tag,
-      bodyBytes: input.bodyText.length,
+      bodyBytes: bodyText.length,
       relayBytes: input.relayBytes,
-      bodyHash: hashText(input.bodyText),
-      diff: diffSummary(previousBodyText, input.bodyText),
+      bodyHash: hashText(bodyText),
+      diff: diffSummary(previousBodyText, bodyText),
       body: bodySummary,
       files,
     }
 
     const writes = [
-      writeDumpFile(files.body, input.bodyText),
-      writeDumpFile(files.metadata, `${JSON.stringify(metadata, null, 2)}\n`),
+      writeDumpFile(files.body, bodyText),
+      writeDumpFile(files.metadata, json(metadata)),
     ]
 
     if (input.payload !== undefined && files.relay) {
       writes.push(
-        writeDumpFile(
-          files.relay,
-          `${JSON.stringify(redactForDump(input.payload), null, 2)}\n`,
-        ),
+        writeDumpFile(files.relay, json(redactForDump(input.payload))),
       )
     }
 
@@ -702,19 +707,19 @@ async function dumpRequest(input: {
       writes.push(
         writeDumpFile(
           files.request,
-          `${JSON.stringify(
+          json(
             redactForDump({
               ...input.request,
               headers: headersToRecord(input.request.headers),
             }),
-            null,
-            2,
-          )}\n`,
+          ),
         ),
       )
     }
 
     await Promise.all(writes)
+    if (input.directPreviousKey !== undefined)
+      rememberDirectDumpBody(input.directPreviousKey, bodyText)
     scheduleDumpSweep(dumpDir, Object.values(files))
 
     relayLog(
@@ -746,7 +751,7 @@ export async function dumpDirectRequest(input: {
   if (!dumpEnabled) return null
   const previousKey = directDumpPreviousKey(input)
   const previousBodyText = directDumpPreviousBodies.get(previousKey)
-  const handle = await dumpRequest({
+  return dumpRequest({
     affinity: input.affinity,
     transport: 'direct',
     route: input.route,
@@ -754,6 +759,7 @@ export async function dumpDirectRequest(input: {
     error: input.error,
     bodyText: input.bodyText,
     previousBodyText,
+    directPreviousKey: previousKey,
     request: {
       url: input.url,
       method: input.method,
@@ -761,8 +767,6 @@ export async function dumpDirectRequest(input: {
     },
     tag: input.tag,
   })
-  rememberDirectDumpBody(previousKey, input.bodyText)
-  return handle
 }
 
 export async function dumpRelayRequest(input: {

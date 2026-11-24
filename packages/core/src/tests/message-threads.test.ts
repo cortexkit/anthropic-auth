@@ -42,6 +42,36 @@ function input(): MessageThreadInput {
 }
 const assistant = { role: 'assistant', content: 'answer' }
 const next = { role: 'user', content: 'two' }
+
+test('a credited thread send keeps the token only in its signed physical body', async () => {
+  const seen: string[] = []
+  class RecordingTracker extends MessageThreadTracker {
+    override prepare(request: MessageThreadInput) {
+      seen.push(JSON.stringify(request.body))
+      return super.prepare(request)
+    }
+  }
+  const tracker = new RecordingTracker()
+  const body = {
+    ...input().body,
+    system: [
+      {
+        type: 'text',
+        text: 'x-anthropic-billing-header: cc_version=2.1.0; cc_entrypoint=cli; cch=00000;',
+      },
+    ],
+  }
+  const sentinel = 'sentinel_thread_credit_f314c'
+  const prepared = await prepareMessageThreadRequest(tracker, {
+    ...input(),
+    headers: new Headers(),
+    bodyText: JSON.stringify({ ...body, fallback_credit_token: sentinel }),
+  })
+  expect(seen).toEqual([await signRequestBody(JSON.stringify(body))])
+  expect(JSON.parse(prepared.bodyText).fallback_credit_token).toBe(sentinel)
+  expect(prepared.bodyText).toBe(await signRequestBody(prepared.bodyText))
+})
+
 function anchor(tracker: MessageThreadTracker, request = input()) {
   const prepared = tracker.prepare(request)
   prepared.complete({

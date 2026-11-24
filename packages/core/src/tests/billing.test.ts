@@ -5,6 +5,18 @@ import {
   withAnthropicBilling,
 } from '../billing.ts'
 import { CacheKeepManager } from '../cachekeep.ts'
+import { protectFallbackCreditResponse } from '../fallback-credit.ts'
+import {
+  __setLogTestSink,
+  getLogLevel,
+  type LogTestRecord,
+  setLogLevel,
+} from '../logger.ts'
+import {
+  createServerSideFallbackStreamRewriter,
+  logServedServerFallback,
+} from '../server-fallback.ts'
+import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback-usage.ts'
 
 const key = Symbol.for('cortexkit.routing')
 const globals = globalThis as Record<symbol, unknown>
@@ -47,6 +59,65 @@ const start = {
   type: 'message_start',
   message: { id: 'msg_test', usage: { input_tokens: 12, output_tokens: 0 } },
 }
+
+test('redacted responses keep reply text out of server events, logs, and billing reports', async () => {
+  const reports = capture()
+  const records: LogTestRecord[] = []
+  const events: unknown[] = []
+  const sentinel = 'sentinel_internal_content_69f7'
+  const credit = 'sentinel_internal_credit_1a7b'
+  const level = getLogLevel()
+  setLogLevel('info')
+  __setLogTestSink((record) => records.push(record))
+  try {
+    const guarded = protectFallbackCreditResponse(
+      response([
+        {
+          type: 'message_start',
+          message: {
+            ...start.message,
+            id: credit,
+            model: 'claude-opus-5',
+            fallback_credit_token: credit,
+          },
+        },
+        { type: 'content_block_delta', delta: { text: sentinel } },
+        {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: { output_tokens: 3 },
+        },
+        { type: 'message_stop' },
+      ]),
+      {
+        requestHeaders: new Headers({
+          'anthropic-beta': SERVER_SIDE_FALLBACK_BETA,
+        }),
+      },
+    )
+    const recorded = observeAnthropicBillingResponse(request, guarded)
+    const rewriter = createServerSideFallbackStreamRewriter({
+      requestedModel: 'claude-opus-4-8',
+      onOutcome: (outcome) => {
+        events.push(outcome)
+        logServedServerFallback('test', outcome)
+      },
+    })
+    expect(rewriter.push(await recorded.text()) + rewriter.flush()).toContain(
+      sentinel,
+    )
+    await Bun.sleep(10)
+    expect(reports).toHaveLength(1)
+    expect(events).toHaveLength(1)
+    expect(records).toHaveLength(1)
+    const metadata = JSON.stringify([reports, records, events])
+    expect(metadata).not.toContain(sentinel)
+    expect(metadata).not.toContain(credit)
+  } finally {
+    __setLogTestSink(null)
+    setLogLevel(level)
+  }
+})
 
 test.each(['\r', '\r\n'])(
   'billing accepts SSE framing %j across byte chunks',

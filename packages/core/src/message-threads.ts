@@ -1,5 +1,9 @@
 import { createHash, type Hash, randomUUID } from 'node:crypto'
 import { signRequestBody } from './cch.ts'
+import {
+  hasFallbackCreditInRequest,
+  withoutFallbackCredit,
+} from './fallback-credit.ts'
 import { logger } from './logger.ts'
 import {
   type FullCacheTail,
@@ -1554,7 +1558,12 @@ export async function prepareMessageThreadRequest(
     signal?: AbortSignal
   },
 ) {
-  const fullText = input.bodyText
+  // Only the one physical retry carries the credit. Thread history, cache
+  // annotations and the snapshot are prepared from the signed replayable view.
+  const credited = hasFallbackCreditInRequest(input.bodyText)
+  const fullText = credited
+    ? await withoutFallbackCredit(input.bodyText)
+    : input.bodyText
   let full: Body | undefined
   const fullBody = () => (full ??= JSON.parse(fullText) as Body)
   if (input.session) {
@@ -1617,7 +1626,15 @@ export async function prepareMessageThreadRequest(
       ? JSON.stringify(prepared.body)
       : fullOutgoing()
     : fullOutgoing()
-  let bodyText = await signRequestBody(outgoing)
+  let bodyText = await signRequestBody(
+    credited
+      ? JSON.stringify({
+          ...JSON.parse(outgoing),
+          fallback_credit_token: JSON.parse(input.bodyText)
+            .fallback_credit_token,
+        })
+      : outgoing,
+  )
   let recovered = false
   let credential = input.credential
   const mayResend = async (
@@ -1684,7 +1701,7 @@ export async function prepareMessageThreadRequest(
       // At most one create and one stateless resend for thread errors.
       // A separate gzip rejection may replay a request uncompressed once,
       // then turns gzip off until process restart.
-      if (!threading || recovered) return response
+      if (credited || !threading || recovered) return response
       const rejectedCreate =
         prepared.decision.type === 'create' &&
         (await isThreadCreateRejection(response))

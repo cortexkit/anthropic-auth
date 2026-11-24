@@ -13,6 +13,7 @@ import {
   applyClaudeCodeHeaders,
   selectClaudeCodeBetas,
 } from '../claude-code.ts'
+import { withoutFallbackCredit } from '../fallback-credit.ts'
 import { __setLogTestSink } from '../logger.ts'
 import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback-usage.ts'
 
@@ -223,6 +224,39 @@ describe('cacheKeepSourceWarmIdleCap', () => {
 })
 
 describe('CacheKeepManager source-warm targets', () => {
+  test('live tracking cannot retain a credit or replace the last safe template with one', async () => {
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+    })
+    const request = {
+      sessionId: 'ses_round',
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: new Headers(),
+      storage: hybridStorage(),
+      cacheMode: 'hybrid',
+    }
+    const credited = await signRequestBody(
+      JSON.stringify({
+        ...JSON.parse(sourceBody()),
+        fallback_credit_token: 'sentinel_template_credit_121cc',
+      }),
+    )
+    const clean = await withoutFallbackCredit(credited)
+    try {
+      expect(manager.track({ ...request, bodyText: clean })).toEqual({
+        tracked: true,
+      })
+      expect(manager.track({ ...request, bodyText: credited }).tracked).toBe(
+        false,
+      )
+      expect(manager.trackedRequest(request.sessionId)?.bodyText).toBe(clean)
+      const warm = await buildCacheKeepPrewarmBody(credited)
+      expect(warm).toEqual(await buildCacheKeepPrewarmBody(clean))
+    } finally {
+      manager.stop()
+    }
+  })
+
   function trackSourceWarm(manager: CacheKeepManager) {
     return manager.track({
       sessionId: 'source-warm:ses_round:fable-5',

@@ -8,6 +8,7 @@ import {
   reportAnthropicBillingFailure,
 } from './billing.ts'
 import { dumpRelayRequest } from './dump.ts'
+import { hasFallbackCreditInRequest } from './fallback-credit.ts'
 import { claudeGatewayProxyApplies } from './gateway.ts'
 import { parseJsonRedacted } from './json.ts'
 import { logger, relayLog } from './logger.ts'
@@ -1981,6 +1982,13 @@ export async function sendViaRelay(options: {
   } = options
   requireUpstreamUrl?.(input instanceof Request ? input.url : input.toString())
   if (!config || !isRelayableAnthropicRequest(input, body)) return fallback()
+  const bodyText = body as string
+  // The relay can replay requests and retain patch bases. Don't hand it a
+  // one-use credit until its physical-send path can enforce that lifetime.
+  if (hasFallbackCreditInRequest(bodyText)) {
+    if (config.fallbackToDirect) return fallback()
+    throw new Error('Fallback credit cannot be sent through the relay')
+  }
   if (relayProxyApplies(config.url)) {
     // Nothing is sent to the relay. Like a relay that cannot be reached, this
     // goes direct when fallbackToDirect allows it and fails otherwise.
@@ -1998,7 +2006,6 @@ export async function sendViaRelay(options: {
     return fallback()
   }
 
-  const bodyText = body as string
   const hashStart = perfNowMs()
   const nextHash = hashBody(bodyText)
   relayPerfLog('hash_body', {

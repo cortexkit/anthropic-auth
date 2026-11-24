@@ -24,6 +24,11 @@ import type {
 import { signRequestBody, stripBillingLineageFromBody } from './cch.ts'
 import { orderClaudeCodeBody } from './claude-code.ts'
 import { dumpDirectRequest, dumpResponseArtifact } from './dump.ts'
+import {
+  hasFallbackCreditInRequest,
+  protectFallbackCreditResponse,
+  withoutFallbackCredit,
+} from './fallback-credit.ts'
 import { claudeGatewaySecretValues } from './gateway.ts'
 import { logger } from './logger.ts'
 import { getClaudeModelCatalogue } from './model-capabilities.ts'
@@ -373,6 +378,7 @@ export async function buildCacheKeepPrewarmBody(
 
   // Keep-warm refreshes the cache without advancing the conversation's previous-message ID.
   delete body.diagnostics
+  delete body.fallback_credit_token
   if (!hasExplicitCacheControl(body)) {
     return { ok: false, reason: 'body has no explicit cache breakpoints' }
   }
@@ -1796,6 +1802,10 @@ export class CacheKeepManager {
       | 'policyState'
     >
   }): { tracked: true } | { tracked: false; reason: string } {
+    // Live tracking is synchronous. The caller must re-sign a credited body
+    // before handing it to CacheKeep; don't replace the last safe template.
+    if (hasFallbackCreditInRequest(input.bodyText))
+      return { tracked: false, reason: 'request contains fallback credit' }
     if (input.storage && this.options.resolveSettings) {
       const schedule = this.options.resolveSettings(input.storage)
       const target = this.targetSettings(schedule, input.bodyText)
@@ -2066,10 +2076,11 @@ export class CacheKeepManager {
     accountStoragePath?: string
     isSubagent?: boolean
   }): Promise<CacheKeepPrewarmResult> {
+    const bodyText = await withoutFallbackCredit(input.bodyText)
     const current = this.targets.get(input.sessionId)
     if (
       current &&
-      (current.bodyText !== input.bodyText ||
+      (current.bodyText !== bodyText ||
         current.url !== input.url ||
         current.oauthAccountId !== input.oauthAccountId ||
         current.oauthAccountIdentity !== input.oauthAccountIdentity)
@@ -2082,8 +2093,8 @@ export class CacheKeepManager {
     const target: CacheKeepTarget = {
       id: input.sessionId,
       url: input.url,
-      bodyText: input.bodyText,
-      bodyBytes: Buffer.byteLength(input.bodyText, 'utf8'),
+      bodyText,
+      bodyBytes: Buffer.byteLength(bodyText, 'utf8'),
       cacheExpiresAt: this.options.now?.() ?? Date.now(),
       nextPrewarmAt: this.options.now?.() ?? Date.now(),
       consecutiveFailures: 0,
@@ -2505,7 +2516,7 @@ export class CacheKeepManager {
       // credentials that send carried. Provider bodies are scrubbed before
       // callbacks or dumps read them; transport exceptions retain only closed
       // diagnostics. The scope retires when the error body is read or cancelled;
-      // a successful body is passed through untouched.
+      // fallback-beta bodies also need credit redaction before billing.
       const send = async (attemptHeaders: Headers): Promise<Response> => {
         ensureActive()
         if (!this.isCurrentTarget(target))
@@ -2521,13 +2532,17 @@ export class CacheKeepManager {
           'http',
         )
         try {
-          const dispatch = () => {
+          const dispatch = async () => {
             ensureActive()
-            return fetchImpl(target.url, {
+            const raw = await fetchImpl(target.url, {
               method: 'POST',
               headers: attemptHeaders,
               body: prewarm.bodyText,
               signal: attempt.signal,
+            })
+            return protectFallbackCreditResponse(scope.redactResponse(raw), {
+              requestHeaders: attemptHeaders,
+              framing: 'http',
             })
           }
           let billing: AnthropicBillingRequest | undefined
@@ -2554,7 +2569,7 @@ export class CacheKeepManager {
             await this.options.settleWarm?.(target)
             ensureActive()
           }
-          return scope.redactResponse(sent)
+          return sent
         } catch (error) {
           if (
             error instanceof CacheKeepWarmRefusal ||

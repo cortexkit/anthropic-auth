@@ -13,6 +13,10 @@ import {
   type CacheKeepWarmReservation,
 } from './cachekeep.ts'
 import {
+  hasFallbackCreditInRequest,
+  withoutFallbackCredit,
+} from './fallback-credit.ts'
+import {
   ensureHolderDirectory,
   type HolderLiveness,
   holderEntryIsLive,
@@ -1160,6 +1164,14 @@ export class CacheKeepStore {
             candidates.push([name, entry.cacheExpiresAt])
             continue
           }
+          const removedCredit = hasFallbackCreditInRequest(entry.bodyText)
+          if (removedCredit) {
+            entry = {
+              ...entry,
+              bodyText: await withoutFallbackCredit(entry.bodyText),
+            }
+            if (!(await permitted())) continue
+          }
           const owned = mode === 'restore' ? ownRelease?.item : undefined
           if (owned && (this.claims?.get(key) !== owned || owned.closing))
             continue
@@ -1178,9 +1190,9 @@ export class CacheKeepStore {
               owned.retained = true
               owned.adopted = { entry, acceptedAt: restoredAcceptedAt }
             }
-            // Retire pre-2.5.4 files only after the accepted record is durable
-            // in the private data store.
-            if (directory !== this.directory) {
+            // Replace a credited file with its signed, replayable body. Retire
+            // legacy paths only after the private copy is durable.
+            if (removedCredit || directory !== this.directory) {
               try {
                 const adopted = entry
                 const migrate = async (assertOwned?: () => Promise<void>) => {
@@ -1188,10 +1200,13 @@ export class CacheKeepStore {
                   // The durable copy is authoritative; the old source must
                   // not resurrect a session once that copy is forgotten.
                   await assertOwned?.()
-                  await rm(path, { force: true })
+                  if (directory !== this.directory)
+                    await rm(path, { force: true })
                 }
                 if (owned) {
                   if (!(await owned.claim.withCurrent(migrate))) continue
+                } else if (release?.withCurrent) {
+                  if (!(await release.withCurrent(() => migrate()))) continue
                 } else await migrate()
               } catch {
                 this.refuse()
@@ -1303,6 +1318,7 @@ export class CacheKeepStore {
 
   changed(target: Readonly<CacheKeepTarget>, realTurn = true) {
     if (this.disabled) return
+    if (hasFallbackCreditInRequest(target.bodyText)) return
     const entry = record(target, this.options.pluginVersion)
     if (realTurn) this.realTurn(entry.id)
     const previous = this.latest.get(entry.id)
@@ -1366,6 +1382,8 @@ export class CacheKeepStore {
   async reserveWarm(
     target: Readonly<CacheKeepTarget>,
   ): Promise<CacheKeepWarmReservation> {
+    if (hasFallbackCreditInRequest(target.bodyText))
+      return 'ownership-unverified'
     if (this.disabled) return this.memoryOnly || 'ownership-unverified'
     const entry = record(target, this.options.pluginVersion)
     const timer = this.timers.get(entry.id)
@@ -1467,7 +1485,10 @@ export class CacheKeepStore {
     const path = join(this.directory, `${hash(entry.id)}.json.gz`)
     const temp = `${path}.${randomUUID()}.tmp`
     try {
-      const safe = { ...entry, bodyText: sanitizedBody(entry.bodyText) }
+      const safe = {
+        ...entry,
+        bodyText: sanitizedBody(await withoutFallbackCredit(entry.bodyText)),
+      }
       const bytes = await compress(JSON.stringify(safe))
       if (!(await createWindowsOwnerOnly(temp, bytes, this.options.ownerOnly)))
         await writeFile(temp, bytes, { flag: 'wx', mode: 0o600 })

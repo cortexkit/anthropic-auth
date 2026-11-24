@@ -5,11 +5,13 @@ import { join } from 'node:path'
 import { createEmptyStorage } from '../accounts.ts'
 import { CacheKeepManager, type CacheKeepPrewarmResult } from '../cachekeep.ts'
 import { resetDumpState, setDumpEnabled } from '../dump.ts'
+import { FALLBACK_CREDIT_PLACEHOLDER } from '../fallback-credit.ts'
 import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
 import {
   PROVIDER_ERROR_MAX_BODY_BYTES,
   PROVIDER_ERROR_REDACTION,
 } from '../provider-error.ts'
+import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback-usage.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
 // Every send in this file goes to an injected fetch; nothing leaves the
@@ -21,6 +23,43 @@ const URL = 'https://api.anthropic.com/v1/messages'
 const V1 = 'synthetic-cachekeep-scope-v1-7c41e0d2b9'
 const V2 = 'synthetic-cachekeep-scope-v2-a58f3301c6'
 const API_KEY = 'synthetic-cachekeep-api-key-e09b7d4413'
+
+suite.test(
+  'CacheKeep beta errors are redacted before response observation and dumps',
+  async () => {
+    const credit = 'sentinel_prewarm_error_credit_84e4'
+    const content = 'sentinel_prewarm_error_content_100f'
+    const fixture = await harness({
+      sentHeaders: new Headers({
+        authorization: `Bearer ${V1}`,
+        'anthropic-beta': SERVER_SIDE_FALLBACK_BETA,
+      }),
+      fetchImpl: async () =>
+        Response.json(
+          {
+            type: 'error',
+            error: {
+              type: 'invalid_request_error',
+              message: `rejected ${credit}: ${content}`,
+            },
+            fallback_credit_token: credit,
+          },
+          { status: 400 },
+        ),
+    })
+    expect((await fixture.run()).ok).toBe(false)
+    expect(fixture.observations).toHaveLength(1)
+    const observed = JSON.stringify(fixture.observations)
+    expect(observed).toContain(`rejected ${FALLBACK_CREDIT_PLACEHOLDER}`)
+    expect(observed).not.toContain(credit)
+    const telemetry = JSON.stringify([
+      fixture.logs,
+      await fixture.responseText(),
+    ])
+    expect(telemetry).not.toContain(credit)
+    expect(telemetry).not.toContain(content)
+  },
+)
 
 const bodyText = JSON.stringify({
   model: 'claude-opus-4-8',
