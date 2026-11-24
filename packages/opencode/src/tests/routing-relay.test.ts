@@ -255,7 +255,7 @@ describe('shared routing relay', () => {
   )
 
   test.each(['missing', 'headers', 'other-model', 'read-failed'])(
-    'scoped exhaustion with %s poll reading never blocks the whole account',
+    'explicit Fable scope reports the Fable pool with a %s poll reading',
     async (mode) => {
       const reports: unknown[] = []
       globals[key] = () => ({
@@ -288,7 +288,14 @@ describe('shared routing relay', () => {
       )
       await Promise.resolve()
       await Promise.resolve()
-      expect(reports).toEqual([])
+      expect(reports).toEqual([
+        {
+          account_id: 'account',
+          outcome: 'exhausted',
+          window: '7d',
+          pool: 'fable',
+        },
+      ])
     },
   )
 

@@ -15,6 +15,8 @@ const WINDOW_KEYS: Record<string, QuotaWindowName> = {
   '5h': 'five_hour',
   '7d': 'seven_day',
 }
+const SCOPED_WINDOW_HEADER =
+  /^anthropic-ratelimit-unified-(7d[_-]([a-z0-9]+))-(?:status|utilization)$/
 
 export function isQuotaBearingHeaderFrame(headers: Headers): boolean {
   return Object.keys(WINDOW_KEYS).some((suffix) =>
@@ -58,6 +60,26 @@ function normalizeWindow(
   }
 }
 
+function windowConfirmedExhausted(headers: Headers, suffix: string) {
+  const utilization = finiteHeaderNumber(
+    headers,
+    `${PREFIX}${suffix}-utilization`,
+  )
+  return (
+    headers.get(`${PREFIX}${suffix}-status`) === 'rejected' ||
+    (utilization !== undefined && utilization >= 1)
+  )
+}
+
+/** Even an unrelated scoped window rules out inferring a limit from stored quota. */
+export function hasScopedQuotaExhaustionHeaders(headers: Headers) {
+  for (const name of headers.keys()) {
+    const suffix = SCOPED_WINDOW_HEADER.exec(name)?.[1]
+    if (suffix && windowConfirmedExhausted(headers, suffix)) return true
+  }
+  return false
+}
+
 /** Only a rejected status or raw utilization at least one confirms a 429's limit. */
 export function quotaExhaustionFromHeaders(
   headers: Headers,
@@ -66,15 +88,7 @@ export function quotaExhaustionFromHeaders(
 ): OAuthQuotaSnapshot {
   const snapshot: OAuthQuotaSnapshot = {}
   const exhausted = (suffix: string): AccountQuotaWindow | undefined => {
-    const utilization = finiteHeaderNumber(
-      headers,
-      `${PREFIX}${suffix}-utilization`,
-    )
-    if (
-      headers.get(`${PREFIX}${suffix}-status`) !== 'rejected' &&
-      (utilization == null || utilization < 1)
-    )
-      return undefined
+    if (!windowConfirmedExhausted(headers, suffix)) return undefined
     return {
       usedPercent: 100,
       remainingPercent: 0,
@@ -86,21 +100,18 @@ export function quotaExhaustionFromHeaders(
     const window = exhausted(suffix)
     if (window) snapshot[key] = window
   }
+  const modelTokens = modelId?.toLowerCase().split(/[-_.]/)
   for (const name of headers.keys()) {
-    const match =
-      /^anthropic-ratelimit-unified-(7d[_-]([a-z0-9]+))-(?:status|utilization)$/.exec(
-        name,
-      )
-    if (!match || !modelId?.toLowerCase().split(/[-_.]/).includes(match[2]!))
-      continue
-    const window = exhausted(match[1]!)
+    const [, id, scope] = SCOPED_WINDOW_HEADER.exec(name) ?? []
+    if (!id || !scope || !modelTokens?.includes(scope)) continue
+    const window = exhausted(id)
     if (window)
       snapshot.scoped = [
         {
           ...window,
-          id: match[1]!,
-          title: match[2]!,
-          modelName: match[2]!,
+          id,
+          title: scope,
+          modelName: scope,
           modelId,
         },
       ]

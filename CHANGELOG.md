@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## 2.17.0
 
+- Shared routing learns when Claude refuses a request because its Fable quota window is full, even if the refusal and the last quota check each tell only part of the story. OpenCode 2 also reports the HTTP error status and Claude request ID for failed attempts.
 - OpenCode 1, OpenCode 2 and Pi: after a rate limit, the retry stays on the account that already holds the conversation’s cache when it can.
 - Windows: when the plugin refuses to create its state folder because another account can change a folder above it, the message now names that folder and the account, and says how to fix it: remove that account's change access, or set `XDG_STATE_HOME` to a folder only you can change (#881).
 - Uses common-auth 0.59.0. On OpenCode 2, if sign-in setup fails partway, the hooks it had already registered are removed once, by common-auth. When OpenCode 2 abandons a message that is waiting for a free Claude account slot, the plugin also cancels its pending request to routing, so the slot is handed back at once.

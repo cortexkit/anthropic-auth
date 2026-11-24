@@ -21,6 +21,7 @@ import {
   classifyGzipRejection,
   claudeGatewayHeaderValues,
   claudeGatewayModelUrl,
+  createAnthropicBillingObserver,
   createDumpResponseObserver,
   createProviderErrorRedactor,
   createProviderErrorResponseScope,
@@ -1909,7 +1910,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       const quotaStopMessage = data ? quotaStopMessages.get(data) : undefined
       if (data) quotaStopMessages.delete(data)
       const billingSend = data ? billingSends.get(data) : undefined
-      if (billingSend) {
+      if (billingSend && !billingSend.received) {
         billingSend.received = true
         if (data && fromUpstream(response.headers, data))
           response = observeAnthropicBillingResponse(
@@ -2239,6 +2240,17 @@ export function createNativeAnthropicAdapter<Q, P>(
     quotaFromHeaders(headers, status, attempt) {
       const data = attempt.data
       if (!data || !fromUpstream(headers, data)) return undefined
+      const billingSend = billingSends.get(data)
+      if (status >= 400 && billingSend && !billingSend.received) {
+        // common-auth ends HTTP errors before rewriteResponse. Capture the
+        // upstream status and request ID before attempt cleanup drops them.
+        billingSend.received = true
+        createAnthropicBillingObserver(
+          billingSend.input,
+          status,
+          headers,
+        ).finish()
+      }
       if (data.route === 'oauth' && status >= 200 && status < 300)
         physicalAcceptances.set(data, { at: deps.now?.() ?? Date.now() })
       return source.quotaFromHeaders?.(headers, {

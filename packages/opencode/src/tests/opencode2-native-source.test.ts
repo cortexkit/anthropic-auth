@@ -3541,6 +3541,160 @@ describe('OC2 installed quota reroutes', () => {
     return fixture
   }
 
+  test.each([undefined, 'Fable', 'Claude-Fable-Pool', 'stored-only'] as const)(
+    'installed scoped Fable 429 reports exhaustion and the failed physical attempt (stored pool %s)',
+    async (storedPool) => {
+      const fixture = await vaultRetryPool('main-first')
+      const fable = { ...scope, modelID: 'claude-fable-5-2' }
+      const row = (await fixture.runtime.read()).accounts.find(
+        (account) => account.credentialId === work,
+      )
+      if (!row) throw new Error('Missing refused vault route')
+      const receipt = await fixture.runtime.authorizeVault(row.id)
+      expect(row.id).not.toBe(receipt.credentialId)
+      expect(receipt.credentialId).toBe(work)
+      const reset = Math.floor(Date.now() / 1000) + 86_400
+      const resetsAt = new Date(reset * 1000).toISOString()
+      if (storedPool !== undefined) {
+        const now = Date.now()
+        await fixture.runtime.vault.publish(receipt, {
+          quota: {
+            accountIdentity: fallbackIdentity,
+            checkedAt: now,
+            source: 'headers',
+            fieldSources: { seven_day: 'headers', scoped: 'poll' },
+            seven_day: {
+              usedPercent: 64,
+              remainingPercent: 36,
+              checkedAt: now,
+              resetsAt,
+            },
+            scoped: [
+              {
+                id: 'claude-weekly-scoped-fable',
+                title: 'Fable only',
+                modelName: 'Fable',
+                ...(storedPool === 'Claude-Fable-Pool' && {
+                  modelId: storedPool,
+                }),
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt: now,
+                resetsAt,
+              },
+            ],
+          },
+        })
+        // The vault persists a native quota map; the report reads the decoded
+        // Anthropic snapshot under the credential ID, not the logical route ID.
+        expect(
+          (await fixture.runtime.read()).accounts.find(
+            (account) => account.id === row.id,
+          ),
+        ).toMatchObject({
+          accountIdentity: fallbackIdentity,
+          credentialId: receipt.credentialId,
+          quota: {
+            source: 'headers',
+            fieldSources: { seven_day: 'headers', scoped: 'poll' },
+            seven_day: { usedPercent: 64 },
+            scoped: [
+              {
+                id: 'claude-weekly-scoped-fable',
+                modelName: 'Fable',
+                remainingPercent: 0,
+              },
+            ],
+          },
+        })
+      }
+      const globals = globalThis as Record<symbol, unknown>
+      const key = Symbol.for('cortexkit.routing')
+      const previous = globals[key]
+      const reports: Record<string, unknown>[] = []
+      const billed = Promise.withResolvers<void>()
+      let advice = { account_id: fallbackIdentity, credential_id: work }
+      globals[key] = (sessionId: string) => ({
+        accountFor: async () => advice,
+        report: (payload: Record<string, unknown>) => {
+          if (sessionId !== fable.sessionID) return
+          reports.push(payload)
+          if (payload.kind === 'billing' && payload.outcome === 'failed')
+            billed.resolve()
+        },
+      })
+      cleanups.push(() => {
+        if (previous === undefined) delete globals[key]
+        else globals[key] = previous
+      })
+      const host = await retryHost(source(fixture.runtime, fixture.paths))
+      const rejected = await host.send(fable)
+      expect(rejected.headers.get('authorization')).toBe(vaultBearer(work))
+      await host.response(
+        rejected,
+        429,
+        fable,
+        {
+          'request-id': 'req_scoped_fable_limit',
+          'anthropic-ratelimit-unified-status': 'rejected',
+          'anthropic-ratelimit-unified-7d-utilization': '0.64',
+          ...(storedPool !== 'stored-only' && {
+            'anthropic-ratelimit-unified-7d_fable-status': 'rejected',
+            'anthropic-ratelimit-unified-7d_fable-utilization': '1.0',
+            'anthropic-ratelimit-unified-7d_fable-reset': String(reset),
+          }),
+        },
+        '{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}',
+      )
+      await billed.promise
+      advice = { account_id: identity, credential_id: main }
+      expect(await host.retry(false, fable)).toEqual({ retry: true, delay: 0 })
+      const replacement = await host.send(fable)
+      expect(replacement.headers.get('authorization')).toBe(vaultBearer(main))
+      await host.response(replacement, 200, fable)
+      expect(reports.filter((report) => report.outcome === 'served')).toEqual([
+        {
+          account_id: identity,
+          credential_id: main,
+          outcome: 'served',
+          headers: {},
+        },
+      ])
+      expect(
+        reports.filter((report) => report.outcome === 'exhausted'),
+      ).toEqual([
+        {
+          account_id: fallbackIdentity,
+          credential_id: work,
+          outcome: 'exhausted',
+          window: '7d',
+          pool:
+            storedPool === 'Claude-Fable-Pool' ? 'claude-fable-pool' : 'fable',
+          resets_at: reset * 1000,
+        },
+      ])
+      expect(
+        reports.filter(
+          (report) => report.kind === 'billing' && report.outcome === 'failed',
+        ),
+      ).toEqual([
+        {
+          kind: 'billing',
+          attempt_id: expect.any(String),
+          account_id: fallbackIdentity,
+          credential_id: work,
+          model: fable.modelID,
+          provider: 'anthropic',
+          request_kind: 'primary',
+          charge_basis: 'subscription_included',
+          status: 429,
+          provider_request_id: 'req_scoped_fable_limit',
+          outcome: 'failed',
+        },
+      ])
+    },
+  )
+
   test.each(['warm', 'exhausted', 'disabled', 'already refused'] as const)(
     'vault: scoped Fable 429 and repeated routing advice respect the %s cache account',
     async (condition) => {

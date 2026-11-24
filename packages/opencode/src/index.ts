@@ -8593,6 +8593,7 @@ const anthropicAuthPlugin = async (
             let relayReturned = false
             let relayCacheAcceptance: object | undefined
             let routingHeaders: Headers | undefined
+            let routingStatus: number | undefined
             const reportScoped401 = reportVault401
             // The relay scrubs each physical relay attempt's responses and
             // errors with that attempt's own credentials and the relay token;
@@ -8635,6 +8636,7 @@ const anthropicAuthPlugin = async (
                     billing: billingFor(nextAuthorization),
                     errorSecrets: [nextAuthorization.accessToken],
                     onUpstreamStatus: (status: number) => {
+                      routingStatus = status
                       if (
                         status >= 200 &&
                         status < 300 &&
@@ -8806,6 +8808,7 @@ const anthropicAuthPlugin = async (
                   response.status,
                   modelForIdentity,
                   servedTurn,
+                  usedDirectFetch || routingStatus === 429,
                 )
                 if (response.status === 200) {
                   // Keep the upstream headers before sticky retries replace the
@@ -8817,6 +8820,7 @@ const anthropicAuthPlugin = async (
                       headers,
                       429,
                       modelForIdentity,
+                      false,
                       false,
                     ),
                   )

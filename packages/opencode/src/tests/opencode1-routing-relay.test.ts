@@ -1782,9 +1782,8 @@ describe('OC1 shared routing relay', () => {
   for (const { mode, modelId, pool } of [
     { mode: 'fable', modelId: undefined, pool: 'fable' },
     { mode: 'fable', modelId: 'Claude-Fable-Pool', pool: 'claude-fable-pool' },
-    // Outside routing's pool alphabet even after lowercasing: no report at all.
-    { mode: 'fable', modelId: 'Fable Pool', pool: undefined },
-    { mode: 'fable-without-poll', modelId: undefined, pool: undefined },
+    { mode: 'fable', modelId: 'Fable Pool', pool: 'fable' },
+    { mode: 'fable-without-poll', modelId: undefined, pool: 'fable' },
   ]) {
     test(`Fable 429 (${mode}, model id ${modelId}) reports pool ${pool} on OpenCode 1`, async () => {
       let calls = 0
@@ -1810,18 +1809,14 @@ describe('OC1 shared routing relay', () => {
       await response.body?.cancel()
       expect(
         reports.filter((report) => report.outcome === 'exhausted'),
-      ).toEqual(
-        pool
-          ? [
-              {
-                account_id: syntheticMainAccountUuid,
-                outcome: 'exhausted',
-                window: '7d',
-                pool,
-              },
-            ]
-          : [],
-      )
+      ).toEqual([
+        {
+          account_id: syntheticMainAccountUuid,
+          outcome: 'exhausted',
+          window: '7d',
+          pool,
+        },
+      ])
     })
   }
 })
