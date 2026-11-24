@@ -185,9 +185,9 @@ export async function closeNativeTypeDeclarations(
     version: string
     exports: Record<string, { types?: string }>
   }
-  if (manifest.version !== '0.58.0')
+  if (manifest.version !== '0.59.0')
     throw new Error(
-      `Expected published common-auth 0.58.0, got ${manifest.version}`,
+      `Expected published common-auth 0.59.0, got ${manifest.version}`,
     )
   const producerDist = join(producerRoot, 'dist')
   const assets = join(distRoot, TYPE_ASSETS)

@@ -18,6 +18,9 @@ import { reportRoutingResponse } from './routing-reports.ts'
 
 export const ROUTING_HOLD_LIMIT_MS = MAX_HOST_RETRY_MS
 const ROUTING_ASK_DEADLINE_MS = 2_000
+// Leave room in the request budget for common-auth to wait up to 500 ms
+// for the bridge to settle after the ask deadline.
+const ROUTING_ASK_WINDOW_MS = ROUTING_ASK_DEADLINE_MS + 500
 export type RoutingChoice = {
   account_id: string
   credential_id: string
@@ -216,7 +219,7 @@ export function createRoutingRelay(
       const stopWithinBudget =
         capacityWait !== 'wait' && capacityWait.stopWithinBudget === true
       const hasAskWindow = (time: number) =>
-        waitUntil === undefined || time + ROUTING_ASK_DEADLINE_MS <= waitUntil
+        waitUntil === undefined || time + ROUTING_ASK_WINDOW_MS <= waitUntil
       const capacityRefusal = (resetsAtMs: number, now: number) =>
         new RoutingRefusalError(
           { code: 'concurrency_full', resetsAtMs },
@@ -246,11 +249,7 @@ export function createRoutingRelay(
           ),
         },
         {
-          // Join an in-flight ask until it settles or reaches its deadline.
-          // The plugin cannot force the routing bridge (the host's RPC
-          // callback) to settle its promise, so it must honor deadlineMs.
-          // Capacity sleeps can still abort immediately.
-          signal: stopWithinBudget ? undefined : signal,
+          signal,
           now: clock.now,
           sleep:
             waitUntil === undefined &&

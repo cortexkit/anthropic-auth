@@ -452,7 +452,7 @@ describe('OC2 shared routing relay', () => {
   })
 
   test.each([
-    ['inside the final RPC window', 238_001] as const,
+    ['inside the final RPC window', 237_501] as const,
     ['beyond the capacity budget', 240_001] as const,
   ])(
     'OC2 stops without another capacity ask when the reset is %s',
@@ -492,7 +492,7 @@ describe('OC2 shared routing relay', () => {
     bridge(async (_request, { deadlineMs }) => {
       expect(deadlineMs).toBe(2_000)
       asks.push(clock.now() - start)
-      if (asks.length === 1) return capacityFull(start + 238_000)
+      if (asks.length === 1) return capacityFull(start + 237_500)
       pending = true
       opened.resolve()
       try {
@@ -507,7 +507,7 @@ describe('OC2 shared routing relay', () => {
     })
     void send.catch(() => {})
     await Promise.race([opened.promise, send])
-    clock.advance(2_000)
+    clock.advance(2_500)
     expect(returned).toBe(false)
     expect(pending).toBe(true)
     answer.resolve(undefined)
@@ -515,7 +515,7 @@ describe('OC2 shared routing relay', () => {
       code: 'concurrency_full',
       message: capacityRefusalText,
     })
-    expect(asks).toEqual([0, 238_000])
+    expect(asks).toEqual([0, 237_500])
     expect(pending).toBe(false)
     expect(authorize).not.toHaveBeenCalled()
   })
@@ -547,6 +547,45 @@ describe('OC2 shared routing relay', () => {
     controller.abort()
     await expect(send).rejects.toMatchObject({ name: 'AbortError' })
     expect(asks).toBe(1)
+  })
+
+  test('aborting an OC2 capacity wait cancels the in-flight routing ask', async () => {
+    const f = await vaultWithFallback()
+    const clock = capacityClock()
+    const native = source(f.runtime, f.paths, cleanups, clock)
+    const host = await retryHost(native)
+    const controller = new AbortController()
+    const reason = new Error('host cancelled the request')
+    const opened = Promise.withResolvers<void>()
+    const answer = Promise.withResolvers<undefined>()
+    let asks = 0
+    let bridgeAbortReason: unknown
+    bridge((_request, { signal }) => {
+      if (++asks === 1) return capacityFull(clock.now() + 1_000)
+      signal?.addEventListener(
+        'abort',
+        () => {
+          bridgeAbortReason = signal.reason
+          answer.resolve(undefined)
+        },
+        { once: true },
+      )
+      opened.resolve()
+      return answer.promise
+    })
+
+    const send = host.send(scope, undefined, {}, controller.signal)
+    void send.catch(() => {})
+    try {
+      await Promise.race([opened.promise, send])
+      controller.abort(reason)
+      expect(bridgeAbortReason).toBe(reason)
+      await expect(send).rejects.toBe(reason)
+      expect(asks).toBe(2)
+    } finally {
+      answer.resolve(undefined)
+      await send.catch(() => {})
+    }
   })
 
   test('OC2 retry-phase selection does not wait for capacity', async () => {
@@ -720,7 +759,7 @@ describe('OC2 shared routing relay', () => {
   function bridge(
     accountFor: (
       request: Record<string, unknown>,
-      options: { deadlineMs: number },
+      options: { deadlineMs: number; signal?: AbortSignal },
     ) => unknown,
     report: (value: unknown) => unknown = () => {},
   ) {
@@ -729,7 +768,7 @@ describe('OC2 shared routing relay', () => {
     globals[key] = () => ({
       accountFor: async (
         request: Record<string, unknown>,
-        options: { deadlineMs: number },
+        options: { deadlineMs: number; signal?: AbortSignal },
       ) => accountFor(request, options),
       report,
     })
