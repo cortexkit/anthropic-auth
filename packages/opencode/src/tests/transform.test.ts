@@ -1481,6 +1481,14 @@ describe('prefixToolNames', () => {
     expect(result.messages[0].content[1].type).toBe('text')
   })
 
+  test('keeps the existing wire bytes when history has no native tool updates', () => {
+    const input =
+      '{"stream":true,"tools":[{"name":"read"}],"model":"claude-sonnet-5","tool_choice":{"type":"tool","name":"read"},"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"read","input":{}},{"type":"text","text":"read"}]}]}'
+    expect(prefixToolNames(JSON.parse(input), { isOAuth: true })).toBe(
+      '{"model":"claude-sonnet-5","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"mcp_Read","input":{}},{"type":"text","text":"read"}]}],"tools":[{"name":"mcp_Read"}],"tool_choice":{"type":"tool","name":"mcp_Read"},"stream":true}',
+    )
+  })
+
   test('does not prefix non-tool_use blocks', () => {
     const body = {
       messages: [

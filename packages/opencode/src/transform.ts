@@ -155,12 +155,39 @@ export async function cancelUnsafeToolNameResponse(
   }
 }
 
-function responseToolNames(tools: unknown): ToolNameMap {
+function nativeToolUpdateName(block: unknown) {
+  if (!isRecord(block) || !isRecord(block.tool)) return undefined
+  const addition = block.type === 'tool_addition'
+  const field =
+    addition && block.tool.type === 'tool_definition'
+      ? block.tool.definition
+      : block.type === 'tool_removal' && block.tool.type === 'tool_reference'
+        ? block.tool
+        : undefined
+  if (isRecord(field) && typeof field.name === 'string' && field.name) {
+    return { field, name: field.name, addition }
+  }
+  return undefined
+}
+
+function responseToolNames(tools: unknown, messages: unknown): ToolNameMap {
   const names = new Set<string>()
   if (Array.isArray(tools)) {
     for (const tool of tools) {
       if (isRecord(tool) && typeof tool.name === 'string' && tool.name) {
         names.add(tool.name)
+      }
+    }
+  }
+  if (Array.isArray(messages)) {
+    // Only tools still declared at the end of history can name a new reply call.
+    for (const message of messages) {
+      if (!isRecord(message) || !Array.isArray(message.content)) continue
+      for (const block of message.content) {
+        const update = nativeToolUpdateName(block)
+        if (!update) continue
+        if (update.addition) names.add(update.name)
+        else names.delete(update.name)
       }
     }
   }
@@ -290,8 +317,7 @@ export function setOAuthHeaders(
 }
 
 /**
- * Add TOOL_PREFIX to tool names in the request body.
- * Prefixes both tool definitions and tool_use blocks in messages.
+ * Apply one wire spelling to tool declarations, choices, calls, and updates.
  */
 export function prefixToolNames(
   parsed: Record<string, unknown>,
@@ -330,6 +356,8 @@ export function prefixToolNames(
             if (block.type === 'tool_use' && block.name) {
               return { ...block, name: prefixName(block.name) }
             }
+            const update = nativeToolUpdateName(block)
+            if (update) update.field.name = prefixName(update.name)
             return block
           })
         }
@@ -1872,7 +1900,7 @@ export async function rewriteRequestBody(
 
     const prefixStart = rewriteNowMs()
     if (options.modelRemapEnabled === true) remapRequestBodyModel(parsed)
-    const toolNameMap = responseToolNames(parsed.tools)
+    const toolNameMap = responseToolNames(parsed.tools, parsed.messages)
     let prefixed = prefixToolNames(parsed, { isOAuth: options.isOAuth })
     let sourceAnchorRestored = false
     if (

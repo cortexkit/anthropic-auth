@@ -124,6 +124,69 @@ function traceOwnedReader(source: ReadableStream<Uint8Array>) {
 }
 
 describe('request-bound response tool names', () => {
+  test('round-trips a native tool addition and prefixes the removal of a declared tool', async () => {
+    const inputSchema = { type: 'object', properties: {} }
+    const content = [
+      {
+        type: 'tool_addition',
+        tool: {
+          type: 'tool_definition',
+          definition: {
+            name: 'ReadNotes',
+            description: 'Read notes',
+            input_schema: inputSchema,
+          },
+        },
+      },
+      {
+        type: 'tool_removal',
+        tool: { type: 'tool_reference', name: 'knowhow' },
+      },
+    ]
+    let toolNameMap: ToolNameMap | undefined
+    const body = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-opus-4-6',
+          max_tokens: 1024,
+          tools: [{ name: 'knowhow', input_schema: inputSchema }],
+          messages: [
+            { role: 'user', content: 'Use the requested tool.' },
+            { role: 'system', content },
+            { role: 'user', content: 'Read the notes.' },
+          ],
+        }),
+        {
+          onToolNameMap: (map) => {
+            toolNameMap = map
+          },
+        },
+      ),
+    )
+    expect(body.tools[0].name).toBe('mcp_Knowhow')
+    expect(body.messages[1].content).toEqual([
+      {
+        type: 'tool_addition',
+        tool: {
+          type: 'tool_definition',
+          definition: {
+            name: 'mcp_ReadNotes',
+            description: 'Read notes',
+            input_schema: inputSchema,
+          },
+        },
+      },
+      {
+        type: 'tool_removal',
+        tool: { type: 'tool_reference', name: 'mcp_Knowhow' },
+      },
+    ])
+    expect(toolNameMap?.declaredHostNames).toEqual(new Set(['ReadNotes']))
+    expect(await restore({ body, toolNameMap }, ['mcp_ReadNotes'])).toEqual([
+      'ReadNotes',
+    ])
+  })
+
   test('refuses oversized hazardous JSON instead of invoking another host tool', async () => {
     const request = await prepare(['search', 'mcp_Search'])
     const response = createStrippedStream(
