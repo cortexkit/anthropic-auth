@@ -1253,6 +1253,60 @@ test('Pi reacquires for a real turn after a peer released its takeover claim', a
   }
 })
 
+test('a queued Pi flush cannot drop the real-turn claim that replaced its restore claim', async () => {
+  const f = await fixture()
+  const seed = f.create().process
+  const id = 'session-S'
+  const storagePath = 'pi-storage'
+  expect((await seed.trackAccepted(f.input(id), f.snapshot))?.tracked).toBe(
+    true,
+  )
+  await seed.stop()
+  const restoring = f.create().process
+  await restoring.startSession(storagePath, id)
+  expect(restoring.manager.trackedCount()).toBe(1)
+  const store = await Reflect.get(restoring, 'store').call(
+    restoring,
+    storagePath,
+  )
+  const peer = new CacheKeepClaim(store.directory, id)
+  const entered = Promise.withResolvers<void>()
+  const unblock = Promise.withResolvers<void>()
+  Reflect.get(store, 'enqueue').call(store, () => {
+    entered.resolve()
+    return unblock.promise
+  })
+  try {
+    await entered.promise
+    // Drain queues the restored entry's flush under the original claim.
+    const flushing = store.drain()
+    expect(await peer.acquire()).toBe(true)
+    await peer.release()
+    restoring.realTurn(id)
+    await Promise.all(Reflect.get(restoring, 'tracking'))
+    expect(await peer.acquire()).toBe(false)
+
+    unblock.resolve()
+    await flushing
+    expect(store.isCommitted(id)).toBe(false)
+    expect(restoring.manager.trackedRequest(id)?.bodyText).toContain(
+      'original prefix',
+    )
+    // The next acceptance saves under the replacement; shutdown can release it.
+    expect(
+      (await restoring.trackAccepted(f.input(id, 'next prefix'), f.snapshot))
+        ?.tracked,
+    ).toBe(true)
+    await store.drain()
+    expect(store.isCommitted(id)).toBe(true)
+    await restoring.stop()
+    expect(await peer.acquire()).toBe(true)
+  } finally {
+    unblock.resolve()
+    await peer.release()
+  }
+})
+
 test('Pi startup cannot unlink the fresh record published during a restore takeover', async () => {
   const f = await fixture()
   const id = 'session-S'

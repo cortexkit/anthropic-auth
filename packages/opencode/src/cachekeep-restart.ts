@@ -227,6 +227,8 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
       if (!deleted && !owner && !shared.loading) return
       shared.owners.delete(hash)
       shared.restored.delete(hash)
+      // Without a deletion event, a restore scan's temporary claim can keep
+      // the file on disk. A later restore checks its session policy again.
       shared.store.removed(id, deleted ? 'deleted' : true)
     },
     reserve,

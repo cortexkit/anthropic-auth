@@ -2275,6 +2275,33 @@ test('OpenCode 2 restores and prewarms a live format-1 record from another plugi
   expect(warm.max_tokens).toBe(0)
 })
 
+test('OpenCode 2 saves a restored warm count without promoting its idle claim', async () => {
+  const f = await fixture()
+  const { id, peer, record, claim } = await seedPeer(f)
+  await peer.releaseClaims(() => true)
+  const before = JSON.parse(
+    gunzipSync(await readFile(record)).toString(),
+  ) as SavedCacheKeepTarget
+  const next = await f.start()
+  let atSend: SavedCacheKeepTarget | undefined
+  next.setSend(async () => {
+    atSend = JSON.parse(gunzipSync(await readFile(record)).toString())
+    return Response.json({ usage: { cache_read_input_tokens: 1 } })
+  })
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(1)
+  expect(atSend).toMatchObject({
+    id,
+    bodyText: before.bodyText,
+    policyState: {
+      lastRealRequestAt: before.policyState!.lastRealRequestAt,
+      warmsSinceLastRealRequest: 1,
+    },
+  })
+  expect(JSON.parse(await readFile(claim, 'utf8')).restoreOnly).toBe(true)
+})
+
 test('OpenCode 2 warm timing measures physical headers before its buffered response body', async () => {
   const lines = captureStartupLogs()
   const f = await fixture(false, false, 'debug')
@@ -4421,6 +4448,55 @@ test('a freshness drop prompts one rescan that adopts the newer peer record', as
     expect(scanning).toHaveBeenCalledTimes(1)
   } finally {
     scanning.mockRestore()
+  }
+})
+
+test('a superseded OC2 turn cannot overwrite a newer body through a restore claim', async () => {
+  const f = await fixture()
+  const { id, peer, record, claim } = await seedPeer(f)
+  await peer.releaseClaims(() => true)
+  const next = await f.start()
+  const { manager, persistence } = sharedKeeper(f)
+  await persistence.drain()
+  const saved = await readFile(record)
+  const newer = JSON.parse(gunzipSync(saved).toString()) as SavedCacheKeepTarget
+  expect(manager.trackedRequest(id)?.bodyText).toBe(newer.bodyText)
+  expect(JSON.parse(await readFile(claim, 'utf8')).restoreOnly).toBe(true)
+
+  const entered = Promise.withResolvers<void>()
+  const unblock = Promise.withResolvers<void>()
+  Reflect.get(persistence, 'enqueue').call(persistence, () => {
+    entered.resolve()
+    return unblock.promise
+  })
+  try {
+    await entered.promise
+    // Roll the clock back before accepting a different body. The real-claim
+    // request and the acceptance's coalesced write cannot run yet.
+    f.advance(-500)
+    const older = 'Accepted locally after the clock rolled back'
+    await next.live(undefined, { messages: [{ role: 'user', content: older }] })
+    expect(manager.trackedRequest(id)?.bodyText).toContain(older)
+    expect(manager.trackedPolicyState(id)!.lastRealRequestAt).toBeLessThan(
+      newer.policyState!.lastRealRequestAt,
+    )
+    const timer = Reflect.get(persistence, 'timers').get(id)
+    const flush = f.timers.timeouts.get(timer)!
+    f.advance(flush.at - f.now())
+    const flushing = flush.callback()
+
+    // The next primary turn replaces the pending real-claim request but not
+    // the accepted body. The older flush must not write under the restore claim.
+    const turn = await next.prepare()
+    expect(manager.trackedRequest(id)?.bodyText).toContain(older)
+    unblock.resolve()
+    await flushing
+    await persistence.drain()
+    expect(await readFile(record)).toEqual(saved)
+    await next.respond(turn)
+  } finally {
+    unblock.resolve()
+    await persistence.drain()
   }
 })
 

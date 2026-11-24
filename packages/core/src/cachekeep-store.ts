@@ -661,6 +661,7 @@ type StoreClaim = {
   acquired: Promise<boolean | UnverifiedClaim>
   retained: boolean
   restoreOnly: boolean
+  adopted?: SavedCacheKeepTarget
   retiring?: boolean
   closing?: Promise<void>
   releaseRetry?: ReturnType<typeof setTimeout>
@@ -853,6 +854,7 @@ export class CacheKeepStore {
       }
       owned.retained = true
       owned.restoreOnly = false
+      owned.adopted = undefined
       intent.item = owned
       this.pendingRealClaims.delete(id)
       return owned
@@ -1149,7 +1151,10 @@ export class CacheKeepStore {
             throw new Error('Stale restart file')
           }
           if (accepted === true) {
-            if (owned) owned.retained = true
+            if (owned) {
+              owned.retained = true
+              owned.adopted = entry
+            }
             // Retire pre-2.5.4 files only after the accepted record is durable
             // in the private data store.
             if (directory !== this.directory) {
@@ -1372,12 +1377,17 @@ export class CacheKeepStore {
     reopen = false,
   ): Promise<CacheKeepWarmReservation> {
     const { id } = entry
-    const stillLatest = () => this.latest.get(id) === entry
-    if (!stillLatest()) return 'ownership-unverified'
+    const { intent, external } = authority
+    const externalStillCurrent = () =>
+      external === this.options.externalClaim?.(id)
+    // A host may replace its claim while this write waits in the queue. The
+    // old write can neither use the replacement nor report its loss.
+    const canPublish = () =>
+      this.latest.get(id) === entry && externalStillCurrent()
+    if (!canPublish()) return 'ownership-unverified'
     const key = hash(id)
     // A write may follow the acquisition it was queued behind, but may not
     // use a token from an unrelated acquisition that happened in the meantime.
-    const { intent, external } = authority
     let item = intent?.item ?? authority.item
     if (item !== this.retainedClaim(key)) item = undefined
     if (
@@ -1389,14 +1399,26 @@ export class CacheKeepStore {
       if (reopened === 'ownership-unverified') return reopened
       item = reopened
     }
+    // A restore claim may update the adopted body's warm bookkeeping, but a
+    // different acceptance needs a real claim and the newer-record check above.
+    if (item?.restoreOnly) {
+      const adopted = item.adopted
+      if (
+        !adopted ||
+        acceptedAt(entry) !== acceptedAt(adopted) ||
+        entry.bodyText !== adopted.bodyText ||
+        entry.url !== adopted.url ||
+        entry.oauthAccountIdentity !== adopted.oauthAccountIdentity
+      )
+        return 'ownership-unverified'
+    }
     const claim = item?.claim ?? external
     if ((this.claims || this.options.externalClaim) && !claim) {
-      if (reopen && this.latest.get(id) === entry) this.loseClaim(id)
+      if (reopen && this.claims && canPublish()) this.loseClaim(id)
       return 'not-owner'
     }
     const write = async (assertOwned?: () => Promise<void>) => {
-      if (!(await this.writeEntry(entry, assertOwned, stillLatest)))
-        return false
+      if (!(await this.writeEntry(entry, assertOwned, canPublish))) return false
       this.committed.set(id, entry)
       return true
     }
@@ -1419,8 +1441,9 @@ export class CacheKeepStore {
         }
       }, acceptedAt(entry))
     )
-      return result
+      return externalStillCurrent() ? result : 'ownership-unverified'
     if (item) await this.closeClaim(key, item)
+    if (!externalStillCurrent()) return 'ownership-unverified'
     if (this.latest.get(id) === entry) this.loseClaim(id)
     return 'not-owner'
   }
