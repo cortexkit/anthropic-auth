@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from 'bun:test'
+import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { chmodSync } from 'node:fs'
 import {
   chmod,
@@ -12,6 +12,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import * as lockFs from '@cortexkit/common-auth/fs'
 import { lockPathFor, withLock } from '@cortexkit/common-auth/fs'
 import {
   HOLDER_FILE_NAME,
@@ -707,12 +708,16 @@ test('a layout lock that fails with an I/O error, not contention, refuses with t
 
 test('a state folder that is created but can not be flushed refuses with the fixed text', async () => {
   const m = await machine()
+  const logs: LogTestRecord[] = []
+  __setLogTestSink((record) => logs.push(record))
   const base = defaultStateLayoutFs()
   const fs: StateLayoutFs = {
     ...base,
     syncDirectory: async () => {
-      throw Object.assign(new Error(`EIO: i/o error, fsync '${m.stateRoot}'`), {
+      throw Object.assign(new Error('private-failure-detail'), {
         code: 'EIO',
+        stage: 'UNRECOGNIZED_STAGE',
+        reason: 'UNRECOGNIZED_REASON',
       })
     },
   }
@@ -721,6 +726,91 @@ test('a state folder that is created but can not be flushed refuses with the fix
     (caught: unknown) => caught,
   )
   expectIoRefusal(error, m)
+  expect(logs.at(-1)?.payload).toEqual({
+    code: 'io-failed',
+    paths: [stateSub(m)],
+    errorCode: 'EIO',
+  })
+  expect(JSON.stringify(logs)).not.toContain('private-failure-detail')
+})
+
+test('an inherited-ACL refusal logs the private directory helper identifiers', async () => {
+  const m = await machine()
+  const logs: LogTestRecord[] = []
+  __setLogTestSink((record) => logs.push(record))
+  // Inject the Windows helper's refusal at state-folder preparation without
+  // setting Windows-specific directory permissions or changing the platform.
+  const cause = Object.assign(new Error('Private directory refused'), {
+    code: 'ERR_PRIVATE_FILES_SECURITY',
+    stage: 'verify',
+    reason: 'not-protected',
+  })
+  const error = await decide(m, {
+    moveEnabled: true,
+    fs: {
+      ...defaultStateLayoutFs(),
+      syncDirectory: async () => {
+        throw cause
+      },
+    },
+  }).then(
+    () => undefined,
+    (caught: unknown) => caught,
+  )
+  expectIoRefusal(error, m)
+  expect(error).toHaveProperty('cause', cause)
+  expect(logs.at(-1)?.payload).toEqual({
+    code: 'io-failed',
+    paths: [stateSub(m)],
+    errorCode: 'ERR_PRIVATE_FILES_SECURITY',
+    stage: 'verify',
+    reason: 'not-protected',
+  })
+})
+
+test('a holder lock release failure logs the lease path and error code', async () => {
+  const m = await machine()
+  await rm(m.configDir, { recursive: true })
+  const logs: LogTestRecord[] = []
+  __setLogTestSink((record) => logs.push(record))
+  const holderFile = join(m.configDir, HOLDER_FILE_NAME)
+  const cause = Object.assign(new Error('private-release-detail'), {
+    code: 'EACCES',
+    path: 'untrusted-error-path',
+  })
+  const acquire = lockFs.acquireRefreshFileLock
+  const spy = spyOn(lockFs, 'acquireRefreshFileLock').mockImplementation(
+    async (options) => {
+      const lock = await acquire(options)
+      if (!lock || options.path !== holderFile) return lock
+      return {
+        ...lock,
+        release: async () => {
+          // Release the real lease before simulating failure so it doesn't
+          // leave a live lock behind in the disposable profile.
+          await lock.release()
+          throw cause
+        },
+      }
+    },
+  )
+  try {
+    const error = await decide(m, { moveEnabled: true }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    )
+    expectIoRefusal(error, m)
+    expect(error).toHaveProperty('cause', cause)
+    expect(logs.at(-1)?.payload).toEqual({
+      code: 'io-failed',
+      paths: [lockPathFor(holderFile, 'holders')],
+      errorCode: 'EACCES',
+    })
+    expect(JSON.stringify(logs)).not.toContain('private-release-detail')
+    expect(JSON.stringify(logs)).not.toContain('untrusted-error-path')
+  } finally {
+    spy.mockRestore()
+  }
 })
 
 test('a restore whose layout lock fails with an I/O error refuses with the fixed text', async () => {
