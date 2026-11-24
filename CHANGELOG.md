@@ -4,6 +4,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- OpenCode 1, OpenCode 2 and Pi: when Claude can't confirm which account a freshly refreshed login belongs to, the plugin checks again after 5 minutes, then 15, then hourly, instead of blocking the login for up to a day. The refusal says when it will check again, and Reset account backoff in `/claude` checks on the next turn (#880).
+- Pi: Agent Runner's mid-run instruction changes are placed right after the message they belong to, so the prompt cache holds, including when a session continues or forks.
+- Pi: honours Agent Runner's per-run reply length cap, for Claude subscriptions and paid API keys.
+- Pi: replies may be as long as the model allows (128,000 tokens on Opus 5.5 and Fable 5.2), as on OpenCode, instead of 16,384, still fitted to the context window.
 - Setup: when it can't read or write a folder that decides where its state is, the log now names the folder or lock and the filesystem error code, as the error message says it does.
 - OpenCode 1, OpenCode 2 and Pi: when shared routing reports that every account is at its concurrent-request limit, requests wait for a free slot instead of ending the turn. OpenCode 2 waits at most four minutes, because it times plugin work out at five; after that the turn stops and says to send the message again in a few minutes.
 - OpenCode: tools that OpenCode adds or removes in the middle of a session keep the same names in Claude requests as their declarations.
@@ -56,7 +60,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - OpenCode 2 no longer clears another server's keep-warm state when it drops old sessions from memory or shuts down, and a deleted session can't be brought back by a request that was still in flight.
 - Keep-warm requests are sent only by the process that owns the session, and a real turn can resume keep-warm after another process took over a restored session and then let it go.
 - Pi: a queued lane start keeps its marker hidden even with many sessions open or text after it, stays out of the conversation's request chain if you type while it routes, and can still use a subscription listed after a paid key.
-- Keep-warm retries after a temporary lock failure instead of forgetting the session, keeps a saved session when it can't check whether it was deleted, and after an OpenCode 2 plugin reload picks its sessions up from the saved records, without counting cancelled warms against their limits.
+- Keep-warm retries after a temporary lock failure instead of forgetting the session, and keeps a saved session when it can't check whether it was deleted. During an OpenCode 2 plugin reload, folders still on the old version keep warming their sessions, and reloaded folders pick up saved sessions as they're released. On the first upgrade from 2.16.6, both versions can briefly warm the same session, and the old version may remove one saved record.
 - OpenCode 1 never falls back to a paid API key when Thalamus's shared routing becomes unavailable mid-request, in any routing mode, and retries with a refreshed login without waiting for the rejected response to close.
 - Pi answers a message that carries a `/claude` lane start together with other content as a normal turn.
 
