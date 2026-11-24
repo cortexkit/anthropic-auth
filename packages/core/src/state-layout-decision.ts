@@ -1,6 +1,7 @@
 import { mkdir, readdir } from 'node:fs/promises'
-import { homedir } from 'node:os'
+import { homedir, constants as osConstants } from 'node:os'
 import { basename, dirname, join } from 'node:path'
+import { types as utilTypes } from 'node:util'
 import { vaultAuthority } from '@cortexkit/common-auth/claustrum'
 import { LockContentionError } from '@cortexkit/common-auth/fs'
 
@@ -212,6 +213,65 @@ function isExplicit(env: NodeJS.ProcessEnv): boolean {
   )
 }
 
+const privateFileCodes = new Set([
+  'ERR_PRIVATE_FILES_SECURITY',
+  'ERR_PRIVATE_FILES_UNAVAILABLE',
+])
+const privateFileStages = new Set([
+  'safe-parent',
+  'verify',
+  'directory',
+  'directory-create',
+  'create',
+  'read',
+  'remove',
+  'release-not-confirmed',
+])
+const privateFileReasons = new Set([
+  'unsupported-filesystem',
+  'native-addon-unavailable',
+  'wrong-owner',
+  'extra-ace',
+  'not-protected',
+  'null-dacl',
+  'empty-dacl',
+  'reparse-point',
+  'unsafe-ancestor',
+  'writable-by-others',
+  'wrong-kind',
+  'io-error',
+  'mode',
+])
+
+function logRefusal(message: string, error: StateLayoutRefusalError): void {
+  const { code, paths, cause } = error
+  const fields: Record<string, unknown> = { code, paths }
+  if (
+    code === 'io-failed' &&
+    cause !== null &&
+    typeof cause === 'object' &&
+    !utilTypes.isProxy(cause)
+  ) {
+    // Only known filesystem identifiers belong in the log. Do not invoke
+    // getters or copy the exception's message, path, or other details.
+    const stringField = (key: string) => {
+      const descriptor = Object.getOwnPropertyDescriptor(cause, key)
+      return typeof descriptor?.value === 'string' ? descriptor.value : ''
+    }
+    const errorCode = stringField('code')
+    const stage = stringField('stage')
+    const reason = stringField('reason')
+    if (
+      Object.hasOwn(osConstants.errno, errorCode) ||
+      privateFileCodes.has(errorCode)
+    )
+      fields.errorCode = errorCode
+    if (privateFileStages.has(stage)) fields.stage = stage
+    if (privateFileReasons.has(reason)) fields.reason = reason
+  }
+  logger.error('state-layout', message, fields)
+}
+
 function refuse(
   code: StateLayoutRefusalError['code'],
   message: string,
@@ -219,7 +279,7 @@ function refuse(
   cause?: unknown,
 ): never {
   const error = new StateLayoutRefusalError(code, message, paths, cause)
-  logger.error('state-layout', message, { code, paths })
+  logRefusal(message, error)
   throw error
 }
 
@@ -250,10 +310,6 @@ function restoreUnfinished(configDir: string): never {
   )
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
 /**
  * The config folder's identity (see `configFolderIdentity`), undefined when
  * it doesn't exist. Any other failure to resolve it (a folder on the way
@@ -267,7 +323,7 @@ function configIdentity(configDir: string): string | undefined {
   } catch (error) {
     refuse(
       'io-failed',
-      `anthropic-auth can't resolve its config folder ${configDir}: ${errorMessage(error)}`,
+      "anthropic-auth can't resolve its config folder",
       [configDir],
       error,
     )
@@ -523,10 +579,12 @@ async function admitHeld(
     stateHomeServingFiles(dataset.newPaths),
   )
   if (conflict) {
-    logger.error('state-layout', conflict.message, {
-      code: conflict.code,
-      paths: conflict.paths,
-    })
+    logRefusal(
+      conflict.code === 'io-failed'
+        ? 'anthropic-auth could not check its state folder'
+        : conflict.message,
+      conflict,
+    )
     throw conflict
   }
   await warnReappearedMetadata(record)
@@ -572,13 +630,14 @@ async function admitFast(
  * its lease then expires on its own.
  */
 async function releaseLocks(ctx: StateLayoutTransitionContext): Promise<void> {
+  const paths: string[] = []
   try {
-    await ctx.stack.releaseAll()
+    await ctx.stack.releaseAll((path) => paths.push(path))
   } catch (error) {
     refuse(
       'io-failed',
-      `anthropic-auth could not release its locks: ${errorMessage(error)}`,
-      [],
+      'anthropic-auth could not release its locks',
+      paths,
       error,
     )
   }
@@ -755,7 +814,7 @@ async function legacyWhileMoveOff(
     // either; refuse without showing the path.
     refuse(
       'io-failed',
-      `anthropic-auth can't resolve its files in ${configDir}: ${errorMessage(error)}`,
+      "anthropic-auth can't resolve its files in the config folder",
       [configDir],
       error,
     )
@@ -940,7 +999,7 @@ export async function decideOpenCodeStateLayout(
     const homeDefault = homeDefaultConfigDir(home)
     refuse(
       'io-failed',
-      `anthropic-auth can't resolve ${homeDefault}, which names its state folder, so it won't use either copy: ${errorMessage(error)}`,
+      "anthropic-auth can't resolve the default config folder, which names its state folder",
       [homeDefault],
       error,
     )
@@ -1079,7 +1138,7 @@ export async function decideOpenCodeStateLayout(
         if (!(error instanceof LockContentionError))
           refuse(
             'io-failed',
-            `anthropic-auth can't take the layout lock beside ${layoutRecordPath(sub)}: ${errorMessage(error)}`,
+            "anthropic-auth can't take the layout lock",
             [layoutRecordPath(sub)],
             error,
           )
@@ -1146,7 +1205,7 @@ async function ensureSubfolder(sub: string, fs: StateLayoutFs): Promise<void> {
     if (error instanceof StateLayoutCrash) throw error
     refuse(
       'io-failed',
-      `anthropic-auth can't create its state folder ${sub}: ${errorMessage(error)}`,
+      "anthropic-auth can't create its state folder",
       [sub],
       error,
     )

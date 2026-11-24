@@ -9,6 +9,7 @@ import {
 import {
   acquireRefreshFileLock,
   LockContentionError,
+  lockPathFor,
   type RefreshFileLock,
 } from '@cortexkit/common-auth/fs'
 import { POOL_LOCK_DEFAULTS } from '@cortexkit/common-auth/store'
@@ -294,15 +295,22 @@ export class StateLayoutLockStack {
   }
 
   /** Release every lock taken after `mark` (an earlier `size`), newest first. */
-  async releaseTo(mark: number): Promise<void> {
+  async releaseTo(
+    mark: number,
+    onFailure?: (path: string) => void,
+  ): Promise<void> {
     let failure: unknown
+    let failedLock: StateLayoutLockSpec | undefined
     while (this.held.length > mark) {
       const entry = this.held.pop()
       if (!entry) break
       try {
         await entry.lock.release()
       } catch (error) {
-        failure ??= error
+        if (failure == null) {
+          failure = error
+          failedLock = entry.spec
+        }
       }
       this.observe?.({
         type: 'released',
@@ -310,10 +318,13 @@ export class StateLayoutLockStack {
         path: entry.spec.path,
       })
     }
-    if (failure !== undefined) throw failure
+    if (failure !== undefined && failedLock) {
+      onFailure?.(lockPathFor(failedLock.path, failedLock.name))
+      throw failure
+    }
   }
 
-  async releaseAll(): Promise<void> {
-    await this.releaseTo(0)
+  async releaseAll(onFailure?: (path: string) => void): Promise<void> {
+    await this.releaseTo(0, onFailure)
   }
 }

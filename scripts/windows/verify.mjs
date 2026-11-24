@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
+import { verifyWindowsOpenCode2Setup } from '../../packages/opencode/scripts/verify-windows-opencode2-setup.mjs'
 import {
   assertHealthySetupPublication,
   isolatedEnvironment,
@@ -250,6 +251,7 @@ const ok = await withReceipt(
         fixtureToken,
       })
     })
+    await verifyWindowsOpenCode2Setup({ cli, consumer, core, root, step })
   },
   async () => {
     const evidence = await cleanupFixture(root, { secrets: [fixtureToken] })

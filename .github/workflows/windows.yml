@@ -86,6 +86,8 @@ jobs:
         with:
           name: anthropic-release-packages
           path: ${{ runner.temp }}/anthropic-packed
+      # The verifier records both fresh and pre-existing OpenCode 2 config cases
+      # alongside the OpenCode 1 proof, using the same packed installation.
       - name: Verify installed packages under Node and retain receipt
         run: |
           $packs = Join-Path $env:RUNNER_TEMP 'anthropic-packed'
