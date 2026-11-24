@@ -7,6 +7,7 @@ import {
   custodyTombstoneOAuth,
   fetchOAuthQuotaSnapshot,
   readNativeEnrollmentMode,
+  SERVER_SIDE_FALLBACK_BETA,
   THINKING_BINDING_CONTROLS_BETA,
 } from '@cortexkit/anthropic-auth-core'
 import type { OpenCode2HookContext } from '@cortexkit/common-auth/opencode2'
@@ -18,7 +19,6 @@ import {
 import type { IntegrationOAuthMethodRegistration } from '@opencode/plugin/promise/integration'
 import type { Registration } from '@opencode/plugin/promise/registration'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
-import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback'
 import {
   CLAUDE_POOL_LOGIN_METHOD_ID,
   CLAUDE_VAULT_ACTIVATION_METHOD_ID,

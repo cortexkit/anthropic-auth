@@ -12,12 +12,17 @@ import {
   CLAUDE_CODE_IDENTITY,
   CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
+  createServerSideFallbackStreamRewriter,
   FAST_MODE_BETA,
   logger,
   MessageThreadTracker,
   OPENCODE_IDENTITY_PREFIX,
   PER_TURN_CONTROL_BETA,
   REQUIRED_BETAS,
+  SERVER_FALLBACK_MARKER_TEXT,
+  SERVER_FALLBACK_SIGNATURE_PREFIX,
+  SERVER_SIDE_FALLBACK_BETA,
+  type ServerSideFallbackOutcome,
   signRequestBody,
   THINKING_BINDING_CONTROLS_BETA,
   TRAILING_ASSISTANT_HISTORY_MESSAGE,
@@ -30,13 +35,6 @@ import {
   markOpenCodeEffortTransitions,
 } from '../effort-history'
 import { FableFallbackManager } from '../fable-fallback'
-import {
-  createServerSideFallbackStreamRewriter,
-  SERVER_FALLBACK_MARKER_TEXT,
-  SERVER_FALLBACK_SIGNATURE_PREFIX,
-  SERVER_SIDE_FALLBACK_BETA,
-  type ServerSideFallbackOutcome,
-} from '../server-fallback'
 import {
   addFastModeBetaHeader,
   CC_VERSION_SUFFIX_SESSION_LIMIT,

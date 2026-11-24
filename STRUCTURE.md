@@ -36,7 +36,8 @@ docs/           public user and contributor documentation
   - Claude Code shape: `claude-code.ts`, `cch.ts` (billing header and body signature), `constants.ts` (the emulated Claude Code version and betas).
   - Paid API-key routes: `api-key-request.ts` (history checks, internal-marker cleanup and model aliases without OAuth shaping) and `api-route-url.ts` (saved URL and environment precedence).
   - Cache diagnostics: `cache-diagnostics.ts` (previous-message tracking, record validation and debug formatting shared by all hosts).
-  - Per-model handling: `model-capabilities.ts` (one row per model) and `models.ts` (catalogue and pricing).
+  - Per-model handling: `model-capabilities.ts` (one row per model, including refusal-fallback routes) and `models.ts` (catalogue and pricing).
+  - Refusal fallback: `refusal-fallback-targets.ts` (target choice) and `server-fallback.ts` (Anthropic's server-side fallback: body field, stored markers and stream rewrite).
   - Mid-conversation controls: `thinking-binding.ts`, `mid-conversation-output-config.ts` (effort markers) and `turn-end-note.ts`.
   - History and transport: `request-history.ts` (structural checks), `message-threads.ts`, `request-gzip.ts`, `relay.ts`, `oauth-origin.ts` and `request-abort.ts`.
 - **Routing and quota:**
@@ -55,7 +56,7 @@ docs/           public user and contributor documentation
 - `transform.ts`: OpenCode 1 request and stream rewriting.
 - `cachekeep-restart.ts`: OpenCode 1 restart ownership, persistence and staggered restore.
 - **Shared by OpenCode 1 and 2:**
-  - Server fallback and OpenCode 1 recovery rounds: `server-fallback.ts`, `fable-fallback.ts`.
+  - OpenCode 1's older recovery-round manager: `fable-fallback.ts`.
   - Request plumbing: `effort-history.ts` (the effort plan), `billing-lineage.ts`, `lane-start.ts`, `routing-relay.ts` (shared routing), `prompt-context.ts`.
   - Diagnostics and display: `cache-diagnostics.ts` and `sidebar-state.ts`.
 - `v2/`: OpenCode 2, built to `dist/v2/server.js` and loaded through the `./server` export.

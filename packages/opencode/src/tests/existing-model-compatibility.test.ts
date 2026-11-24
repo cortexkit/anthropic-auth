@@ -3,9 +3,9 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   CLAUDE_MODEL_CAPABILITIES,
+  SERVER_SIDE_FALLBACK_BETA,
   selectClaudeCodeBetas,
 } from '@cortexkit/anthropic-auth-core'
-import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback'
 import { rewriteRequestBody } from '../transform'
 
 // Captured before adding Fable 5.2. Keep the recorded request bodies and apply

@@ -1,9 +1,10 @@
 import { describe, expect, mock, spyOn } from 'bun:test'
-import { type AccountStorage, logger } from '@cortexkit/anthropic-auth-core'
 import {
+  type AccountStorage,
+  logger,
   SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
-} from '../server-fallback'
+} from '@cortexkit/anthropic-auth-core'
 import { createMockClient } from './support/opencode1-client.ts'
 import {
   installLoaderSetup,

@@ -7,11 +7,11 @@ import {
   isOAuthAccount,
   type LogTestRecord,
   type OAuthAccount,
+  SERVER_SIDE_FALLBACK_BETA,
   setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import type { TestLifetime } from '../../../core/src/tests/test-lifetime.ts'
-import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback'
 import { drainSidebarWrites, type getSidebarState } from '../sidebar-state'
 import { getPluginTestHandles } from './plugin-test-handles'
 import type { createMockClient } from './support/opencode1-client.ts'

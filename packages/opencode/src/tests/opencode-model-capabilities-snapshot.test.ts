@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { applyServerSideFallbackToBody } from '@cortexkit/anthropic-auth-core'
 import {
   applyOpenCodeEffortMarkers,
   encodeOpenCodeEffortPlan,
@@ -10,7 +11,6 @@ import {
   isRecoverableRefusalModel,
   recoverableRefusalFamily,
 } from '../fable-fallback'
-import { applyServerSideFallbackToBody } from '../server-fallback'
 import { rewriteRequestBody } from '../transform'
 import { createNativeClaudeModelRules } from '../v2/models'
 

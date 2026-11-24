@@ -3,6 +3,7 @@ import {
   __setLogTestSink,
   type AccountStorage,
   CACHE_KEEP_EXTENDED_TTL_BETA,
+  SERVER_SIDE_FALLBACK_BETA,
   sessionCacheActivity,
   setCache1hState,
 } from '@cortexkit/anthropic-auth-core'
@@ -11,7 +12,6 @@ import {
   sourceWarmRecoveryKey,
   sourceWarmTargetId,
 } from '../fable-fallback'
-import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback'
 import { getPluginTestHandles } from './plugin-test-handles'
 import type {
   createMockClient,

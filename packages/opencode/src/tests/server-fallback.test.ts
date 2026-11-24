@@ -8,7 +8,7 @@ import {
   SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
   type ServerSideFallbackOutcome,
-} from '../server-fallback'
+} from '@cortexkit/anthropic-auth-core'
 import { createStrippedStream, rewriteRequestBody } from '../transform'
 
 const sse = (event: string, data: unknown) =>
