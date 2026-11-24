@@ -5,7 +5,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - Setup: when it can't read or write a folder that decides where its state is, the log now names the folder or lock and the filesystem error code, as the error message says it does.
-- OpenCode 1, OpenCode 2 and Pi: when shared routing reports that every account is at its concurrent-request limit, requests wait for a free slot instead of ending the turn.
+- OpenCode 1, OpenCode 2 and Pi: when shared routing reports that every account is at its concurrent-request limit, requests wait for a free slot instead of ending the turn. OpenCode 2 waits at most four minutes, because it times plugin work out at five; after that the turn stops and says to send the message again in a few minutes.
+- OpenCode: tools that OpenCode adds or removes in the middle of a session keep the same names in Claude requests as their declarations.
 - OpenCode: the one-time state move no longer treats a running older plugin as gone after the system clock is corrected forward. A start with a different XDG_STATE_HOME no longer moves the state while an earlier move under another state folder is unfinished; it stops and says to start again with the setting used then.
 - An invalid sticky-routing state file is now set aside as a private backup and replaced, with one warning, instead of failing and logging on every routing write (#876).
 - After a revoked vault enrollment is replaced at the same path, the plugin uses the new enrollment without a restart (#877).
