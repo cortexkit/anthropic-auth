@@ -1426,8 +1426,11 @@ export function createNativeAnthropicSource(
               getRoutingMode(snapshot.policyStorage) === 'sticky-balanced',
           })
         } catch (error) {
-          // The vault refusal finds no quota policy at work when the accounts
-          // left out are confirmed exhausted yet not below a quota floor.
+          // The vault's no-route builder explains a refusal only by the user's
+          // own quota policy, such as the quota floor (the minimum remaining
+          // quota they set), and throws when none applies. Accounts left out
+          // because they're confirmed out of quota get the plain exhausted
+          // refusal instead, unless a sign-in failure explains it.
           if (!(error instanceof NativeVaultNoAccountError)) throw error
           if (!quotaExplainsRefusal) throw error
           response = exhaustedRefusal()
