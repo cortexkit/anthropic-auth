@@ -345,6 +345,7 @@ test('Ultra paid API authorization still requires a fresh weekly reading', async
 })
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+  sessionCacheActivity.forget(scope.sessionID)
 })
 
 function waitRecorder(accountFor: () => unknown = () => null) {
@@ -3500,6 +3501,7 @@ describe('OC2 installed quota reroutes', () => {
 
   async function vaultRetryPool(
     mode: 'fallback-first' | 'main-first' | 'sticky-balanced',
+    spareRemaining = 90,
   ) {
     const fixture = await vaultWithFallback(false, { mode, spare: true })
     const now = Date.now()
@@ -3512,6 +3514,7 @@ describe('OC2 installed quota reroutes', () => {
       if (!account?.accountIdentity)
         throw new Error(`Missing vault account ${credential}`)
       order.push(account.id)
+      const remaining = credential === spare ? spareRemaining : 90
       await fixture.runtime.vault.publish(
         await fixture.runtime.authorizeVault(account.id),
         {
@@ -3519,13 +3522,13 @@ describe('OC2 installed quota reroutes', () => {
             accountIdentity: account.accountIdentity,
             checkedAt: now,
             five_hour: {
-              usedPercent: 10,
-              remainingPercent: 90,
+              usedPercent: 100 - remaining,
+              remainingPercent: remaining,
               checkedAt: now,
             },
             seven_day: {
-              usedPercent: 10,
-              remainingPercent: 90,
+              usedPercent: 100 - remaining,
+              remainingPercent: remaining,
               checkedAt: now,
             },
           },
@@ -3537,6 +3540,101 @@ describe('OC2 installed quota reroutes', () => {
     })
     return fixture
   }
+
+  test.each(['warm', 'exhausted', 'disabled', 'already refused'] as const)(
+    'vault: scoped Fable 429 and repeated routing advice respect the %s cache account',
+    async (condition) => {
+      const fixture = await vaultRetryPool('sticky-balanced', 20)
+      const fable = { ...scope, modelID: 'claude-fable-5-2' }
+      const host = await retryHost(source(fixture.runtime, fixture.paths))
+      const warm = { account_id: changedIdentity, credential_id: spare }
+      const refused = { account_id: identity, credential_id: main }
+      let advice = warm
+      waitRecorder(() => advice)
+      const previous = await host.send(fable)
+      expect(previous.headers.get('authorization')).toBe(vaultBearer(spare))
+      await host.response(previous, 200, fable)
+
+      if (condition === 'exhausted' || condition === 'disabled') {
+        const row = (await fixture.runtime.read()).accounts.find(
+          (account) => account.credentialId === spare,
+        )
+        if (!row) throw new Error('Missing warm account')
+        if (condition === 'disabled') {
+          await fixture.runtime.setEnabled(row.id, false)
+        } else {
+          const now = Date.now()
+          await fixture.runtime.vault.publish(
+            await fixture.runtime.authorizeVault(row.id),
+            {
+              quota: {
+                accountIdentity: changedIdentity,
+                checkedAt: now,
+                source: 'poll',
+                five_hour: {
+                  usedPercent: 80,
+                  remainingPercent: 20,
+                  checkedAt: now,
+                },
+                seven_day: {
+                  usedPercent: 80,
+                  remainingPercent: 20,
+                  checkedAt: now,
+                },
+                scoped: [
+                  {
+                    id: 'claude-weekly-scoped-fable',
+                    title: 'Fable only',
+                    modelName: 'Fable',
+                    usedPercent: 100,
+                    remainingPercent: 0,
+                    checkedAt: now,
+                    resetsAt: new Date(now + 86_400_000).toISOString(),
+                  },
+                ],
+              },
+            },
+          )
+        }
+      }
+
+      if (condition === 'already refused') {
+        const first = await host.send(fable)
+        expect(first.headers.get('authorization')).toBe(vaultBearer(spare))
+        await host.response(first, 429, fable)
+        advice = refused
+        expect(await host.retry(false, fable)).toEqual({
+          retry: true,
+          delay: 0,
+        })
+      } else advice = refused
+
+      const request = await host.send(fable)
+      expect(request.headers.get('authorization')).toBe(vaultBearer(main))
+      await host.response(request, 429, fable, {
+        'anthropic-ratelimit-unified-7d-utilization': '0.64',
+        'anthropic-ratelimit-unified-7d_fable-utilization': '1',
+        'anthropic-ratelimit-unified-7d_fable-status': 'rejected',
+        'anthropic-ratelimit-unified-7d_fable-reset': String(
+          Math.floor(Date.now() / 1000) + 86_400,
+        ),
+      })
+      expect(
+        await host.retry(
+          false,
+          fable,
+          undefined,
+          1234,
+          condition === 'already refused' ? 2 : 1,
+        ),
+      ).toEqual({ retry: true, delay: 0 })
+      const retry = await host.send(fable)
+      expect(retry.headers.get('authorization')).toBe(
+        vaultBearer(condition === 'warm' ? spare : work),
+      )
+      await host.response(retry, 200, fable)
+    },
+  )
 
   for (const [mode, order, description] of [
     [
@@ -3602,6 +3700,53 @@ describe('OC2 installed quota reroutes', () => {
     const third = await host.send()
     expect(third.headers.get('authorization')).toBe(`Bearer ${spareAccess}`)
     await host.response(third, 200)
+  })
+
+  test('local: a retry prefers the last accepted cache account without routing', async () => {
+    const access = [
+      'sk-ant-oat01-native-only',
+      'sk-ant-oat01-local-work',
+      'sk-ant-oat01-local-spare',
+    ] as const
+    const fixture = await local({
+      resolveIdentity: async (token) =>
+        ({
+          accountUuid: token === access[1] ? fallbackIdentity : changedIdentity,
+        }) as never,
+    })
+    for (const [id, token] of [
+      ['work', access[1]],
+      ['spare', access[2]],
+    ] as const) {
+      await fixture.runtime.loginOAuth({
+        routeId: id,
+        credential: {
+          access: token,
+          refresh: `${id}-refresh`,
+          expires: Date.now() + 3600_000,
+        },
+      })
+    }
+    const fable = { ...scope, modelID: 'claude-fable-5-2' }
+    const host = await retryHost(source(fixture.runtime, fixture.paths))
+    // The previous turn reached the last account after two unconfirmed limits.
+    for (const token of access.slice(0, 2)) {
+      const request = await host.send(fable)
+      expect(request.headers.get('authorization')).toBe(`Bearer ${token}`)
+      await host.response(request, 429, fable)
+      expect(await host.retry(false, fable)).toEqual({ retry: true, delay: 0 })
+    }
+    const previous = await host.send(fable)
+    expect(previous.headers.get('authorization')).toBe(`Bearer ${access[2]}`)
+    await host.response(previous, 200, fable)
+
+    const request = await host.send(fable)
+    expect(request.headers.get('authorization')).toBe(`Bearer ${access[0]}`)
+    await host.response(request, 429, fable, rejectWindow('7d', 24))
+    expect(await host.retry(false, fable)).toEqual({ retry: true, delay: 0 })
+    const retry = await host.send(fable)
+    expect(retry.headers.get('authorization')).toBe(`Bearer ${access[2]}`)
+    await host.response(retry, 200, fable)
   })
 
   test('vault: a retry uses excluded shared routing advice only after trying the other routes', async () => {

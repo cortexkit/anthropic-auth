@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## 2.17.0
 
+- OpenCode 1, OpenCode 2 and Pi: after a rate limit, the retry stays on the account that already holds the conversation’s cache when it can.
 - Windows: when the plugin refuses to create its state folder because another account can change a folder above it, the message now names that folder and the account, and says how to fix it: remove that account's change access, or set `XDG_STATE_HOME` to a folder only you can change (#881).
 - Uses common-auth 0.59.0. On OpenCode 2, if sign-in setup fails partway, the hooks it had already registered are removed once, by common-auth. When OpenCode 2 abandons a message that is waiting for a free Claude account slot, the plugin also cancels its pending request to routing, so the slot is handed back at once.
 - OpenCode 1, OpenCode 2 and Pi: when Claude can't confirm which account a freshly refreshed login belongs to, the plugin checks again after 5 minutes, then 15, then hourly, instead of blocking the login for up to a day. The refusal says when it will check again, and Reset account backoff in `/claude` checks on the next turn (#880).

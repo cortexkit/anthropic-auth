@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, mock, spyOn } from 'bun:test'
 import { gunzipSync } from 'node:zlib'
-import { tokenFingerprint } from '@cortexkit/anthropic-auth-core'
+import {
+  sessionCacheActivity,
+  tokenFingerprint,
+} from '@cortexkit/anthropic-auth-core'
 import { ROUTING_HOLD_LIMIT_MS } from '../routing-relay'
 import { getPluginTestHandles } from './plugin-test-handles'
 import { installLoaderSetup } from './support/opencode1-loader-setup'
@@ -27,6 +30,7 @@ const globals = globalThis as Record<symbol, unknown>
 const key = Symbol.for('cortexkit.routing')
 afterEach(() => {
   delete globals[key]
+  sessionCacheActivity.forget('ses_relay_oc1_warm_retry')
 })
 
 describe('OC1 shared routing relay', () => {
@@ -40,6 +44,7 @@ describe('OC1 shared routing relay', () => {
       | 'main-first'
       | 'fallback-first' = 'sticky-balanced',
     relay = false,
+    sessionId = 'ses_relay_oc1',
   ) {
     const now = Date.now()
     const paidBackup = mode.startsWith('paid backup')
@@ -165,7 +170,9 @@ describe('OC1 shared routing relay', () => {
                           access: 'sk-ant-oat01-third-access',
                           refresh: 'third-refresh',
                           expires: now + 3600_000,
-                          quota: quota(80),
+                          quota: quota(
+                            mode === 'three accounts for warm retry' ? 50 : 80,
+                          ),
                         },
                       ]
                     : []),
@@ -240,7 +247,7 @@ describe('OC1 shared routing relay', () => {
     ) =>
       loader.fetch(MESSAGES_URL, {
         method: 'POST',
-        headers: { 'x-session-affinity': 'ses_relay_oc1' },
+        headers: { 'x-session-affinity': sessionId },
         body:
           payload instanceof ReadableStream
             ? payload
@@ -263,6 +270,55 @@ describe('OC1 shared routing relay', () => {
       ...getPluginTestHandles(plugin),
     }
   }
+
+  test.each(['sticky-balanced', 'main-first'] as const)(
+    'OC1 %s scoped Fable retry prefers the last accepted cache account',
+    async (mode) => {
+      let sends = 0
+      const f = await fixture(
+        'three accounts for warm retry',
+        () =>
+          ++sends === 2
+            ? new Response('limited', {
+                status: 429,
+                headers: {
+                  'anthropic-ratelimit-unified-7d-utilization': '0.64',
+                  'anthropic-ratelimit-unified-7d_fable-utilization': '1',
+                  'anthropic-ratelimit-unified-7d_fable-reset': String(
+                    Math.floor(Date.now() / 1000) + 86_400,
+                  ),
+                },
+              })
+            : new Response('ok'),
+        undefined,
+        mode,
+        false,
+        'ses_relay_oc1_warm_retry',
+      )
+      let accountId = syntheticFallbackAccountUuid(1)
+      globals[key] = () => ({
+        accountFor: async () => ({
+          account_id: accountId,
+          credential_id: 'local',
+        }),
+      })
+      const payload = {
+        model: 'claude-fable-5-2',
+        messages: [{ role: 'user', content: 'hello' }],
+        max_tokens: 10,
+      }
+      expect(await (await f.send(payload)).text()).toBe('ok')
+      expect(f.sends).toEqual(['Bearer sk-ant-oat01-third-access'])
+      accountId = syntheticMainAccountUuid
+      if (mode === 'main-first') delete globals[key]
+      expect(await (await f.send(payload)).text()).toBe('ok')
+      expect(f.sends).toEqual([
+        'Bearer sk-ant-oat01-third-access',
+        'Bearer sk-ant-oat01-main-access',
+        'Bearer sk-ant-oat01-third-access',
+      ])
+    },
+  )
 
   test('OC1 OAuth sends runner notes from its session handle in the final signed body', async () => {
     const f = await fixture()

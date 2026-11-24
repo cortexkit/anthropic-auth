@@ -1385,6 +1385,7 @@ export function createNativeAnthropicSource(
           storage: snapshot.policyStorage,
           inputBytes: 1,
           preferredAccountId: input.previousAccountId,
+          preferWarmRetryAccount: input.phase === 'retry',
           // A refusal leaves the host in charge; it must not clear its route.
           preserveOnNoCandidate: true,
         })
@@ -1410,7 +1411,15 @@ export function createNativeAnthropicSource(
                 ...routes.filter((account) => account.id === 'main'),
                 ...routes.filter((account) => account.id !== 'main'),
               ]
-        if (ordered[0]) return ordered[0].id
+        const warm =
+          input.phase === 'retry'
+            ? sessionCacheActivity.warmRetryAccount(
+                input.sessionID,
+                ordered,
+                (account) => account.id,
+              )
+            : undefined
+        if (warm || ordered[0]) return (warm ?? ordered[0])?.id
       }
       if (snapshot.mode === 'claustrum') {
         const holdForPool = poolHold()
