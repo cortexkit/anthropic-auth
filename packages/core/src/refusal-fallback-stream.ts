@@ -225,8 +225,10 @@ type Attempt = ReturnType<typeof createAttempt>
  * Join one eligible client-mode Messages SSE response to at most one retry.
  * Pass protected physical responses (see protectFallbackCreditResponse), after
  * installing per-attempt billing/observation and before host stream parsing.
- * HTTP errors from the original request pass through untouched. For a round or
- * a routed response, omit `retry` to apply the same holds without another send.
+ * HTTP errors from the original request pass through untouched. For a response
+ * already sent to a fallback model (a later step of a recovery round started by
+ * an earlier refusal), or one routed there, omit `retry`: the same holds apply
+ * without another send.
  * `sourceModel` is the host-requested ID, even if a target served this response.
  *
  * `isFresh` must be synchronous and cheap. It guards action at the refusal,
