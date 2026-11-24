@@ -39,8 +39,9 @@ const TEMP = /^[a-f0-9]{64}\.json\.gz\.[a-f0-9-]+\.tmp$/
 const TOMBSTONE = /^[a-f0-9]{64}\.deleted$/
 const TOMBSTONE_MS = 24 * 60 * 60 * 1000
 const TEMP_STALE_MS = 60 * 60 * 1000
-// Small wall-clock corrections should not destroy a replayable record.
 const RECORD_CLOCK_SKEW_MS = 1000
+// Allow a clock rollback of one hour, the longest cache lifetime, plus margin.
+const RECORD_MAX_FUTURE_MS = 2 * 60 * 60 * 1000
 const MAX_RECORD_BYTES = 2 * CACHE_KEEP_MAX_BODY_BYTES + 64 * 1024
 // Replay compatibility depends only on the record format, not the plugin
 // version. Bump this for format changes; the loader must accept or migrate the
@@ -538,11 +539,11 @@ function sanitizedBody(text: string): string {
   return stripped ? JSON.stringify(body) : text
 }
 
-function invalidReason(
+function recordStatus(
   value: SavedCacheKeepTarget,
   name: string,
   now: number,
-): DropReason | undefined {
+): 'format' | 'invalid' | 'future' | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value))
     return 'invalid'
   if (value.v !== RECORD_FORMAT_VERSION) return 'format'
@@ -573,10 +574,7 @@ function invalidReason(
       (state.needsRealRequest !== undefined &&
         typeof state.needsRealRequest !== 'boolean') ||
       !Number.isFinite(state.lastRealRequestAt) ||
-      state.lastRealRequestAt > now + RECORD_CLOCK_SKEW_MS ||
-      (state.lastWarmAt !== undefined &&
-        (!Number.isFinite(state.lastWarmAt) ||
-          state.lastWarmAt > now + RECORD_CLOCK_SKEW_MS)) ||
+      (state.lastWarmAt !== undefined && !Number.isFinite(state.lastWarmAt)) ||
       !Number.isSafeInteger(state.warmsSinceLastRealRequest) ||
       state.warmsSinceLastRealRequest < 0 ||
       !Number.isFinite(state.warmCostSoFar) ||
@@ -594,7 +592,12 @@ function invalidReason(
     return 'invalid'
   // Malformed bodies and credential-bearing records are not replayable.
   if (sanitizedBody(value.bodyText) !== value.bodyText) return 'invalid'
-  if (value.cacheExpiresAt <= now) return 'expired'
+  if (state) {
+    const ahead =
+      Math.max(state.lastRealRequestAt, state.lastWarmAt ?? -Infinity) - now
+    if (ahead > RECORD_MAX_FUTURE_MS) return 'invalid'
+    if (ahead > RECORD_CLOCK_SKEW_MS) return 'future'
+  }
 }
 
 function validSavedPolicy(value: unknown): boolean {
@@ -983,9 +986,6 @@ export class CacheKeepStore {
     mode: 'restore' | 'sweep' = 'restore',
   ) {
     const clock = this.options.now ?? Date.now
-    // Follow forward clock changes without making a record look newer after a
-    // backward step. Keep the caller's time reference for validation.
-    const clockOffset = now - clock()
     await this.chain
     if (!(await this.directoryReady())) return
     let directory = this.directory
@@ -1080,15 +1080,17 @@ export class CacheKeepStore {
           const raw = await this.inflateRecord(bytes)
           reason = 'invalid'
           entry = JSON.parse(raw) as SavedCacheKeepTarget
-          const invalid = invalidReason(
-            entry,
-            name,
-            Math.max(now, clock() + clockOffset),
-          )
-          if (invalid && invalid !== 'expired') {
-            reason = invalid
+          const status = recordStatus(entry, name, clock())
+          if (status === 'future') {
+            // After a clock rollback, leave the record unclaimed for the next
+            // scan (on a new lease or claim release) or for expiry.
+            continue
+          }
+          if (status) {
+            reason = status
             throw new Error('Invalid restart file')
           }
+          const expired = entry.cacheExpiresAt <= now
           reason = undefined
           if (!(await permitted())) continue
           let deleted = false
@@ -1106,7 +1108,7 @@ export class CacheKeepStore {
             reason = 'deleted'
             throw new Error('Deleted restart record')
           }
-          if (collecting && !invalid) {
+          if (collecting && !expired) {
             // Keep only the sort keys. The second pass rechecks both the
             // claim and the record before accepting it, without buffering all
             // saved bodies or holding their claims between passes.
@@ -1115,7 +1117,7 @@ export class CacheKeepStore {
           }
           const acceptance = accept(entry)
           if (acceptance === undefined) continue
-          const accepted = invalid ?? acceptance
+          const accepted = expired ? 'expired' : acceptance
           if (accepted !== true && accepted !== undefined) {
             reason = accepted || 'invalid'
             throw new Error('Stale restart file')
@@ -1227,12 +1229,13 @@ export class CacheKeepStore {
       const saved = JSON.parse(
         await this.inflateRecord(bytes),
       ) as SavedCacheKeepTarget
-      const invalid = invalidReason(
+      const status = recordStatus(
         saved,
         name,
         this.options.now?.() ?? Date.now(),
       )
-      return (!invalid || invalid === 'expired') && acceptedAt(saved) > when
+      // Not ready for replay does not make a newer accepted body expendable.
+      return (!status || status === 'future') && acceptedAt(saved) > when
     } catch {
       return false
     }

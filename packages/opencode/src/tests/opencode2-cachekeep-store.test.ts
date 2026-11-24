@@ -354,7 +354,7 @@ test.each([
       hasWarmed: false,
     }
     f.target.policyState[field] =
-      field === 'lastRealRequestAt' ? Date.now() + 60_000 : -1
+      field === 'lastRealRequestAt' ? Date.now() + 3 * 60 * 60 * 1000 : -1
     f.store.changed(f.target)
     await f.store.drain()
     let restored = 0
@@ -366,6 +366,32 @@ test.each([
     expect(await readdir(f.store.directory)).toEqual([])
   },
 )
+
+test('a restart scan leaves a record one minute ahead untouched', async () => {
+  const f = await fixture()
+  f.store.changed({
+    ...f.target,
+    policyState: {
+      ownerSessionId: f.target.id,
+      planned: true,
+      lastRealRequestAt: Date.now() + 60_000,
+      warmsSinceLastRealRequest: 0,
+      warmCostSoFar: 0,
+      hasWarmed: false,
+    },
+  })
+  await f.store.drain()
+  const [name] = await readdir(f.store.directory)
+  const path = join(f.store.directory, name!)
+  const saved = await readFile(path)
+  let restored = 0
+  await f.store.load(Date.now(), () => {
+    restored++
+    return true
+  })
+  expect(restored).toBe(0)
+  expect(await readFile(path)).toEqual(saved)
+})
 
 test('a transient write failure after verifying the claim does not turn enabled persistence into memory-only mode', async () => {
   let failWrites = false

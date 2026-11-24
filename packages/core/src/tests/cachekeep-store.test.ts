@@ -146,30 +146,76 @@ test('a scan restores a record committed and released after the scan began', asy
   }
 })
 
-test('a backward clock step never makes a valid restart record look future-dated', async () => {
+test('a scan defers a valid record after a backward clock step until the clock catches up', async () => {
   const { root, store, makeStore, target } = await storeFixture()
   const start = Date.now()
   let now = start
   const scanning = makeStore(undefined, () => now)
   const restored: string[] = []
+  const path = join(store.directory, `${key}.json.gz`)
+  const accept = (entry: { id: string }) => {
+    restored.push(entry.id)
+    return true
+  }
   try {
     store.changed({ ...target, policyState: acceptedPolicy(start) })
     await store.drain()
     await store.releaseClaims(() => true)
-    await scanning.load(
-      start,
-      (entry) => {
-        restored.push(entry.id)
-        return true
-      },
-      undefined,
-      () => {
-        now = start - 10_000
-        return true
-      },
-    )
+    const saved = await readFile(path)
+    await scanning.load(start, accept, undefined, () => {
+      now = start - 10_000
+      return true
+    })
+    expect(restored).toEqual([])
+    expect(await readFile(path)).toEqual(saved)
+    now = start + 1
+    await scanning.load(now, accept)
     expect(restored).toEqual([session])
-    expect(await readdir(store.directory)).toEqual([`${key}.json.gz`])
+  } finally {
+    await scanning.releaseClaims(() => true)
+    await store.releaseClaims(() => true)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a scan keeps a newer peer commit written before a mid-scan clock rollback', async () => {
+  const { root, store, makeStore, target, claims } = await storeFixture()
+  const start = Date.now()
+  let now = start
+  const scanning = makeStore(undefined, () => now)
+  const path = join(store.directory, `${key}.json.gz`)
+  const restored: string[] = []
+  const accept = (entry: { bodyText: string }) => {
+    restored.push(entry.bodyText)
+    return true
+  }
+  const newer = '{"system":"newer during scan"}'
+  let saved: Buffer<ArrayBuffer> | undefined
+  try {
+    store.changed({ ...target, policyState: acceptedPolicy(start) })
+    await store.drain()
+    await scanning.load(start, accept, undefined, async () => {
+      if (!saved) {
+        now = start + 10_000
+        store.changed({
+          ...target,
+          bodyText: newer,
+          policyState: acceptedPolicy(now),
+        })
+        await store.drain()
+        await store.releaseClaims(() => true)
+        saved = await readFile(path)
+        now = start + 2_000
+      }
+      return true
+    })
+    expect(restored).toEqual([])
+    expect(await readFile(path)).toEqual(saved!)
+    expect(await readdir(claims)).not.toContain(`${key}.claim.json`)
+
+    now = start + 10_001
+    await scanning.load(now, accept)
+    expect(restored).toEqual([newer])
   } finally {
     await scanning.releaseClaims(() => true)
     await store.releaseClaims(() => true)
@@ -178,28 +224,42 @@ test('a backward clock step never makes a valid restart record look future-dated
 })
 
 test.each(['lastRealRequestAt', 'lastWarmAt'] as const)(
-  'restart validation tolerates small skew in %s but rejects a clock jump',
+  'restart validation tolerates small skew in %s, defers rollback and rejects far future',
   async (field) => {
-    const { root, store, makeStore, target } = await storeFixture()
+    const { root, store, makeStore, target, claims } = await storeFixture()
     const now = Date.now()
     const scanning = makeStore(undefined, () => now)
     const restored: string[] = []
+    const path = join(store.directory, `${key}.json.gz`)
+    const limit = 2 * 60 * 60 * 1000
     try {
-      for (const skew of [50, 30_000]) {
+      for (const [skew, outcome] of [
+        [50, 'restore'],
+        [30_000, 'defer'],
+        [limit, 'defer'],
+        [limit + 1, 'drop'],
+        [Infinity, 'drop'],
+      ] as const) {
+        restored.length = 0
         store.changed({
           ...target,
           policyState: { ...acceptedPolicy(now), [field]: now + skew },
         })
         await store.drain()
         await store.releaseClaims(() => true)
+        const saved = await readFile(path)
         await scanning.load(now, (entry) => {
           restored.push(entry.id)
           return true
         })
+        expect(restored).toEqual(outcome === 'restore' ? [session] : [])
+        if (outcome === 'drop')
+          expect(await readdir(store.directory)).toEqual([])
+        else expect(await readFile(path)).toEqual(saved)
+        if (outcome === 'defer')
+          expect(await readdir(claims)).not.toContain(`${key}.claim.json`)
         await scanning.releaseClaims(() => true)
       }
-      expect(restored).toEqual([session])
-      expect(await readdir(store.directory)).toEqual([])
     } finally {
       await store.releaseClaims(() => true)
       await scanning.releaseClaims(() => true)
@@ -240,6 +300,47 @@ test('a pending real claim cannot replace a newer peer commit', async () => {
     expect(await contender.reserveWarm(older)).toBe('not-owner')
     expect(lost).toEqual([session])
     expect(await readFile(path)).toEqual(saved)
+    expect(await readdir(claims)).not.toContain(`${key}.claim.json`)
+  } finally {
+    await contender.releaseClaims(() => true)
+    await store.releaseClaims(() => true)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a pending real claim cannot replace a newer peer commit after a clock rollback', async () => {
+  const { root, store, makeStore, target, claims } = await storeFixture()
+  const start = Date.now()
+  let now = start
+  const lost: string[] = []
+  const contender = makeStore(
+    (id) => lost.push(id),
+    () => now,
+  )
+  const older = { ...target, policyState: acceptedPolicy(start) }
+  const path = join(store.directory, `${key}.json.gz`)
+  try {
+    store.changed({ ...target, policyState: acceptedPolicy(start - 2_000) })
+    await store.drain()
+    contender.changed(older)
+    await contender.drain()
+    expect(contender.isCommitted(session)).toBe(false)
+
+    now = start + 10_000
+    store.changed({
+      ...target,
+      bodyText: '{"system":"newer before rollback"}',
+      policyState: acceptedPolicy(now),
+    })
+    await store.drain()
+    await store.releaseClaims(() => true)
+    const saved = await readFile(path)
+    now = start + 2_000
+
+    const outcome = await contender.reserveWarm(older)
+    expect(await readFile(path)).toEqual(saved)
+    expect(outcome).toBe('not-owner')
+    expect(lost).toEqual([session])
     expect(await readdir(claims)).not.toContain(`${key}.claim.json`)
   } finally {
     await contender.releaseClaims(() => true)

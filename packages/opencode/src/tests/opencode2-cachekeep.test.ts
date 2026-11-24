@@ -3207,6 +3207,42 @@ test('hybrid-disabled request dispatch never waits on a held restart write', asy
   }
 })
 
+test('the hybrid-off sweep preserves a planned peer record after a clock rollback during drain', async () => {
+  const f = await fixture()
+  runnerPolicyForReview({ ttl: 'long', keep_warm: 'always' })
+  const { id, peer, record, tracked } = await seedPeer(f)
+  expect(tracked.policyState?.planned).toBe(true)
+  const next = await f.start()
+  const current = keeperFor(f.paths.storageId)
+  expect(current.manager.trackedRequest(id)).toBeUndefined()
+  const saved = await readFile(record)
+  await peer.releaseClaims(() => true)
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    cacheKeep: { enabled: false },
+  }))
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const drain = current.persistence.drain.bind(current.persistence)
+  const draining = spyOn(current.persistence, 'drain').mockImplementationOnce(
+    async () => {
+      entered.resolve()
+      await resume.promise
+      await drain()
+    },
+  )
+  try {
+    await next.prepare(undefined, {}, 'ses_during_disable')
+    await entered.promise
+    f.advance(-10_000)
+  } finally {
+    resume.resolve()
+    await current.localCleanup
+    draining.mockRestore()
+  }
+  expect(await readFile(record)).toEqual(saved)
+})
+
 test('reload from a 2.6.0-shaped owner supports accepted usage and planned warming', async () => {
   const f = await fixture()
   const reports: unknown[] = []
@@ -4384,6 +4420,96 @@ test('a freshness drop prompts one rescan that adopts the newer peer record', as
     expect(current.manager.trackedRequest(id)?.bodyText).toContain(newest)
     expect(scanning).toHaveBeenCalledTimes(1)
   } finally {
+    scanning.mockRestore()
+  }
+})
+
+test('a failed in-flight OC2 turn cannot delete a newer peer record on a freshness wakeup', async () => {
+  const f = await fixture()
+  const { id, peer, record, tracked } = await seedPeer(f)
+  const next = await f.start()
+  const current = sharedKeeper(f)
+  await next.live()
+  await current.persistence.drain()
+  expect(current.persistence.isCommitted(id)).toBe(false)
+  const older = (
+    Reflect.get(current.manager, 'targets') as Map<string, CacheKeepTarget>
+  ).get(id)!
+  const pending = await next.prepare()
+  const newest = 'Peer accepted this before the pending turn failed'
+  f.advance(5_000)
+  peer.changed({
+    ...tracked,
+    bodyText: tracked.bodyText.replace('Hello', newest),
+    policyState: { ...tracked.policyState!, lastRealRequestAt: f.now() },
+  })
+  await peer.drain()
+  await peer.releaseClaims(() => true)
+  const saved = await readFile(record)
+  const scanning = spyOn(current.persistence, 'load')
+  try {
+    expect(await current.persistence.reserveWarm(older)).toBe('not-owner')
+    await keeperFor(f.paths.storageId)?.loading
+    expect(scanning).toHaveBeenCalledTimes(1)
+    const adoptedWhilePending = current.manager.trackedRequest(id)
+
+    await next.respond(pending, Response.json({}, { status: 503 }))
+    await current.persistence.drain()
+    expect(await readFile(record)).toEqual(saved)
+    expect(adoptedWhilePending).toBeUndefined()
+    await keeperFor(f.paths.storageId)?.loading
+    expect(current.manager.trackedRequest(id)?.bodyText).toContain(newest)
+    expect(scanning).toHaveBeenCalledTimes(2)
+  } finally {
+    scanning.mockRestore()
+  }
+})
+
+test('a queued freshness rescan can adopt after a turn finishes during the prior scan', async () => {
+  const f = await fixture()
+  const { id, peer, tracked } = await seedPeer(f)
+  const next = await f.start()
+  const current = sharedKeeper(f)
+  const owner = keeperFor(f.paths.storageId)
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const load = current.persistence.load.bind(current.persistence)
+  const scanning = spyOn(current.persistence, 'load').mockImplementationOnce(
+    async (...args) => {
+      await load(...args)
+      entered.resolve()
+      await resume.promise
+    },
+  )
+  const scan = owner.adopt()
+  try {
+    await entered.promise
+    await next.live()
+    await current.persistence.drain()
+    expect(current.persistence.isCommitted(id)).toBe(false)
+    const older = (
+      Reflect.get(current.manager, 'targets') as Map<string, CacheKeepTarget>
+    ).get(id)!
+
+    const newest = 'Peer accepted this during the first scan'
+    f.advance(5_000)
+    peer.changed({
+      ...tracked,
+      bodyText: tracked.bodyText.replace('Hello', newest),
+      policyState: { ...tracked.policyState!, lastRealRequestAt: f.now() },
+    })
+    await peer.drain()
+    await peer.releaseClaims(() => true)
+    expect(await current.persistence.reserveWarm(older)).toBe('not-owner')
+
+    resume.resolve()
+    await scan
+    await owner.loading
+    expect(current.manager.trackedRequest(id)?.bodyText).toContain(newest)
+    expect(scanning).toHaveBeenCalledTimes(2)
+  } finally {
+    resume.resolve()
+    await scan
     scanning.mockRestore()
   }
 })

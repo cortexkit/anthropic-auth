@@ -864,6 +864,8 @@ export class CacheKeepManager {
       /** Hosts may mirror targets without delaying a live request on storage I/O. */
       onTargetChanged?: (target: Readonly<CacheKeepTarget>) => void
       onTargetRemoved?: (id: string) => void
+      /** Called after the session's last real turn and its cleanup settle. */
+      onRealTurnsSettled?: (id: string) => void
       /** Persistent hosts must commit the reservation before any physical send. */
       reserveWarm?: (
         target: Readonly<CacheKeepTarget>,
@@ -1038,8 +1040,12 @@ export class CacheKeepManager {
           )
       } catch {
       } finally {
-        if (turns.pending === 0 && this.realTurns.get(sessionId) === turns)
+        if (turns.pending === 0 && this.realTurns.get(sessionId) === turns) {
           this.realTurns.delete(sessionId)
+          try {
+            this.options.onRealTurnsSettled?.(sessionId)
+          } catch {}
+        }
         try {
           if (lifetime === this.lifetime) this.scheduleDueTimer()
         } catch {}
@@ -1124,6 +1130,11 @@ export class CacheKeepManager {
       finish: () => release(),
       pause: () => release(true),
     }
+  }
+
+  /** Includes late responses that can still track or retire a restart target. */
+  hasRealTurn(sessionId: string) {
+    return this.realTurns.has(sessionId)
   }
 
   private realTurnBusy(sessionId: string) {

@@ -131,7 +131,8 @@ interface SharedCacheKeep {
   readonly registry: CacheKeepSessionRegistry
   readonly persistence: CacheKeepStore
   loading?: Promise<void>
-  restoreSkips?: Set<string>
+  // Forget and deletion must not let a scan already in progress revive a session.
+  removedDuringRestore?: Set<string>
   readonly prepared: Map<
     number,
     {
@@ -217,10 +218,12 @@ function createSharedCacheKeep(
   const prepared: SharedCacheKeep['prepared'] = new Map()
   const leases: SharedCacheKeep['leases'] = new Map()
   const restored = new Set<string>()
+  const restoreAfterTurn = new Set<string>()
   let lastRestoredSend = 0
   let retaining: Promise<void> | undefined
   const persistence = new CacheKeepStore({
     storageId,
+    now: options.now,
     ...options.persistence,
     sessionClaims: true,
     restoreNewestFirst: true,
@@ -277,6 +280,14 @@ function createSharedCacheKeep(
     onTargetRemoved: (id) => {
       restored.delete(id)
       shared.persistence.removed(id)
+    },
+    onRealTurnsSettled: (id) => {
+      if (
+        restoreAfterTurn.delete(id) &&
+        leases.size &&
+        !manager.trackedRequest(id)
+      )
+        void shared.adopt()
     },
     // While no instance is live the sessions are only retained, not warmed,
     // so the shared session list for the status menu shows none of them.
@@ -398,8 +409,8 @@ function createSharedCacheKeep(
     async adopt() {
       const retained = retaining
       const previousScan = shared.loading
-      shared.restoreSkips ??= new Set<string>()
-      const skipped = shared.restoreSkips
+      shared.removedDuringRestore ??= new Set<string>()
+      const removed = shared.removedDuringRestore
       // A directory's previous activation may have just released sessions.
       // Queue a new scan even if this keeper already has other live leases.
       const loading = (async () => {
@@ -418,10 +429,16 @@ function createSharedCacheKeep(
             // Disposal may race startup. Leave the file for the next live lease.
             if (
               !leases.size ||
-              skipped.has(sessionHash(entry.id)) ||
+              removed.has(sessionHash(entry.id)) ||
               manager.trackedRequest(entry.id)
             )
               return undefined
+            // Don't give a foreground turn a saved target it didn't start
+            // with: if the turn fails, it retires the target for this session.
+            if (manager.hasRealTurn(entry.id)) {
+              restoreAfterTurn.add(entry.id)
+              return undefined
+            }
             if (entry.cacheExpiresAt <= now) return 'expired'
             if (
               !isCacheKeepHybridActive(snapshot.policyStorage) &&
@@ -484,7 +501,7 @@ function createSharedCacheKeep(
           undefined,
           (hash) =>
             leases.size > 0 &&
-            !skipped.has(hash) &&
+            !removed.has(hash) &&
             !manager
               .trackedSessions()
               .some(({ id }) => sessionHash(id) === hash),
@@ -496,7 +513,7 @@ function createSharedCacheKeep(
         .finally(() => {
           if (shared.loading === loading) {
             shared.loading = undefined
-            shared.restoreSkips = undefined
+            shared.removedDuringRestore = undefined
           }
         })
       shared.loading = loading
@@ -553,7 +570,6 @@ export function createNativeCacheKeep(
       input.agent === 'prime'
     )
       return undefined
-    owner.restoreSkips?.add(sessionHash(input.sessionID))
     owner.persistence.realTurn(input.sessionID, false)
     try {
       for (const turn of realTurns) if (!turn.active) realTurns.delete(turn)
@@ -1130,7 +1146,7 @@ export function createNativeCacheKeep(
     resolvedParent,
     forgetSession(sessionID: string) {
       acceptedStates.delete(sessionID)
-      owner.restoreSkips?.add(sessionHash(sessionID))
+      owner.removedDuringRestore?.add(sessionHash(sessionID))
       manager.untrack(sessionID)
       for (const [attemptId, entry] of pending)
         if (entry.sessionID === sessionID) discardAttempt(attemptId)
@@ -1140,7 +1156,7 @@ export function createNativeCacheKeep(
       // deletion event can invalidate a record belonging to another server.
       const current =
         shareds.get(options.storageId)?.get(cacheKeepModule) ?? owner
-      current.restoreSkips?.add(sessionHash(sessionID))
+      current.removedDuringRestore?.add(sessionHash(sessionID))
       current.persistence.removed(sessionID, 'deleted')
     },
     registry,
