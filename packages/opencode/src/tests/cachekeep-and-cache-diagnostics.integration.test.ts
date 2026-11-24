@@ -1559,6 +1559,12 @@ describe('cache diagnostics', () => {
     expect(warm.body.max_tokens).toBe(0)
     expect(warm.body.thinking).toEqual(live.body.thinking)
     expect(warm.body.messages).toEqual(live.body.messages)
+    for (const request of [live, warm]) {
+      expect(request.body).not.toHaveProperty('fallbacks')
+      expect(request.headers.get('anthropic-beta')?.split(',')).toContain(
+        core.SERVER_SIDE_FALLBACK_BETA,
+      )
+    }
     expect(warm.headers.get('anthropic-beta')?.split(',')).toContain(
       'thinking-binding-controls-2026-08-01',
     )

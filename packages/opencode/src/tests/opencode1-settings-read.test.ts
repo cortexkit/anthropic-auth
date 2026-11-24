@@ -597,6 +597,19 @@ describe('OpenCode 1 settings service reads', () => {
     })
   }
 
+  test('client mode keeps the fallback beta in the OpenCode 1 request and explicit warm snapshots', async () => {
+    const observed = await observeSettings(snapshotSettings(false), 1)
+    expect(observed.warms).toHaveLength(1)
+    expect(
+      [observed.request, observed.warms[0]!].map(({ headers }) =>
+        new Headers(headers)
+          .get('anthropic-beta')
+          ?.split(',')
+          .includes(core.SERVER_SIDE_FALLBACK_BETA),
+      ),
+    ).toEqual([true, true])
+  })
+
   for (const custody of ['local', 'claustrum'] as const) {
     test(`a ${custody} user-file projection never reaches a legacy write, including account-order writes`, async () => {
       if (custody === 'claustrum') {

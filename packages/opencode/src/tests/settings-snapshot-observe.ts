@@ -218,6 +218,7 @@ export async function observeSettings(
     setOAuthHeaders(headers, 'synthetic-snapshot-access', {
       body: JSON.parse(body),
       identity,
+      refusalFallbackMode: options.refusalFallbackMode,
     })
     if (options.fastModeEnabled) addFastModeBetaHeader(headers)
     headers.set('x-client-request-id', '22222222-2222-4222-8222-222222222222')
