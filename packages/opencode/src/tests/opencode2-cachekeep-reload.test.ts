@@ -85,7 +85,7 @@ test.each([false, true])(
         timers.delete(timer)
       }) as unknown as typeof clearInterval,
       onTargetChanged: (target) => owner.persistence.changed(target),
-      onTargetRemoved: (id) => owner.persistence.removed(id),
+      onTargetRemoved: (_id, target) => owner.persistence.removed(target),
     })
     cleanups.push(() => manager.stop())
     const target = {

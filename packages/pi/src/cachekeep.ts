@@ -81,15 +81,17 @@ export class PiCacheKeep {
     const schedule = managerOptions.setIntervalImpl ?? setInterval
     this.schedule = schedule
     this.cancel = managerOptions.clearIntervalImpl ?? clearInterval
+    const persisted = (target: Readonly<CacheKeepTarget>) => {
+      const identity = target.hostMetadata?.accountIdentity
+      return typeof identity === 'string'
+        ? { ...target, oauthAccountIdentity: identity }
+        : undefined
+    }
     const persistWarm = async (target: Readonly<CacheKeepTarget>) => {
       const session = this.sessions.get(target.id)
-      const identity = target.hostMetadata?.accountIdentity
-      if (this.stopping || !session || typeof identity !== 'string')
-        return 'not-owner' as const
-      return session.store.reserveWarm({
-        ...target,
-        oauthAccountIdentity: identity,
-      })
+      const entry = persisted(target)
+      if (this.stopping || !session || !entry) return 'not-owner' as const
+      return session.store.reserveWarm(entry)
     }
     this.manager = new CacheKeepManager({
       ...managerOptions,
@@ -108,12 +110,8 @@ export class PiCacheKeep {
       },
       onTargetChanged: (target) => {
         const session = this.sessions.get(target.id)
-        const identity = target.hostMetadata?.accountIdentity
-        if (session && typeof identity === 'string')
-          session.store.changed({
-            ...target,
-            oauthAccountIdentity: identity,
-          })
+        const entry = persisted(target)
+        if (session && entry) session.store.changed(entry)
         managerOptions.onTargetChanged?.(target)
       },
       reserveWarm: persistWarm,
@@ -121,10 +119,10 @@ export class PiCacheKeep {
         this.manager.isCurrentTarget(target)
           ? persistWarm(target)
           : Promise.resolve(false),
-      onTargetRemoved: (id) => {
+      onTargetRemoved: (id, target) => {
         this.restored.delete(id)
-        this.sessions.get(id)?.store.removed(id)
-        managerOptions.onTargetRemoved?.(id)
+        this.sessions.get(id)?.store.removed(persisted(target) ?? target)
+        managerOptions.onTargetRemoved?.(id, target)
       },
       prepareHeaders: async (headers, target, attempt, isTargetCurrent) => {
         // Delay the actual first send, not just its due time: minute ticks can

@@ -213,12 +213,14 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
       }
       shared.store.changed(entry, !lease.manager.isRestoredTarget(target))
     },
-    removed(id: string) {
-      const hash = sessionHash(id)
+    removed(target: Readonly<CacheKeepTarget>) {
+      const hash = sessionHash(target.id)
       if (shared.owners.get(hash) !== lease) return
       shared.owners.delete(hash)
       shared.restored.delete(hash)
-      shared.store.removed(id)
+      shared.store.removed(
+        persisted(target) ?? { ...target, oauthAccountIdentity: undefined },
+      )
     },
     forget(id: string, deleted = false) {
       const hash = sessionHash(id)

@@ -73,7 +73,7 @@ export async function openKeeper(
       now,
       loadStorage: async () => storage,
       onTargetChanged: (target) => lease.changed(target),
-      onTargetRemoved: (id) => lease.removed(id),
+      onTargetRemoved: (_id, target) => lease.removed(target),
       reserveWarm: (target) => lease.reserve(target),
       settleWarm: (target) => lease.settle(target),
       fetchImpl,

@@ -3935,8 +3935,8 @@ const anthropicAuthPlugin = async (
       )
         cacheKeepSourceCopies.set(target.id, kept)
     },
-    onTargetRemoved: (id) => {
-      cacheKeepRestart.removed(id)
+    onTargetRemoved: (id, target) => {
+      cacheKeepRestart.removed(target)
       const kept = cacheKeepSourceCopies.get(id)
       cacheKeepSourceCopies.delete(id)
       // A terminal stop must retire both copies. Do not let an old target's

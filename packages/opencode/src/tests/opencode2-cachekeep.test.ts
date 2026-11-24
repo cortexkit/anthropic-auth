@@ -142,9 +142,11 @@ function cacheKeepFailureTrace() {
     },
     observeStore(store: CacheKeepStore, label: string) {
       const removed = store.removed.bind(store)
-      const removal = spyOn(store, 'removed').mockImplementation((id) => {
+      const removal = spyOn(store, 'removed').mockImplementation((...args) => {
+        const [target] = args
+        const id = typeof target === 'string' ? target : target.id
         record(`${label} restart delete enqueued: ${id}`)
-        removed(id)
+        removed(...args)
       })
       const drain = store.drain.bind(store)
       const draining = spyOn(store, 'drain').mockImplementation(() =>
@@ -4547,6 +4549,69 @@ test('a superseded OC2 turn cannot overwrite a newer body through a restore clai
   }
 })
 
+test('OC2 budget eviction preserves the body adopted by the restore claim', async () => {
+  const f = await fixture()
+  const { id, peer, record, claim } = await seedPeer(f)
+  await peer.releaseClaims(() => true)
+  const next = await f.start()
+  const { manager, persistence } = sharedKeeper(f)
+  await persistence.drain()
+  const saved = await readFile(record)
+  const newer = JSON.parse(gunzipSync(saved).toString()) as SavedCacheKeepTarget
+  expect(manager.trackedRequest(id)?.bodyText).toBe(newer.bodyText)
+  expect(JSON.parse(await readFile(claim, 'utf8')).restoreOnly).toBe(true)
+
+  const imminentId = 'ses_oc2_imminent'
+  await next.live(undefined, {}, imminentId)
+  const targets = Reflect.get(manager, 'targets') as Map<
+    string,
+    CacheKeepTarget
+  >
+  const imminent = targets.get(imminentId)!
+  // Model the byte pressure without making a 64 MiB prompt. The other target
+  // is due soon and leaves just enough room for the saved body.
+  imminent.bodyBytes = CACHE_KEEP_MAX_BODY_BYTES - targets.get(id)!.bodyBytes
+  imminent.nextPrewarmAt = f.now() + 30_000
+  await persistence.drain()
+
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  Reflect.get(persistence, 'enqueue').call(persistence, () => {
+    entered.resolve()
+    return resume.promise
+  })
+  const track = spyOn(manager, 'track')
+  try {
+    await entered.promise
+    f.advance(-500)
+    expect(f.now()).toBeLessThan(newer.policyState!.lastRealRequestAt)
+    await next.live(undefined, {
+      messages: [{ role: 'user', content: 'Older, larger body. '.repeat(200) }],
+    })
+    const accepted = track.mock.lastCall![0]
+    const acceptedBytes = Buffer.byteLength(accepted.bodyText)
+    expect(accepted.sessionId).toBe(id)
+    expect(acceptedBytes).toBeLessThan(CACHE_KEEP_MAX_BODY_BYTES)
+    expect(acceptedBytes + imminent.bodyBytes).toBeGreaterThan(
+      CACHE_KEEP_MAX_BODY_BYTES,
+    )
+    expect(track.mock.results.at(-1)?.value).toEqual({
+      tracked: false,
+      reason: 'evicted by cachekeep limits',
+    })
+    expect(manager.trackedSessions().map(({ id }) => id)).toEqual([imminentId])
+
+    resume.resolve()
+    await persistence.drain()
+    await keeperFor(f.paths.storageId)?.loading
+    expect(await readFile(record)).toEqual(saved)
+  } finally {
+    track.mockRestore()
+    resume.resolve()
+    await persistence.drain()
+  }
+})
+
 test('a failed OC2 turn cannot unlink a newer body through a restore claim', async () => {
   const f = await fixture()
   const { id, peer, record, claim } = await seedPeer(f)
@@ -4571,6 +4636,14 @@ test('a failed OC2 turn cannot unlink a newer body through a restore claim', asy
     return { entered: entered.promise, resume: resume.resolve }
   }
   const beforeFlush = holdQueue()
+  const resumeScan = Promise.withResolvers<void>()
+  const load = persistence.load.bind(persistence)
+  const rescan = spyOn(persistence, 'load').mockImplementation(
+    async (...args) => {
+      await resumeScan.promise
+      await load(...args)
+    },
+  )
   let afterFlush: ReturnType<typeof holdQueue> | undefined
   try {
     await beforeFlush.entered
@@ -4599,17 +4672,25 @@ test('a failed OC2 turn cannot unlink a newer body through a restore claim', asy
     afterFlush.resume()
     await persistence.drain()
     expect(await readFile(record)).toEqual(saved)
-    expect(await readFile(claim, 'utf8')).toBe(restoreClaim)
+    await expect(readFile(claim, 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
 
-    // A normal release lets the next activation adopt the same saved body.
-    await next.dispose()
-    await f.start()
-    expect(sharedKeeper(f).manager.trackedRequest(id)?.bodyText).toBe(
-      newer.bodyText,
-    )
+    // Let the claim-available scan finish on the same keeper, with its lease
+    // still open. Pausing the scan lets us observe the gap between claims.
+    resumeScan.resolve()
+    await keeperFor(f.paths.storageId)?.loading
+    expect(rescan).toHaveBeenCalledTimes(1)
+    expect(manager.trackedRequest(id)?.bodyText).toBe(newer.bodyText)
+    const adoptedClaim = await readFile(claim, 'utf8')
+    expect(adoptedClaim).not.toBe(restoreClaim)
+    expect(JSON.parse(adoptedClaim).restoreOnly).toBe(true)
+    expect(await readFile(record)).toEqual(saved)
   } finally {
     beforeFlush.resume()
     afterFlush?.resume()
+    resumeScan.resolve()
+    rescan.mockRestore()
     await persistence.drain()
   }
 })

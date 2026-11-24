@@ -277,9 +277,9 @@ function createSharedCacheKeep(
     responseTtlMs: (response) => warmResponseLifetimes.get(response),
     onTargetChanged: (target) =>
       shared.persistence.changed(target, !manager.isRestoredTarget(target)),
-    onTargetRemoved: (id) => {
+    onTargetRemoved: (id, target) => {
       restored.delete(id)
-      shared.persistence.removed(id)
+      shared.persistence.removed(target)
     },
     onRealTurnsSettled: (id) => {
       const deferred = restoreAfterTurn.get(id)

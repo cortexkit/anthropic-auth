@@ -865,7 +865,9 @@ export class CacheKeepStore {
         throw error
       }
       // A removal and a new accepted body can queue while this lock is held.
-      // Completing the older acquisition must not consume the new one.
+      // Completing the older acquisition must not consume the new one. If a
+      // non-covered removal canceled this acquisition, release the claim and
+      // leave the saved body for a later scan rather than deleting or writing it.
       if (!isPending() || owned.retiring || this.claims?.get(key) !== owned) {
         if (!owned.retiring) await this.closeClaim(key, owned)
         return
@@ -1514,17 +1516,27 @@ export class CacheKeepStore {
     }
   }
 
-  removed(id: string, removeUnowned: boolean | 'deleted' = false) {
+  removed(
+    ...[target, removeUnowned]:
+      | [target: Readonly<CacheKeepTarget>]
+      | [id: string, removeUnowned: true | 'deleted']
+  ) {
+    const id = typeof target === 'string' ? target : target.id
     const key = hash(id)
     const item = this.retainedClaim(key)
     const external = this.options.externalClaim?.(id)
+    // Pruning can evict a replacement before it is reported to the store.
+    // Only the acceptance being retired can justify unlinking its record.
     const canRemove =
-      removeUnowned === 'deleted' || claimCoversEntry(item, this.latest.get(id))
+      removeUnowned === 'deleted' ||
+      claimCoversEntry(
+        item,
+        typeof target === 'string'
+          ? undefined
+          : record(target, this.options.pluginVersion),
+      )
     this.forgetEntry(id)
-    // A retired target can only delete under the claim it already held, and a
-    // restore-only claim for a different acceptance must stay retained.
-    if (!canRemove) return
-    if (item) item.retiring = true
+    if (item && canRemove) item.retiring = true
     if (
       !removeUnowned &&
       (this.claims || this.options.externalClaim) &&
@@ -1534,6 +1546,7 @@ export class CacheKeepStore {
       return
     this.enqueue(
       async () => {
+        if (!canRemove) return
         const owned = item && this.claims?.get(key) === item ? item : undefined
         const claim = owned?.claim ?? external
         const path = join(this.directory, `${key}.json.gz`)
@@ -1550,9 +1563,10 @@ export class CacheKeepStore {
           await rm(path, { force: true })
       },
       async () => {
-        // Release the retired claim even if the record directory is unusable.
+        // Release even if the directory is unusable. An uncovered record stays
+        // on disk, so wake keepers that may now be able to adopt it.
         if (item && this.claims?.get(key) === item)
-          await this.closeClaim(key, item)
+          await this.closeClaim(key, item, !canRemove)
       },
     )
   }

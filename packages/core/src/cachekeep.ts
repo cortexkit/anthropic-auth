@@ -863,7 +863,7 @@ export class CacheKeepManager {
       ) => Promise<void> | void
       /** Hosts may mirror targets without delaying a live request on storage I/O. */
       onTargetChanged?: (target: Readonly<CacheKeepTarget>) => void
-      onTargetRemoved?: (id: string) => void
+      onTargetRemoved?: (id: string, target: Readonly<CacheKeepTarget>) => void
       /** Called after the session's last real turn and its cleanup settle. */
       onRealTurnsSettled?: (id: string) => void
       /** Persistent hosts must commit the reservation before any physical send. */
@@ -1237,7 +1237,7 @@ export class CacheKeepManager {
     this.reportStop(target, reason, this.options.now?.() ?? Date.now())
     this.retainStopped(target, reason, this.options.now?.() ?? Date.now())
     this.targets.delete(id)
-    this.options.onTargetRemoved?.(id)
+    this.options.onTargetRemoved?.(id, target)
     this.publishTrackedSessions()
     return true
   }
@@ -1665,7 +1665,7 @@ export class CacheKeepManager {
     })
     this.retainStopped(target, stopReason(reason), now)
     this.targets.delete(target.id)
-    this.options.onTargetRemoved?.(target.id)
+    this.options.onTargetRemoved?.(target.id, target)
   }
 
   private retainStopped(
@@ -1751,7 +1751,7 @@ export class CacheKeepManager {
         })
         this.reportStop(target, reason, now)
         this.targets.delete(id)
-        this.options.onTargetRemoved?.(id)
+        this.options.onTargetRemoved?.(id, target)
       }
     }
     while (this.targets.size > CACHE_KEEP_MAX_TARGETS)

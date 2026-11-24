@@ -179,7 +179,7 @@ test('a replacement restart store drains the old pending body before loading or 
 test('removal and policy-off cancel queued writes without resurrecting a file', async () => {
   const f = await fixture()
   f.store.changed(f.target)
-  f.store.removed(f.target.id)
+  f.store.removed(f.target)
   await f.store.drain()
   expect(await readdir(f.store.directory)).toEqual([])
   f.store.changed(f.target)
