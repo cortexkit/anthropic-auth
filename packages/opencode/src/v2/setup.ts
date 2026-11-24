@@ -567,6 +567,7 @@ export async function setupAnthropicAuth(
     fetch: options.fetch,
     subagent,
   })
+  // Restoring saved sessions can wait for disk and claims; user requests don't.
   void cacheKeep.ready.catch(() => {
     logger.warn('cachekeep', 'failed to start keep-warm restoration')
   })

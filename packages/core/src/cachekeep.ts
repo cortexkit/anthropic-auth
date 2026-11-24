@@ -1551,8 +1551,8 @@ export class CacheKeepManager {
       }
       throw new CacheKeepWarmWait()
     }
-    // Once admitted, dispatch without yielding: a hand-over must either
-    // refund a cancelled reservation or leave the charge for a real send.
+    // Do not yield between the cancellation check and dispatch: either the
+    // cancelled reservation is refunded or the charge is for a real send.
     return dispatch?.()
   }
 
@@ -1606,6 +1606,15 @@ export class CacheKeepManager {
     } catch {
       logger.warn('cachekeep', 'failed to publish tracked sessions')
     }
+  }
+
+  /** Restart scans can fill spare capacity without evicting a live target. */
+  hasRoomForRestore(bodyText: string) {
+    return (
+      this.targets.size < CACHE_KEEP_MAX_TARGETS &&
+      this.totalBodyBytes() + Buffer.byteLength(bodyText, 'utf8') <=
+        CACHE_KEEP_MAX_BODY_BYTES
+    )
   }
 
   private totalBodyBytes() {

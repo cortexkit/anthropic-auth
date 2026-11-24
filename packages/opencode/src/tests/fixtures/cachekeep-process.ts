@@ -122,16 +122,14 @@ export async function openKeeper(
     source: source as NativeSource,
   })
   await keeper.ready
-  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  const owner = (
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v3')
+  const copies = (
     (globalThis as Record<symbol, unknown>)[key] as Map<
       string,
-      {
-        manager: CacheKeepManager
-        persistence: CacheKeepStore
-      }
+      Map<symbol, { manager: CacheKeepManager; persistence: CacheKeepStore }>
     >
   ).get(storageId)
+  const owner = copies?.values().next().value
   if (!owner) throw new Error('OpenCode 2 did not start a keep-warm owner')
   return {
     manager: owner.manager,

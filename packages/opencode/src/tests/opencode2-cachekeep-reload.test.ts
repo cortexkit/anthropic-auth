@@ -19,7 +19,7 @@ afterEach(async () => {
 })
 
 test.each([false, true])(
-  'OpenCode 2 reload restores and tracks after closing a 2.5.3 shared owner (retained: %s)',
+  'OpenCode 2 reload never accesses a 2.16.6 keeper in the old slot (retained: %s)',
   async (retained) => {
     const directory = await mkdtemp(join(tmpdir(), 'oc2-cachekeep-reload-'))
     cleanups.push(() => rm(directory, { recursive: true, force: true }))
@@ -58,7 +58,6 @@ test.each([false, true])(
       cacheExpiresAt: number
       nextPrewarmAt: number
     }
-    // The published 2.5.3 registry knows only the original three fields.
     const registry = {
       publish: (sessions: readonly LegacySession[]) =>
         disk.publish(
@@ -106,20 +105,15 @@ test.each([false, true])(
         0,
       ]),
     }
-    // Expose the old manager surface, not its new registrySessions method or
-    // reason-aware untrack signature, even though the backing scheduler is current.
-    const legacyManager = {
-      track: manager.track.bind(manager),
-      trackedSessions: manager.trackedSessions.bind(manager),
-      untrack: (id: string) => manager.untrack(id),
-    }
+    const lease = { stopped: false }
     const owner = {
-      manager: legacyManager,
+      manager,
       registry,
       persistence,
       prepared: new Map(),
-      leases: new Map(retained ? [] : [[0, { stopped: false }]]),
+      leases: new Map(retained ? [] : [[0, lease]]),
       nextGeneration: 1,
+      persistenceFollowsOwner: true,
       retain: () => manager.stop(),
       adopt: async () => {
         manager.start()
@@ -127,13 +121,27 @@ test.each([false, true])(
       },
     }
     expect(manager.track(target).tracked).toBe(true)
+    await persistence.drain()
+    if (retained) manager.stop()
     if (!retained) manager.start()
     const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-    const scope = globalThis as any
-    scope[key] ??= new Map()
-    const shared = scope[key]
-    shared.set(storageId, owner)
-    cleanups.push(() => shared.delete(storageId))
+    const original = Object.getOwnPropertyDescriptor(globalThis, key)
+    const legacy = new Map([[storageId, owner]])
+    const touches: string[] = []
+    Object.defineProperty(globalThis, key, {
+      configurable: true,
+      get: () => {
+        touches.push('read')
+        return legacy
+      },
+      set: () => {
+        touches.push('write')
+      },
+    })
+    cleanups.push(() => {
+      if (original) Object.defineProperty(globalThis, key, original)
+      else Reflect.deleteProperty(globalThis, key)
+    })
     const keep = createNativeCacheKeep({
       storageId,
       runtime,
@@ -144,12 +152,19 @@ test.each([false, true])(
     })
     cleanups.push(() => keep.dispose())
     await keep.ready
-    const current = shared.get(storageId)
-    expect(current).not.toBe(owner)
+    expect(touches).toEqual([])
+    const current = [
+      ...(globalThis as any)[
+        Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v3')
+      ]
+        .get(storageId)
+        .values(),
+    ][0]
     expect(keep.registry).not.toBe(
       registry as unknown as CacheKeepSessionRegistry,
     )
-    expect(timers.size).toBe(0)
+    expect(legacy.get(storageId)).toBe(owner)
+    expect(timers.size).toBe(retained ? 0 : 1)
     await keep.track({
       sessionID: 'ses_after_reload',
       attemptId: 'after-reload',
@@ -180,7 +195,9 @@ test.each([false, true])(
         nextPrewarmAt: now + 3_300_000,
       })),
     )
-    expect(timers.size).toBe(0)
+    expect(timers.size).toBe(retained ? 0 : 1)
+    expect(lease.stopped).toBe(false)
+    expect(touches).toEqual([])
     keep.forgetSession('ses_before_reload')
     expect(
       current.manager.trackedSessions().map(({ id }: LegacySession) => id),
@@ -250,9 +267,13 @@ test('OpenCode 2 hybrid disable removes local records but preserves a mixed stor
   })
   cleanups.push(() => keep.dispose())
   await keep.ready
-  const shared = (globalThis as any)[
-    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-  ].get(storageId)
+  const shared = [
+    ...(globalThis as any)[
+      Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v3')
+    ]
+      .get(storageId)
+      .values(),
+  ][0]
   const input = {
     attemptId: 'local',
     sessionID: 'ses_local',

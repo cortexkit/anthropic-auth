@@ -644,8 +644,8 @@ export interface CacheKeepStoreOptions {
   /** Pi claims only sessions opened by its host, in its existing directory. */
   externalClaim?: (id: string) => CacheKeepClaim | undefined
   onClaimLost?: (id: string) => void
-  /** Wait for the previous scheduler to flush and release its claims. */
-  waitForWriter?: Promise<void>
+  /** Prefer the saved sessions with the most remaining cache lifetime. */
+  restoreNewestFirst?: boolean
 }
 
 type UnverifiedClaim = 'ownership-unverified'
@@ -693,10 +693,10 @@ export class CacheKeepStore {
     this.pendingRealClaims = previous?.pendingRealClaims ?? new Map()
     // Capture pending writes before the shared entry switches writers. New
     // writes and loads wait for them, so an old write cannot land last.
-    const handover = options.waitForWriter ?? previous?.drain()
-    this.switchingWriter = !!handover
-    this.chain = handover
-      ? handover.finally(() => {
+    const drainingPrevious = previous?.drain()
+    this.switchingWriter = !!drainingPrevious
+    this.chain = drainingPrevious
+      ? drainingPrevious.finally(() => {
           this.switchingWriter = false
         })
       : Promise.resolve()
@@ -991,7 +991,15 @@ export class CacheKeepStore {
           return
         }
       }
-      for (const name of names.sort()) {
+      const candidates: Array<[name: string, expiresAt: number]> = []
+      let collecting = mode === 'restore' && this.options.restoreNewestFirst
+      function* orderedNames() {
+        yield* names.sort()
+        collecting = false
+        candidates.sort((a, b) => b[1] - a[1])
+        for (const [name] of candidates) yield name
+      }
+      for (const name of orderedNames()) {
         const temp = TEMP.test(name)
         if (!FILE.test(name) && !temp) continue
         const key = name.slice(0, 64)
@@ -1078,6 +1086,13 @@ export class CacheKeepStore {
           if (deleted) {
             reason = 'deleted'
             throw new Error('Deleted restart record')
+          }
+          if (collecting && !invalid) {
+            // Keep only the sort keys. The second pass rechecks both the
+            // claim and the record before accepting it, without buffering all
+            // saved bodies or holding their claims between passes.
+            candidates.push([name, entry.cacheExpiresAt])
+            continue
           }
           const acceptance = accept(entry)
           if (acceptance === undefined) continue

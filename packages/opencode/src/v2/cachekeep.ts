@@ -122,17 +122,14 @@ interface CacheKeepLease {
 }
 
 /**
- * Tracked sessions for one account storage, shared by every plugin instance in
- * the host process that uses that storage. OpenCode 2 creates one plugin
- * instance per directory and disposes it when it evicts the directory or a
- * plugin file changes, so the tracked sessions must outlive any one instance.
+ * Tracked sessions for one account storage, shared by directories using the
+ * same plugin module. OpenCode replaces each directory's activation separately,
+ * so different modules can be live at the same time.
  */
 interface SharedCacheKeep {
-  readonly module: object
   readonly manager: CacheKeepManager
   readonly registry: CacheKeepSessionRegistry
   readonly persistence: CacheKeepStore
-  retired?: true
   loading?: Promise<void>
   restoreSkips?: Set<string>
   readonly prepared: Map<
@@ -194,16 +191,16 @@ function discardLocalTargets(
     .catch(() => logger.warn('cachekeep', 'local restart cleanup failed'))
 }
 
-// Directories using the same module share a scheduler. A fresh module needs
-// the global slot to find and close the previous scheduler before restoring.
-const cacheKeepModule = {}
+// Different modules coordinate through the restart claims, not through one
+// another's schedulers. Older installers must not find and reuse these keepers.
+const cacheKeepModule = Symbol()
 const SHARED_CACHE_KEEPS = Symbol.for(
-  'cortexkit.anthropic-auth.opencode2.cachekeep.v2',
+  'cortexkit.anthropic-auth.opencode2.cachekeep.v3',
 )
 
-function sharedCacheKeeps(): Map<string, SharedCacheKeep> {
+function sharedCacheKeeps() {
   const scope = globalThis as typeof globalThis & {
-    [SHARED_CACHE_KEEPS]?: Map<string, SharedCacheKeep>
+    [SHARED_CACHE_KEEPS]?: Map<string, Map<symbol, SharedCacheKeep>>
   }
   scope[SHARED_CACHE_KEEPS] ??= new Map()
   return scope[SHARED_CACHE_KEEPS]
@@ -215,7 +212,6 @@ const sessionHash = (id: string) =>
 function createSharedCacheKeep(
   storageId: string,
   options: NativeCacheKeepOptions,
-  handover?: Promise<void>,
 ): SharedCacheKeep {
   const prepared: SharedCacheKeep['prepared'] = new Map()
   const leases: SharedCacheKeep['leases'] = new Map()
@@ -226,7 +222,7 @@ function createSharedCacheKeep(
     storageId,
     ...options.persistence,
     sessionClaims: true,
-    waitForWriter: handover,
+    restoreNewestFirst: true,
     onClaimLost(id) {
       restored.delete(id)
       manager.releaseTarget(id)
@@ -244,7 +240,6 @@ function createSharedCacheKeep(
   const schedule = options.setIntervalImpl ?? globalThis.setInterval
   const manager: CacheKeepManager = new CacheKeepManager({
     loadStorage: async () => {
-      await handover
       const lease = newestLease()
       const storage = lease ? await lease.loadStorage() : null
       if (lease && !lease.stopped)
@@ -343,21 +338,24 @@ function createSharedCacheKeep(
   }
   const dropExpired = () => {
     stopExpiry()
-    if (shared.retired || leases.size > 0) return
+    if (leases.size > 0) return
     const now = options.now?.() ?? Date.now()
     const earliest =
       manager.dropExpiredTargets() ??
       (retainedUntil > now ? retainedUntil : undefined)
     if (earliest === undefined) {
       const shareds = sharedCacheKeeps()
-      if (shareds.get(storageId) === shared) shareds.delete(storageId)
+      const copies = shareds.get(storageId)
+      if (copies?.get(cacheKeepModule) === shared) {
+        copies.delete(cacheKeepModule)
+        if (!copies.size) shareds.delete(storageId)
+      }
       return
     }
     expiry = setTimeout(dropExpired, Math.max(0, earliest - now))
     if (typeof expiry === 'object' && 'unref' in expiry) expiry.unref()
   }
   const shared: SharedCacheKeep = {
-    module: cacheKeepModule,
     manager,
     registry,
     persistence,
@@ -369,7 +367,7 @@ function createSharedCacheKeep(
       manager.abortWarms()
       prepared.clear()
       const loading = shared.loading
-      retaining = (async () => {
+      const retainingTargets = (async () => {
         await manager.drain()
         await loading
         await shared.localCleanup
@@ -391,16 +389,20 @@ function createSharedCacheKeep(
         }
         dropExpired()
       })().finally(() => {
-        retaining = undefined
+        if (retaining === retainingTargets) retaining = undefined
       })
-      return retaining
+      retaining = retainingTargets
+      return retainingTargets
     },
     async adopt() {
       const retained = retaining
-      shared.loading ??= (async () => {
-        const skipped = new Set<string>()
-        shared.restoreSkips = skipped
-        await handover
+      const previousScan = shared.loading
+      shared.restoreSkips ??= new Set<string>()
+      const skipped = shared.restoreSkips
+      // A directory's previous activation may have just released sessions.
+      // Queue a new scan even if this keeper already has other live leases.
+      const loading = (async () => {
+        await previousScan
         await retained
         stopExpiry()
         retainedUntil = 0
@@ -449,6 +451,9 @@ function createSharedCacheKeep(
               !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
             )
               return 'invalid'
+            // Saved sessions can fill spare capacity, but are not new user
+            // turns. Leave overflow on disk for another lease to pick up.
+            if (!manager.hasRoomForRestore(entry.bodyText)) return undefined
             const nextPrewarmAt =
               entry.nextPrewarmAt <= now
                 ? now + overdue++ * 3000
@@ -488,10 +493,13 @@ function createSharedCacheKeep(
           logger.warn('cachekeep', 'failed to restore tracked sessions')
         })
         .finally(() => {
-          shared.loading = undefined
-          shared.restoreSkips = undefined
+          if (shared.loading === loading) {
+            shared.loading = undefined
+            shared.restoreSkips = undefined
+          }
         })
-      await shared.loading
+      shared.loading = loading
+      await loading
       if (!leases.size) return
       // A session whose cache expired while no instance was live has nothing
       // left to keep warm; drop it rather than prewarm it.
@@ -505,48 +513,11 @@ function createSharedCacheKeep(
   return shared
 }
 
-function retireSharedCacheKeep(
-  previous: Omit<SharedCacheKeep, 'manager'> & {
-    manager: Partial<
-      Pick<CacheKeepManager, 'stop' | 'abortWarms' | 'drain' | 'dispose'>
-    >
-  },
-) {
-  const { manager, persistence, registry } = previous
-  previous.retired = true
-  // Preserve accepted bodies, but a request still waiting for headers on the
-  // old module has no lease on the new scheduler. Its next turn can track it.
-  for (const lease of previous.leases.values()) lease.stopped = true
-  previous.leases.clear()
-  manager.stop?.()
-  manager.abortWarms?.()
-  // Older owners may only expose their shutdown through the last-lease hook.
-  const retaining = manager.dispose ? undefined : previous.retain?.()
-  return (async () => {
-    await persistence.drain()
-    await retaining
-    await previous.loading
-    await previous.localCleanup
-    // Current schedulers refund an unsent reservation before the drain ends.
-    // On upgrade from an older scheduler its saved charge is ambiguous: it
-    // might have sent, so keep that charge rather than risk exceeding the cap.
-    await manager.drain?.()
-    await manager.dispose?.()
-    await persistence.drain()
-    await persistence.releaseClaims?.(() => true)
-    await registry.dispose().catch(() => {
-      logger.warn('cachekeep', 'failed to withdraw previous tracked sessions')
-    })
-  })()
-}
-
 /**
  * Keep admitted hybrid-cache prefixes warm using fresh native authorization for
- * each send. Instances for the same account storage share one set of tracked
- * sessions: a later instance takes over sending for sessions an earlier one
- * tracked, and the timer stops only when the last instance is disposed. The
- * sessions themselves outlive the last instance until their cache expires, so
- * an instance that boots for the same storage in that time adopts them.
+ * each send. Instances of this module using the same storage share one keeper
+ * until the last lease closes. Other modules can adopt its saved sessions once
+ * it releases their claims and while their caches are still live.
  */
 export function createNativeCacheKeep(
   options: NativeCacheKeepOptions & {
@@ -562,16 +533,15 @@ export function createNativeCacheKeep(
   const { runtime, source } = options
   const abort = new AbortController()
   const shareds = sharedCacheKeeps()
-  const previous = shareds.get(options.storageId)
+  let copies = shareds.get(options.storageId)
+  if (!copies) {
+    copies = new Map()
+    shareds.set(options.storageId, copies)
+  }
   const owner =
-    previous?.module === cacheKeepModule
-      ? previous
-      : createSharedCacheKeep(
-          options.storageId,
-          options,
-          previous && retireSharedCacheKeep(previous),
-        )
-  shareds.set(options.storageId, owner)
+    copies.get(cacheKeepModule) ??
+    createSharedCacheKeep(options.storageId, options)
+  copies.set(cacheKeepModule, owner)
   const { manager, registry } = owner
   const realTurns = new Set<CacheKeepRealTurn>()
   const beginRealTurn = (input: RequestScope) => {
@@ -947,11 +917,8 @@ export function createNativeCacheKeep(
     read: () => runtime.read(),
     subagent: options.subagent,
   }
-  const adopting = owner.leases.size === 0
   owner.leases.set(lease.generation, lease)
-  const ready = (
-    adopting ? owner.adopt() : (owner.loading ?? Promise.resolve())
-  ).then(() => {
+  const ready = owner.adopt().then(() => {
     if (!lease.stopped)
       for (const session of manager.trackedSessions())
         options.subagent?.(session.id)
@@ -1158,7 +1125,6 @@ export function createNativeCacheKeep(
     resolvedParent,
     forgetSession(sessionID: string) {
       acceptedStates.delete(sessionID)
-      if (owner.retired) return
       owner.restoreSkips?.add(sessionHash(sessionID))
       manager.untrack(sessionID)
       for (const [attemptId, entry] of pending)
@@ -1167,7 +1133,8 @@ export function createNativeCacheKeep(
     sessionDeleted(sessionID: string) {
       // Local routing cleanup also runs on eviction and shutdown. Only the host
       // deletion event can invalidate a record belonging to another server.
-      const current = shareds.get(options.storageId) ?? owner
+      const current =
+        shareds.get(options.storageId)?.get(cacheKeepModule) ?? owner
       current.restoreSkips?.add(sessionHash(sessionID))
       current.persistence.removed(sessionID, 'deleted')
     },
