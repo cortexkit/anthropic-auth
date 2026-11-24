@@ -9,6 +9,7 @@ import {
   SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
   stripServerFallbackUsageMarkers,
 } from './server-fallback-usage.ts'
+import type { RefusalFallbackMode } from './settings-definition.ts'
 
 export const SERVER_FALLBACK_MARKER_TEXT = '\u2060'
 
@@ -218,20 +219,22 @@ function rewriteStoredMarkers(body: Record<string, unknown>, enabled: boolean) {
         block?.type === 'thinking' &&
         typeof block.signature === 'string' &&
         block.signature.startsWith(SERVER_FALLBACK_SIGNATURE_PREFIX)
-      if (!isInternalMarker) {
-        rewritten.push(rawBlock)
-        continue
-      }
-
-      const marker = decodeMarkerSignature(block.signature)
-      if (enabled && marker) {
-        rewritten.push(fallbackBlock(marker))
-        restoredMarkers++
-      } else {
+      if (!enabled && block?.type === 'fallback') {
         droppedMarkers++
+      } else if (!isInternalMarker) {
+        rewritten.push(rawBlock)
+      } else {
+        const marker = decodeMarkerSignature(block.signature)
+        if (enabled && marker) {
+          rewritten.push(fallbackBlock(marker))
+          restoredMarkers++
+        } else {
+          droppedMarkers++
+        }
       }
     }
-    message.content = rewritten
+    if (rewritten.length !== message.content.length || enabled)
+      message.content = rewritten
   }
   return { restoredMarkers, droppedMarkers }
 }
@@ -254,6 +257,46 @@ export function applyServerSideFallbackToBody(
     delete body.fallbacks
   }
   return { enabled, ...markerResult }
+}
+
+function isUnsignedThinking(value: unknown): boolean {
+  const block = asRecord(value)
+  return (
+    block?.type === 'thinking' &&
+    (typeof block.signature !== 'string' || block.signature.length === 0)
+  )
+}
+
+/** Drop replayed thinking that the upstream never signed, preserving other blocks. */
+export function stripUnsignedThinkingBlocks(
+  body: Record<string, unknown>,
+): boolean {
+  if (!Array.isArray(body.messages)) return false
+  let changed = false
+  for (let index = body.messages.length - 1; index >= 0; index--) {
+    const message = asRecord(body.messages[index])
+    if (!Array.isArray(message?.content)) continue
+    const blocks = message.content
+    if (!blocks.some(isUnsignedThinking)) continue
+    const content = blocks.filter((value) => !isUnsignedThinking(value))
+    if (content.length === 0 && message.role === 'assistant')
+      body.messages.splice(index, 1)
+    else message.content = content
+    changed = true
+  }
+  return changed
+}
+
+/** Enforce the fallback mode on the payload after caller edits, before signing. */
+export function sanitizeClaudeCodeRequestBody(
+  body: Record<string, unknown>,
+  mode: RefusalFallbackMode,
+): boolean {
+  const removedThinking = stripUnsignedThinkingBlocks(body)
+  if (mode === 'server') return removedThinking
+  const hadFallbacks = Object.hasOwn(body, 'fallbacks')
+  const { droppedMarkers } = applyServerSideFallbackToBody(body, false)
+  return removedThinking || hadFallbacks || droppedMarkers > 0
 }
 
 function parseSseEvent(rawEvent: string): ParsedSseEvent {

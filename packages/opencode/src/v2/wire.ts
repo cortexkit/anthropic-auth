@@ -176,6 +176,7 @@ export function createNativeWirePolicy(
         turnEndNoteEnabled: true,
         turnEndNote: snapshot.policyStorage.turnEndNote,
         serverSideFallbackEnabled: refusalFallbackMode === 'server',
+        refusalFallbackMode,
         laneStart,
         billingLineage: lineage
           ? {

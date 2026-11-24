@@ -3857,6 +3857,7 @@ const anthropicAuthPlugin = async (
   const cacheWarmFetch = fetchOAuthModel(currentWarmGateway, requestGzipLatch)
   const cacheKeepManager: CacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
+    refusalFallbackMode: readRefusalFallbackMode,
     resolveSettings: (storage, model) =>
       nativeAccounts.resolveSettings?.(storage, model) ?? storage,
     now: runtimeNow,
@@ -4056,6 +4057,7 @@ const anthropicAuthPlugin = async (
         setOAuthHeaders(headers, accessToken, {
           body: parsedBody,
           identity,
+          refusalFallbackMode: attempt.refusalFallbackMode,
         })
         headers.set(
           'anthropic-beta',
@@ -7942,6 +7944,7 @@ const anthropicAuthPlugin = async (
                   body: finalBody,
                   identity,
                   requestClass,
+                  refusalFallbackMode,
                 })
                 const diagnostics = finalBody.diagnostics
                 const sentPreviousMessageId =

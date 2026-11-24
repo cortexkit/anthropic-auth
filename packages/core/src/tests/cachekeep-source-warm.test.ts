@@ -8,8 +8,13 @@ import {
   cacheWarmCacheablePrefixFingerprint,
   isCacheKeepHybridActive,
 } from '../cachekeep.ts'
-import { selectClaudeCodeBetas } from '../claude-code.ts'
+import { signRequestBody } from '../cch.ts'
+import {
+  applyClaudeCodeHeaders,
+  selectClaudeCodeBetas,
+} from '../claude-code.ts'
 import { __setLogTestSink } from '../logger.ts'
+import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback-usage.ts'
 
 const hybridStorage = (): AccountStorage => ({
   version: 1,
@@ -54,6 +59,41 @@ function sourceBody() {
 }
 
 describe('cachekeep source-warm prewarm body', () => {
+  test.each([
+    ['client', false, false, true],
+    ['client', true, false, true],
+    ['off', false, false, true],
+    ['off', true, false, true],
+    ['server', false, true, true],
+    ['server', true, false, false],
+  ] as const)(
+    '%s prewarm (source warm: %s) pairs opt-in %s with beta %s',
+    async (refusalFallbackMode, stripServerFallback, optIn, beta) => {
+      const result = await buildCacheKeepPrewarmBody(sourceBody(), {
+        refusalFallbackMode,
+        stripServerFallback,
+      })
+      if (!result.ok) throw new Error(result.reason)
+      const body = JSON.parse(result.bodyText)
+      expect(Object.hasOwn(body, 'fallbacks')).toBe(optIn)
+      expect(body.max_tokens).toBe(0)
+      expect(result.bodyText).toBe(await signRequestBody(result.bodyText))
+      const headers = applyClaudeCodeHeaders(new Headers(), 'test-token', {
+        body,
+        refusalFallbackMode,
+        requestClass: 'auxiliary',
+      })
+      expect(headers.get('anthropic-beta')?.split(',')).toContain(
+        'oauth-2025-04-20',
+      )
+      expect(
+        headers
+          .get('anthropic-beta')
+          ?.split(',')
+          .includes(SERVER_SIDE_FALLBACK_BETA),
+      ).toBe(beta)
+    },
+  )
   test('ordinary and source warms preserve thinking block binding with its beta', async () => {
     const body = JSON.parse(sourceBody())
     body.thinking = {

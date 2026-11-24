@@ -525,6 +525,50 @@ test('OpenCode 2 ignores the removed fallback environment switch on each request
   expect(response('off').serverSideFallbackModel).toBeUndefined()
 })
 
+test.each(['client', 'off'] as const)(
+  'OpenCode 2 in %s strips and re-signs a prewarm prepared in server mode',
+  async (refusalFallbackMode) => {
+    const wire = createNativeWirePolicy()
+    const { source } = makeSource({
+      requestOptions: (input) =>
+        wire.requestOptions(input, {
+          policyStorage: {},
+          refusalFallbackMode,
+        } as core.NativeAccountSnapshot),
+    })
+    const native = createNativeAnthropicAdapter({ source })
+    try {
+      const clean = {
+        model: 'claude-fable-5',
+        max_tokens: 0,
+        system: [
+          {
+            type: 'text',
+            text: 'x-anthropic-billing-header: cc_version=2.1.302; cc_entrypoint=cli; cch=00000;',
+          },
+        ],
+        messages: [{ role: 'user', content: 'kept prefix' }],
+      }
+      const stale = await signRequestBody(
+        JSON.stringify({ ...clean, fallbacks: 'default' }),
+      )
+      const host = new Host(native.adapter)
+      const { final } = await host.run(
+        scopeOf({ agent: 'cachekeep', modelID: clean.model }),
+        hostRequest(JSON.parse(stale)),
+      )
+      expect(final.headers.get('anthropic-beta')?.split(',')).toContain(
+        SERVER_SIDE_FALLBACK_BETA,
+      )
+      expect(await final.clone().text()).toBe(
+        await signRequestBody(JSON.stringify(clean)),
+      )
+    } finally {
+      native.dispose()
+    }
+  },
+)
+
 test.each([
   ['server', 'claude-fable-5', true, 'tool_use'],
   ['server', 'claude-fable-5', false, 'refusal'],
@@ -548,11 +592,22 @@ test.each([
     try {
       const { attempt, final } = await host.run(
         scopeOf({ modelID: 'claude-fable-5' }),
-        hostRequest({ ...sonnetPayload(), model, stream: true }),
+        hostRequest({
+          ...sonnetPayload(),
+          model,
+          stream: true,
+          fallbacks: false,
+        }),
       )
       const enabled = mode === 'server' && model === 'claude-fable-5'
       const sentBody = (await final.clone().json()) as Record<string, unknown>
       expect(sentBody.fallbacks).toBe(enabled ? 'default' : undefined)
+      expect(
+        final.headers
+          .get('anthropic-beta')
+          ?.split(',')
+          .includes(SERVER_SIDE_FALLBACK_BETA),
+      ).toBe(model === 'claude-fable-5')
       const stopDetails = { type: 'refusal', category: 'test' }
       const frames = [
         sse('message_start', {

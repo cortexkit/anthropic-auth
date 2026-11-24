@@ -24,6 +24,7 @@ import {
   createDumpResponseObserver,
   createProviderErrorRedactor,
   createProviderErrorResponseScope,
+  DEFAULT_REFUSAL_FALLBACK_MODE,
   type DumpHandle,
   type DumpTag,
   decideRequestGzip,
@@ -47,6 +48,7 @@ import {
   type ProviderResponseMode,
   prepareMessageThreadRequest,
   RELAY_PROXY_REFUSAL,
+  type RefusalFallbackMode,
   type RequestGzipLatch,
   relayProxyApplies,
   remapModelId,
@@ -57,6 +59,7 @@ import {
   resolveNativePoolPaths,
   rewriteApiKeyRequestBody,
   runWithRequestSignal,
+  sanitizeClaudeCodeRequestBody,
   sendWithRequestGzip,
   setDumpEnabled as setDumpEnabledCore,
   signRequestBody,
@@ -276,6 +279,7 @@ export type NativeAnthropicBodyOptions = Omit<
   | 'deferSigning'
 > & {
   readonly cacheDiagnosticsPreviousMessageReceivedAt?: number
+  readonly refusalFallbackMode?: RefusalFallbackMode
 }
 
 type StrippedStreamOptions = NonNullable<
@@ -1287,6 +1291,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     // options or the body rewrite.
     ensureLive()
     const messages = body !== undefined && isMessagesUrl(request.url)
+    let cacheKeepBodyChanged = false
     const url =
       rewriteUrl(
         request.url,
@@ -1334,6 +1339,7 @@ export function createNativeAnthropicAdapter<Q, P>(
           else headers.set(name, value)
         }
         let finalBody: Record<string, unknown> | null = null
+        let refusalFallbackMode: RefusalFallbackMode | undefined
         if (body !== undefined && messages) {
           const context: NativeAnthropicRequestContext<P> = {
             ...contextOf(attempt, data),
@@ -1350,6 +1356,11 @@ export function createNativeAnthropicAdapter<Q, P>(
           }
           const { cacheDiagnosticsPreviousMessageReceivedAt, ...options } =
             (await source.requestOptions?.(context)) ?? {}
+          refusalFallbackMode =
+            options.refusalFallbackMode ??
+            (options.serverSideFallbackEnabled
+              ? 'server'
+              : DEFAULT_REFUSAL_FALLBACK_MODE)
           // Recheck session revocation after awaiting policy options. A
           // cleared session must not enter body rewriting or signing.
           ensureLive()
@@ -1367,6 +1378,9 @@ export function createNativeAnthropicAdapter<Q, P>(
             }
             body = await rewriteRequestBody(body, {
               ...options,
+              serverSideFallbackEnabled:
+                refusalFallbackMode === 'server' &&
+                options.serverSideFallbackEnabled === true,
               deferSigning: true,
               onThreadCacheSlot: (slot) => {
                 threadCacheSlot = slot
@@ -1380,9 +1394,18 @@ export function createNativeAnthropicAdapter<Q, P>(
           }
           const parsed = parseJson(body)
           finalBody = isRecord(parsed) ? parsed : null
+          if (
+            attempt.agent === 'cachekeep' &&
+            finalBody &&
+            sanitizeClaudeCodeRequestBody(finalBody, refusalFallbackMode)
+          ) {
+            body = JSON.stringify(finalBody)
+            cacheKeepBodyChanged = true
+          }
         }
         setOAuthHeaders(headers, accessToken, {
           body: finalBody,
+          refusalFallbackMode,
           ...(identity ? { identity } : {}),
           requestClass:
             attempt.kind !== 'primary' || isAuxiliaryAgent(attempt.agent)
@@ -1683,7 +1706,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       data.route === 'oauth' &&
       messages &&
       body !== undefined &&
-      attempt.agent !== 'cachekeep'
+      (attempt.agent !== 'cachekeep' || cacheKeepBodyChanged)
     ) {
       body = await signRequestBody(body)
       ensureLive()

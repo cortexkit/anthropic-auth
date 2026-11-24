@@ -18,7 +18,9 @@ import {
   observeMessageThreadResponse,
   prepareMessageThreadRequest,
 } from '../message-threads.ts'
+import { sanitizeClaudeCodeRequestBody } from '../server-fallback.ts'
 import {
+  SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_FALLBACK_USAGE_MARKER_TEXT,
   SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
 } from '../server-fallback-usage.ts'
@@ -2153,6 +2155,82 @@ test.each(['default', 'different-policy', null])(
     )
   },
 )
+
+test('the first client request after a server opt-in creates once without stored fallback markers', async () => {
+  const tracker = new MessageThreadTracker()
+  const original = { ...input(), account: 'fallback-mode-upgrade' }
+  original.body.fallbacks = 'default'
+  const headers = new Headers({ 'anthropic-beta': 'base' })
+  const prepare = (body: MessageThreadInput['body']) =>
+    prepareMessageThreadRequest(tracker, {
+      ...original,
+      headers,
+      bodyText: JSON.stringify(body),
+    })
+  const finish = (id: string, text: string) =>
+    sse([
+      {
+        type: 'message_start',
+        message: { id, content: [{ type: 'text', text }] },
+      },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      { type: 'message_stop' },
+    ])
+
+  const first = await prepare(original.body)
+  expect(JSON.parse(first.bodyText).fallbacks).toBe('default')
+  await first.observe(finish('msg_server', 'answer')).text()
+  const candidate = advance(original).body
+  const ordinaryContent = [{ type: 'text', text: 'answer' }]
+  candidate.messages = [
+    { role: 'user', content: 'one' },
+    {
+      role: 'assistant',
+      content: [
+        ...ordinaryContent,
+        {
+          type: 'thinking',
+          thinking: '',
+          signature: `${SERVER_FALLBACK_SIGNATURE_PREFIX}claude-opus-5-5|claude-opus-5`,
+        },
+      ],
+    },
+    next,
+  ]
+  sanitizeClaudeCodeRequestBody(candidate, 'client')
+  const upgraded = await prepare(candidate)
+  expect(JSON.parse(upgraded.bodyText)).toEqual({
+    model: 'claude-opus-5-5',
+    system: original.body.system,
+    tools: original.body.tools,
+    output_config: original.body.output_config,
+    messages: [
+      { role: 'user', content: 'one' },
+      { role: 'assistant', content: ordinaryContent },
+      next,
+    ],
+    thread: { type: 'create' },
+  })
+  await upgraded.observe(finish('msg_client', 'second answer')).text()
+  const latest = { role: 'user', content: 'three' }
+  const followup = await prepare({
+    ...candidate,
+    messages: [
+      ...(candidate.messages as unknown[]),
+      { role: 'assistant', content: 'second answer' },
+      latest,
+    ],
+  })
+  const wire = JSON.parse(followup.bodyText)
+  expect(wire.thread).toEqual({
+    type: 'continue',
+    previous_message_id: 'msg_client',
+  })
+  expect(wire.messages).toHaveLength(1)
+  expect(wire.messages[0].role).toBe('user')
+  const content = wire.messages[0].content
+  expect(typeof content === 'string' ? content : content[0].text).toBe('three')
+})
 
 test.each([
   'adjacent assistant',

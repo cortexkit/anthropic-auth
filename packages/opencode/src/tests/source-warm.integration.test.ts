@@ -436,7 +436,8 @@ describe('source-warm', () => {
       const warm = sourceWarms(round)[0]!
       expect(warm.maxTokens).toBe(0)
       expect(warm.fallbacks).toBeUndefined()
-      expect(warm.betas.split(',').map((beta) => beta.trim())).not.toContain(
+      // Client-mode source warms keep the beta without opting into server routing.
+      expect(warm.betas.split(',').map((beta) => beta.trim())).toContain(
         SERVER_SIDE_FALLBACK_BETA,
       )
       expect(warm.betas).toContain(CACHE_KEEP_EXTENDED_TTL_BETA)

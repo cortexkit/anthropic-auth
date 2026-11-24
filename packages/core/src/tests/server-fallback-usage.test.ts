@@ -1,5 +1,7 @@
 import { expect, test } from 'bun:test'
 import { buildCacheKeepPrewarmBody } from '../cachekeep.ts'
+import { extractBillingHeaderCCH, signRequestBody } from '../cch.ts'
+import { sanitizeClaudeCodeRequestBody } from '../server-fallback.ts'
 import {
   SERVER_FALLBACK_USAGE_MARKER_TEXT,
   SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
@@ -64,3 +66,64 @@ test('ordinary and source prewarms strip usage markers without changing outgoing
     }
   }
 })
+
+test.each(['client', 'off', 'server'] as const)(
+  '%s post-hook preparation drops unsigned thinking before signing',
+  async (mode) => {
+    const signedThinking = {
+      type: 'thinking',
+      thinking: 'kept',
+      signature: 'signed',
+    }
+    const redactedThinking = { type: 'redacted_thinking', data: 'opaque' }
+    const text = { type: 'text', text: 'answer' }
+    const user = { role: 'user', content: 'continue' }
+    const ordinary = {
+      model: 'claude-fable-5',
+      system: [
+        {
+          type: 'text',
+          text: 'x-anthropic-billing-header: cc_version=2.1.302; cc_entrypoint=cli; cch=00000;',
+        },
+      ],
+      messages: [
+        { role: 'user', content: 'first' },
+        {
+          role: 'assistant',
+          content: [signedThinking, redactedThinking, text],
+        },
+        user,
+      ],
+      ...(mode === 'server' ? { fallbacks: 'default' } : {}),
+    }
+    const unsignedOrdinary = JSON.stringify(ordinary)
+    const expected = await signRequestBody(unsignedOrdinary)
+    expect(extractBillingHeaderCCH(expected)).not.toBe('00000')
+    expect(sanitizeClaudeCodeRequestBody(ordinary, mode)).toBe(false)
+    expect(JSON.stringify(ordinary)).toBe(unsignedOrdinary)
+    for (const value of ['default', false, null, { caller: 'custom' }, []]) {
+      const callerReplacement = {
+        ...ordinary,
+        fallbacks: mode === 'server' ? 'default' : value,
+        messages: [
+          ordinary.messages[0]!,
+          {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'no signature' },
+              signedThinking,
+              { type: 'thinking', thinking: 'empty signature', signature: '' },
+              redactedThinking,
+              text,
+            ],
+          },
+          user,
+        ],
+      }
+      expect(sanitizeClaudeCodeRequestBody(callerReplacement, mode)).toBe(true)
+      expect(await signRequestBody(JSON.stringify(callerReplacement))).toBe(
+        expected,
+      )
+    }
+  },
+)

@@ -13,6 +13,7 @@ import {
   CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
   createServerSideFallbackStreamRewriter,
+  extractBillingHeaderCCH,
   FAST_MODE_BETA,
   logger,
   MessageThreadTracker,
@@ -768,8 +769,11 @@ describe('setOAuthHeaders', () => {
     expect(body.tool_choice).toBeUndefined()
     const headers = new Headers()
     const previousHeaders = new Headers()
-    setOAuthHeaders(headers, 'token', { body })
-    setOAuthHeaders(previousHeaders, 'token', { body: previous })
+    setOAuthHeaders(headers, 'token', { body, refusalFallbackMode: 'server' })
+    setOAuthHeaders(previousHeaders, 'token', {
+      body: previous,
+      refusalFallbackMode: 'server',
+    })
     expect(headers.get('anthropic-beta')).toBe(
       previousHeaders.get('anthropic-beta'),
     )
@@ -811,10 +815,11 @@ describe('setOAuthHeaders', () => {
     }
   })
 
-  test('adds the server-side fallback beta only for opted-in bodies', () => {
+  test('adds the server-side fallback beta in server mode only for opted-in bodies', () => {
     const enabled = new Headers()
     setOAuthHeaders(enabled, 'token', {
       body: { model: 'claude-fable-5', fallbacks: 'default' },
+      refusalFallbackMode: 'server',
     })
     expect(enabled.get('anthropic-beta')?.split(',')).toContain(
       SERVER_SIDE_FALLBACK_BETA,
@@ -823,9 +828,66 @@ describe('setOAuthHeaders', () => {
     const disabled = new Headers()
     setOAuthHeaders(disabled, 'token', {
       body: { model: 'claude-fable-5' },
+      refusalFallbackMode: 'server',
     })
     expect(disabled.get('anthropic-beta')?.split(',')).not.toContain(
       SERVER_SIDE_FALLBACK_BETA,
+    )
+  })
+
+  test.each(['client', 'off'] as const)(
+    'OpenCode 1 in %s sends the fallback beta without a body opt-in',
+    async (refusalFallbackMode) => {
+      const raw = JSON.stringify({
+        model: 'claude-fable-5',
+        max_tokens: 32,
+        fallbacks: { caller: true },
+        messages: [
+          { role: 'user', content: 'first' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'unfinished' },
+              { type: 'text', text: 'answer' },
+            ],
+          },
+          { role: 'user', content: 'continue' },
+        ],
+      })
+      const client = await rewriteRequestBody(raw, { isOAuth: true })
+      const body = JSON.parse(client)
+      expect(body).not.toHaveProperty('fallbacks')
+      expect(body.messages[1].content).toEqual([
+        { type: 'text', text: 'answer' },
+      ])
+      const headers = setOAuthHeaders(new Headers(), 'token', {
+        body,
+        refusalFallbackMode,
+      })
+      expect(headers.get('anthropic-beta')?.split(',')).toContain(
+        SERVER_SIDE_FALLBACK_BETA,
+      )
+      expect(client).toBe(await signRequestBody(client))
+    },
+  )
+
+  test('ordinary client fallback request bytes differ from server only in fallbacks and cch', async () => {
+    const input = JSON.stringify({
+      model: 'claude-fable-5',
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'first prompt' }],
+    })
+    const server = await rewriteRequestBody(input, {
+      isOAuth: true,
+      serverSideFallbackEnabled: true,
+    })
+    const client = await rewriteRequestBody(input, { isOAuth: true })
+    const { fallbacks, ...ordinary } = JSON.parse(server)
+    expect(fallbacks).toBe('default')
+    expect(client).toBe(await signRequestBody(JSON.stringify(ordinary)))
+    expect(extractBillingHeaderCCH(client)).toBeTruthy()
+    expect(extractBillingHeaderCCH(client)).not.toBe(
+      extractBillingHeaderCCH(server),
     )
   })
 
@@ -4115,7 +4177,7 @@ describe('rewriteRequestBody', () => {
         [
           base,
           image,
-          { type: 'thinking', thinking: 'reasoning' },
+          { type: 'thinking', thinking: 'reasoning', signature: 'signed' },
           { type: 'text', text: 'live' },
         ],
       ],

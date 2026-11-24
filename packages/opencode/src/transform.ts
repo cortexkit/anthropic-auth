@@ -44,15 +44,17 @@ import {
   PARAGRAPH_REMOVAL_ANCHORS,
   parseSseFrame,
   REQUIRED_BETAS,
+  type RefusalFallbackMode,
   readSessionCachePolicy,
   remapRequestBodyModel,
   resolveClaudeModelCapabilities,
-  SERVER_SIDE_FALLBACK_BETA,
   type ServerSideFallbackOutcome,
   SseFrameTooLargeError,
+  sanitizeClaudeCodeRequestBody,
   selectClaudeCodeBetas,
   signRequestBody,
   stripEmptyTrailingAssistantMessages,
+  stripUnsignedThinkingBlocks,
   TEXT_REPLACEMENTS,
   type ThinkingPrefixMismatchBehavior,
   TOOL_PREFIX,
@@ -300,18 +302,12 @@ export function setOAuthHeaders(
     body?: Record<string, unknown> | null
     identity?: ClaudeCodeIdentity
     requestClass?: ClaudeCodeRequestClass
+    refusalFallbackMode?: RefusalFallbackMode
   } = {},
 ): Headers {
   // This is the shared boundary where an access value becomes a bearer header.
   assertNotCustodyTombstone(accessToken, 'anthropic')
-  return applyClaudeCodeHeaders(headers, accessToken, {
-    ...options,
-    extraBetas: [
-      ...(options.body?.fallbacks === 'default'
-        ? [SERVER_SIDE_FALLBACK_BETA]
-        : []),
-    ],
-  })
+  return applyClaudeCodeHeaders(headers, accessToken, options)
 }
 
 /**
@@ -1726,6 +1722,7 @@ export async function rewriteRequestBody(
     const messagesBeforeStrip = Array.isArray(parsed.messages)
       ? parsed.messages.length
       : undefined
+    stripUnsignedThinkingBlocks(parsed)
     stripEmptyTrailingAssistantMessages(parsed.messages)
     const removedWhitespaceBlocks =
       stripLatestAssistantToolUseTrailingWhitespace(parsed)
@@ -1944,6 +1941,24 @@ export async function rewriteRequestBody(
       error instanceof TrailingAssistantHistoryError
     ) {
       throw error
+    }
+    // A failed optional rewrite must not let caller-supplied fallback state or
+    // unsigned thinking through. Leave malformed JSON to the upstream as before.
+    let original: unknown
+    try {
+      original = JSON.parse(body)
+    } catch {
+      return body
+    }
+    if (
+      isRecord(original) &&
+      sanitizeClaudeCodeRequestBody(
+        original,
+        options.serverSideFallbackEnabled === true ? 'server' : 'client',
+      )
+    ) {
+      const cleaned = JSON.stringify(original)
+      return options.deferSigning ? cleaned : await signRequestBody(cleaned)
     }
     return body
   }

@@ -485,6 +485,7 @@ async function rebuildRequest(testCase: VectorCase): Promise<VectorOutput> {
   setOAuthHeaders(headers, fixed.accessToken, {
     body: JSON.parse(body),
     identity,
+    refusalFallbackMode: 'server',
   })
   if (fastModeRequested) addFastModeBetaHeader(headers)
   // Production sets a fresh crypto.randomUUID() per request; the vectors hold

@@ -14,6 +14,8 @@ import {
   resolveClaudeModelCapabilities,
   TURN_END_NOTE_BETA,
 } from './model-capabilities.ts'
+import { SERVER_SIDE_FALLBACK_BETA } from './server-fallback-usage.ts'
+import type { RefusalFallbackMode } from './settings-definition.ts'
 import { THINKING_BINDING_CONTROLS_BETA } from './thinking-binding.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
@@ -505,6 +507,8 @@ export function applyClaudeCodeHeaders(
     body?: Record<string, unknown> | null
     identity?: ClaudeCodeIdentity
     extraBetas?: string[]
+    /** Captured for this send. Select betas before replacing the requested model with a fallback target. */
+    refusalFallbackMode?: RefusalFallbackMode
     /**
      * Claude Code's `x-claude-code-request-class`: `main` for a conversation
      * turn, `auxiliary` for background requests such as title generation.
@@ -517,7 +521,17 @@ export function applyClaudeCodeHeaders(
     .split(',')
     .map((beta) => beta.trim())
     .filter(Boolean)
-  const extraBetas = [...incomingBetas, ...(options.extraBetas ?? [])]
+  const extraBetas = [...incomingBetas, ...(options.extraBetas ?? [])].filter(
+    (beta) => beta.trim() !== SERVER_SIDE_FALLBACK_BETA,
+  )
+  const { body, refusalFallbackMode } = options
+  if (
+    resolveClaudeModelCapabilities(body?.model)?.serverSideFallback === true &&
+    (refusalFallbackMode === 'client' ||
+      refusalFallbackMode === 'off' ||
+      (refusalFallbackMode === 'server' && body?.fallbacks === 'default'))
+  )
+    extraBetas.push(SERVER_SIDE_FALLBACK_BETA)
 
   headers.set('accept', 'application/json')
   headers.set('authorization', `Bearer ${accessToken}`)

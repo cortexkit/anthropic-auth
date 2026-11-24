@@ -38,6 +38,7 @@ import {
   type ProviderErrorSummary,
   summarizePrewarmProviderError,
 } from './provider-error.ts'
+import { sanitizeClaudeCodeRequestBody } from './server-fallback.ts'
 import { stripServerFallbackUsageMarkers } from './server-fallback-usage.ts'
 import {
   isSessionCacheWarmStopReason,
@@ -47,6 +48,7 @@ import {
   requestCacheLifetimeMs,
   type SessionCachePolicy,
 } from './session-cache-policy.ts'
+import type { RefusalFallbackMode } from './settings-definition.ts'
 import { readThreeWayBoolean } from './settings-three-way.ts'
 
 export const CLAUDE_CACHE_KEEP_COMMAND_NAME = 'claude-cachekeep'
@@ -351,7 +353,10 @@ function hasExplicitCacheControl(value: unknown): boolean {
 
 export async function buildCacheKeepPrewarmBody(
   bodyText: string,
-  options: { stripServerFallback?: boolean } = {},
+  options: {
+    stripServerFallback?: boolean
+    refusalFallbackMode?: RefusalFallbackMode
+  } = {},
 ): Promise<{ ok: true; bodyText: string } | { ok: false; reason: string }> {
   let body: Record<string, unknown>
   try {
@@ -373,21 +378,17 @@ export async function buildCacheKeepPrewarmBody(
   }
 
   const warm = structuredClone(body) as Record<string, unknown>
-  stripServerFallbackUsageMarkers(warm)
+  // A source warm must not opt into server-side routing. An ordinary server-mode
+  // prewarm retains the opt-in so it warms whichever model served the live turns.
+  const mode = options.stripServerFallback
+    ? 'client'
+    : (options.refusalFallbackMode ?? 'server')
+  if (mode === 'server') stripServerFallbackUsageMarkers(warm)
+  sanitizeClaudeCodeRequestBody(warm, mode)
   delete warm.thread
   stripBillingLineageFromBody(warm)
   warm.max_tokens = 0
   delete warm.stream
-  if (options.stripServerFallback === true) {
-    // A source warm carrying the server-side fallback opt-in can be
-    // sticky-routed to a fallback model instead of the source model whose
-    // cache it should extend. The warm re-derives its betas from its own
-    // body, so dropping the opt-in here also drops the server-fallback
-    // beta from its headers. Ordinary prewarms keep the opt-in: while the
-    // fallback model serves the live turns, the prewarm should warm that
-    // same cache.
-    delete warm.fallbacks
-  }
 
   const thinking = warm.thinking as Record<string, unknown> | undefined
   if (thinking?.type === 'enabled') delete warm.thinking
@@ -625,6 +626,8 @@ export function cacheKeepSourceWarmIdleCap(modelId: string): number {
 
 export type CacheKeepPrewarmAttempt = {
   id: number
+  /** Shared by the prepared body and its authorization headers. */
+  refusalFallbackMode?: RefusalFallbackMode
   /** One deadline covers credential authorization and the HTTP attempt. */
   signal?: AbortSignal
   /** Buffered host senders call this as soon as the physical response headers arrive. */
@@ -821,6 +824,7 @@ export class CacheKeepManager {
         storage: AccountStorage,
         model?: string,
       ) => AccountStorage
+      refusalFallbackMode?: () => RefusalFallbackMode
       fetchImpl?: typeof fetch
       /**
        * The fetch for one target's warm, when it depends on the target (for
@@ -2378,7 +2382,7 @@ export class CacheKeepManager {
       target.policyState?.ownerSessionId ?? target.id,
     )
     let headersMs: number | null = null
-    const attempt = {
+    const attempt: CacheKeepPrewarmAttempt & { signal: AbortSignal } = {
       id: ++this.nextPrewarmAttemptId,
       signal: AbortSignal.any([
         AbortSignal.timeout(timeout),
@@ -2434,8 +2438,10 @@ export class CacheKeepManager {
         ensureActive()
       }
       const preparedTarget = { ...target, bodyText }
+      attempt.refusalFallbackMode = this.options.refusalFallbackMode?.()
       const prewarm = await buildCacheKeepPrewarmBody(bodyText, {
         stripServerFallback: target.sourceWarm === true,
+        refusalFallbackMode: attempt.refusalFallbackMode,
       })
       ensureActive()
       if (!prewarm.ok) return prewarm

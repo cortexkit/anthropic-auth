@@ -3,6 +3,34 @@ import {
   applyClaudeCodeHeaders,
   selectClaudeCodeBetas,
 } from '../claude-code.ts'
+import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback-usage.ts'
+
+test.each([
+  ['client', 'claude-fable-5-2', undefined, true],
+  ['off', 'claude-fable-5-2', undefined, true],
+  ['server', 'claude-fable-5-2', 'default', true],
+  ['server', 'claude-fable-5-2', undefined, false],
+  ['server', 'claude-fable-5-2', false, false],
+  ['client', 'claude-opus-4-8', undefined, false],
+  ['off', 'claude-opus-4-8', undefined, false],
+  ['server', 'claude-opus-4-8', 'default', false],
+] as const)(
+  '%s with %s and fallbacks %j selects only the managed fallback beta: %s',
+  (refusalFallbackMode, model, fallbacks, eligible) => {
+    for (const requestClass of ['main', 'auxiliary'] as const) {
+      const body = { model, ...(fallbacks === undefined ? {} : { fallbacks }) }
+      const headers = applyClaudeCodeHeaders(
+        new Headers({ 'anthropic-beta': SERVER_SIDE_FALLBACK_BETA }),
+        'test-token',
+        { body, requestClass, refusalFallbackMode },
+      )
+      const expected = selectClaudeCodeBetas(body, [], requestClass)
+      expect(headers.get('anthropic-beta')).toBe(
+        eligible ? `${expected},${SERVER_SIDE_FALLBACK_BETA}` : expected,
+      )
+    }
+  },
+)
 
 // Literal beta lists from recorded interactive Claude Code 2.1.302 requests,
 // not computed by the selector under test. They include display-updates while
