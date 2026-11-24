@@ -4695,6 +4695,90 @@ test('a failed OC2 turn cannot unlink a newer body through a restore claim', asy
   }
 })
 
+test('an OC2 primary request does not reuse a restore claim queued for release', async () => {
+  const f = await fixture()
+  const { id, peer, record, claim } = await seedPeer(f)
+  await peer.releaseClaims(() => true)
+  const next = await f.start()
+  const { manager, persistence } = sharedKeeper(f)
+  const saved = await readFile(record)
+  const restoreClaim = await readFile(claim, 'utf8')
+  const restored = JSON.parse(restoreClaim)
+  expect(restored.restoreOnly).toBe(true)
+
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  Reflect.get(persistence, 'enqueue').call(persistence, () => {
+    entered.resolve()
+    return resume.promise
+  })
+  const resumeScan = Promise.withResolvers<void>()
+  const load = persistence.load.bind(persistence)
+  const rescan = spyOn(persistence, 'load').mockImplementation(
+    async (...args) => {
+      await resumeScan.promise
+      await load(...args)
+    },
+  )
+  try {
+    await entered.promise
+    f.advance(-500)
+    const older = 'Accepted locally after the clock rolled back'
+    await next.live(undefined, { messages: [{ role: 'user', content: older }] })
+    expect(manager.trackedRequest(id)?.bodyText).toContain(older)
+    const savedTarget = JSON.parse(
+      gunzipSync(saved).toString(),
+    ) as SavedCacheKeepTarget
+    expect(manager.trackedPolicyState(id)!.lastRealRequestAt).toBeLessThan(
+      savedTarget.policyState!.lastRealRequestAt,
+    )
+
+    // Retire the older body while unrelated store work still holds the queue.
+    const failing = await next.prepare()
+    await next.respond(failing, Response.json({}, { status: 503 }))
+    expect(manager.trackedRequest(id)).toBeUndefined()
+    expect(await readFile(claim, 'utf8')).toBe(restoreClaim)
+
+    // The next primary request can start without waiting for the release, but
+    // an unaccepted request must not open another claim during cleanup.
+    f.advance(1_000)
+    const accepted = 'Accepted after the restore claim retired'
+    const turn = await next.prepare(undefined, {
+      messages: [{ role: 'user', content: accepted }],
+    })
+    resume.resolve()
+    await persistence.drain()
+    expect(await readFile(record)).toEqual(saved)
+    await expect(readFile(claim, 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+
+    await next.respond(turn)
+    await persistence.drain()
+    const realClaim = JSON.parse(await readFile(claim, 'utf8'))
+    expect(realClaim.restoreOnly).toBeUndefined()
+    expect(realClaim.token).toBeTypeOf('string')
+    expect(realClaim.token).not.toBe(restored.token)
+    expect(persistence.isCommitted(id)).toBe(true)
+    const committed = await readFile(record)
+    expect(JSON.parse(gunzipSync(committed).toString()).bodyText).toContain(
+      accepted,
+    )
+
+    resumeScan.resolve()
+    await keeperFor(f.paths.storageId)?.loading
+    await next.dispose()
+    expect(await readdir(`${f.disk}.claims`)).toEqual([])
+    expect(await readFile(record)).toEqual(committed)
+  } finally {
+    resume.resolve()
+    resumeScan.resolve()
+    rescan.mockRestore()
+    await persistence.drain()
+    await keeperFor(f.paths.storageId)?.loading
+  }
+})
+
 test('a failed in-flight OC2 turn cannot delete a newer peer record on a freshness wakeup', async () => {
   const f = await fixture()
   const { id, peer, record, tracked } = await seedPeer(f)

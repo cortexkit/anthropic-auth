@@ -16,6 +16,9 @@ import {
 import { version as pluginVersion } from '../package.json'
 
 const RESTORE_SPACING_MS = 3000
+// Plugin versions loaded in one OpenCode 1 process share the live store through
+// this globalThis slot. Keep store method signatures (such as removed())
+// compatible across releases, or use a new slot key.
 const SLOT = Symbol.for('cortexkit.anthropic-auth.opencode1.cachekeep-restore')
 
 type Lease = {

@@ -724,6 +724,53 @@ test('a real turn claims again after a peer took over and released a restore-onl
   }
 })
 
+test('an uncovered removal releases a restore claim even if its promotion was in progress', async () => {
+  const { root, store: seed, makeStore, target, claims } = await storeFixture()
+  const restoring = makeStore()
+  const record = join(seed.directory, `${key}.json.gz`)
+  const promoted = Promise.withResolvers<boolean>()
+  const resume = Promise.withResolvers<void>()
+  let releases = 0
+  const unwatch = restoring.onClaimAvailable(() => releases++)
+  try {
+    seed.changed(target)
+    await seed.drain()
+    await seed.releaseClaims(() => true)
+    const saved = await readFile(record)
+    await restoring.load(Date.now(), () => true)
+    const claim = Reflect.get(restoring, 'claims').get(key)
+      .claim as CacheKeepClaim
+    const promote = claim.promote.bind(claim)
+    const promotion = spyOn(claim, 'promote').mockImplementation(
+      async (when) => {
+        const result = await promote(when)
+        promoted.resolve(result)
+        await resume.promise
+        return result
+      },
+    )
+    try {
+      restoring.realTurn(session, false)
+      expect(await promoted.promise).toBe(true)
+      restoring.removed({ ...target, bodyText: '{"system":"uncovered body"}' })
+      resume.resolve()
+      await restoring.drain()
+      // Only removal cleanup announces the release so the saved body can be adopted again.
+      expect(releases).toBe(1)
+      expect(await readdir(claims)).toEqual([])
+      expect(await readFile(record)).toEqual(saved)
+    } finally {
+      resume.resolve()
+      promotion.mockRestore()
+    }
+  } finally {
+    unwatch()
+    await restoring.releaseClaims(() => true)
+    await seed.releaseClaims(() => true)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 for (const deletion of ['owner', 'non-owner'] as const) {
   test(`a pending real turn cannot resurrect a record deleted by the ${deletion}`, async () => {
     const {

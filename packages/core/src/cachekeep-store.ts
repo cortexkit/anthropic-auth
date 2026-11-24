@@ -1536,7 +1536,7 @@ export class CacheKeepStore {
           : record(target, this.options.pluginVersion),
       )
     this.forgetEntry(id)
-    if (item && canRemove) item.retiring = true
+    if (item) item.retiring = true
     if (
       !removeUnowned &&
       (this.claims || this.options.externalClaim) &&
