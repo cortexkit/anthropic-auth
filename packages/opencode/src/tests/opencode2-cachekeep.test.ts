@@ -4534,7 +4534,7 @@ test('a superseded OC2 turn cannot overwrite a newer body through a restore clai
     f.advance(flush.at - f.now())
     const flushing = flush.callback()
 
-    // The next primary turn replaces the pending real-claim request but not
+    // The next foreground turn replaces the pending real-claim request but not
     // the accepted body. The older flush must not write under the restore claim.
     const turn = await next.prepare()
     expect(manager.trackedRequest(id)?.bodyText).toContain(older)

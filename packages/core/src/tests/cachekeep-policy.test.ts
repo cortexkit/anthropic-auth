@@ -912,7 +912,7 @@ test.each(['ownership-unverified', 'not-owner'] as const)(
         resume.resolve()
       }
       expect(isCacheKeepWarmWait(await warming)).toBe(true)
-      // A caller can stop after a live veto, before a tick republishes its state.
+      // A caller can stop after the store refuses the reservation, before a tick republishes its state.
       f.manager.stop()
       expect(outcome).toBe(veto)
       expect(sends).toBe(0)
