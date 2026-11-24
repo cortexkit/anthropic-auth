@@ -142,6 +142,7 @@ interface SharedCacheKeep {
   >
   /** Live leases by generation, in the order they were taken. */
   readonly leases: Map<number, CacheKeepLease>
+  unwatchRetriedReleases?: () => void
   nextGeneration: number
   /** The scheduler pass in progress, so the last release can wait for it. */
   ticking?: Promise<void>
@@ -918,6 +919,12 @@ export function createNativeCacheKeep(
     subagent: options.subagent,
   }
   owner.leases.set(lease.generation, lease)
+  if (owner.leases.size === 1)
+    owner.unwatchRetriedReleases = owner.persistence.onRetriedClaimRelease(
+      () => {
+        if (owner.leases.size) void owner.adopt()
+      },
+    )
   const ready = owner.adopt().then(() => {
     if (!lease.stopped)
       for (const session of manager.trackedSessions())
@@ -1157,6 +1164,10 @@ export function createNativeCacheKeep(
       // alone; the timer stops only when no instance holds a lease.
       const last =
         owner.leases.delete(lease.generation) && owner.leases.size === 0
+      if (last) {
+        owner.unwatchRetriedReleases?.()
+        owner.unwatchRetriedReleases = undefined
+      }
       const ticking = last ? owner.ticking : undefined
       const retaining = last ? owner.retain() : undefined
       cleanup = (async () => {

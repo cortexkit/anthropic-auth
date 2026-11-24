@@ -39,6 +39,8 @@ const TEMP = /^[a-f0-9]{64}\.json\.gz\.[a-f0-9-]+\.tmp$/
 const TOMBSTONE = /^[a-f0-9]{64}\.deleted$/
 const TOMBSTONE_MS = 24 * 60 * 60 * 1000
 const TEMP_STALE_MS = 60 * 60 * 1000
+// Small wall-clock corrections should not destroy a replayable record.
+const RECORD_CLOCK_SKEW_MS = 1000
 const MAX_RECORD_BYTES = 2 * CACHE_KEEP_MAX_BODY_BYTES + 64 * 1024
 // Replay compatibility depends only on the record format, not the plugin
 // version. Bump this for format changes; the loader must accept or migrate the
@@ -571,9 +573,10 @@ function invalidReason(
       (state.needsRealRequest !== undefined &&
         typeof state.needsRealRequest !== 'boolean') ||
       !Number.isFinite(state.lastRealRequestAt) ||
-      state.lastRealRequestAt > now ||
+      state.lastRealRequestAt > now + RECORD_CLOCK_SKEW_MS ||
       (state.lastWarmAt !== undefined &&
-        (!Number.isFinite(state.lastWarmAt) || state.lastWarmAt > now)) ||
+        (!Number.isFinite(state.lastWarmAt) ||
+          state.lastWarmAt > now + RECORD_CLOCK_SKEW_MS)) ||
       !Number.isSafeInteger(state.warmsSinceLastRealRequest) ||
       state.warmsSinceLastRealRequest < 0 ||
       !Number.isFinite(state.warmCostSoFar) ||
@@ -740,12 +743,16 @@ export class CacheKeepStore {
   }
 
   private closeClaim(key: string, item: StoreClaim) {
-    if (item.releaseRetry) clearTimeout(item.releaseRetry)
+    const retrying = item.releaseRetry !== undefined
+    if (retrying) clearTimeout(item.releaseRetry)
     item.releaseRetry = undefined
     item.retained = false
     item.closing ??= (async () => {
       if ((await item.acquired) === true) await item.claim.release()
       if (this.claims?.get(key) === item) this.claims.delete(key)
+      // A live keeper may have scanned while this claim was still held. Normal
+      // releases (including scans' own releases) must not start another scan.
+      if (retrying) process.emit(this.retriedReleaseEvent())
     })().catch((error) => {
       item.closing = undefined
       // A failed unlink leaves a live PID in the file. Keep retrying even if
@@ -758,6 +765,18 @@ export class CacheKeepStore {
       throw error
     })
     return item.closing
+  }
+
+  private retriedReleaseEvent() {
+    return `cortexkit.cachekeep.claim-release-retried:${this.directory}`
+  }
+
+  onRetriedClaimRelease(listener: () => void) {
+    const event = this.retriedReleaseEvent()
+    process.on(event, listener)
+    return () => {
+      process.off(event, listener)
+    }
   }
 
   private async scanClaim(key: string, purpose: 'session' | 'sweep') {
@@ -786,18 +805,33 @@ export class CacheKeepStore {
     const intent = this.pendingRealClaims.get(id)
     const entry = this.latest.get(id)
     const when = acceptedAt(entry)
-    const dropDeleted = () => {
+    const dropStale = () => {
       if (
         this.latest.get(id) === entry &&
         this.pendingRealClaims.get(id) === intent
       )
         this.loseClaim(id)
     }
-    const acquired = () => {
+    const acquired = async (owned: StoreClaim) => {
+      owned.retained = true
+      try {
+        // A peer may have saved a more recent real turn before releasing. The
+        // claim now excludes peer writes, but doesn't make this body newer.
+        if (entry && (await this.hasNewerRecord(id, when))) {
+          dropStale()
+          await this.closeClaim(key, owned)
+          return
+        }
+      } catch (error) {
+        await this.closeClaim(key, owned)
+        throw error
+      }
       // A removal and a new accepted body can queue while this lock is held.
       // Completing the older acquisition must not consume the new one.
+      owned.restoreOnly = false
       if (this.pendingRealClaims.get(id) === intent)
         this.pendingRealClaims.delete(id)
+      return owned
     }
     const key = hash(id)
     let item = this.claims?.get(key)
@@ -807,14 +841,9 @@ export class CacheKeepStore {
     }
     if (item) {
       if ((await item.acquired) === true) {
-        if (await item.claim.promote(when)) {
-          item.retained = true
-          item.restoreOnly = false
-          acquired()
-          return item
-        }
+        if (await item.claim.promote(when)) return acquired(item)
         if (item.claim.wasDeleted) {
-          dropDeleted()
+          dropStale()
           await this.closeClaim(key, item)
           return
         }
@@ -825,12 +854,8 @@ export class CacheKeepStore {
     item = this.openClaim(key, 'session', false, when)
     if (!item) return 'ownership-unverified' as const
     const result = await item.acquired
-    if (result === true) {
-      item.retained = true
-      acquired()
-      return item
-    }
-    if (item.claim.wasDeleted) dropDeleted()
+    if (result === true) return acquired(item)
+    if (item.claim.wasDeleted) dropStale()
     await this.closeClaim(key, item)
     if (result === 'ownership-unverified') return result
   }
@@ -932,6 +957,7 @@ export class CacheKeepStore {
       this.persistenceEnabled = true
       return true
     } catch {
+      // The startup fallback has no disk claim, so two copies can both warm.
       if (!this.persistenceEnabled) this.refuse(true)
       else this.writeFailed()
       return false
@@ -955,6 +981,9 @@ export class CacheKeepStore {
     guard?: (sessionHash: string) => boolean | Promise<boolean>,
     mode: 'restore' | 'sweep' = 'restore',
   ) {
+    const clock = this.options.now ?? Date.now
+    // Preserve the caller's time reference, but advance it while the scan runs.
+    const clockOffset = now - clock()
     await this.chain
     if (!(await this.directoryReady())) return
     let directory = this.directory
@@ -1015,7 +1044,7 @@ export class CacheKeepStore {
               temp || mode === 'sweep' ? 'sweep' : 'session',
             )
         if ((claim || this.claims) && !release) continue
-        let reason: DropReason = 'unreadable'
+        let reason: DropReason | undefined
         let entry: SavedCacheKeepTarget | undefined
         const permitted = async () => {
           try {
@@ -1033,44 +1062,21 @@ export class CacheKeepStore {
             reason = 'unfinished-write'
             throw new Error('Unfinished write')
           }
-          const stat = await lstat(path)
-          if (
-            !stat.isFile() ||
-            stat.isSymbolicLink() ||
-            stat.size > MAX_RECORD_BYTES ||
-            !(await isOwnerOnly(
-              path,
-              () =>
-                stat.uid === process.getuid?.() &&
-                (stat.mode & 0o777) === 0o600,
-              this.options.ownerOnly,
-            ))
-          ) {
+          const bytes = await this.readRecordBytes(path)
+          if (bytes === 'unsafe-file') {
             reason = 'unsafe-file'
             throw new Error('Unsafe restart file')
           }
-          let bytes = await readWindowsOwnerOnly(path, this.options.ownerOnly)
-          if (!bytes) {
-            const file = await open(
-              path,
-              constants.O_RDONLY | constants.O_NOFOLLOW,
-            )
-            try {
-              bytes = await file.readFile()
-            } finally {
-              await file.close()
-            }
-          }
-          const raw = await decompress(bytes, {
-            maxOutputLength: MAX_RECORD_BYTES,
-          })
+          reason = 'unreadable'
+          const raw = await this.inflateRecord(bytes)
           reason = 'invalid'
-          entry = JSON.parse(raw.toString('utf8')) as SavedCacheKeepTarget
-          const invalid = invalidReason(entry, name, now)
+          entry = JSON.parse(raw) as SavedCacheKeepTarget
+          const invalid = invalidReason(entry, name, clock() + clockOffset)
           if (invalid && invalid !== 'expired') {
             reason = invalid
             throw new Error('Invalid restart file')
           }
+          reason = undefined
           if (!(await permitted())) continue
           let deleted = false
           try {
@@ -1127,6 +1133,11 @@ export class CacheKeepStore {
             restored++
           }
         } catch {
+          // A failed open, read or close doesn't prove the record is invalid.
+          if (!reason) {
+            this.writeFailed()
+            continue
+          }
           const drop = async () => {
             if (temp && !(await this.staleTemp(path))) return
             if (guard && !(await guard(key))) return
@@ -1163,6 +1174,57 @@ export class CacheKeepStore {
           restored,
           dropped,
         })
+    }
+  }
+
+  private async readRecordBytes(path: string) {
+    const stat = await lstat(path)
+    if (
+      !stat.isFile() ||
+      stat.isSymbolicLink() ||
+      stat.size > MAX_RECORD_BYTES ||
+      !(await isOwnerOnly(
+        path,
+        () => stat.uid === process.getuid?.() && (stat.mode & 0o777) === 0o600,
+        this.options.ownerOnly,
+      ))
+    )
+      return 'unsafe-file' as const
+    const bytes = await readWindowsOwnerOnly(path, this.options.ownerOnly)
+    if (bytes) return bytes
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+    try {
+      return await file.readFile()
+    } finally {
+      await file.close()
+    }
+  }
+
+  private async inflateRecord(bytes: Buffer) {
+    const raw = await decompress(bytes, { maxOutputLength: MAX_RECORD_BYTES })
+    return raw.toString('utf8')
+  }
+
+  private async hasNewerRecord(id: string, when: number) {
+    const name = `${hash(id)}.json.gz`
+    const bytes = await this.readRecordBytes(join(this.directory, name)).catch(
+      (error) => {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      },
+    )
+    if (!bytes || bytes === 'unsafe-file') return false
+    try {
+      const saved = JSON.parse(
+        await this.inflateRecord(bytes),
+      ) as SavedCacheKeepTarget
+      const invalid = invalidReason(
+        saved,
+        name,
+        this.options.now?.() ?? Date.now(),
+      )
+      return (!invalid || invalid === 'expired') && acceptedAt(saved) > when
+    } catch {
+      return false
     }
   }
 
@@ -1237,7 +1299,7 @@ export class CacheKeepStore {
   async reserveWarm(
     target: Readonly<CacheKeepTarget>,
   ): Promise<CacheKeepWarmReservation> {
-    if (this.disabled) return this.memoryOnly
+    if (this.disabled) return this.memoryOnly || 'ownership-unverified'
     const entry = record(target, this.options.pluginVersion)
     const timer = this.timers.get(entry.id)
     if (timer) (this.options.clearTimeoutImpl ?? clearTimeout)(timer)
@@ -1245,8 +1307,7 @@ export class CacheKeepStore {
     this.pending.delete(entry.id)
     this.latest.set(entry.id, entry)
     this.lastWrite.set(entry.id, this.options.now?.() ?? Date.now())
-    let result: CacheKeepWarmReservation =
-      this.claims || this.options.externalClaim ? 'ownership-unverified' : false
+    let result: CacheKeepWarmReservation = 'ownership-unverified'
     this.chain = this.chain
       .then(async () => {
         if (!(await this.directoryReady())) return
@@ -1262,7 +1323,8 @@ export class CacheKeepStore {
     reopen = false,
   ): Promise<CacheKeepWarmReservation> {
     const { id } = entry
-    if (this.latest.get(id) !== entry) return false
+    const stillLatest = () => this.latest.get(id) === entry
+    if (!stillLatest()) return 'ownership-unverified'
     const key = hash(id)
     let item = this.claims?.get(key)
     if (
@@ -1279,19 +1341,19 @@ export class CacheKeepStore {
       return 'not-owner'
     }
     const write = async (assertOwned?: () => Promise<void>) => {
-      await this.writeEntry(entry, assertOwned)
+      if (!(await this.writeEntry(entry, assertOwned, stillLatest)))
+        return false
       this.committed.set(id, entry)
-    }
-    if (!claim) {
-      await write()
       return true
     }
-    let committed = false
+    if (!claim) {
+      return (await write()) || 'ownership-unverified'
+    }
+    let result: CacheKeepWarmReservation = 'ownership-unverified'
     if (
       await claim.withCurrent(async (assertOwned) => {
         try {
-          await write(assertOwned)
-          committed = true
+          if (await write(assertOwned)) result = true
         } catch (error) {
           if (!reopen) throw error
           // In the local "hours" keep-warm schedule (no runner policy) a warm may
@@ -1299,10 +1361,11 @@ export class CacheKeepStore {
           // session. Check that the write failed without losing the lock.
           await assertOwned()
           this.writeFailed()
+          result = false
         }
       }, acceptedAt(entry))
     )
-      return committed
+      return result
     if (item) await this.closeClaim(key, item)
     if (this.latest.get(id) === entry) this.loseClaim(id)
     return 'not-owner'
@@ -1311,6 +1374,7 @@ export class CacheKeepStore {
   private async writeEntry(
     entry: SavedCacheKeepTarget,
     assertOwned?: () => Promise<void>,
+    stillLatest?: () => boolean,
   ) {
     const path = join(this.directory, `${hash(entry.id)}.json.gz`)
     const temp = `${path}.${randomUUID()}.tmp`
@@ -1320,9 +1384,18 @@ export class CacheKeepStore {
       if (!(await createWindowsOwnerOnly(temp, bytes, this.options.ownerOnly)))
         await writeFile(temp, bytes, { flag: 'wx', mode: 0o600 })
       await assertOwned?.()
-      await renameWithWindowsSharingRetry(temp, path, {
-        platform: this.options.ownerOnly?.platform,
-      })
+      // A refund or new acceptance can supersede the snapshot during staging.
+      if (stillLatest && !stillLatest()) return false
+      const publication = await renameWithWindowsSharingRetry(
+        temp,
+        path,
+        { platform: this.options.ownerOnly?.platform },
+        async () => {
+          await assertOwned?.()
+          return stillLatest && !stillLatest() ? 'skip' : 'publish'
+        },
+      )
+      return publication === 'published'
     } finally {
       await rm(temp, { force: true })
     }

@@ -1517,7 +1517,13 @@ export class CacheKeepManager {
         // the send. Keep the conservative charge for a standalone reservation.
         if (dispatch) {
           refund()
-          if (state && reservation === true && this.isCurrentTarget(target))
+          // A same-body usage update can queue a copy of the charge even if
+          // the reservation itself was superseded before it could write.
+          if (
+            state &&
+            reservation !== 'not-owner' &&
+            this.isCurrentTarget(target)
+          )
             await this.options.settleWarm?.(current)
         }
         throw new CacheKeepWarmWait()

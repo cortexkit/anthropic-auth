@@ -13,6 +13,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { gunzipSync, gzipSync } from 'node:zlib'
 import {
   __setLogTestSink,
@@ -4022,13 +4023,141 @@ function failNextRestartWrite(store: CacheKeepStore) {
     writeEntry: (
       entry: SavedCacheKeepTarget,
       assertOwned?: () => Promise<void>,
-    ) => Promise<void>
+      stillLatest?: () => boolean,
+    ) => Promise<boolean>
   }
   const write = writer.writeEntry.bind(writer)
   return spyOn(writer, 'writeEntry')
     .mockImplementation(write)
     .mockRejectedValueOnce(new Error('Temporary restart write failure'))
 }
+
+test.each([false, true])(
+  'OC2 refunds a cancelled warm copied into a newer usage snapshot (timer already flushing: %s)',
+  async (flushTimer) => {
+    runnerPolicies([])
+    const f = await fixture()
+    await f.live(undefined, { model: 'claude-opus-5-5' })
+    const { manager, persistence } = sharedKeeper(f)
+    const id = 'ses_oc2_keep'
+    const target = (
+      Reflect.get(manager, 'targets') as Map<string, CacheKeepTarget>
+    ).get(id)!
+    const state = target.policyState!
+    Object.assign(state, {
+      warmsSinceLastRealRequest: 23,
+      warmCostSoFar: 2,
+      prefixTokens: 1000,
+      inputTokens: 1000,
+      hasWarmed: true,
+    })
+    expect(await persistence.reserveWarm(target)).toBe(true)
+    const [name] = await readdir(f.disk)
+    const saved = async () =>
+      JSON.parse(gunzipSync(await readFile(join(f.disk, name!))).toString())
+        .policyState
+    const store = persistence as unknown as {
+      directoryReady(): Promise<boolean>
+      writeEntry(
+        entry: SavedCacheKeepTarget,
+        assertOwned?: () => Promise<void>,
+        stillLatest?: () => boolean,
+      ): Promise<boolean>
+    }
+    const reserving = Promise.withResolvers<void>()
+    const resumeReserve = Promise.withResolvers<void>()
+    const flushed = Promise.withResolvers<void>()
+    const resumeFlush = Promise.withResolvers<void>()
+    const ready = store.directoryReady.bind(store)
+    const checking = spyOn(store, 'directoryReady').mockImplementationOnce(
+      async () => {
+        reserving.resolve()
+        await resumeReserve.promise
+        return ready()
+      },
+    )
+    const reserve = persistence.reserveWarm.bind(persistence)
+    const returnReservation = Promise.withResolvers<void>()
+    const settling = Promise.withResolvers<void>()
+    const reservation = spyOn(persistence, 'reserveWarm')
+      .mockImplementation((entry) => {
+        const result = reserve(entry)
+        settling.resolve()
+        return result
+      })
+      .mockImplementationOnce(async (entry) => {
+        const result = await reserve(entry)
+        if (flushTimer) await returnReservation.promise
+        return result
+      })
+    const write = store.writeEntry.bind(store)
+    const countsSeenByTimer: number[] = []
+    const writing = spyOn(store, 'writeEntry').mockImplementation(
+      async (...args) => {
+        const [entry] = args
+        if (!flushTimer || entry.policyState?.warmsSinceLastRealRequest !== 24)
+          return write(...args)
+        flushed.resolve()
+        await resumeFlush.promise
+        const result = await write(...args)
+        countsSeenByTimer.push((await saved()).warmsSinceLastRealRequest)
+        return result
+      },
+    )
+    f.due()
+    const warming = f.timers.fire()
+    let reloading: ReturnType<typeof f.reload> | undefined
+    let flushing: Promise<unknown> | undefined
+    try {
+      await Promise.race([reserving.promise, warming])
+      expect(state.warmsSinceLastRealRequest).toBe(24)
+      expect(state.pendingWarmCost).toBeGreaterThan(0)
+      const timersBeforeUsage = new Set(f.timers.timeouts.keys())
+      manager.recordAcceptedUsage(id, target.bodyText, {
+        cache_read_input_tokens: 2000,
+      })
+      if (flushTimer) {
+        const timer = [...f.timers.timeouts].find(
+          ([key, timer]) => !timersBeforeUsage.has(key) && timer.at > f.now(),
+        )
+        expect(timer).toBeDefined()
+        flushing = Promise.resolve(timer![1].callback())
+      }
+      reloading = f.reload()
+      resumeReserve.resolve()
+      if (flushTimer) {
+        await Promise.race([flushed.promise, flushing!])
+        expect(writing).toHaveBeenCalledTimes(1)
+        returnReservation.resolve()
+        // Let the cancelled reservation publish the refund while the timer's
+        // already-started write is still staging its snapshot.
+        await Promise.race([settling.promise, warming])
+        resumeFlush.resolve()
+      }
+      const next = await reloading
+      expect(f.sent).toHaveLength(0)
+      expect(state.warmsSinceLastRealRequest).toBe(23)
+      expect(await saved()).toMatchObject({
+        warmsSinceLastRealRequest: 23,
+        prefixTokens: 2000,
+      })
+      expect((await saved()).pendingWarmCost).toBeUndefined()
+      expect(countsSeenByTimer).toEqual(flushTimer ? [23] : [])
+      expect(sharedKeeper(f).manager.trackedRequest(id)).toBeDefined()
+      f.advance(20_000)
+      await f.timers.fire()
+      expect(next.sent).toHaveLength(1)
+    } finally {
+      resumeReserve.resolve()
+      returnReservation.resolve()
+      resumeFlush.resolve()
+      await Promise.all([warming, reloading, flushing])
+      checking.mockRestore()
+      reservation.mockRestore()
+      writing.mockRestore()
+    }
+  },
+)
 
 test.each([false, true])(
   'OC2 reload preserves a record when an unsent reservation is refunded (refund write fails: %s)',
@@ -4174,6 +4303,52 @@ test('OC2 reload keeps a live old folder working and rescans when its replacemen
   expect(second.sent).toHaveLength(2)
   expect(next.sent).toHaveLength(0)
   expect(replacement.sent).toHaveLength(2)
+})
+
+test('a retried claim release prompts one rescan by a live OC2 keeper', async () => {
+  const f = await fixture()
+  await f.live()
+  const previous = sharedKeeper(f)
+  await previous.persistence.drain()
+  const id = 'ses_oc2_keep'
+  const resume = Promise.withResolvers<void>()
+  const released = Promise.withResolvers<void>()
+  const release = CacheKeepClaim.prototype.release
+  const releasing = spyOn(CacheKeepClaim.prototype, 'release')
+    .mockRejectedValueOnce(new Error('Temporary claim release failure'))
+    .mockImplementationOnce(async function (this: CacheKeepClaim) {
+      await resume.promise
+      await release.call(this)
+      released.resolve()
+    })
+  try {
+    await f.reload()
+    const current = sharedKeeper(f)
+    expect(current.manager.trackedRequest(id)).toBeUndefined()
+    const scanning = spyOn(current.persistence, 'load')
+    try {
+      resume.resolve()
+      await released.promise
+      // The notification follows claim release and removal from the old store.
+      await delay(0)
+      await keeperFor(f.paths.storageId)?.loading
+      expect(current.manager.trackedRequest(id)).toBeDefined()
+      expect(scanning).toHaveBeenCalledTimes(1)
+
+      const peer = await f.start()
+      const normal = 'ses_normally_released'
+      await peer.live(undefined, {}, normal)
+      await previous.persistence.drain()
+      expect(previous.persistence.isCommitted(normal)).toBe(true)
+      await peer.dispose()
+      expect(scanning).toHaveBeenCalledTimes(1)
+    } finally {
+      scanning.mockRestore()
+    }
+  } finally {
+    resume.resolve()
+    releasing.mockRestore()
+  }
 })
 
 test('OC2 saves a real turn at its next warm after the old folder releases its claim', async () => {
