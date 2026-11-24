@@ -122,7 +122,6 @@ describe('model capability table', () => {
 
   test('ids outside the table resolve to nothing', () => {
     for (const model of [
-      'claude-opus-4-8',
       'claude-sonnet-4-5',
       'claude-haiku-4-5',
       'claude-haiku-5-5-fast',

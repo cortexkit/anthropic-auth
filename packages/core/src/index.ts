@@ -70,6 +70,8 @@ export type {
   ClaudeModelCatalogue,
   ClaudeModelFamily,
   ClaudeModelPricing,
+  ClaudeModelTokenLimits,
+  ClaudeRefusalFallbackRoute,
   ClaudeRefusalRecoveryFamily,
 } from './model-capabilities.ts'
 // Named rather than `export *`: the beta constants and the id normalizer are
@@ -81,6 +83,7 @@ export {
   getClaudeModelCatalogue,
   pinsEffortOnEveryRequest,
   resolveClaudeModelCapabilities,
+  resolveClaudeModelTokenLimits,
 } from './model-capabilities.ts'
 export * from './model-remap.ts'
 export * from './models.ts'
@@ -364,6 +367,7 @@ export * from './quota-headers.ts'
 export * from './quota-manager.ts'
 export * from './quota-refusal.ts'
 export * from './quotas.ts'
+export * from './refusal-fallback-targets.ts'
 export * from './relay.ts'
 export * from './relay-location.ts'
 export * from './relocation-guard.ts'

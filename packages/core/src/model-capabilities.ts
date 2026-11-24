@@ -136,14 +136,17 @@ export type ClaudeModelPricing = {
   cacheWrite1h: number
 }
 
+export type ClaudeModelTokenLimits = {
+  contextWindow: number
+  maxOutputTokens: number
+}
+
 /**
  * Catalogue facts for a model the plugin registers itself in OpenCode and Pi,
  * rather than taking from the host's own model list.
  */
-export type ClaudeModelCatalogue = {
+export type ClaudeModelCatalogue = ClaudeModelTokenLimits & {
   releaseDate: string
-  contextWindow: number
-  maxOutputTokens: number
   pricing: ClaudeModelPricing
   /** Higher prices for every token of a request above `inputTokensAbove` input tokens. */
   longContext?: { inputTokensAbove: number; pricing: ClaudeModelPricing }
@@ -156,6 +159,12 @@ export type ClaudeRefusalRecoveryFamily =
   | 'fable-5-2'
   | 'opus-5'
   | 'opus-5-5'
+
+export type ClaudeRefusalFallbackRoute = {
+  readonly category: 'bio' | 'cyber'
+  readonly targets: readonly string[]
+  readonly source: string
+}
 
 export type ClaudeModelCapabilities = {
   /** Exact Anthropic model id. */
@@ -172,6 +181,8 @@ export type ClaudeModelCapabilities = {
   limited?: true
   /** Absent when the model comes from the host's own catalogue. */
   catalogue?: ClaudeModelCatalogue
+  /** API token limits for models whose catalogue is supplied by the host. */
+  tokenLimits?: ClaudeModelTokenLimits
   /**
    * Thinking settings the API accepts. OpenCode's transform.ts and Pi's
    * convert.ts still normalize thinking with per-family code; a test checks
@@ -206,6 +217,8 @@ export type ClaudeModelCapabilities = {
   serverSideFallback: boolean
   /** OpenCode recovers from a content-filter refusal on Opus 4.8 under this key. */
   refusalRecoveryFamily?: ClaudeRefusalRecoveryFamily
+  /** Client fallback routes, keyed by the exact API refusal category. */
+  refusalFallbacks?: readonly ClaudeRefusalFallbackRoute[]
   /**
    * Model-scoped weekly quota this model draws from. Quota matching in
    * accounts.ts and native-quota-codec.ts still matches the substrings
@@ -221,10 +234,27 @@ export type ClaudeModelCapabilities = {
 
 const ALL_ADAPTIVE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 
-const FABLE_MYTHOS_5_CATALOGUE: ClaudeModelCatalogue = {
-  releaseDate: '2026-06-09',
+// Anthropic Models API capture, 23 Nov 2026, with server-side-fallback-2026-07-01.
+const MODELS_API_1M_LIMITS: ClaudeModelTokenLimits = {
   contextWindow: 1_000_000,
   maxOutputTokens: 128_000,
+}
+
+const FALLBACK_CAPTURE =
+  'Anthropic Models API allowed_fallback_models (23 Nov 2026); head capture 24 Nov 2026'
+const OPUS_48_THEN_OPUS_5 = ['claude-opus-4-8', 'claude-opus-5'] as const
+const FABLE_REFUSAL_FALLBACKS: readonly ClaudeRefusalFallbackRoute[] = [
+  {
+    category: 'bio',
+    targets: ['claude-opus-5', 'claude-opus-4-8'],
+    source: `https://www.anthropic.com/news/improving-fable-5-s-biology-safeguards; ${FALLBACK_CAPTURE}`,
+  },
+  { category: 'cyber', targets: OPUS_48_THEN_OPUS_5, source: FALLBACK_CAPTURE },
+]
+
+const FABLE_MYTHOS_5_CATALOGUE: ClaudeModelCatalogue = {
+  releaseDate: '2026-06-09',
+  ...MODELS_API_1M_LIMITS,
   pricing: {
     input: 10,
     output: 50,
@@ -236,8 +266,7 @@ const FABLE_MYTHOS_5_CATALOGUE: ClaudeModelCatalogue = {
 
 const FABLE_MYTHOS_5_1_CATALOGUE: ClaudeModelCatalogue = {
   releaseDate: '2026-09-01',
-  contextWindow: 1_000_000,
-  maxOutputTokens: 128_000,
+  ...MODELS_API_1M_LIMITS,
   pricing: {
     input: 10,
     output: 50,
@@ -249,8 +278,7 @@ const FABLE_MYTHOS_5_1_CATALOGUE: ClaudeModelCatalogue = {
 
 const FABLE_MYTHOS_5_2_CATALOGUE: ClaudeModelCatalogue = {
   releaseDate: '2026-11-09',
-  contextWindow: 1_000_000,
-  maxOutputTokens: 128_000,
+  ...MODELS_API_1M_LIMITS,
   pricing: {
     input: 8,
     output: 40,
@@ -277,6 +305,7 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     claudeCodeBetas: CLAUDE_CODE_DEFAULT_BETAS,
     serverSideFallback: true,
     refusalRecoveryFamily: 'fable-5',
+    refusalFallbacks: FABLE_REFUSAL_FALLBACKS,
     scopedQuota: 'fable',
     fastMode: false,
   },
@@ -313,6 +342,7 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     claudeCodeBetas: claudeCodeBetaLists({ perTurnControl: true }),
     serverSideFallback: true,
     refusalRecoveryFamily: 'fable-5-1',
+    refusalFallbacks: FABLE_REFUSAL_FALLBACKS,
     scopedQuota: 'fable',
     fastMode: false,
   },
@@ -352,6 +382,7 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     claudeCodeBetas: claudeCodeBetaLists({ perTurnControl: true }),
     serverSideFallback: true,
     refusalRecoveryFamily: 'fable-5-2',
+    refusalFallbacks: FABLE_REFUSAL_FALLBACKS,
     scopedQuota: 'fable',
     // Claude Code's runtime capability list for 5.2 lacks fast_mode today, so
     // we don't send speed: fast until a real request proves subscription accounts accept it.
@@ -381,10 +412,27 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     fastMode: false,
   },
   {
+    id: 'claude-opus-4-8',
+    name: 'Claude Opus 4.8',
+    family: 'opus',
+    idSuffixes: 'any',
+    tokenLimits: MODELS_API_1M_LIMITS,
+    thinkingModes: ['adaptive', 'disabled'],
+    rejectsForcedToolChoice: false,
+    efforts: { default: 'high' },
+    effortMarkers: 'none',
+    turnEndNote: false,
+    thinkingBindingControls: false,
+    claudeCodeBetas: CLAUDE_CODE_DEFAULT_BETAS,
+    serverSideFallback: false,
+    fastMode: true,
+  },
+  {
     id: 'claude-opus-5',
     name: 'Claude Opus 5',
     family: 'opus',
     idSuffixes: 'any',
+    tokenLimits: MODELS_API_1M_LIMITS,
     // Disabled thinking is accepted only at effort high or below.
     thinkingModes: ['adaptive', 'disabled'],
     rejectsForcedToolChoice: false,
@@ -396,6 +444,18 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     claudeCodeBetas: claudeCodeBetaLists({ perTurnControl: true }),
     serverSideFallback: true,
     refusalRecoveryFamily: 'opus-5',
+    refusalFallbacks: [
+      {
+        category: 'bio',
+        targets: ['claude-opus-4-8'],
+        source: FALLBACK_CAPTURE,
+      },
+      {
+        category: 'cyber',
+        targets: ['claude-opus-4-8'],
+        source: `https://www.anthropic.com/news/claude-opus-5; ${FALLBACK_CAPTURE}`,
+      },
+    ],
     fastMode: true,
   },
   {
@@ -405,8 +465,7 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     idSuffixes: 'any',
     catalogue: {
       releaseDate: '2026-09-18',
-      contextWindow: 1_000_000,
-      maxOutputTokens: 128_000,
+      ...MODELS_API_1M_LIMITS,
       pricing: {
         input: 4,
         output: 20,
@@ -424,6 +483,18 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     claudeCodeBetas: claudeCodeBetaLists({ perTurnControl: true }),
     serverSideFallback: true,
     refusalRecoveryFamily: 'opus-5-5',
+    refusalFallbacks: [
+      {
+        category: 'bio',
+        targets: OPUS_48_THEN_OPUS_5,
+        source: FALLBACK_CAPTURE,
+      },
+      {
+        category: 'cyber',
+        targets: OPUS_48_THEN_OPUS_5,
+        source: FALLBACK_CAPTURE,
+      },
+    ],
     fastMode: true,
   },
   {
@@ -431,6 +502,7 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     name: 'Claude Sonnet 5',
     family: 'sonnet',
     idSuffixes: 'any',
+    tokenLimits: MODELS_API_1M_LIMITS,
     thinkingModes: ['adaptive', 'disabled'],
     rejectsForcedToolChoice: false,
     efforts: { default: 'high' },
@@ -448,8 +520,7 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     idSuffixes: 'any',
     catalogue: {
       releaseDate: '2026-09-28',
-      contextWindow: 1_000_000,
-      maxOutputTokens: 128_000,
+      ...MODELS_API_1M_LIMITS,
       pricing: {
         input: 2,
         output: 10,
@@ -557,6 +628,14 @@ export function getClaudeModelCatalogue(id: string): ClaudeModelCatalogue {
   const catalogue = getClaudeModelCapabilities(id).catalogue
   if (!catalogue) throw new Error(`No catalogue facts for ${id}`)
   return catalogue
+}
+
+/** Limits recorded for a request model, whether or not the plugin registers it. */
+export function resolveClaudeModelTokenLimits(
+  model: unknown,
+): ClaudeModelTokenLimits | undefined {
+  const row = resolveClaudeModelCapabilities(model)
+  return row?.catalogue ?? row?.tokenLimits
 }
 
 /**
