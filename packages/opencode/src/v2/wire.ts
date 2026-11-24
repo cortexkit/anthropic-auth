@@ -3,9 +3,11 @@ import {
   CacheDiagnosticsBetaTracker,
   CacheDiagnosticsTracker,
   cacheDiagnosticsMessageId,
+  DEFAULT_REFUSAL_FALLBACK_MODE,
   formatCacheDiagnosticsLogLine,
   logger,
   type NativeAccountSnapshot,
+  type RefusalFallbackMode,
   readThreeWayBoolean,
   remapModelId,
   resolveClaudeModelCapabilities,
@@ -20,7 +22,6 @@ import {
 import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start'
 import {
   logServedServerFallback,
-  resolveContentFilterFallbackMode,
   type ServerSideFallbackOutcome,
 } from '../server-fallback'
 import type {
@@ -28,14 +29,6 @@ import type {
   NativeAnthropicResponseContext,
 } from './adapter'
 import type { NativeSourceProvenance } from './source'
-
-function serverSideFallbackEnabled() {
-  return (
-    resolveContentFilterFallbackMode(
-      process.env.OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK,
-    ) === 'server'
-  )
-}
 
 /**
  * Claude Code's billing header names the user prompt a request belongs to and
@@ -53,7 +46,10 @@ export function createNativeWirePolicy(
   const cacheDiagnosticBetas = new CacheDiagnosticsBetaTracker()
   const laneStarts = new Set<string>()
   const laneAttempts = new Set<string>()
-  const attemptSessions = new Map<string, string>()
+  const attempts = new Map<
+    string,
+    { sessionID: string; refusalFallbackMode: RefusalFallbackMode }
+  >()
   const bound = <K, V>(map: Map<K, V>) => {
     while (map.size > 512) {
       const first = map.keys().next()
@@ -152,8 +148,13 @@ export function createNativeWirePolicy(
         contexts.set(input.attemptId, lineage)
         bound(contexts)
       }
-      attemptSessions.set(input.attemptId, input.sessionID)
-      bound(attemptSessions)
+      const refusalFallbackMode =
+        snapshot.refusalFallbackMode ?? DEFAULT_REFUSAL_FALLBACK_MODE
+      attempts.set(input.attemptId, {
+        sessionID: input.sessionID,
+        refusalFallbackMode,
+      })
+      bound(attempts)
       const laneStart = input.correlation[LANE_START_REQUEST_HEADER] === '1'
       if (laneStart) laneAttempts.add(input.attemptId)
       const previous = cacheDiagnostics.previousFor(input.sessionID)
@@ -178,7 +179,7 @@ export function createNativeWirePolicy(
         midConversationEffortEnabled: false,
         turnEndNoteEnabled: true,
         turnEndNote: snapshot.policyStorage.turnEndNote,
-        serverSideFallbackEnabled: serverSideFallbackEnabled(),
+        serverSideFallbackEnabled: refusalFallbackMode === 'server',
         laneStart,
         billingLineage: lineage
           ? {
@@ -205,12 +206,15 @@ export function createNativeWirePolicy(
       const model = remapModelId(input.modelID)
       // A dated model alias can differ from the requested ID without a fallback.
       const canFallback =
-        serverSideFallbackEnabled() &&
+        attempts.get(input.attemptId)?.refusalFallbackMode === 'server' &&
         resolveClaudeModelCapabilities(model)?.serverSideFallback === true
       const laneStart = laneAttempts.has(input.attemptId)
       const sent = input.cacheDiagnostics
       const observe = (message: Record<string, unknown>) => {
-        if (!sent || attemptSessions.get(input.attemptId) !== input.sessionID)
+        if (
+          !sent ||
+          attempts.get(input.attemptId)?.sessionID !== input.sessionID
+        )
           return
         const receivedAt = Date.now()
         const messageId = cacheDiagnosticsMessageId(message)
@@ -276,7 +280,7 @@ export function createNativeWirePolicy(
           .catch(() => {})
       }
       return {
-        serverSideFallbackModel: model,
+        serverSideFallbackModel: canFallback ? model : undefined,
         onServerSideFallbackOutcome(outcome: ServerSideFallbackOutcome) {
           if (canFallback) logServedServerFallback(input.sessionID, outcome)
         },
@@ -286,7 +290,7 @@ export function createNativeWirePolicy(
         onStreamEnd() {
           contexts.delete(input.attemptId)
           laneAttempts.delete(input.attemptId)
-          attemptSessions.delete(input.attemptId)
+          attempts.delete(input.attemptId)
         },
       }
     },
@@ -301,11 +305,11 @@ export function createNativeWirePolicy(
       latest.delete(sessionID)
       cacheDiagnostics.forgetSession(sessionID)
       laneStarts.delete(sessionID)
-      for (const [attempt, session] of attemptSessions)
-        if (session === sessionID) {
+      for (const [attempt, request] of attempts)
+        if (request.sessionID === sessionID) {
           contexts.delete(attempt)
           laneAttempts.delete(attempt)
-          attemptSessions.delete(attempt)
+          attempts.delete(attempt)
         }
     },
   }

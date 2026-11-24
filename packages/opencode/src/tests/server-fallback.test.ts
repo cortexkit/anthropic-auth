@@ -2,7 +2,6 @@ import { describe, expect, test } from 'bun:test'
 import {
   applyServerSideFallbackToBody,
   createServerSideFallbackStreamRewriter,
-  resolveContentFilterFallbackMode,
   SERVER_FALLBACK_MARKER_TEXT,
   SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_FALLBACK_USAGE_MARKER_TEXT,
@@ -154,21 +153,13 @@ function fallbackStream(options?: {
   return frames.join('')
 }
 
-describe('resolveContentFilterFallbackMode', () => {
-  test('defaults to Anthropic server-side fallback', () => {
-    expect(resolveContentFilterFallbackMode(undefined)).toBe('server')
-    expect(resolveContentFilterFallbackMode('')).toBe('server')
-    expect(resolveContentFilterFallbackMode('invalid')).toBe('server')
-  })
-
-  test('retains the ten-response recovery behind the legacy value', () => {
-    expect(resolveContentFilterFallbackMode('legacy')).toBe('legacy')
-    expect(resolveContentFilterFallbackMode(' LEGACY ')).toBe('legacy')
-    expect(resolveContentFilterFallbackMode('server')).toBe('server')
-  })
-})
-
 describe('applyServerSideFallbackToBody', () => {
+  test('removes caller-supplied fallback policies when server fallback is off', () => {
+    const body = { model: 'claude-fable-5', fallbacks: ['claude-opus-5'] }
+    expect(applyServerSideFallbackToBody(body, false).enabled).toBe(false)
+    expect(body).not.toHaveProperty('fallbacks')
+  })
+
   test('opts only recoverable Fable/Opus models into the default server policy', () => {
     for (const model of [
       'claude-fable-5',
@@ -371,7 +362,7 @@ describe('applyServerSideFallbackToBody', () => {
     ])
   })
 
-  test('drops historical internal markers when legacy mode is selected', () => {
+  test('drops historical internal markers when server fallback is not selected', () => {
     const body = {
       model: 'claude-fable-5',
       messages: [
@@ -720,7 +711,7 @@ describe('createServerSideFallbackStreamRewriter', () => {
       sse('content_block_stop', { type: 'content_block_stop', index: 0 }),
       sse('message_delta', {
         type: 'message_delta',
-        delta: { stop_reason: 'refusal' },
+        delta: { stop_reason: 'refusal', stop_details: { category: 'test' } },
         usage: {
           output_tokens: 1,
           iterations: [{ type: 'fallback_message', model: 'claude-opus-4-8' }],
@@ -742,6 +733,7 @@ describe('createServerSideFallbackStreamRewriter', () => {
     expect(handled).toBe(1)
     expect(output).toContain('"stop_reason":"tool_use"')
     expect(output).not.toContain('"stop_reason":"refusal"')
+    expect(output).not.toContain('"stop_details"')
     expect(outcomes).toEqual([
       expect.objectContaining({
         fallback: true,
@@ -749,6 +741,11 @@ describe('createServerSideFallbackStreamRewriter', () => {
         stopReason: 'refusal',
       }),
     ])
+
+    const withoutCallback = createServerSideFallbackStreamRewriter({
+      requestedModel: 'claude-fable-5',
+    })
+    expect(withoutCallback.push(stream) + withoutCallback.flush()).toBe(output)
   })
 
   test.each([

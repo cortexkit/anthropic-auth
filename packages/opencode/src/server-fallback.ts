@@ -87,8 +87,6 @@ function validateFallbackUsage(usage: Record<string, unknown> | undefined) {
   }
 }
 
-export type ContentFilterFallbackMode = 'server' | 'legacy'
-
 export type ServerSideFallbackOutcome = {
   requestedModel: string
   servedModel?: string
@@ -244,12 +242,6 @@ function rewriteStoredMarkers(body: Record<string, unknown>, enabled: boolean) {
   return { restoredMarkers, droppedMarkers }
 }
 
-export function resolveContentFilterFallbackMode(
-  value: string | undefined,
-): ContentFilterFallbackMode {
-  return value?.trim().toLowerCase() === 'legacy' ? 'legacy' : 'server'
-}
-
 export function applyServerSideFallbackToBody(
   body: Record<string, unknown>,
   requested: boolean,
@@ -264,7 +256,7 @@ export function applyServerSideFallbackToBody(
   const markerResult = rewriteStoredMarkers(body, enabled)
   if (enabled) {
     body.fallbacks = 'default'
-  } else if (body.fallbacks === 'default') {
+  } else {
     delete body.fallbacks
   }
   return { enabled, ...markerResult }
@@ -459,10 +451,10 @@ export function createServerSideFallbackStreamRewriter(options: {
         hasCompletedToolUse &&
         openToolUseIndexes.size === 0 &&
         delta &&
-        options.onRefusalAfterToolUse &&
-        options.onRefusalAfterToolUse() !== false
+        options.onRefusalAfterToolUse?.() !== false
       ) {
         delta.stop_reason = 'tool_use'
+        delete delta.stop_details
         return `${usageMarker}${parsed.event ? `event: ${parsed.event}\n` : ''}${data ? `data: ${JSON.stringify(data)}\n` : ''}${boundary}`
       }
       return usageMarker + rawEvent + boundary

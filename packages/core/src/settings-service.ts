@@ -41,6 +41,7 @@ export type SettingsValues = {
 
 export const SETTINGS_PROTECTION_KEYS = [
   'max_same_account_wait',
+  'refusal_fallback',
   'quota_minimum_remaining_five_hour',
   'quota_minimum_remaining_seven_day',
   'quota_minimum_remaining_scoped',
@@ -378,6 +379,12 @@ export function planSettingsRecreation(
     if (setting === 'killswitch_account_floors') continue
     const own = writer.values[setting]
     const other = peer.values[setting]
+    // The file-level recreation check requires both hosts to agree on this
+    // shared setting; it cannot be written at a host override level.
+    if (setting === 'refusal_fallback') {
+      edits.push({ setting, value: own })
+      continue
+    }
     if (sameJson(own, other)) {
       edits.push({ setting, value: own })
       continue
@@ -470,7 +477,10 @@ export interface SettingsRecreationInput {
   none?: boolean
 }
 
-export type SettingsRecreationRefusalReason = 'own-unknown' | 'peer-unknown'
+export type SettingsRecreationRefusalReason =
+  | 'own-unknown'
+  | 'peer-unknown'
+  | 'refusal-fallback-conflict'
 
 /**
  * What a menu write or setup that finds the file missing does, as a pure
@@ -491,6 +501,8 @@ export function planSettingsFileRecreation(
   if (peer.none)
     return { edits: settingsRecreationForWriter(writer.values, writer.host) }
   if (peer.rung === 3) return { refused: 'peer-unknown' }
+  if (writer.values.refusal_fallback !== peer.values.refusal_fallback)
+    return { refused: 'refusal-fallback-conflict' }
   return { edits: planSettingsRecreation(writer, peer).edits }
 }
 
@@ -1675,6 +1687,7 @@ class SettingsProtectionLease {
             {
               'own-unknown': `${host}'s protection settings could not be recovered`,
               'peer-unknown': `the protection settings of ${peer} are unknown`,
+              'refusal-fallback-conflict': `${host} and ${peer} last applied different refusal_fallback modes`,
             }[plan.refused]
           }.`
         : 'A menu write will recreate it.'

@@ -185,6 +185,7 @@ const fileValues = {
   routing_mode: 'fallback-first',
   max_same_account_wait: 'cache',
   wait_for_reset: true,
+  refusal_fallback: 'off',
   fallback_on: [502],
   refresh_enabled: false,
   refresh_interval_minutes: 12,
@@ -252,12 +253,13 @@ test('every file setting projects into its corresponding legacy-shaped leaf', as
     )
 })
 
-test('host levels apply to every setting except the account-floor list and the gateway', async () => {
+test('host levels apply only to settings that declare host overrides', async () => {
   const source = Object.fromEntries(
     Object.entries(fileValues).map(([key, value]) => [
       key,
-      // List, record and gateway settings take no host levels.
+      // These settings have one value for both hosts.
       key === 'killswitch_account_floors' ||
+      key === 'refusal_fallback' ||
       key === 'gateway_headers' ||
       key === 'gateway_url'
         ? value

@@ -36,6 +36,7 @@ function gate() {
 }
 
 const complete: SettingsProtectionValues = {
+  refusal_fallback: 'off',
   killswitch_enabled: true,
   killswitch_default_five_hour: 21,
   killswitch_default_seven_day: 32,
@@ -89,6 +90,42 @@ async function fixture(source: unknown = complete, name = 'settings.jsonc') {
   return { file, root, open }
 }
 
+test('a copy from before refusal fallback was configurable recovers the client default', async () => {
+  const f = await fixture('{broken')
+  const { refusal_fallback: _mode, ...values } = complete
+  await writeFile(
+    `${f.file}.applied.json`,
+    JSON.stringify({
+      pi: { readAt: 1, values },
+    }),
+  )
+  const service = await f.open('pi')
+  expect(service.snapshot().protection.pi.rung).toBe(1)
+  expect(service.resolve('pi').refusal_fallback).toBe('client')
+  expect(service.resolve('pi').killswitch_default_five_hour).toBe(21)
+})
+
+test('a missing settings file is not recreated from two conflicting applied fallback modes', async () => {
+  const f = await fixture()
+  await rm(f.file)
+  await writeSettingsProtectionCopy(f.file, 'pi', {
+    readAt: 1,
+    values: complete,
+  })
+  await writeSettingsProtectionCopy(f.file, 'opencode', {
+    readAt: 2,
+    values: { ...complete, refusal_fallback: 'server' },
+  })
+  const service = await f.open('pi')
+  expect(service.resolve('pi').refusal_fallback).toBe('off')
+  await expect(
+    service.update([{ setting: 'dump_enabled', value: true }], 'pi', {
+      createMissing: true,
+    }),
+  ).rejects.toThrow('recreate')
+  expect(await Bun.file(f.file).exists()).toBe(false)
+})
+
 for (const name of ['settings.jsonc', 'custom-target.jsonc']) {
   test(`published rung 0 writes only the acting host beside ${name}, owner-only and without credentials`, async () => {
     const f = await fixture(
@@ -123,11 +160,15 @@ for (const name of ['settings.jsonc', 'custom-target.jsonc']) {
     const raw = await readFile(`${f.file}.applied.json`, 'utf8')
     const copy = JSON.parse(raw)
     expect(Object.keys(copy)).toEqual(['pi'])
-    expect(copy.pi.values).toEqual(complete)
+    const { refusal_fallback, ...previousFormat } = complete
+    expect(copy.pi.values).toEqual(previousFormat)
+    expect(copy.pi.refusal_fallback).toBe(refusal_fallback)
     expect(copy.pi.readAt).toBe(readAt)
     expect(copy.pi.readAt).toBeGreaterThan(0)
     expect(Object.keys(copy.pi.values).sort()).toEqual(
-      [...SETTINGS_PROTECTION_KEYS].sort(),
+      SETTINGS_PROTECTION_KEYS.filter(
+        (key) => key !== 'refusal_fallback',
+      ).sort(),
     )
     expect(raw).not.toContain('must-not-copy')
     expect((await stat(`${f.file}.applied.json`)).mode & 0o777).toBe(0o600)
@@ -550,6 +591,7 @@ for (const missing of [false, true]) {
         } else if (storeState === 'unparseable') {
           expect(actual.rung).toBe(3)
           expect(actual.values).toEqual({
+            refusal_fallback: 'client',
             killswitch_enabled: true,
             killswitch_default_five_hour: 5,
             killswitch_default_seven_day: 10,
@@ -566,6 +608,7 @@ for (const missing of [false, true]) {
           expect(actual.values).toEqual(
             storeState === 'full'
               ? {
+                  refusal_fallback: 'client',
                   killswitch_enabled: true,
                   killswitch_default_five_hour: 81,
                   killswitch_default_seven_day: 82,
@@ -586,6 +629,7 @@ for (const missing of [false, true]) {
                   max_same_account_wait: 'off',
                 }
               : {
+                  refusal_fallback: 'client',
                   killswitch_enabled: false,
                   killswitch_default_five_hour: 5,
                   killswitch_default_seven_day: 10,

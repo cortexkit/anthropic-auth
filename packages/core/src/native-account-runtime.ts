@@ -146,7 +146,11 @@ import {
   nativeRelocationGuard,
   type RelocationGuard,
 } from './relocation-guard.ts'
-import { SETTINGS_WRITE_FAILURES } from './settings-definition.ts'
+import {
+  DEFAULT_REFUSAL_FALLBACK_MODE,
+  type RefusalFallbackMode,
+  SETTINGS_WRITE_FAILURES,
+} from './settings-definition.ts'
 import type { SettingsMoveDiagnostic } from './settings-mode-status.ts'
 import { getSettingsFilePath } from './settings-paths.ts'
 import {
@@ -261,6 +265,7 @@ export interface NativeAccountRuntime {
    * use it only for model requests, never for sign-in, refresh or usage.
    */
   getClaudeGateway?(): ClaudeGateway | undefined
+  getRefusalFallbackMode?(): RefusalFallbackMode
   /** Hosts call after startup and committed menu writes; watches use the same deduplicated hook. */
   applySettingsEffects?(): void
   /** Await at instance start and before every /claude action, never on requests. */
@@ -428,6 +433,8 @@ export function acquireNativeAccountRuntime(
     getSettingsStatus: () => use().getSettingsStatus?.(),
     getSettingsModeStatus: () => use().getSettingsModeStatus?.() ?? '',
     getClaudeGateway: () => use().getClaudeGateway?.(),
+    getRefusalFallbackMode: () =>
+      use().getRefusalFallbackMode?.() ?? DEFAULT_REFUSAL_FALLBACK_MODE,
     applySettingsEffects: () => use().applySettingsEffects?.(),
     prepareSettingsAction: () =>
       use().prepareSettingsAction?.() ?? Promise.resolve(),
@@ -955,6 +962,7 @@ function buildNativeAccountRuntime(
       runtime: metadata.status === 'ready' ? metadata.state : undefined,
       roster,
     })
+    snapshot.refusalFallbackMode = runtimeSettings.refusalFallbackMode()
     // A relay in account settings outside their default location is never
     // used: show it as off, so every host sends directly and Status says why.
     const relay = snapshot.policyStorage.relay
@@ -1252,6 +1260,7 @@ function buildNativeAccountRuntime(
       ),
     setSettingsDiagnostic: runtimeSettings.setDiagnostic,
     getClaudeGateway: runtimeSettings.gateway,
+    getRefusalFallbackMode: runtimeSettings.refusalFallbackMode,
     resolveSettings: runtimeSettings.resolve,
     applySettingsEffects: runtimeSettings.applyEffects,
     prepareSettingsAction: runtimeSettings.prepareAction,

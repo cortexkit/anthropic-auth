@@ -63,6 +63,7 @@ import {
   createSseFramer,
   createStickyNoRouteResponse,
   custodyTombstoneOAuth,
+  DEFAULT_REFUSAL_FALLBACK_MODE,
   type DumpHandle,
   decideOpenCodeStateLayoutOnce,
   decideStickyQuotaFailure,
@@ -210,6 +211,7 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  type RefusalFallbackMode,
   readClaustrumEnrollmentStatus,
   readNativeAccountsForRequest,
   readNativeEnrollmentMode,
@@ -306,7 +308,6 @@ import {
   type FableSourceWarmInit,
   type FableSourceWarmKeep,
   type FableStandbyCacheAnchor,
-  isRecoverableRefusalModel,
   parseSourceWarmTargetId,
   recoverableRefusalFamily,
   sourceWarmTargetId,
@@ -371,11 +372,7 @@ import {
   adoptRpcServer,
   type RpcServerAdoption,
 } from './rpc/server-registry.ts'
-import {
-  logServedServerFallback,
-  resolveContentFilterFallbackMode,
-  type ServerSideFallbackOutcome,
-} from './server-fallback.ts'
+import { logServedServerFallback } from './server-fallback.ts'
 import { getOpenCodeAuthPath } from './setup/paths.ts'
 import {
   formatPrimeTime,
@@ -893,7 +890,6 @@ const ZERO_MODEL_COST = {
 type FableRequestContext = {
   plan: FableFallbackPlan
   oauthAccountId?: string
-  serverFallback?: boolean
   opusCacheAnchor?: FableStandbyCacheAnchor
   standbyBridgeLogged?: boolean
   subagent?: boolean
@@ -944,17 +940,6 @@ function asProviderAccountUuid(
   return value as ProviderAccountUuid | undefined
 }
 
-/**
- * Compose the recovery-window notice text for the requested model. Fable 5 and
- * Opus 5 follow the same Anthropic-recommended fallback (Opus 4.8) for the
- * same reason (cyber safety classifiers returning `stop_reason: "refusal"`),
- * so the message structure is shared; only the model name moves.
- */
-function buildSwitchedToOpusNotice(modelId: string, remaining: number): string {
-  const label = fallbackModelLabel(modelId)
-  return `${label} content filter detected. Switched to Opus 4.8 for a ${remaining}-response recovery window before trying ${label} again.`
-}
-
 function buildRestoredNotice(modelId: string): string {
   const label = fallbackModelLabel(modelId)
   return `${label} recovery window complete. Returning to ${label}.`
@@ -976,17 +961,6 @@ function fallbackModelLabel(modelId: string): string {
     return 'Opus 4.8'
   }
   return modelId
-}
-
-function buildServerFallbackNotice(
-  requestedModelId: string,
-  targetModelId: string,
-): string {
-  return `Anthropic safety fallback served this step on ${fallbackModelLabel(targetModelId)}; the next step tries ${fallbackModelLabel(requestedModelId)} again.`
-}
-
-function buildServerRestoredNotice(requestedModelId: string): string {
-  return `Anthropic safety fallback ended. Returning to ${fallbackModelLabel(requestedModelId)}.`
 }
 
 type AnthropicProviderModel = {
@@ -1471,6 +1445,8 @@ const anthropicAuthPlugin = async (
       },
     },
   })
+  const readRefusalFallbackMode = () =>
+    nativeAccounts.getRefusalFallbackMode?.() ?? DEFAULT_REFUSAL_FALLBACK_MODE
   try {
     await nativeAccounts.prepareSettingsAction?.()
     nativeAccounts.applySettingsEffects?.()
@@ -2166,9 +2142,6 @@ const anthropicAuthPlugin = async (
     return result.retry ? result.receipt : undefined
   }
 
-  const fallbackMode = resolveContentFilterFallbackMode(
-    process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE,
-  )
   const fableFallbackManager = new FableFallbackManager(runtimeNow)
   // Which thinking blocks the fallback model wrote during recovery rounds, so
   // requests back to the source model can leave them out (recovery-thinking.ts).
@@ -2199,7 +2172,6 @@ const anthropicAuthPlugin = async (
   const effortPlanTracker = new OpenCodeEffortPlanTracker()
   const billingLineageTracker = new BillingLineageTracker()
   const stickyQuotaRetries = new StickyQuotaRetryCounter()
-  const serverFallbackTargets = new Map<string, string>()
   const pendingDesktopNotices = new Map<string, string[]>()
   const pendingRecoveryDesktopNotices = new Map<string, string>()
   const desktopNoticeFlushes = new Map<string, Promise<void>>()
@@ -3880,6 +3852,9 @@ const anthropicAuthPlugin = async (
   > = []
   const cacheKeepScopedAttempts = new Map<number, NativeOAuthAuthorization>()
   const cacheKeepSourceCopies = new Map<string, FableSourceWarmKeep>()
+  const currentWarmGateway = () => nativeAccounts.getClaudeGateway?.()
+  const sourceWarmFetch = fetchOAuthModel(currentWarmGateway)
+  const cacheWarmFetch = fetchOAuthModel(currentWarmGateway, requestGzipLatch)
   const cacheKeepManager: CacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
     resolveSettings: (storage, model) =>
@@ -3898,10 +3873,21 @@ const anthropicAuthPlugin = async (
     },
     // Prewarms carry an OAuth bearer: recheck the destination, no redirects.
     // A keep-warm is a model request, so it follows the current gateway.
-    fetchImpl: fetchOAuthModel(
-      () => nativeAccounts.getClaudeGateway?.(),
-      requestGzipLatch,
-    ),
+    fetchForTarget: (target) => {
+      if (!target.sourceWarm) return cacheWarmFetch
+      // The mode can change during credential checks or warm reservation.
+      // Send source warms without gzip so a compression retry cannot skip this check.
+      return Object.assign(
+        async (...args: Parameters<typeof fetch>) => {
+          if (readRefusalFallbackMode() !== 'client') {
+            cacheKeepManager.untrack(target.id, 'policy-refused')
+            throw new CacheKeepWarmRefusal('stopped')
+          }
+          return sourceWarmFetch(...args)
+        },
+        { preconnect: sourceWarmFetch.preconnect },
+      )
+    },
     billingRequest: (target, attempt) => {
       const payer = cacheKeepScopedAttempts.get(attempt.id)
       if (!payer) return
@@ -4137,6 +4123,10 @@ const anthropicAuthPlugin = async (
     },
     validatePrewarm: ({ target, warmBodyText }) => {
       if (!target.sourceWarm) return { ok: true as const }
+      if (readRefusalFallbackMode() !== 'client') {
+        cacheKeepManager.untrack(target.id, 'policy-refused')
+        return { ok: false, reason: 'refusal-fallback-mode-changed' }
+      }
       const kept = fableFallbackManager.sourceWarmForTarget(target.id)
       if (!kept) {
         // The round ended (or never kept a source) while the target lived
@@ -4172,50 +4162,6 @@ const anthropicAuthPlugin = async (
     allowUrl: (url) => isAllowedOAuthDestination(url, modelGateway(url)),
     now: runtimeNow,
   })
-
-  // Track one recovery round's kept source prefix as a second CacheKeep
-  // target. It reuses the live prewarm path (same lead, same auth, same
-  // retry and logging), keyed so it cannot collide with the session's live
-  // target. A round that ends before expiry sends nothing: the target is
-  // removed on the round's end and the tick only fires at the lead.
-  async function syncSourceWarmTarget(plan: FableFallbackPlan) {
-    const family = recoverableRefusalFamily(plan.requestedModel)
-    if (!family) return
-    const targetId = sourceWarmTargetId(plan.sessionId, family)
-    const kept = fableFallbackManager.sourceWarmFor(plan.recoveryKey)
-    if (!kept) {
-      cacheKeepManager.untrack(targetId)
-      return
-    }
-    let storage: AccountStorage | null
-    try {
-      storage = await loadAccounts()
-    } catch {
-      return
-    }
-    const tracked = cacheKeepManager.track({
-      sessionId: targetId,
-      ownerSessionId: plan.sessionId,
-      acceptedAt: kept.sentAt,
-      url: kept.url,
-      headers: new Headers(kept.headers),
-      bodyText: kept.bodyText,
-      ttlMs: requestCacheLifetimeMs(kept.bodyText),
-      storage,
-      cacheMode: 'hybrid',
-      oauthAccountId: kept.oauthAccountId,
-      ...(kept.accountIdentity !== undefined && {
-        oauthAccountIdentity: kept.accountIdentity,
-      }),
-      isSubagent: kept.subagent ?? false,
-      sourceWarm: true,
-    })
-    if (!tracked.tracked) {
-      // CacheKeep policy (disabled, non-hybrid, off-schedule, subagents)
-      // refused the warm: forget the prefix with the target.
-      fableFallbackManager.dropSourceWarm(plan.recoveryKey)
-    }
-  }
 
   // Prime sends a minimal Haiku request after the account's quota reset to
   // start its next five-hour usage window. One shared manager and an atomic
@@ -5329,85 +5275,12 @@ const anthropicAuthPlugin = async (
     return flush
   }
 
-  function observeServerFallbackOutcome(
-    plan: FableFallbackPlan,
-    outcome: ServerSideFallbackOutcome,
-    storage: AccountStorage | null,
-    auth: { access?: string; refresh?: string },
-  ) {
-    logServedServerFallback(plan.sessionId, outcome)
-    if (outcome.fallback && outcome.targetModel) {
-      const previousTarget = serverFallbackTargets.get(plan.recoveryKey)
-      serverFallbackTargets.delete(plan.recoveryKey)
-      serverFallbackTargets.set(plan.recoveryKey, outcome.targetModel)
-      while (serverFallbackTargets.size > 128) {
-        const oldest = serverFallbackTargets.keys().next().value
-        if (oldest) serverFallbackTargets.delete(oldest)
-        else break
-      }
-      const visibleNotice = fableRecoveryNotices.get(plan.sessionId)
-      if (
-        previousTarget === outcome.targetModel &&
-        visibleNotice?.mode === 'server' &&
-        recoverableRefusalFamily(visibleNotice.requestedModelId) ===
-          recoverableRefusalFamily(plan.requestedModel) &&
-        visibleNotice.targetModelId === outcome.targetModel
-      ) {
-        return
-      }
-      publishFableRecoveryNotice(
-        {
-          sessionId: plan.sessionId,
-          mode: 'server',
-          remaining: 0,
-          requestedModelId: plan.requestedModel,
-          targetModelId: outcome.targetModel,
-        },
-        storage,
-        auth,
-        buildServerFallbackNotice(plan.requestedModel, outcome.targetModel),
-      )
-      return
-    }
-
-    if (
-      outcome.stopReason === 'refusal' ||
-      !serverFallbackTargets.delete(plan.recoveryKey)
-    ) {
-      return
-    }
-    logger.info(
-      'fable-fallback',
-      'Anthropic server-side safety fallback ended',
-      {
-        session: plan.sessionId,
-        requestedModel: plan.requestedModel,
-      },
-    )
-    publishFableRecoveryNotice(
-      {
-        sessionId: plan.sessionId,
-        mode: 'fable',
-        remaining: 0,
-        requestedModelId: plan.requestedModel,
-      },
-      storage,
-      auth,
-      buildServerRestoredNotice(plan.requestedModel),
-    )
-  }
-
   function clearFableRecoveryNotice(
     sessionId: string | null | undefined,
     storage: AccountStorage | null,
     auth: { access?: string; refresh?: string },
   ) {
     if (!sessionId) return
-    for (const recoveryKey of serverFallbackTargets.keys()) {
-      if (recoveryKey.startsWith(`${sessionId}\0`)) {
-        serverFallbackTargets.delete(recoveryKey)
-      }
-    }
     if (!fableRecoveryNotices.delete(sessionId)) return
     void writeSidebarState(storage, {
       activeId: lastSidebarRouting.activeId,
@@ -7774,6 +7647,7 @@ const anthropicAuthPlugin = async (
             input: string | URL | Request,
             init: RequestInit | undefined,
             accessToken: string,
+            refusalFallbackMode: RefusalFallbackMode,
             trace?: PerfTrace,
             route = 'unknown',
             currentStorage?: Awaited<ReturnType<typeof loadAccounts>>,
@@ -7833,6 +7707,7 @@ const anthropicAuthPlugin = async (
               return requestStorage
             }
             const requestHeaders = mergeHeaders(input, init)
+            let serverFallbackModel: string | undefined
             const relayAffinity =
               requestHeaders.get('x-session-affinity') ||
               requestHeaders.get('x-opencode-session')
@@ -8007,7 +7882,7 @@ const anthropicAuthPlugin = async (
                   recoveryRoundThinking: recoveryRoundThinking?.size
                     ? recoveryRoundThinking
                     : undefined,
-                  serverSideFallbackEnabled: fallbackMode === 'server',
+                  serverSideFallbackEnabled: refusalFallbackMode === 'server',
                   laneStart: laneStartRequest,
                   billingLineage: activeBillingLineage,
                   cacheDiagnosticsPreviousMessageId,
@@ -8053,6 +7928,12 @@ const anthropicAuthPlugin = async (
               const headerBodyParseStart = nowMs()
               try {
                 const finalBody = JSON.parse(body) as Record<string, unknown>
+                if (
+                  refusalFallbackMode === 'server' &&
+                  finalBody.fallbacks === 'default' &&
+                  typeof finalBody.model === 'string'
+                )
+                  serverFallbackModel = finalBody.model
                 if (
                   readSessionCachePolicy(relayAffinity, true)?.ttl !== undefined
                 )
@@ -8853,6 +8734,8 @@ const anthropicAuthPlugin = async (
               // asked for a newer credential), end it as cancelled here.
               if (response.status === 401)
                 await endIfCancelled(response, init?.signal)
+              if (serverFallbackModel)
+                serverFallbackResponses.set(response, serverFallbackModel)
               if (response.ok) {
                 // HTTP relay success is accepted even without a request-id;
                 // an optimistic WebSocket 200 still needs its upstream status.
@@ -9390,6 +9273,7 @@ const anthropicAuthPlugin = async (
           }
 
           const responseRouteKinds = new WeakMap<Response, 'oauth' | 'api'>()
+          const serverFallbackResponses = new WeakMap<Response, string>()
           function cancelAbandonedResponse(response?: Response) {
             void response?.body?.cancel().catch(() => {})
           }
@@ -9465,6 +9349,7 @@ const anthropicAuthPlugin = async (
 
           type RequestRouting = {
             trace: PerfTrace
+            refusalFallbackMode: RefusalFallbackMode
             refusal: ReturnType<typeof createRefusalOwner>
             attemptedPaid: Set<string>
             shared?: {
@@ -9541,6 +9426,7 @@ const anthropicAuthPlugin = async (
                   input,
                   init,
                   scopedAttempt.accessToken,
+                  routing.refusalFallbackMode,
                   trace,
                   `fallback_${index}`,
                   storage,
@@ -9559,6 +9445,7 @@ const anthropicAuthPlugin = async (
                   input,
                   init,
                   account.access,
+                  routing.refusalFallbackMode,
                   trace,
                   `fallback_${index}`,
                   storage,
@@ -9797,13 +9684,7 @@ const anthropicAuthPlugin = async (
                 dropSessionSourceWarms(sessionId)
               }
               const fablePlan = fableFallbackManager.plan(sessionId, init?.body)
-              const serverFallbackModel =
-                fallbackMode === 'server' &&
-                isRecoverableRefusalModel(
-                  fablePlan?.effectiveModel ?? requestModel,
-                )
-                  ? (fablePlan?.effectiveModel ?? requestModel)
-                  : undefined
+              const refusalFallbackMode = readRefusalFallbackMode()
               const fableRequest: FableRequestContext | undefined = fablePlan
                 ? { plan: fablePlan }
                 : undefined
@@ -9820,10 +9701,13 @@ const anthropicAuthPlugin = async (
               })
               const requestRouting: RequestRouting = {
                 trace,
+                refusalFallbackMode,
                 refusal,
                 attemptedPaid: new Set(),
               }
               const wrapResponse = (response: Response) => {
+                const serverFallbackModel =
+                  serverFallbackResponses.get(response)
                 const diagnosticsContext =
                   cacheDiagnosticsResponses.get(response)
                 if (
@@ -9904,86 +9788,6 @@ const anthropicAuthPlugin = async (
                           responseMode: 'json' as const,
                         }
                     : {}),
-                  contentFilterModel: fablePlan?.requestedModel,
-                  ...(!fablePlan?.downgraded && fablePlan
-                    ? {
-                        onContentFilter: (context) => {
-                          if (!fableRequest?.oauthAccountId) {
-                            logger.debug(
-                              'fable-fallback',
-                              'content filter recovery unavailable for non-OAuth route',
-                              { session: fablePlan.sessionId },
-                            )
-                            return false
-                          }
-                          // HTTP success alone does not prove a refused
-                          // request populated its tail cache entry.
-                          const accepted = acceptedSourceRequests.get(
-                            fablePlan.recoveryKey,
-                          )
-                          acceptedSourceRequests.delete(fablePlan.recoveryKey)
-                          const keep =
-                            accepted?.oauthAccountId ===
-                            fableRequest.oauthAccountId
-                              ? accepted
-                              : undefined
-                          const remaining = fableFallbackManager.activate(
-                            fablePlan,
-                            fableRequest.oauthAccountId,
-                            keep,
-                          )
-                          void syncSourceWarmTarget(fablePlan).catch(() => {
-                            logger.warn(
-                              'fable-fallback',
-                              'source warm sync failed',
-                              {
-                                session: fablePlan.sessionId,
-                              },
-                            )
-                          })
-                          pendingRecoveryDesktopNotices.delete(
-                            fablePlan.recoveryKey,
-                          )
-                          pendingRecoveryDesktopNotices.set(
-                            fablePlan.recoveryKey,
-                            buildSwitchedToOpusNotice(
-                              fablePlan.requestedModel,
-                              remaining,
-                            ),
-                          )
-                          while (pendingRecoveryDesktopNotices.size > 128) {
-                            const oldest = pendingRecoveryDesktopNotices
-                              .keys()
-                              .next().value
-                            if (oldest)
-                              pendingRecoveryDesktopNotices.delete(oldest)
-                            else break
-                          }
-                          serverFallbackTargets.delete(fablePlan.recoveryKey)
-                          logger.info(
-                            'fable-fallback',
-                            'content filter detected; switching session to Opus 4.8',
-                            {
-                              session: fablePlan.sessionId,
-                              requestedModel: fablePlan.requestedModel,
-                              completedToolUse:
-                                context?.completedToolUse === true,
-                              remaining,
-                            },
-                          )
-                          publishFableRecoveryNotice(
-                            {
-                              sessionId: fablePlan.sessionId,
-                              mode: 'opus',
-                              remaining,
-                              requestedModelId: fablePlan.requestedModel,
-                            },
-                            storage,
-                            auth,
-                          )
-                        },
-                      }
-                    : {}),
                   ...(fablePlan && fableRequest
                     ? {
                         onComplete: (finishReason: string) => {
@@ -9991,8 +9795,7 @@ const anthropicAuthPlugin = async (
                             if (
                               fableRequest.sourceCandidate &&
                               fableRequest.sourceCacheUsed ===
-                                fableRequest.sourceCandidate &&
-                              !fableRequest.serverFallback
+                                fableRequest.sourceCandidate
                             ) {
                               acceptedSourceRequests.delete(
                                 fablePlan.recoveryKey,
@@ -10009,10 +9812,8 @@ const anthropicAuthPlugin = async (
                                 acceptedSourceRequests.delete(oldest)
                               }
                             }
-                            const ended = fableFallbackManager.completeSource(
-                              fablePlan,
-                              !fableRequest.serverFallback,
-                            )
+                            const ended =
+                              fableFallbackManager.completeSource(fablePlan)
                             if (ended) {
                               // The source serves again: the round (and its
                               // warm) is over.
@@ -10092,20 +9893,8 @@ const anthropicAuthPlugin = async (
                   ...(serverFallbackModel
                     ? {
                         serverSideFallbackModel: serverFallbackModel,
-                        onServerSideFallbackOutcome: (
-                          outcome: ServerSideFallbackOutcome,
-                        ) => {
-                          if (fableRequest)
-                            fableRequest.serverFallback = outcome.fallback
-                          if (fablePlan)
-                            observeServerFallbackOutcome(
-                              fablePlan,
-                              outcome,
-                              storage,
-                              auth,
-                            )
-                          else logServedServerFallback(sessionId, outcome)
-                        },
+                        onServerSideFallbackOutcome: (outcome) =>
+                          logServedServerFallback(sessionId, outcome),
                       }
                     : {}),
                 })
@@ -10223,17 +10012,7 @@ const anthropicAuthPlugin = async (
               quotaManager.seedFallbacksFromAccounts(
                 (storage?.accounts ?? []).filter(isOAuthAccount),
               )
-              const visibleRecovery = sessionId
-                ? fableRecoveryNotices.get(sessionId)
-                : undefined
-              if (
-                recoveryModelChanged ||
-                !fablePlan ||
-                (fallbackMode === 'server' &&
-                  visibleRecovery?.requestedModelId &&
-                  recoverableRefusalFamily(visibleRecovery.requestedModelId) !==
-                    recoverableRefusalFamily(fablePlan.requestedModel))
-              ) {
+              if (recoveryModelChanged || !fablePlan) {
                 clearFableRecoveryNotice(sessionId, storage, auth)
               }
               const replayableRequest = isReplayableRequest(input, init?.body)
@@ -10560,6 +10339,7 @@ const anthropicAuthPlugin = async (
                         input,
                         init,
                         '',
+                        refusalFallbackMode,
                         trace,
                         `routing:${account.id}`,
                         storage,
@@ -11067,6 +10847,7 @@ const anthropicAuthPlugin = async (
                           input,
                           init,
                           scopedAttempt.accessToken,
+                          refusalFallbackMode,
                           trace,
                           `sticky:${selected.id}`,
                           stickyRoutes.storage,
@@ -11084,6 +10865,7 @@ const anthropicAuthPlugin = async (
                         input,
                         init,
                         selected.access ?? '',
+                        refusalFallbackMode,
                         trace,
                         `sticky:${selected.id}`,
                         stickyRoutes.storage,
@@ -11677,6 +11459,7 @@ const anthropicAuthPlugin = async (
                       input,
                       init,
                       scopedAttempt.accessToken,
+                      refusalFallbackMode,
                       trace,
                       'main',
                       storage,
@@ -12190,6 +11973,7 @@ const anthropicAuthPlugin = async (
                     input,
                     init,
                     '',
+                    refusalFallbackMode,
                     trace,
                     'main',
                     storage,
@@ -12205,6 +11989,7 @@ const anthropicAuthPlugin = async (
                 input,
                 init,
                 auth.access,
+                refusalFallbackMode,
                 trace,
                 'main',
                 storage,

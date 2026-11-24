@@ -19,6 +19,16 @@ const model = { ...user, overrides: { host: true, model: true } } as const
 const floor = number({ min: 0, max: 100 })
 const nonnegative = number({ min: 0 })
 
+const refusalFallbackModes = ['client', 'server', 'off'] as const
+export type RefusalFallbackMode = (typeof refusalFallbackModes)[number]
+export const DEFAULT_REFUSAL_FALLBACK_MODE: RefusalFallbackMode = 'client'
+
+export function isRefusalFallbackMode(
+  value: unknown,
+): value is RefusalFallbackMode {
+  return refusalFallbackModes.some((mode) => mode === value)
+}
+
 /** Scalar ranges follow validateNativeMigrationSettings; list entries replace whole values. */
 export const settingsDefinition = defineSettings({
   plugin: 'anthropic-auth',
@@ -34,6 +44,11 @@ export const settingsDefinition = defineSettings({
       default: '15m',
     },
     wait_for_reset: { ...host, value: boolean(), default: false },
+    refusal_fallback: {
+      ...user,
+      value: oneOf(refusalFallbackModes),
+      default: DEFAULT_REFUSAL_FALLBACK_MODE,
+    },
     fallback_on: { ...host, value: list(integer()), default: [401, 403, 429] },
     refresh_enabled: { ...host, value: boolean(), default: true },
     refresh_interval_minutes: { ...host, value: nonnegative, default: 10 },
@@ -131,6 +146,7 @@ export type SettingsKey = keyof typeof settingsDefinition.settings
  */
 export const SETTINGS_FILE_ONLY_KEYS = [
   'wait_for_reset',
+  'refusal_fallback',
   'gateway_url',
   'gateway_headers',
 ] as const satisfies readonly SettingsKey[]
@@ -144,6 +160,8 @@ export const SETTINGS_DEFAULT_READERS = {
   routing_mode: 'packages/core/src/routing.ts:getRoutingMode',
   max_same_account_wait: 'packages/core/src/routing.ts:getMaxSameAccountWait',
   wait_for_reset: 'packages/core/src/routing.ts:getWaitForReset',
+  refusal_fallback:
+    'packages/core/src/native-runtime-settings.ts:refusalFallbackMode',
   fallback_on: 'packages/core/src/accounts.ts:shouldFallbackStatus',
   refresh_enabled: 'packages/opencode/src/index.ts:mainRefreshEnabled',
   refresh_interval_minutes:

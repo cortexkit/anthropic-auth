@@ -122,6 +122,20 @@ test('request settings use their model and the next request sees a watch publica
   )
 })
 
+test('the runtime reads the current fallback mode for each request or warm without file I/O', async () => {
+  const f = await fixture({ refusal_fallback: 'server' })
+  const readsBefore = f.reads()
+  const sentMode = f.reader.refusalFallbackMode()
+  expect(sentMode).toBe('server')
+  expect(f.reads()).toBe(readsBefore)
+  await writeFile(f.file, '{"refusal_fallback":"off"}')
+  await f.service.refresh()
+  const readsAfter = f.reads()
+  expect(f.reader.refusalFallbackMode()).toBe('off')
+  expect(f.reads()).toBe(readsAfter)
+  expect(sentMode).toBe('server')
+})
+
 test('legacy, separate, and absent-service readers preserve the exact legacy record without defaults', async () => {
   const f = await fixture({ routing_mode: 'sticky-balanced' })
   const storage = createEmptyStorage()

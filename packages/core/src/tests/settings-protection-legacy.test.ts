@@ -19,6 +19,7 @@ afterEach(async () => {
 })
 
 const emptyProtection: SettingsProtectionValues = {
+  refusal_fallback: 'client',
   killswitch_enabled: false,
   killswitch_default_five_hour: 5,
   killswitch_default_seven_day: 10,
@@ -88,6 +89,7 @@ for (const host of ['opencode', 'pi'] as const) {
           },
         })
         expect(result).toEqual({
+          refusal_fallback: 'client',
           killswitch_enabled: true,
           killswitch_default_five_hour: 31,
           killswitch_default_seven_day: 42,

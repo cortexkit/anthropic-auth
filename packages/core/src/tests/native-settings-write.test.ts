@@ -710,6 +710,7 @@ for (const host of ['opencode', 'pi'] as const) {
     expect(raw).toEqual({
       schema_version: 1,
       max_same_account_wait: 'off',
+      refusal_fallback: 'client',
       quota_minimum_remaining_five_hour: 12,
       quota_minimum_remaining_seven_day: 0,
       quota_minimum_remaining_scoped: 0,

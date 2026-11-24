@@ -6,6 +6,11 @@ import {
   type PublicationOptions,
   renameWithWindowsSharingRetry,
 } from './publication-rename.ts'
+import {
+  DEFAULT_REFUSAL_FALLBACK_MODE,
+  isRefusalFallbackMode,
+  type RefusalFallbackMode,
+} from './settings-definition.ts'
 import type { SettingsHost } from './settings-paths.ts'
 import {
   SETTINGS_PROTECTION_KEYS,
@@ -17,6 +22,12 @@ export interface SettingsProtectionCopyEntry {
   /** Time the published generation was read, not when its detached write ran. */
   readAt: number
   values: SettingsProtectionValues
+}
+
+type StoredProtectionCopyEntry = {
+  readAt: number
+  values: Omit<SettingsProtectionValues, 'refusal_fallback'>
+  refusal_fallback?: RefusalFallbackMode
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -32,21 +43,25 @@ function floor(value: unknown): value is number {
   )
 }
 
-// This is the persisted-copy format, not user-file resolution: every field is
-// required and overrides, inferred fields and partial recovery are not allowed.
-function validEntry(value: unknown): value is SettingsProtectionCopyEntry {
+// Keep the original values shape so older releases accept the same copy.
+// A missing sibling means the mode was unset before this setting existed.
+function validEntry(value: unknown): value is StoredProtectionCopyEntry {
   if (
     !record(value) ||
     typeof value.readAt !== 'number' ||
     !Number.isFinite(value.readAt) ||
     value.readAt <= 0 ||
-    !record(value.values)
+    !record(value.values) ||
+    (Object.hasOwn(value, 'refusal_fallback') &&
+      !isRefusalFallbackMode(value.refusal_fallback))
   )
     return false
   const values = value.values
   if (
-    Object.keys(values).length !== SETTINGS_PROTECTION_KEYS.length ||
-    !SETTINGS_PROTECTION_KEYS.every((key) => Object.hasOwn(values, key)) ||
+    Object.keys(values).length !== SETTINGS_PROTECTION_KEYS.length - 1 ||
+    !SETTINGS_PROTECTION_KEYS.every(
+      (key) => key === 'refusal_fallback' || Object.hasOwn(values, key),
+    ) ||
     typeof values.killswitch_enabled !== 'boolean' ||
     !['off', '15m', 'cache'].includes(values.max_same_account_wait as string) ||
     !['default', 'on', 'off'].includes(
@@ -122,7 +137,10 @@ export async function readSettingsProtectionCopy(
   const entry = copy[host]
   if (!validEntry(entry))
     throw new Error('The applied protection copy entry is invalid')
-  return entry.values
+  return {
+    ...entry.values,
+    refusal_fallback: entry.refusal_fallback ?? DEFAULT_REFUSAL_FALLBACK_MODE,
+  }
 }
 
 /** Merge only the writer's host while holding the copy's cross-process lock. */
@@ -133,7 +151,9 @@ export async function writeSettingsProtectionCopy(
   lockTimeoutMs = 5_000,
   publicationOptions: PublicationOptions = {},
 ): Promise<void> {
-  if (!validEntry(entry)) throw new Error('Invalid protection copy entry')
+  const { refusal_fallback, ...values } = entry.values
+  const stored = { readAt: entry.readAt, values, refusal_fallback }
+  if (!validEntry(stored)) throw new Error('Invalid protection copy entry')
   const publication = capturePublicationOptions(publicationOptions)
   const path = `${file}.applied.json`
   await withLock(
@@ -159,7 +179,7 @@ export async function writeSettingsProtectionCopy(
       const other = host === 'opencode' ? 'pi' : 'opencode'
       const merged = {
         ...(Object.hasOwn(copy, other) ? { [other]: copy[other] } : {}),
-        [host]: entry,
+        [host]: stored,
       }
       const temp = `${path}.${process.pid}.${randomUUID()}.tmp`
       try {

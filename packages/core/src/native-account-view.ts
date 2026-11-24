@@ -111,6 +111,8 @@ export function formatNativeAccountState(
 export interface NativeAccountSnapshot {
   mode: 'local' | 'claustrum'
   settings: Record<string, unknown>
+  /** User-file mode captured for this request's policy and response. */
+  refusalFallbackMode?: import('./settings-definition.ts').RefusalFallbackMode
   accounts: NativeAccountView[]
   /** Vault storage, or the local destination recorded by the authorized migration journal. */
   routingPath?: string

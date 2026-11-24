@@ -124,6 +124,39 @@ async function fixture(source = '{}', realWatch = false) {
   }
 }
 
+test('a trusted settings file without a fallback mode defaults to client', async () => {
+  const service = await (await fixture()).open()
+  for (const host of ['opencode', 'pi'] as const) {
+    expect(service.resolve(host).refusal_fallback).toBe('client')
+  }
+})
+
+for (const [label, contents] of [
+  ['empty', ''],
+  ['truncated', '{"refusal_fallback":'],
+  ['newer-schema', '{"schema_version":2,"refusal_fallback":"client"}'],
+] as const) {
+  test(`a settings file (${label}) keeps the last applied off fallback mode`, async () => {
+    const f = await fixture('{"refusal_fallback":"off"}')
+    const clients = await Promise.all(
+      (['opencode', 'pi'] as const).map(async (host) => ({
+        host,
+        service: await f.open({ host }),
+      })),
+    )
+    for (const { host, service } of clients)
+      expect(service.resolve(host).refusal_fallback).toBe('off')
+    await writeFile(f.file, contents)
+    for (const { host, service } of clients) {
+      await service.refresh()
+      const protection = service.snapshot().protection[host]
+      expect(protection.usable).toBe(false)
+      expect(protection.values.refusal_fallback).toBe('off')
+      expect(service.resolve(host).refusal_fallback).toBe('off')
+    }
+  })
+}
+
 test('one path owns one handle and watch until its last plugin lease is disposed', async () => {
   const f = await fixture('{"dump_enabled":true}')
   const [a, b] = await Promise.all([f.open(), f.open()])
@@ -911,6 +944,7 @@ function protectionOf(values: SettingsGeneration['contexts']['pi']['noModel']) {
 }
 
 const distinctProtection: SettingsProtectionValues = {
+  refusal_fallback: 'client',
   killswitch_enabled: true,
   killswitch_default_five_hour: 31,
   killswitch_default_seven_day: 42,
@@ -1135,6 +1169,7 @@ test('unavailable recovery sources use exactly the most restrictive set', async 
     },
   })
   const expected: SettingsProtectionValues = {
+    refusal_fallback: 'client',
     killswitch_enabled: true,
     killswitch_default_five_hour: 5,
     killswitch_default_seven_day: 10,

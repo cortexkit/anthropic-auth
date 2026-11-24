@@ -496,6 +496,37 @@ function hostRequest(
 const sse = (event: string, data: unknown) =>
   `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
 
+test('OpenCode 2 ignores the removed fallback environment switch on each request', () => {
+  const wire = createNativeWirePolicy()
+  const input = {
+    agent: 'build',
+    correlation: {},
+    sessionID: 'ses_fallback_mode',
+  }
+  const request = (refusalFallbackMode?: core.RefusalFallbackMode) =>
+    wire.requestOptions(
+      { ...input, attemptId: refusalFallbackMode ?? 'default' },
+      { policyStorage: {}, refusalFallbackMode } as core.NativeAccountSnapshot,
+    )
+  process.env.OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK = 'server'
+  expect(request().serverSideFallbackEnabled).toBe(false)
+  expect(request('off').serverSideFallbackEnabled).toBe(false)
+  process.env.OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK = 'legacy'
+  expect(request('server').serverSideFallbackEnabled).toBe(true)
+  expect(request('off').serverSideFallbackEnabled).toBe(false)
+  const response = (attemptId: string) =>
+    wire.responseOptions({
+      ...input,
+      attemptId,
+      kind: 'primary',
+      accountId: 'main',
+      modelID: 'claude-fable-5',
+      status: 200,
+    })
+  expect(response('server').serverSideFallbackModel).toBe('claude-fable-5')
+  expect(response('off').serverSideFallbackModel).toBeUndefined()
+})
+
 function cacheDiagnosticsHost() {
   const wire = createNativeWirePolicy()
   const { source } = makeSource({
@@ -1181,7 +1212,11 @@ describe('OpenCode 2 native Anthropic adapter: request shape', () => {
   test('logs one INFO record with only validated metadata for each server fallback step', async () => {
     const wire = createNativeWirePolicy()
     const { source } = makeSource({
-      options: { serverSideFallbackEnabled: true },
+      requestOptions: (input) =>
+        wire.requestOptions(input, {
+          policyStorage: {},
+          refusalFallbackMode: 'server',
+        } as core.NativeAccountSnapshot),
       responseOptions: wire.responseOptions,
     })
     const native = createNativeAnthropicAdapter({ source })
