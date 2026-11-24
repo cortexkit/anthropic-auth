@@ -7,6 +7,16 @@
 - **Generation-2 `setup --login` refuses:** this is intentional. Run [empty initialization](opencode-2.md#empty-initialization), start OpenCode and choose **Claude Pro / Max (native account pool)**. If Pi is also found, `--yes` selects both; use interactive host deselection for a Pi-only login.
 - **A dry run succeeds but the real run refuses:** previews execute no callbacks. Real-run authority, consent, path-alias and vault-inventory checks can still refuse; see [setup options](installation.md#recommended-setup).
 
+### Windows: the plugin can't create its state folder
+
+If the refusal names a folder and an account security identifier (SID), that account can change the named folder, which may be a parent of the plugin's state folder. Remove that account's change access from the named folder, or point `XDG_STATE_HOME` at a folder only you can change. For example, in Command Prompt:
+
+```bat
+setx XDG_STATE_HOME "%LOCALAPPDATA%\cortexkit-state"
+```
+
+Restart OpenCode and your terminals, then run setup again. This moves only the plugin's state folder; OpenCode's configuration stays where it is.
+
 ## Local accounts and migration
 
 `migration-required` means local authority has not been established. Stop the hosts and run setup for the selected generation. `migration-incomplete` means a pre-commit journal must be resumed with the matching inputs; do not delete it to force fresh setup. Version-5 journals have no rollback path.

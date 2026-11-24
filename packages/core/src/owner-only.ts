@@ -135,7 +135,14 @@ export async function ensureWindowsOwnerOnlyDirectory(
   }
   async function safe(directory: string) {
     const verdict = await verifySafeParent(directory)
-    if (!verdict.ok) throw refused('safe-parent', verdict.reason)
+    if (!verdict.ok) {
+      const { level, sid, mask } = verdict
+      throw Object.assign(refused('safe-parent', verdict.reason), {
+        level,
+        sid,
+        mask,
+      })
+    }
   }
   async function privateDirectory(directory: string) {
     const verdict = await api.verifyOwnerOnly(directory)

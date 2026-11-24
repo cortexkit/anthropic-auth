@@ -20,6 +20,7 @@ import {
   runSetup,
   type SetupIO,
   type SetupPlugin,
+  stateLayoutRefusalPublicMessage,
 } from '@cortexkit/anthropic-auth-core'
 import { NativeAccountReadError } from '../../../core/src/native-account-view.ts'
 import { NativeCustodyError } from '../../../core/src/native-custody.ts'
@@ -342,6 +343,47 @@ test('a private-files addon refusal shows the fixed remedy, not its path or code
       }),
     ),
   ).toBeUndefined()
+})
+
+test('setup shows only the validated Windows parent folder and SID from a state layout refusal', () => {
+  const level = 'C:\\Users\\fixture\\.local'
+  const sid = 'S-1-5-21-100-200-300-501'
+  const verdict = {
+    code: 'ERR_PRIVATE_FILES_SECURITY',
+    stage: 'safe-parent',
+    reason: 'writable-by-others',
+    level,
+    sid,
+  }
+  // Setup classifies errors from a different bundle by their own fields.
+  const refusal = (cause: unknown) =>
+    Object.assign(new Error(`raw outer error ${OPAQUE}`, { cause }), {
+      name: 'StateLayoutRefusalError',
+      code: 'io-failed',
+    })
+  const shown = knownFailureMessage(
+    refusal(Object.assign(new Error(`raw cause ${OPAQUE}`), verdict)),
+  )
+  expect(shown).toContain(`Account ${sid} can change "${level}"`)
+  expect(shown).toContain('XDG_STATE_HOME')
+  expect(shown).not.toContain(OPAQUE)
+
+  for (const cause of [
+    { ...verdict, stage: 'verify' },
+    { ...verdict, reason: 'io-error' },
+    { ...verdict, sid: OPAQUE },
+    { ...verdict, level: `${level}\n${OPAQUE}` },
+    { ...verdict, level: 'relative\\folder' },
+    {
+      ...verdict,
+      get level() {
+        throw new Error('Should not read the verdict getter')
+      },
+    },
+  ])
+    expect(knownFailureMessage(refusal(cause))).toBe(
+      stateLayoutRefusalPublicMessage('io-failed'),
+    )
 })
 
 test('shared runner plain errors retain their exact display messages', async () => {

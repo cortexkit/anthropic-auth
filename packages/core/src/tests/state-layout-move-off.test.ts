@@ -25,6 +25,7 @@ import {
 } from '../holder-registry.ts'
 import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
 import type { NativeLockEvent } from '../native-lock-observer.ts'
+import { ensureWindowsOwnerOnlyDirectory } from '../owner-only.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import {
   checkStateHomeServing,
@@ -767,6 +768,78 @@ test('an inherited-ACL refusal logs the private directory helper identifiers', a
     reason: 'not-protected',
   })
 })
+
+test.skipIf(process.platform === 'win32')(
+  'a writable Windows parent names the folder and SID in the io-failed log and public refusal',
+  async () => {
+    const m = await machine()
+    const logs: LogTestRecord[] = []
+    __setLogTestSink((record) => logs.push(record))
+    const level = 'C:\\Users\\fixture\\.local'
+    const sid = 'S-1-5-21-100-200-300-501'
+    const mask = 65542
+    const sub = stateSub(m)
+    const error = await decide(m, {
+      moveEnabled: true,
+      fs: {
+        ...defaultStateLayoutFs(),
+        // Surface the real Windows helper's refusal at the same catch point
+        // on POSIX without changing the process platform or a folder's ACL.
+        syncDirectory: async () => {
+          await ensureWindowsOwnerOnlyDirectory(sub, {
+            platform: 'win32',
+            privateFiles: {
+              readPrivateFile: readFile,
+              async verifyOwnerOnly() {
+                throw new Error('The writable parent should refuse first')
+              },
+              async verifySafeParent(path) {
+                return {
+                  ok: false,
+                  reason: 'writable-by-others',
+                  path,
+                  level,
+                  sid,
+                  mask,
+                }
+              },
+            },
+          })
+        },
+      },
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    )
+    expect(error).toBeInstanceOf(StateLayoutRefusalError)
+    expect(error).toMatchObject({ code: 'io-failed', paths: [sub] })
+    const log = logs.at(-1)
+    expect(log?.payload).toEqual({
+      code: 'io-failed',
+      paths: [sub],
+      errorCode: 'ERR_PRIVATE_FILES_SECURITY',
+      stage: 'safe-parent',
+      reason: 'writable-by-others',
+      level,
+      sid,
+      mask,
+    })
+    expect(error).toHaveProperty(
+      'cause',
+      expect.objectContaining({ level, sid, mask }),
+    )
+    const shown = stateRefusalPublicMessage(error)
+    for (const message of [log?.message, shown]) {
+      expect(message).toContain(`Account ${sid} can change "${level}"`)
+      expect(message).toContain("Remove that account's change access")
+      expect(message).toContain(
+        'set XDG_STATE_HOME to a folder only you can change',
+      )
+      expect(message).not.toContain('Private directory refused')
+    }
+    expect(shown).not.toContain(sub)
+  },
+)
 
 test('a holder lock release failure logs the lease path and error code', async () => {
   const m = await machine()
