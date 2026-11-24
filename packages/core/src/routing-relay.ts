@@ -260,7 +260,7 @@ export function createRoutingRelay(
               : async (ms) => {
                   signal?.throwIfAborted()
                   const now = clock.now()
-                  // The accessor only supplies a delay; retain its reset in the refusal.
+                  // The sleep callback receives only a delay, so compute the reset time here to carry it in the refusal.
                   const resetsAtMs = now + ms
                   lastCapacityReset = resetsAtMs
                   if (
