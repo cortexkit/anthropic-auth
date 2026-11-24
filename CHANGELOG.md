@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Uses common-auth 0.58.0. On OpenCode 2, if sign-in setup fails partway, the hooks it had already registered are removed once, by common-auth.
 - OpenCode 1, OpenCode 2 and Pi: when Claude can't confirm which account a freshly refreshed login belongs to, the plugin checks again after 5 minutes, then 15, then hourly, instead of blocking the login for up to a day. The refusal says when it will check again, and Reset account backoff in `/claude` checks on the next turn (#880).
 - Pi: Agent Runner's mid-run instruction changes are placed right after the message they belong to, so the prompt cache holds, including when a session continues or forks.
 - Pi: honours Agent Runner's per-run reply length cap, for Claude subscriptions and paid API keys.
