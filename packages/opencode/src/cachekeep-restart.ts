@@ -225,7 +225,7 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
         persisted(target) ?? { ...target, oauthAccountIdentity: undefined },
       )
     },
-    forget(id: string, deleted = false) {
+    forget(id: string, deleted = false, acceptedAt?: number) {
       const hash = sessionHash(id)
       if (shared.loading) shared.skippedDuringLoad.add(hash)
       const owner = shared.owners.get(hash)
@@ -236,7 +236,8 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
       // Without a deletion event, a temporary scan claim or a concurrent
       // claim release can leave the file on disk. A later restore checks its
       // session policy again.
-      shared.store.removed(id, deleted ? 'deleted' : true)
+      if (deleted) shared.store.removed(id, 'deleted')
+      else shared.store.removed(id, true, acceptedAt)
     },
     reserve,
     settle: (target: Readonly<CacheKeepTarget>) =>

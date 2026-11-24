@@ -771,6 +771,39 @@ test('an uncovered removal releases a restore claim even if its promotion was in
   }
 })
 
+test('a timed forget leaves the saved record when its freshness cannot be read', async () => {
+  const { root, store, target } = await storeFixture()
+  const path = join(store.directory, `${key}.json.gz`)
+  const accepted = Date.now()
+  try {
+    store.changed({ ...target, policyState: acceptedPolicy(accepted) })
+    await store.drain()
+    await store.releaseClaims(() => true)
+    const saved = await readFile(path)
+
+    const open = fs.open
+    const opening = spyOn(fs, 'open').mockImplementation(
+      async (filePath, ...args) => {
+        if (filePath === path)
+          throw Object.assign(new Error('Temporary read failure'), {
+            code: 'EIO',
+          })
+        return open(filePath, ...args)
+      },
+    )
+    try {
+      store.removed(session, true, accepted + 500)
+      await store.drain()
+    } finally {
+      opening.mockRestore()
+    }
+    expect(await readFile(path)).toEqual(saved)
+  } finally {
+    await store.releaseClaims(() => true)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 for (const deletion of ['owner', 'non-owner'] as const) {
   test(`a pending real turn cannot resurrect a record deleted by the ${deletion}`, async () => {
     const {

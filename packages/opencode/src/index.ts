@@ -8181,6 +8181,7 @@ const anthropicAuthPlugin = async (
                 trackCacheKeepRequest = () => {
                   if (!cacheKeepRestart.active()) return
                   const cacheKeepStart = nowMs()
+                  const acceptedAt = runtimeNow()
                   const tracked = cacheKeepManager.track({
                     sessionId: relayAffinity,
                     url:
@@ -8197,12 +8198,13 @@ const anthropicAuthPlugin = async (
                         cacheKeepCredential(nativeAuthorization),
                     },
                     isSubagent: subagentRequest,
+                    acceptedAt,
                   })
                   acceptedCacheKeepBodyText = tracked.tracked
                     ? bodyText
                     : undefined
                   if (!tracked.tracked && relayAffinity)
-                    cacheKeepRestart.forget(relayAffinity)
+                    cacheKeepRestart.forget(relayAffinity, false, acceptedAt)
                   trace?.mark('cachekeep_track', {
                     session: relayAffinity,
                     ms: roundMs(nowMs() - cacheKeepStart),

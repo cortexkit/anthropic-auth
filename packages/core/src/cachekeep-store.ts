@@ -420,7 +420,7 @@ export class CacheKeepClaim {
     await rm(this.path, { force: true })
   }
 
-  async requestDeletion(markLive: boolean) {
+  async requestDeletion(markLive: boolean, mayDelete?: () => Promise<boolean>) {
     await ensureHolderDirectory(this.directory, this.options.ownerOnly)
     await withNativeLock(this.path, CLAIM_LOCK, async (lease) => {
       const current = await this.read()
@@ -440,7 +440,7 @@ export class CacheKeepClaim {
       ) {
         if (markLive && current.deleted !== true)
           await this.publish({ ...current, deleted: true }, assertOwned)
-      } else {
+      } else if (!mayDelete || (await mayDelete())) {
         await this.unlink(assertOwned)
         this.held = false
       }
@@ -1517,9 +1517,10 @@ export class CacheKeepStore {
   }
 
   removed(
-    ...[target, removeUnowned]:
+    ...[target, removeUnowned, requestAcceptedAt]:
       | [target: Readonly<CacheKeepTarget>]
-      | [id: string, removeUnowned: true | 'deleted']
+      | [id: string, removeUnowned: true, requestAcceptedAt?: number]
+      | [id: string, removeUnowned: 'deleted']
   ) {
     const id = typeof target === 'string' ? target : target.id
     const key = hash(id)
@@ -1550,16 +1551,27 @@ export class CacheKeepStore {
         const owned = item && this.claims?.get(key) === item ? item : undefined
         const claim = owned?.claim ?? external
         const path = join(this.directory, `${key}.json.gz`)
+        // A failed track can retire a claim without covering its saved body.
+        // Check freshness under the deletion lock so a newer body survives.
+        const mayDelete =
+          requestAcceptedAt === undefined
+            ? undefined
+            : async () => !(await this.hasNewerRecord(id, requestAcceptedAt))
         if (this.claims && removeUnowned === 'deleted')
           await this.requestDeletion(claim ?? this.newClaim(key, 'sweep'))
         else if (this.claims && removeUnowned && !item && !claim)
-          await this.newClaim(key, 'sweep').requestDeletion(false)
+          await this.newClaim(key, 'sweep').requestDeletion(false, mayDelete)
         else if (claim)
           await claim.withCurrent(async (assertOwned) => {
+            if (mayDelete && !(await mayDelete())) return
             await assertOwned()
             await rm(path, { force: true })
           })
-        else if (!this.claims && !this.options.externalClaim)
+        else if (
+          !this.claims &&
+          !this.options.externalClaim &&
+          (!mayDelete || (await mayDelete()))
+        )
           await rm(path, { force: true })
       },
       async () => {

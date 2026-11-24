@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -7,8 +8,10 @@ import * as core from '@cortexkit/anthropic-auth-core'
 import {
   __setLogTestSink,
   type AccountStorage,
+  CACHE_KEEP_MAX_BODY_BYTES,
   CacheKeepManager,
   CacheKeepStore,
+  type CacheKeepTarget,
   type CommandApplyRequest,
   type CommandApplyResult,
   cacheKeepStoreDirectory,
@@ -53,6 +56,7 @@ import {
   createOpencode1Test,
   createOpencode1TestContext,
   installOpencode1TestHooks,
+  lifetimeSignal,
 } from './support/opencode1-test-context.ts'
 import { extractUrl, MESSAGES_URL } from './test-fetch'
 
@@ -304,6 +308,107 @@ describe('auth.loader', () => {
       finished?.cacheKeepManager.trackedRequest(sessionId)?.bodyText,
     ).toContain('first live prefix')
   })
+
+  test.each([{ shift: -500 }, { shift: 500 }])(
+    'OC1 failed tracking during a restore scan respects freshness ($shift ms clock step)',
+    async ({ shift }) => {
+      const savedAt = Date.now()
+      let now = savedAt
+      const clock = { now: () => now }
+      await warmFixture()
+      globalThis.fetch = mock(
+        withNativeAdmission(() =>
+          Response.json({ usage: { cache_read_input_tokens: 1500 } }),
+        ),
+      ) as unknown as typeof fetch
+
+      const id = 'oc1-restart-budget'
+      const original = await getPlugin(undefined, '/original-project', clock)
+      await acceptRequest(original, id, 'saved prefix')
+      await original.dispose()
+      testContext.livePlugins.delete(original)
+      const directory = cacheKeepStoreDirectory(
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
+        undefined,
+        'opencode1',
+      )
+      const key = createHash('sha256').update(id).digest('hex')
+      const record = join(directory, `${key}.json.gz`)
+      const claim = join(`${directory}.claims`, `${key}.claim.json`)
+      const saved = await readFile(record)
+      expect(
+        JSON.parse(gunzipSync(saved).toString()).policyState,
+      ).toMatchObject({
+        lastRealRequestAt: savedAt,
+      })
+
+      const owner = await getPlugin(undefined, '/owner-project', clock)
+      const handles = getPluginTestHandles(owner)
+      await handles.drainDispatchWork()
+      const manager = handles.cacheKeepManager
+      const targets = Reflect.get(manager, 'targets') as Map<
+        string,
+        CacheKeepTarget
+      >
+      const restored = targets.get(id)!
+      expect(restored.bodyText).toContain('saved prefix')
+      expect(JSON.parse(await readFile(claim, 'utf8')).restoreOnly).toBe(true)
+
+      const imminentId = 'oc1-imminent'
+      await acceptRequest(owner, imminentId, 'a different session')
+      const imminent = targets.get(imminentId)!
+      // Leave just enough room for the saved body without sending a 64 MiB
+      // prompt. The near-due session wins eviction priority over the replacement.
+      imminent.bodyBytes = CACHE_KEEP_MAX_BODY_BYTES - restored.bodyBytes
+      imminent.nextPrewarmAt = savedAt + 30_000
+
+      const entered = Promise.withResolvers<CacheKeepStore>()
+      const resume = lifetimeSignal(testContext)
+      const load = CacheKeepStore.prototype.load
+      const scan = spyOn(CacheKeepStore.prototype, 'load').mockImplementation(
+        async function (this: CacheKeepStore, ...args) {
+          entered.resolve(this)
+          await resume.raised
+          return load.apply(this, args)
+        },
+      )
+      const track = spyOn(manager, 'track')
+      let other: Awaited<ReturnType<typeof getPlugin>>
+      try {
+        other = await getPlugin(undefined, '/other-project', clock)
+        const store = await entered.promise
+        now = savedAt + shift
+        // The accepted request must finish while the other project's scan is
+        // still paused. The replacement exceeds the remaining body budget.
+        await acceptRequest(owner, id, 'larger replacement prefix '.repeat(200))
+        expect(track.mock.lastCall?.[0]).toMatchObject({
+          sessionId: id,
+          oauthAccountId: restored.oauthAccountId,
+          oauthAccountIdentity: restored.oauthAccountIdentity,
+        })
+        expect(track.mock.results.at(-1)?.value).toEqual({
+          tracked: false,
+          reason: 'evicted by cachekeep limits',
+        })
+        expect(manager.trackedSessions().map(({ id }) => id)).toEqual([
+          imminentId,
+        ])
+
+        await store.drain()
+        await expect(readFile(claim)).rejects.toMatchObject({ code: 'ENOENT' })
+        if (shift < 0) expect(await readFile(record)).toEqual(saved)
+        else
+          await expect(readFile(record)).rejects.toMatchObject({
+            code: 'ENOENT',
+          })
+      } finally {
+        track.mockRestore()
+        scan.mockRestore()
+        resume.raise()
+        if (other) await getPluginTestHandles(other).drainDispatchWork()
+      }
+    },
+  )
 
   test('OC1 reuses the previous full cache boundary after a thread restart', async () => {
     await warmFixture()
