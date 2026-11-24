@@ -38,6 +38,7 @@ import {
   type ProviderAccountUuid,
   quotaSnapshotPassesPolicy,
   RELAY_PROXY_REFUSAL,
+  type RoutingWaitClock,
   readNativeAccountsForRequest,
   readNativeEnrollmentMode,
   resetVaultHostAuthorityForTests,
@@ -404,22 +405,34 @@ test.each([1_999, 2_000])(
 )
 
 describe('OC2 shared routing relay', () => {
+  const capacityRefusalText =
+    'Every Claude account is at its concurrent-request limit. Send the message again in a few minutes.'
+  function capacityClock() {
+    let now = Date.now()
+    const advance = (ms: number) => {
+      now += ms
+    }
+    return {
+      now: () => now,
+      sleep: spyOn({ sleep: async (ms: number) => advance(ms) }, 'sleep'),
+      advance,
+    }
+  }
+  function capacityFull(resetsAtMs: number) {
+    return { refused: { code: 'concurrency_full', resets_at_ms: resetsAtMs } }
+  }
+
   test('OC2 waits for capacity before serving on the selected vault account', async () => {
     const f = await vaultWithFallback()
-    const native = source(f.runtime, f.paths)
+    const clock = capacityClock()
+    const native = source(f.runtime, f.paths, cleanups, clock)
     const host = await retryHost(native)
     const requests: Record<string, unknown>[] = []
     bridge((request) => {
       requests.push(request)
       if (!request.waits_for_capacity)
         return { refused: { code: 'account_selection_final' } }
-      if (requests.length === 1)
-        return {
-          refused: {
-            code: 'concurrency_full',
-            resets_at_ms: Date.now() + 5,
-          },
-        }
+      if (requests.length === 1) return capacityFull(clock.now() + 237_000)
       return {
         account_id: fallbackIdentity,
         credential_id: 'oauth:anthropic:work',
@@ -432,7 +445,127 @@ describe('OC2 shared routing relay', () => {
     )
     expect(requests).toHaveLength(2)
     expect(requests[1]).toEqual(requests[0])
+    expect(clock.sleep).toHaveBeenCalledTimes(1)
     expect((await host.response(request, 200)).ok).toBe(true)
+  })
+
+  test.each([
+    ['inside the final RPC window', 238_001] as const,
+    ['beyond the capacity budget', 240_001] as const,
+  ])(
+    'OC2 stops without another capacity ask when the reset is %s',
+    async (_case, interval) => {
+      const f = await vaultWithFallback()
+      const clock = capacityClock()
+      const native = source(f.runtime, f.paths, cleanups, clock)
+      const authorize = spyOn(native, 'authorizeAccount')
+      const host = await retryHost(native)
+      const reset = clock.now() + interval
+      let asks = 0
+      bridge(() => (++asks === 1 ? capacityFull(reset) : null))
+
+      await expect(host.send()).rejects.toMatchObject({
+        code: 'concurrency_full',
+        message: capacityRefusalText,
+        resetsAtMs: reset,
+      })
+      expect(asks).toBe(1)
+      expect(clock.sleep).not.toHaveBeenCalled()
+      expect(authorize).not.toHaveBeenCalled()
+    },
+  )
+
+  test('OC2 stops at the capacity bound after the last routing ask settles', async () => {
+    const f = await vaultWithFallback()
+    const clock = capacityClock()
+    const native = source(f.runtime, f.paths, cleanups, clock)
+    const authorize = spyOn(native, 'authorizeAccount')
+    const host = await retryHost(native)
+    const opened = Promise.withResolvers<void>()
+    const answer = Promise.withResolvers<undefined>()
+    const asks: number[] = []
+    const start = clock.now()
+    let pending = false
+    let returned = false
+    bridge(async (_request, { deadlineMs }) => {
+      expect(deadlineMs).toBe(2_000)
+      asks.push(clock.now() - start)
+      if (asks.length === 1) return capacityFull(start + 238_000)
+      pending = true
+      opened.resolve()
+      try {
+        return await answer.promise
+      } finally {
+        pending = false
+      }
+    })
+
+    const send = host.send().finally(() => {
+      returned = true
+    })
+    void send.catch(() => {})
+    await Promise.race([opened.promise, send])
+    clock.advance(2_000)
+    expect(returned).toBe(false)
+    expect(pending).toBe(true)
+    answer.resolve(undefined)
+    await expect(send).rejects.toMatchObject({
+      code: 'concurrency_full',
+      message: capacityRefusalText,
+    })
+    expect(asks).toEqual([0, 238_000])
+    expect(pending).toBe(false)
+    expect(authorize).not.toHaveBeenCalled()
+  })
+
+  test('aborting an OC2 capacity sleep stops without another routing ask', async () => {
+    const f = await vaultWithFallback()
+    const clock = capacityClock()
+    const controller = new AbortController()
+    const started = Promise.withResolvers<void>()
+    const native = source(f.runtime, f.paths, cleanups, {
+      ...clock,
+      sleep: (_ms, signal) =>
+        new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(signal.reason), {
+            once: true,
+          })
+          started.resolve()
+        }),
+    })
+    const host = await retryHost(native)
+    let asks = 0
+    bridge(() => {
+      asks++
+      return capacityFull(clock.now() + 60_000)
+    })
+    const send = host.send(scope, undefined, {}, controller.signal)
+    void send.catch(() => {})
+    await Promise.race([started.promise, send])
+    controller.abort()
+    await expect(send).rejects.toMatchObject({ name: 'AbortError' })
+    expect(asks).toBe(1)
+  })
+
+  test('OC2 retry-phase selection does not wait for capacity', async () => {
+    const f = await vaultWithFallback()
+    const clock = capacityClock()
+    const native = source(f.runtime, f.paths, cleanups, clock)
+    let asks = 0
+    bridge(() => (++asks === 1 ? capacityFull(clock.now() + 60_000) : null))
+
+    await expect(
+      native.chooseAccount({
+        ...scope,
+        phase: 'retry',
+        rerouteFrom: {
+          accountId: 'main',
+          limit: { status: 429, reason: 'provider-429' },
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'concurrency_full' })
+    expect(clock.sleep).not.toHaveBeenCalled()
+    expect(asks).toBe(1)
   })
 
   test('OC2 capacity refusal does not wait or rewrite the provider 429 stop text', async () => {
@@ -583,14 +716,19 @@ describe('OC2 shared routing relay', () => {
     },
   )
   function bridge(
-    accountFor: (request: Record<string, unknown>) => unknown,
+    accountFor: (
+      request: Record<string, unknown>,
+      options: { deadlineMs: number },
+    ) => unknown,
     report: (value: unknown) => unknown = () => {},
   ) {
     const globals = globalThis as Record<symbol, unknown>
     const key = Symbol.for('cortexkit.routing')
     globals[key] = () => ({
-      accountFor: async (request: Record<string, unknown>) =>
-        accountFor(request),
+      accountFor: async (
+        request: Record<string, unknown>,
+        options: { deadlineMs: number },
+      ) => accountFor(request, options),
       report,
     })
     cleanups.push(() => {
@@ -2015,10 +2153,12 @@ function source(
   runtime: NativeAccountRuntime,
   paths: NativePoolPaths,
   owned = cleanups,
+  routingWaitClock?: RoutingWaitClock,
 ) {
   const native = createNativeAnthropicSource({
     runtime,
     paths,
+    routingWaitClock,
     requestOptions: () => ({}),
   })
   owned.push(() => native.close())
@@ -2354,11 +2494,13 @@ async function retryHost(native: ReturnType<typeof source>) {
       input = scope,
       credential: string | { apiKey: string } = placeholderSecret('anthropic'),
       body: Record<string, unknown> = {},
+      signal?: AbortSignal,
     ) {
       const draft = {
         ...hostScope(input),
         request: new Request('https://api.anthropic.com/v1/messages', {
           method: 'POST',
+          signal,
           headers: {
             ...(typeof credential === 'string'
               ? { authorization: `Bearer ${credential}` }

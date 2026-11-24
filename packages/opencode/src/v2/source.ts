@@ -45,6 +45,7 @@ import {
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
   RELAY_PROXY_REFUSAL,
+  type RoutingWaitClock,
   readNativeAccountsForRequest,
   readSessionCachePolicy,
   readThreeWayBoolean,
@@ -142,6 +143,7 @@ const quotaSnapshotIsExhausted = (quota: OAuthQuotaSnapshot | undefined) =>
 
 // Match common-auth: the ten retry labels are 2 through 11, inclusive.
 const HOST_RETRY_LIMIT = 10
+const CAPACITY_WAIT_BUDGET_MS = 240_000
 
 const remainingHostRetries = (input: ChooseAccountInput) =>
   HOST_RETRY_LIMIT + 2 - (input.hostAttempt ?? 2)
@@ -323,6 +325,7 @@ export interface NativeSourceOptions {
     route: string
   }) => AnthropicBillingWarming | undefined
   readonly fetch?: typeof fetch
+  readonly routingWaitClock?: RoutingWaitClock
   /** Resolve a host model alias to the upstream ID before request-local policy. */
   readonly resolveModelId?: (scope: RequestScope) => Promise<string>
 }
@@ -372,7 +375,7 @@ export function createNativeAnthropicSource(
         row.accountIdentity === subject.accountIdentity &&
         (!subject.credentialId || row.credentialId === subject.credentialId),
     )?.quota
-  })
+  }, options.routingWaitClock)
   const servedTurns = new Set<string>()
   const stickyQuotaRetries = new StickyQuotaRetryCounter()
   // The latest same-account hold granted for confirmed exhaustion, by session:
@@ -1115,7 +1118,16 @@ export function createNativeAnthropicSource(
         modelID,
         routingCandidates(snapshot.accounts),
         {
-          capacityWait: 'wait',
+          // OpenCode times this middleware without aborting it and offers no
+          // pre-send retry. Waiting longer leaves the routing wait running
+          // after the host returns a generic header timeout.
+          capacityWait:
+            input.phase === 'retry'
+              ? { maxInRequestMs: 0 }
+              : {
+                  maxInRequestMs: CAPACITY_WAIT_BUDGET_MS,
+                  stopWithinBudget: true,
+                },
           signal: active.signal,
           warmCredentialId: routingWarmCredential(
             snapshot.accounts,

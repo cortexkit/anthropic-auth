@@ -17,6 +17,7 @@ import {
 import { reportRoutingResponse } from './routing-reports.ts'
 
 export const ROUTING_HOLD_LIMIT_MS = MAX_HOST_RETRY_MS
+const ROUTING_ASK_DEADLINE_MS = 2_000
 export type RoutingChoice = {
   account_id: string
   credential_id: string
@@ -24,7 +25,7 @@ export type RoutingChoice = {
 }
 type RoutingSubject = { accountIdentity?: string; credentialId?: string }
 type RoutingAskOptions = {
-  capacityWait: 'wait' | { maxInRequestMs: number }
+  capacityWait: 'wait' | { maxInRequestMs: number; stopWithinBudget?: true }
   signal?: AbortSignal
   warmCredentialId?: string
   onCapacityWait?: () => () => void
@@ -62,6 +63,9 @@ export function routingChoiceMatches(
   )
 }
 
+const CAPACITY_STOP_MESSAGE =
+  'Every Claude account is at its concurrent-request limit. Send the message again in a few minutes.'
+
 /** Fixed text avoids exposing router internals. */
 export class RoutingRefusalError extends Error {
   readonly code: RoutingRefusal['refused']['code']
@@ -69,12 +73,18 @@ export class RoutingRefusalError extends Error {
   readonly resetsAtMs?: number
   readonly status: number
 
-  constructor(refusal: RoutingRefusal['refused'], now = Date.now()) {
+  constructor(
+    refusal: RoutingRefusal['refused'],
+    now = Date.now(),
+    manualCapacityRetry = false,
+  ) {
     super(
       refusal.code === 'account_selection_final'
         ? 'Shared routing refused an account for this request.'
         : refusal.code === 'concurrency_full'
-          ? 'Every Claude account is at its concurrent-request limit. Retrying when a slot frees.'
+          ? manualCapacityRetry
+            ? CAPACITY_STOP_MESSAGE
+            : 'Every Claude account is at its concurrent-request limit. Retrying when a slot frees.'
           : 'Shared routing has no account for this request right now.',
     )
     this.name = 'RoutingRefusalError'
@@ -124,10 +134,21 @@ async function waitForCapacity(ms: number, signal?: AbortSignal) {
   } while (ms > 0)
 }
 
+export type RoutingWaitClock = {
+  now: () => number
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>
+}
+
+const routingWaitClock: RoutingWaitClock = {
+  now: () => Date.now(),
+  sleep: waitForCapacity,
+}
+
 export function createRoutingRelay(
   quotaFor?: (
     subject: RoutingSubject,
   ) => Promise<OAuthQuotaSnapshot | undefined>,
+  clock: RoutingWaitClock = routingWaitClock,
 ) {
   const overridden = new Set<string>()
   // Two choices in one session can replace each other's admission. An earlier
@@ -191,14 +212,26 @@ export function createRoutingRelay(
       const waitUntil =
         capacityWait === 'wait'
           ? undefined
-          : Date.now() + capacityWait.maxInRequestMs
+          : clock.now() + capacityWait.maxInRequestMs
+      const stopWithinBudget =
+        capacityWait !== 'wait' && capacityWait.stopWithinBudget === true
+      const hasAskWindow = (time: number) =>
+        waitUntil === undefined || time + ROUTING_ASK_DEADLINE_MS <= waitUntil
+      const capacityRefusal = (resetsAtMs: number, now: number) =>
+        new RoutingRefusalError(
+          { code: 'concurrency_full', resetsAtMs },
+          now,
+          stopWithinBudget,
+        )
+      let lastCapacityReset: number | undefined
       let clearWait: (() => void) | undefined
+      signal?.throwIfAborted()
       const result = await askRoutingUntilCapacity(
         {
           sessionId,
           provider: 'anthropic',
           modelId,
-          deadlineMs: 2000,
+          deadlineMs: ROUTING_ASK_DEADLINE_MS,
           refusals: true,
           ...(warmCredentialId ? { warmCredentialId } : {}),
           candidates: candidates.flatMap((row) =>
@@ -213,27 +246,47 @@ export function createRoutingRelay(
           ),
         },
         {
-          signal,
+          // Join an in-flight ask until it settles or reaches its deadline.
+          // The plugin cannot force the routing bridge (the host's RPC
+          // callback) to settle its promise, so it must honor deadlineMs.
+          // Capacity sleeps can still abort immediately.
+          signal: stopWithinBudget ? undefined : signal,
+          now: clock.now,
           sleep:
-            waitUntil === undefined && !onCapacityWait
+            waitUntil === undefined &&
+            !onCapacityWait &&
+            clock === routingWaitClock
               ? undefined
-              : async (ms, signal) => {
-                  const now = Date.now()
-                  // The helper supplies a delay, so rebuild the reset for the host's retry.
+              : async (ms) => {
+                  signal?.throwIfAborted()
+                  const now = clock.now()
+                  // The accessor only supplies a delay; retain its reset in the refusal.
                   const resetsAtMs = now + ms
+                  lastCapacityReset = resetsAtMs
                   if (
-                    waitUntil !== undefined &&
-                    (now >= waitUntil || resetsAtMs > waitUntil)
+                    (waitUntil !== undefined &&
+                      (now >= waitUntil || resetsAtMs > waitUntil)) ||
+                    (stopWithinBudget && !hasAskWindow(resetsAtMs))
                   )
-                    throw new RoutingRefusalError(
-                      { code: 'concurrency_full', resetsAtMs },
-                      now,
-                    )
+                    throw capacityRefusal(resetsAtMs, now)
                   clearWait ??= onCapacityWait?.()
-                  await waitForCapacity(ms, signal)
+                  await clock.sleep(ms, signal)
+                  signal?.throwIfAborted()
+                  const wokeAt = clock.now()
+                  if (stopWithinBudget && !hasAskWindow(wokeAt))
+                    throw capacityRefusal(resetsAtMs, wokeAt)
                 },
         },
       ).finally(() => clearWait?.())
+      signal?.throwIfAborted()
+      const now = clock.now()
+      if (
+        stopWithinBudget &&
+        waitUntil !== undefined &&
+        now >= waitUntil &&
+        lastCapacityReset !== undefined
+      )
+        throw capacityRefusal(lastCapacityReset, now)
       if (!result) {
         override(sessionId, 'no valid answer within routing deadline')
         return undefined
