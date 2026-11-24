@@ -1983,8 +1983,9 @@ export async function sendViaRelay(options: {
   requireUpstreamUrl?.(input instanceof Request ? input.url : input.toString())
   if (!config || !isRelayableAnthropicRequest(input, body)) return fallback()
   const bodyText = body as string
-  // The relay can replay requests and retain patch bases. Don't hand it a
-  // one-use credit until its physical-send path can enforce that lifetime.
+  // The relay may replay a request, and keeps the last body it accepted as the
+  // base for sending later requests as diffs. A credit token is single-use, so
+  // it must not go through the relay until the relay can guarantee one send.
   if (hasFallbackCreditInRequest(bodyText)) {
     if (config.fallbackToDirect) return fallback()
     throw new Error('Fallback credit cannot be sent through the relay')
