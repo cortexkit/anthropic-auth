@@ -282,6 +282,7 @@ test('provides typed refusal metadata, with credit read only through the private
     creditToken: credit,
     hasHostContent: true,
     hasPrefillClaim: true,
+    prefillBlocks: [{ type: 'text', text: '' }],
     usage: { input_tokens: 11, cache_read_input_tokens: 7, output_tokens: 17 },
   })
   expect(result).not.toContain(credit)

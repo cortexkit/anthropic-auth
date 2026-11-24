@@ -169,6 +169,19 @@ export async function signRequestBody(bodyString: string): Promise<string> {
   )
 }
 
+/** Check the Claude Code billing block's body signature against the final JSON. */
+export async function hasValidRequestBodySignature(bodyString: string) {
+  const signature = extractBillingHeaderCCH(bodyString)
+  if (signature === null) return false
+  try {
+    return (
+      signature === extractBillingHeaderCCH(await signRequestBody(bodyString))
+    )
+  } catch {
+    return false
+  }
+}
+
 /**
  * Compute Claude Code's 3-character suffix for cc_version.
  */

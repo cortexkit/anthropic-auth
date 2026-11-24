@@ -20,12 +20,19 @@ type Frame = SseEvent & {
   type?: string
 }
 
+export type RefusalFallbackPrefillBlock =
+  | { type: 'text'; text: string }
+  | { type: 'thinking'; thinking: string; signature: string }
+  | { type: 'redacted_thinking'; data: string }
+
 export type RefusalFallbackStreamRefusal = {
   category?: string
   creditToken?: string
   usage?: Readonly<Payload>
   hasHostContent: boolean
   hasPrefillClaim: boolean
+  /** Null when the visible content was too large to retain for an exact prefill. */
+  prefillBlocks?: readonly RefusalFallbackPrefillBlock[] | null
 }
 
 export type RefusalFallbackStreamRetry =
@@ -221,6 +228,89 @@ function createAttempt(maxBytes: number, holdChanged: () => void) {
 
 type Attempt = ReturnType<typeof createAttempt>
 
+function createPrefillCapture(maxBytes: number) {
+  const blocks = new Map<
+    number,
+    { block: RefusalFallbackPrefillBlock; closed: boolean }
+  >()
+  let bytes = 0
+  let overflow = false
+  return {
+    push(index: number, frame: Frame) {
+      if (overflow) return
+      if (frame.type === 'content_block_start') {
+        const start = record(frame.payload?.content_block)
+        let block: RefusalFallbackPrefillBlock | undefined
+        if (start?.type === 'text' && typeof start.text === 'string') {
+          block = { type: 'text', text: start.text }
+        } else if (start?.type === 'thinking') {
+          block = {
+            type: 'thinking',
+            thinking: typeof start.thinking === 'string' ? start.thinking : '',
+            signature:
+              typeof start.signature === 'string' ? start.signature : '',
+          }
+        } else if (
+          start?.type === 'redacted_thinking' &&
+          typeof start.data === 'string' &&
+          start.data
+        ) {
+          block = { type: 'redacted_thinking', data: start.data }
+        }
+        if (!block) return
+        blocks.set(index, { block, closed: false })
+      } else {
+        const entry = blocks.get(index)
+        if (!entry) return
+        const { block } = entry
+        if (frame.type === 'content_block_stop') entry.closed = true
+        const delta = record(frame.payload?.delta)
+        if (
+          block.type === 'text' &&
+          delta?.type === 'text_delta' &&
+          typeof delta.text === 'string'
+        ) {
+          block.text += delta.text
+        } else if (block.type === 'thinking') {
+          if (
+            delta?.type === 'thinking_delta' &&
+            typeof delta.thinking === 'string'
+          )
+            block.thinking += delta.thinking
+          if (
+            delta?.type === 'signature_delta' &&
+            typeof delta.signature === 'string'
+          )
+            block.signature += delta.signature
+        }
+      }
+      // Count framing too, so a large number of tiny blocks is also bounded.
+      bytes += frame.bytes.byteLength
+      if (bytes > maxBytes) {
+        overflow = true
+        blocks.clear()
+      }
+    },
+    complete() {
+      if (overflow) return null
+      const content: RefusalFallbackPrefillBlock[] = []
+      for (const { block, closed } of blocks.values()) {
+        // The join closes visible text even if Anthropic refused mid-block.
+        // Thinking must have arrived signed and closed from Anthropic.
+        if (
+          block.type === 'text' ||
+          (closed && (block.type === 'redacted_thinking' || block.signature))
+        )
+          content.push(block)
+      }
+      return content
+    },
+    clear() {
+      blocks.clear()
+    },
+  }
+}
+
 /**
  * Join one eligible client-mode Messages SSE response to at most one retry.
  * Pass protected physical responses (see protectFallbackCreditResponse), after
@@ -279,6 +369,10 @@ export function joinRefusalFallbackStream(
   let lastByte = 0
 
   const source = createAttempt(maxBytes, updateHeartbeat)
+  const prefill =
+    retry && options.takeSourceRefusalCredit
+      ? createPrefillCapture(maxBytes)
+      : undefined
 
   function updateHeartbeat() {
     stopTimer?.()
@@ -403,6 +497,8 @@ export function joinRefusalFallbackStream(
       const hostIndex = nextHostIndex++
       attempt.blocks.set(upstreamIndex, { kind: 'visible', hostIndex })
       openHost.add(hostIndex)
+      if (attempt === source && !source.releasedTool)
+        prefill?.push(hostIndex, frame)
       output.push(indexed(frame, hostIndex))
       emit(output)
     } else if (block?.kind === 'tool_use' || block?.kind === 'refusal') {
@@ -411,6 +507,7 @@ export function joinRefusalFallbackStream(
         const output = beforeContent()
         releaseBlock(attempt, upstreamIndex, output)
         attempt.recordReleasedTool()
+        if (attempt === source) prefill?.clear()
         emit(output)
       }
     } else if (block?.kind === 'visible') {
@@ -418,6 +515,8 @@ export function joinRefusalFallbackStream(
         attempt.blocks.delete(upstreamIndex)
       if (!openHost.has(block.hostIndex)) return
       if (frame.type === 'content_block_stop') openHost.delete(block.hostIndex)
+      if (attempt === source && !source.releasedTool)
+        prefill?.push(block.hostIndex, frame)
       emit([indexed(frame, block.hostIndex)])
     }
   }
@@ -460,7 +559,8 @@ export function joinRefusalFallbackStream(
       )) {
         await waitForDemand()
         if (frame.type === 'message_start') attempt.rememberStart(frame)
-        else if (frame.type === 'ping') emit([frame.bytes])
+        else if (frame.type === 'ping')
+          emit([committed ? frame.bytes : ping.slice()])
         else if (frame.type === 'error' || frame.event === 'error') {
           if (committed) emit([frame.bytes])
           break
@@ -543,6 +643,13 @@ export function joinRefusalFallbackStream(
         await waitForDemand()
         const fresh = freshAtRefusal && isFresh()
         const details = record(delta.stop_details)
+        const creditToken = options.takeSourceRefusalCredit?.()
+        const hasPrefillClaim = details?.fallback_has_prefill_claim === true
+        const prefillBlocks =
+          fresh && creditToken && hasPrefillClaim
+            ? prefill?.complete()
+            : undefined
+        prefill?.clear()
         if (
           sawStop &&
           fresh &&
@@ -554,10 +661,11 @@ export function joinRefusalFallbackStream(
               typeof details.category === 'string'
                 ? details.category
                 : undefined,
-            creditToken: options.takeSourceRefusalCredit?.(),
+            creditToken,
             usage: mergedUsage(source.startUsage, record(frame.payload?.usage)),
             hasHostContent: sourceHasContent,
-            hasPrefillClaim: details?.fallback_has_prefill_claim === true,
+            hasPrefillClaim,
+            ...(prefillBlocks !== undefined && { prefillBlocks }),
           }))
         )
           return
@@ -597,6 +705,7 @@ export function joinRefusalFallbackStream(
     const resolve = demand
     demand = undefined
     source.clear()
+    prefill?.clear()
     retryAttempt?.clear()
     end?.()
     resolve?.()

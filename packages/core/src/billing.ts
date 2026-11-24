@@ -6,7 +6,11 @@ import {
 } from '@cortexkit/common-auth/routing-accessor'
 import { copyStreamResponseTiming } from './stream-completion.ts'
 
-type BillingReport = Extract<ReportRoutingInput, { kind: 'billing' }>
+export type AnthropicBillingReport = Extract<
+  ReportRoutingInput,
+  { kind: 'billing' }
+>
+type BillingReport = AnthropicBillingReport
 export type AnthropicBillingWarming = NonNullable<
   NonNullable<BillingReport['cache']>['warming']
 >
@@ -29,6 +33,8 @@ export type AnthropicBillingRequest = Omit<
    * produced. Must not wait or do I/O; `undefined` leaves `cache.warming` out.
    */
   cacheWarming?: () => AnthropicBillingWarming | undefined
+  /** Local consumer; never serialized into a routing report. */
+  onReport?: (report: AnthropicBillingReport) => void
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -123,17 +129,28 @@ function hasRoutingAccessor() {
   }
 }
 
-function detachReport(report: BillingReport) {
-  if (!hasRoutingAccessor()) return
+function detachReport(
+  report: BillingReport,
+  onReport?: AnthropicBillingRequest['onReport'],
+) {
+  const routing = hasRoutingAccessor()
+  if (!routing && !onReport) return
   // Routing's report callback may never settle; request handling never awaits it.
   setTimeout(() => {
     try {
-      reportRouting(report)
+      if (routing) reportRouting(report)
+    } catch {}
+    try {
+      onReport?.(report)
     } catch {}
   }, 0).unref?.()
 }
 
-function identity({ cacheWarming: _, ...input }: AnthropicBillingRequest) {
+function identity({
+  cacheWarming: _,
+  onReport: _observer,
+  ...input
+}: AnthropicBillingRequest) {
   return {
     ...input,
     kind: 'billing' as const,
@@ -143,7 +160,10 @@ function identity({ cacheWarming: _, ...input }: AnthropicBillingRequest) {
 }
 
 export function reportAnthropicBillingFailure(input: AnthropicBillingRequest) {
-  detachReport({ ...identity(input), cache: undefined, outcome: 'failed' })
+  detachReport(
+    { ...identity(input), cache: undefined, outcome: 'failed' },
+    input.onReport,
+  )
 }
 
 /** One collector per physical upstream response, including relay responses. */
@@ -178,13 +198,16 @@ export function createAnthropicBillingObserver(
       } catch {}
       if (warming) cache = { ...cache, warming }
     }
-    detachReport({
-      ...base,
-      cache,
-      providerResponseId,
-      outcome,
-      ...measured,
-    })
+    detachReport(
+      {
+        ...base,
+        cache,
+        providerResponseId,
+        outcome,
+        ...measured,
+      },
+      input.onReport,
+    )
   }
   const observe = (value: unknown) => {
     const event = record(value)
@@ -192,7 +215,17 @@ export function createAnthropicBillingObserver(
     const message = record(event.message) ?? event
     if (typeof message.id === 'string') providerResponseId = message.id
     const usage = record(message.usage)
-    if (usage) rawUsage = { ...rawUsage, ...usage }
+    if (usage) {
+      const startCache = record(rawUsage.cache_creation)
+      const endCache = record(usage.cache_creation)
+      rawUsage = {
+        ...rawUsage,
+        ...usage,
+        ...((startCache || endCache) && {
+          cache_creation: { ...startCache, ...endCache },
+        }),
+      }
+    }
     if (event.type === 'error') failed = true
     if (event.type === 'message_delta' && usage) finalUsage = true
     if (event.type === 'message' && usage) finalUsage = true
@@ -240,12 +273,14 @@ export function createAnthropicBillingObserver(
 export function observeAnthropicBillingResponse(
   input: AnthropicBillingRequest,
   response: Response,
+  sse?: boolean,
 ): Response {
-  if (!hasRoutingAccessor()) return response
+  if (!hasRoutingAccessor() && !input.onReport) return response
   const observer = createAnthropicBillingObserver(
     input,
     response.status,
     response.headers,
+    sse,
   )
   if (!response.ok || !response.body) {
     observer.finish()
