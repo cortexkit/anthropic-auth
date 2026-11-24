@@ -45,7 +45,7 @@ export type E2EHarnessOptions = {
   relay?: 'websocket' | 'http'
   relayResponseStartDelayMs?: number
   hybridCache?: boolean
-  fallbackMode?: 'server' | 'legacy'
+  refusalFallbackMode?: 'server'
   childTmpDir?: string
   childEnv?: Record<string, string | undefined>
   beforeSpawn?: (env: IsolatedEnv) => void | Promise<void>
@@ -95,7 +95,7 @@ export class E2EHarness {
       anthropicBaseURL: baseURL,
       relay: relayConfig,
       hybridCache: options.hybridCache,
-      fallbackMode: options.fallbackMode,
+      refusalFallbackMode: options.refusalFallbackMode,
       childTmpDir: options.childTmpDir,
       childEnv: options.childEnv,
       beforeSpawn: options.beforeSpawn,

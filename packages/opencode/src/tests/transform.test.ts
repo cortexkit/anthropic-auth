@@ -5139,6 +5139,24 @@ describe('rewriteRequestBody', () => {
     ).toBe(4)
   })
 
+  test('drops a trailing assistant containing only unsigned thinking', async () => {
+    // Anthropic rejects unsigned thinking, so it's dropped before signing.
+    const messages = [{ role: 'user', content: 'hello' }]
+    const body = JSON.stringify({
+      system: 'sys',
+      messages: [
+        ...messages,
+        {
+          role: 'assistant',
+          content: [{ type: 'thinking', thinking: 'plan', signature: '' }],
+        },
+      ],
+    })
+    expect(JSON.parse(await rewriteRequestBody(body)).messages).toEqual(
+      messages,
+    )
+  })
+
   test('refuses a meaningful assistant hidden behind empty trailers', async () => {
     const body = JSON.stringify({
       system: 'sys',
@@ -5191,13 +5209,6 @@ describe('rewriteRequestBody', () => {
       {
         role: 'assistant',
         content: [{ type: 'text', text: ' ' }, { type: 'opaque_block' }],
-      },
-    ],
-    [
-      'visible reasoning',
-      {
-        role: 'assistant',
-        content: [{ type: 'thinking', thinking: 'plan', signature: '' }],
       },
     ],
     [

@@ -228,7 +228,7 @@ export type SpawnOptions = {
   /** Stand-in child used by preparation tests; ordinary runs use the locked host binary. */
   executable?: string
   hybridCache?: boolean
-  fallbackMode?: 'server' | 'legacy'
+  refusalFallbackMode?: 'server'
   relay?: {
     url: string
     token: string
@@ -1023,10 +1023,21 @@ export async function spawnOpencode(
       'opencode-anthropic-auth.log',
     )
     childEnv.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-    if (options.fallbackMode) {
-      childEnv.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = options.fallbackMode
-    } else {
-      delete childEnv.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
+    if (options.refusalFallbackMode) {
+      const settingsFile = join(env.configDir, 'anthropic-auth-settings.jsonc')
+      writeFileSync(
+        settingsFile,
+        JSON.stringify({
+          refusal_fallback: options.refusalFallbackMode,
+          quota_enabled: 'off',
+          refresh_enabled: false,
+          ...(options.hybridCache && {
+            claude_cache_enabled: 'on',
+            claude_cache_mode: 'hybrid',
+          }),
+        }),
+      )
+      childEnv.ANTHROPIC_AUTH_SETTINGS_FILE = settingsFile
     }
     // XDG isolation alone is insufficient: OpenCode also reads ~/.opencode
     // and ~/.claude/skills during lazy project bootstrap. Keep those reads

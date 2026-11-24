@@ -80,7 +80,10 @@ test('existing model request bytes change only for explicit Mythos 5.1 binding',
     )
   }
   const before = JSON.parse(readFileSync(baselinePath, 'utf8')) as typeof after
-  expect(Object.keys(after)).toEqual(Object.keys(before))
+  // Opus 4.8 was added to record fallback context limits, without changing request shaping.
+  expect(
+    Object.keys(after).filter((model) => model !== 'claude-opus-4-8'),
+  ).toEqual(Object.keys(before))
   for (const [model, shapes] of Object.entries(before)) {
     for (const [shape, body] of Object.entries(shapes)) {
       if (

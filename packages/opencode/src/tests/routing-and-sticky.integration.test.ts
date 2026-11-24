@@ -1350,7 +1350,7 @@ describe('auth.loader', () => {
     expect(calls).toBe(1)
   })
 
-  test('sticky-balanced assigns cold Fable to abundant quota and keeps Opus recovery on that account', async () => {
+  test('sticky-balanced assigns cold Fable to abundant quota and routes direct Opus independently', async () => {
     const checkedAt = Date.now()
     const quota = (fableRemaining: number) => ({
       checkedAt,
@@ -1413,13 +1413,7 @@ describe('auth.loader', () => {
     )
     const models: string[] = []
     const authorizations: string[] = []
-    let refusal = true
     let rejectMain = false
-    const refusalSse = [
-      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_filtered"}}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
-      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-    ].join('')
     const successSse = [
       'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok"}}\n\n',
       'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
@@ -1453,10 +1447,6 @@ describe('auth.loader', () => {
         if (rejectMain && authorization === 'Bearer sk-ant-oat01-main-access') {
           return Promise.resolve(new Response('forbidden', { status: 403 }))
         }
-        if (refusal) {
-          refusal = false
-          return Promise.resolve(new Response(refusalSse, { status: 200 }))
-        }
         return Promise.resolve(new Response(successSse, { status: 200 }))
       }),
     ) as unknown as typeof fetch
@@ -1484,16 +1474,10 @@ describe('auth.loader', () => {
       }),
     }
 
-    const filtered = await result.fetch(MESSAGES_URL, request)
-    await expect(filtered.text()).rejects.toThrow()
-    const opus = await result.fetch(MESSAGES_URL, request)
-    await opus.text()
-
-    expect(models).toEqual(['claude-fable-5', 'claude-opus-4-8'])
-    expect(authorizations).toEqual([
-      'Bearer sk-ant-oat01-abundant-access',
-      'Bearer sk-ant-oat01-abundant-access',
-    ])
+    const fable = await result.fetch(MESSAGES_URL, request)
+    await fable.text()
+    expect(models).toEqual(['claude-fable-5'])
+    expect(authorizations).toEqual(['Bearer sk-ant-oat01-abundant-access'])
 
     const directOpus = await result.fetch(MESSAGES_URL, {
       ...request,
