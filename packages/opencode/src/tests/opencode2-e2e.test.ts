@@ -603,12 +603,13 @@ type ScenarioArgs = [
   host?: 'oc1' | 'oc2',
   entry?: 'package' | 'main',
   mode?: 'tool' | 'structured' | 'billing' | 'billing-recovery',
+  auth?: 'legacy-tombstone',
 ]
 async function scenario(
   args: ScenarioArgs,
   clock: ReturnType<typeof phaseClock>,
 ) {
-  const [transport, host = 'oc2', entry = 'package', mode] = args
+  const [transport, host = 'oc2', entry = 'package', mode, auth] = args
   const billing = mode === 'billing' || mode === 'billing-recovery'
   clock.mark('fixture.start')
   const root = await mkdtemp(join(scratch, 'scenario-'))
@@ -800,11 +801,28 @@ export const TestOAuthLoopbackOrigin = async () => ({})`,
     )
     loopbackPlugin = pathToFileURL(loopbackFile).href
   }
+  const authPath = join(env.XDG_DATA_HOME!, 'opencode', 'auth.json')
+  const anthropicPlaceholder = placeholderSecret('anthropic')
   if (host === 'oc1') {
-    await mkdir(join(env.XDG_DATA_HOME!, 'opencode'), { recursive: true })
+    await mkdir(dirname(authPath), { recursive: true })
     await writeFile(
-      join(env.XDG_DATA_HOME!, 'opencode', 'auth.json'),
+      authPath,
       JSON.stringify({ anthropic: custodyTombstoneOAuth('anthropic') }),
+      { mode: 0o600 },
+    )
+  } else if (auth === 'legacy-tombstone') {
+    expect(JSON.parse(await readFile(authPath, 'utf8'))).toMatchObject({
+      anthropic: custodyTombstoneOAuth('anthropic'),
+    })
+  } else {
+    // OpenCode 2.3+ imports legacy auth.json into a fresh database. Seed the
+    // plugin placeholder as the active Anthropic key so the migration's empty
+    // OAuth tombstone does not override the placeholder in config.
+    await writeFile(
+      authPath,
+      JSON.stringify({
+        anthropic: { type: 'api', key: anthropicPlaceholder },
+      }),
       { mode: 0o600 },
     )
   }
@@ -817,7 +835,7 @@ export const TestOAuthLoopbackOrigin = async () => ({})`,
             providers: {
               anthropic: {
                 settings: {
-                  apiKey: placeholderSecret('anthropic'),
+                  apiKey: anthropicPlaceholder,
                   baseURL: `${upstream.url.origin}/v1`,
                 },
                 models: { 'claude-sonnet-5': { name: 'Sonnet 5 synthetic' } },
@@ -971,6 +989,28 @@ console.log(JSON.stringify({ server: entry.server ?? null, setup: typeof mod?.de
         '{invalid legacy credential state',
       )
     })
+  }, 60_000)
+  // Document the OpenCode 2.3+ import behavior customers can encounter on
+  // upgrade (docs/troubleshooting.md, "Moving from OpenCode 1 to OpenCode 2.3 or later").
+  test('real OC2 legacy auth import rejects the OAuth tombstone before sending', async () => {
+    await withScenario(
+      ['direct', 'oc2', 'package', undefined, 'legacy-tombstone'],
+      (run) => {
+        expect(run.result.timedOut).toBe(false)
+        const events = run.result.stdout
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line))
+        expect(events.find((event) => event.type === 'error')).toMatchObject({
+          error: {
+            type: 'provider.auth',
+            message: 'Missing auth credential: value',
+          },
+        })
+        expect(run.wire).toHaveLength(0)
+        expect(run.envelopes).toHaveLength(0)
+      },
+    )
   }, 60_000)
   for (const recovery of [false, true]) {
     test(`real OC2 reports each physical send after host stream consumption (recovery: ${recovery})`, async () => {
