@@ -2379,6 +2379,53 @@ test('OpenCode 2 restores a 2.6 record without policyState and durably caps its 
   expect(owner.manager.trackedCount()).toBe(0)
 })
 
+test.each(['verified', 'unverified'] as const)(
+  'OpenCode 2 warms a live pre-2.7 record with %s initial ownership',
+  async (ownership) => {
+    const f = await fixture()
+    await f.live()
+    await f.dispose()
+    const [name] = await readdir(f.disk)
+    const path = join(f.disk, name!)
+    const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+    saved.pluginVersion = '2.6.0'
+    delete saved.policyState
+    delete saved.lastTouchAt
+    delete saved.lastTouchKind
+    await writeFile(path, gzipSync(JSON.stringify(saved)))
+    forgetCacheKeepProcess(f.paths.storageId)
+    f.advance(60_000)
+    const next = await f.start()
+    const { manager, persistence } = sharedKeeper(f)
+    const id = 'ses_oc2_keep'
+    expect(manager.trackedPolicyState(id)?.lastRealRequestAt).toBe(f.now())
+    const reserve = spyOn(persistence, 'reserveWarm')
+    try {
+      if (ownership === 'unverified')
+        reserve.mockResolvedValueOnce('ownership-unverified')
+      f.advance(saved.nextPrewarmAt - f.now())
+      await f.timers.fireTimeouts()
+      if (ownership === 'unverified') {
+        expect(reserve).toHaveBeenCalled()
+        expect(next.sent).toHaveLength(0)
+        const reservations = reserve.mock.calls.length
+        f.advance(999)
+        await f.timers.fireTimeouts()
+        expect(reserve).toHaveBeenCalledTimes(reservations)
+        expect(next.sent).toHaveLength(0)
+
+        const [target] = manager.trackedSessions()
+        f.advance(target!.nextPrewarmAt - f.now())
+        await f.timers.fireTimeouts()
+      }
+      expect(next.sent).toHaveLength(1)
+      expect(manager.trackedPolicyState(id)?.warmsSinceLastRealRequest).toBe(1)
+    } finally {
+      reserve.mockRestore()
+    }
+  },
+)
+
 test('OpenCode 2 still drops a restart record requiring a real request', async () => {
   const lines = captureStartupLogs()
   const f = await fixture(false, false, 'debug')
@@ -4496,6 +4543,73 @@ test('a superseded OC2 turn cannot overwrite a newer body through a restore clai
     await next.respond(turn)
   } finally {
     unblock.resolve()
+    await persistence.drain()
+  }
+})
+
+test('a failed OC2 turn cannot unlink a newer body through a restore claim', async () => {
+  const f = await fixture()
+  const { id, peer, record, claim } = await seedPeer(f)
+  await peer.releaseClaims(() => true)
+  const next = await f.start()
+  const { manager, persistence } = sharedKeeper(f)
+  await persistence.drain()
+  const saved = await readFile(record)
+  const newer = JSON.parse(gunzipSync(saved).toString()) as SavedCacheKeepTarget
+  const restoreClaim = await readFile(claim, 'utf8')
+  expect(manager.trackedRequest(id)?.bodyText).toBe(newer.bodyText)
+  expect(JSON.parse(restoreClaim).restoreOnly).toBe(true)
+
+  const enqueue = Reflect.get(persistence, 'enqueue').bind(persistence)
+  const holdQueue = () => {
+    const entered = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    enqueue(() => {
+      entered.resolve()
+      return resume.promise
+    })
+    return { entered: entered.promise, resume: resume.resolve }
+  }
+  const beforeFlush = holdQueue()
+  let afterFlush: ReturnType<typeof holdQueue> | undefined
+  try {
+    await beforeFlush.entered
+    f.advance(-500)
+    const older = 'Accepted locally after the clock rolled back'
+    await next.live(undefined, { messages: [{ role: 'user', content: older }] })
+    expect(manager.trackedPolicyState(id)!.lastRealRequestAt).toBeLessThan(
+      newer.policyState!.lastRealRequestAt,
+    )
+    const timer = Reflect.get(persistence, 'timers').get(id)
+    const flush = f.timers.timeouts.get(timer)!
+    f.advance(flush.at - f.now())
+    flush.callback()
+
+    // The next turn supersedes the older body's pending claim. Let its flush
+    // finish, but hold unrelated work ahead of the next turn's acquisition.
+    afterFlush = holdQueue()
+    const turn = await next.prepare()
+    beforeFlush.resume()
+    await afterFlush.entered
+    expect(manager.trackedRequest(id)?.bodyText).toContain(older)
+    expect(await readFile(record)).toEqual(saved)
+
+    await next.respond(turn, Response.json({}, { status: 503 }))
+    expect(manager.trackedRequest(id)).toBeUndefined()
+    afterFlush.resume()
+    await persistence.drain()
+    expect(await readFile(record)).toEqual(saved)
+    expect(await readFile(claim, 'utf8')).toBe(restoreClaim)
+
+    // A normal release lets the next activation adopt the same saved body.
+    await next.dispose()
+    await f.start()
+    expect(sharedKeeper(f).manager.trackedRequest(id)?.bodyText).toBe(
+      newer.bodyText,
+    )
+  } finally {
+    beforeFlush.resume()
+    afterFlush?.resume()
     await persistence.drain()
   }
 })

@@ -96,7 +96,7 @@ function restore(shared: Shared): Promise<void> {
 
     await shared.store.load(
       now,
-      (entry) => {
+      (entry, acceptedAt) => {
         const hash = sessionHash(entry.id)
         if (!mayRestore(hash)) return undefined
         if (entry.cacheExpiresAt <= lease.now()) return 'expired'
@@ -125,6 +125,7 @@ function restore(shared: Shared): Promise<void> {
           oauthAccountIdentity: account.accountIdentity,
           hostMetadata: { restartCredential: entry.oauthAccountIdentity },
           isSubagent: entry.isSubagent,
+          acceptedAt,
           retained: {
             cacheExpiresAt: entry.cacheExpiresAt,
             nextPrewarmAt:
@@ -227,8 +228,9 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
       if (!deleted && !owner && !shared.loading) return
       shared.owners.delete(hash)
       shared.restored.delete(hash)
-      // Without a deletion event, a restore scan's temporary claim can keep
-      // the file on disk. A later restore checks its session policy again.
+      // Without a deletion event, a temporary scan claim or a concurrent
+      // claim release can leave the file on disk. A later restore checks its
+      // session policy again.
       shared.store.removed(id, deleted ? 'deleted' : true)
     },
     reserve,

@@ -1543,8 +1543,13 @@ export class CacheKeepManager {
           if (this.isCurrentTarget(target)) this.releaseTarget(target.id)
           throw new CacheKeepWarmRefusal('stopped')
         }
-        if (reservation === 'ownership-unverified')
+        if (reservation === 'ownership-unverified') {
+          // An unverified claim can become usable again, but retrying a still
+          // due target immediately would spin the due timer until expiry.
+          if (!cancelled() && this.targets.get(target.id) === current)
+            this.scheduleRetry(current, true, 'ownership-unverified')
           throw new CacheKeepWarmWait()
+        }
         throw new CacheKeepPrewarmError('authorization', undefined)
       }
     }
@@ -2258,7 +2263,11 @@ export class CacheKeepManager {
     )
   }
 
-  private scheduleRetry(target: CacheKeepTarget, transient: boolean) {
+  private scheduleRetry(
+    target: CacheKeepTarget,
+    transient: boolean,
+    wait?: 'ownership-unverified',
+  ) {
     const now = this.options.now?.() ?? Date.now()
     const deadline = this.lastPrewarmStart(target)
     if (now >= deadline) {
@@ -2268,16 +2277,21 @@ export class CacheKeepManager {
       })
       return
     }
-    target.consecutiveFailures += 1
-    const backoff = cacheKeepRetryDelayMs(target.id, target.consecutiveFailures)
+    const failures = target.consecutiveFailures + 1
+    // A reservation wait has not attempted a provider request.
+    if (!wait) target.consecutiveFailures = failures
+    const backoff = cacheKeepRetryDelayMs(target.id, failures)
     const delay = transient
       ? Math.min(
           backoff,
-          CACHE_KEEP_TRANSIENT_RETRY_STEP_MS * target.consecutiveFailures,
+          CACHE_KEEP_TRANSIENT_RETRY_STEP_MS * failures,
           CACHE_KEEP_TRANSIENT_RETRY_MAX_MS,
         )
       : backoff
-    target.nextPrewarmAt = Math.min(now + delay, deadline)
+    target.nextPrewarmAt = Math.max(
+      wait ? now + 1000 : now,
+      Math.min(now + delay, deadline),
+    )
   }
 
   private async sendPrewarm(

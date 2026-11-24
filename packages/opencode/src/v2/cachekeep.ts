@@ -427,7 +427,7 @@ function createSharedCacheKeep(
         let overdue = 0
         await shared.persistence.load(
           now,
-          (entry) => {
+          (entry, acceptedAt) => {
             // Disposal may race startup. Leave the file for the next live lease.
             if (
               !leases.size ||
@@ -492,6 +492,7 @@ function createSharedCacheKeep(
               oauthAccountId: account.id,
               oauthAccountIdentity: entry.oauthAccountIdentity,
               isSubagent: entry.isSubagent,
+              acceptedAt,
               retained: {
                 cacheExpiresAt: entry.cacheExpiresAt,
                 nextPrewarmAt,

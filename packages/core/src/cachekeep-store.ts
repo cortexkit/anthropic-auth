@@ -511,11 +511,12 @@ function record(
   }
 }
 
-function acceptedAt(entry: SavedCacheKeepTarget | undefined) {
+function acceptedAt(
+  entry: SavedCacheKeepTarget | undefined,
+  fallback = -Infinity,
+) {
   // A warm extends the expiry but does not accept a new request body.
-  return (
-    entry?.policyState?.lastRealRequestAt ?? entry?.lastTouchAt ?? -Infinity
-  )
+  return entry?.policyState?.lastRealRequestAt ?? entry?.lastTouchAt ?? fallback
 }
 
 function sanitizedBody(text: string): string {
@@ -661,10 +662,27 @@ type StoreClaim = {
   acquired: Promise<boolean | UnverifiedClaim>
   retained: boolean
   restoreOnly: boolean
-  adopted?: SavedCacheKeepTarget
+  adopted?: { entry: SavedCacheKeepTarget; acceptedAt: number }
   retiring?: boolean
   closing?: Promise<void>
   releaseRetry?: ReturnType<typeof setTimeout>
+}
+
+function claimCoversEntry(
+  item: StoreClaim | undefined,
+  entry: SavedCacheKeepTarget | undefined,
+) {
+  if (!item?.restoreOnly) return true
+  // Without a fresh real claim, only the adopted acceptance may be changed.
+  const adopted = item.adopted
+  return (
+    !!adopted &&
+    !!entry &&
+    acceptedAt(entry) === adopted.acceptedAt &&
+    entry.bodyText === adopted.entry.bodyText &&
+    entry.url === adopted.entry.url &&
+    entry.oauthAccountIdentity === adopted.entry.oauthAccountIdentity
+  )
 }
 
 type RealClaimIntent = { item?: StoreClaim }
@@ -1004,7 +1022,7 @@ export class CacheKeepStore {
   // restore, for example when its session is already tracked in this process.
   async load(
     now: number,
-    accept: (entry: SavedCacheKeepTarget) => Acceptance,
+    accept: (entry: SavedCacheKeepTarget, acceptedAt: number) => Acceptance,
     claim?: (sessionHash: string) => Promise<CacheKeepStoreRelease | undefined>,
     guard?: (sessionHash: string) => boolean | Promise<boolean>,
     mode: 'restore' | 'sweep' = 'restore',
@@ -1143,7 +1161,10 @@ export class CacheKeepStore {
           const owned = mode === 'restore' ? ownRelease?.item : undefined
           if (owned && (this.claims?.get(key) !== owned || owned.closing))
             continue
-          const acceptance = accept(entry)
+          // Old records have no acceptance time. Give tracking and the claim
+          // the same fallback without changing the saved record or its age.
+          const restoredAcceptedAt = acceptedAt(entry, clock())
+          const acceptance = accept(entry, restoredAcceptedAt)
           if (acceptance === undefined) continue
           const accepted = expired ? 'expired' : acceptance
           if (accepted !== true && accepted !== undefined) {
@@ -1153,7 +1174,7 @@ export class CacheKeepStore {
           if (accepted === true) {
             if (owned) {
               owned.retained = true
-              owned.adopted = entry
+              owned.adopted = { entry, acceptedAt: restoredAcceptedAt }
             }
             // Retire pre-2.5.4 files only after the accepted record is durable
             // in the private data store.
@@ -1399,19 +1420,7 @@ export class CacheKeepStore {
       if (reopened === 'ownership-unverified') return reopened
       item = reopened
     }
-    // A restore claim may update the adopted body's warm bookkeeping, but a
-    // different acceptance needs a real claim and the newer-record check above.
-    if (item?.restoreOnly) {
-      const adopted = item.adopted
-      if (
-        !adopted ||
-        acceptedAt(entry) !== acceptedAt(adopted) ||
-        entry.bodyText !== adopted.bodyText ||
-        entry.url !== adopted.url ||
-        entry.oauthAccountIdentity !== adopted.oauthAccountIdentity
-      )
-        return 'ownership-unverified'
-    }
+    if (!claimCoversEntry(item, entry)) return 'ownership-unverified'
     const claim = item?.claim ?? external
     if ((this.claims || this.options.externalClaim) && !claim) {
       if (reopen && this.claims && canPublish()) this.loseClaim(id)
@@ -1509,10 +1518,13 @@ export class CacheKeepStore {
     const key = hash(id)
     const item = this.retainedClaim(key)
     const external = this.options.externalClaim?.(id)
-    // A retired target can only delete under the claim it already held. A
-    // later scan may claim a newer record saved by another keeper.
-    if (item) item.retiring = true
+    const canRemove =
+      removeUnowned === 'deleted' || claimCoversEntry(item, this.latest.get(id))
     this.forgetEntry(id)
+    // A retired target can only delete under the claim it already held, and a
+    // restore-only claim for a different acceptance must stay retained.
+    if (!canRemove) return
+    if (item) item.retiring = true
     if (
       !removeUnowned &&
       (this.claims || this.options.externalClaim) &&
