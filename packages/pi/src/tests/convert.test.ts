@@ -65,6 +65,94 @@ function toolResultMsg(toolCallId: string, text: string): Message {
 const defaultCache = { enabled: false, mode: 'hybrid' as const }
 const TEST_MODEL_ID = 'claude-sonnet-4-20250514'
 
+describe('Pi request output limits', () => {
+  const context: Context = { messages: [userMsg('Write the whole file.')] }
+
+  test('defaults Opus 5.5 to the catalogue output limit over Pi metadata', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5-5',
+      context,
+      undefined,
+      defaultCache,
+      false,
+      undefined,
+      { modelLimits: { maxTokens: 32_000 } },
+    )
+    expect(body.max_tokens).toBe(128_000)
+  })
+
+  test('an explicit maxTokens wins over the catalogue output limit', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5-5',
+      context,
+      { maxTokens: 25_000 },
+      defaultCache,
+    )
+    expect(body.max_tokens).toBe(25_000)
+  })
+
+  test('defaults an unlisted model to the output limit supplied by Pi', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-unlisted',
+      context,
+      undefined,
+      defaultCache,
+      false,
+      undefined,
+      { modelLimits: { maxTokens: 42_000 } },
+    )
+    expect(body.max_tokens).toBe(42_000)
+  })
+
+  test('fits the reply to a near-full context using the last reply usage', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5-5',
+      {
+        messages: [
+          userMsg('Earlier question'),
+          {
+            ...assistantMsg('Earlier reply'),
+            stopReason: 'stop',
+            usage: {
+              input: 989_900,
+              output: 100,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 990_000,
+              cost: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                total: 0,
+              },
+            },
+          } as Message,
+          userMsg('Continue'),
+        ],
+      },
+      undefined,
+      defaultCache,
+    )
+    // Pi's near-full rule leaves 4,096 tokens of headroom after the 3-token follow-up.
+    expect(body.max_tokens).toBe(5_901)
+  })
+
+  test('uses the host context window and fits manual thinking when the context clamp binds', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-unlisted',
+      { messages: [userMsg('Continue')] },
+      { maxTokens: 25_000, reasoning: 'high' },
+      defaultCache,
+      false,
+      undefined,
+      { modelLimits: { contextWindow: 10_000 } },
+    )
+    expect(body.max_tokens).toBe(5_901)
+    expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 4_877 })
+  })
+})
+
 // Mirrors the shape of Pi's real prompt: instruction paragraphs followed by the
 // documentation paragraph, which is the only part Anthropic rejects in system[].
 const PI_PROMPT = [
@@ -2289,13 +2377,16 @@ describe('buildAnthropicRequest — cache breakpoint budget', () => {
       } satisfies Context,
       undefined,
       defaultCache,
+      false,
+      undefined,
+      { modelLimits: { maxTokens: 64_000 } },
     )
     const billingHeader =
       `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.` +
       `${computeCcVersionSuffix(firstUserText)}; cc_entrypoint=${CLAUDE_CODE_ENTRYPOINT}; cch=00000;`
     const expected = {
       model: TEST_MODEL_ID,
-      max_tokens: 16_384,
+      max_tokens: 64_000,
       stream: true,
       system: [
         {

@@ -1152,6 +1152,7 @@ async function sendAnthropicRequestAttempt(
         isFastModePersistentlyEnabled(storage),
         identity,
         {
+          modelLimits: options.model,
           apiKey: !!options.apiAccount,
           apiKeyModelCompat: options.model
             .compat as Model<'anthropic-messages'>['compat'],

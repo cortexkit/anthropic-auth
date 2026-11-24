@@ -46,19 +46,20 @@ function setCap(cap: number) {
 
 describe('Pi run output cap', () => {
   test('lowers the default max_tokens in the signed body', async () => {
-    setCap(3_000)
-    const { bodyText } = await build()
-    expect(JSON.parse(bodyText).max_tokens).toBe(3_000)
+    setCap(20_000)
+    const { bodyText } = await build(undefined, {}, 'claude-opus-5-5')
+    expect(JSON.parse(bodyText).max_tokens).toBe(20_000)
     expect(await signRequestBody(bodyText)).toBe(bodyText)
   })
 
   test('keeps the body byte-identical when the cap does not bind', async () => {
     delete globals[routingKey]
     const options = { sessionId: headSessionId, reasoning: 'high' } as const
-    const baseline = await build(options)
-    expect(baseline.body.max_tokens).toBe(16_384)
-    setCap(20_000)
-    expect((await build(options)).bodyText).toBe(baseline.bodyText)
+    const model = 'claude-opus-5-5'
+    const baseline = await build(options, {}, model)
+    expect(baseline.body.max_tokens).toBe(128_000)
+    setCap(140_000)
+    expect((await build(options, {}, model)).bodyText).toBe(baseline.bodyText)
   })
 
   test.each<[string, () => unknown]>([
@@ -107,7 +108,11 @@ describe('Pi run output cap', () => {
 
   test('keeps a lane start at one token under a larger cap', async () => {
     setCap(3_000)
-    const { bodyText } = await build(undefined, { laneStart: true })
+    const { bodyText } = await build(
+      undefined,
+      { laneStart: true },
+      'claude-opus-5-5',
+    )
     expect(JSON.parse(bodyText).max_tokens).toBe(1)
   })
 

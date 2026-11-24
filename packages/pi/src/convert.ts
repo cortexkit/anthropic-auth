@@ -35,6 +35,7 @@ import {
   readRunOutputCap,
   readSessionCachePolicy,
   requestCacheLifetimeMs,
+  resolveClaudeModelCapabilities,
   selectClaudeCodeBetas,
   signRequestBody,
   stripEmptyTrailingAssistantMessages,
@@ -60,6 +61,7 @@ import {
 } from './forks.ts'
 import { isPiLaneStartMessage, stripPiLaneStartNonce } from './lane-start.ts'
 import {
+  clampPiMaxTokensToContext,
   collapseSystemMessages,
   getCurrentSystemPrompt,
   getCurrentTools,
@@ -799,6 +801,15 @@ export function piThreadCacheSlot(
     : undefined
 }
 
+function fitManualThinking(body: AnthropicRequestBody): void {
+  if (body.thinking?.type !== 'enabled') return
+  // As in Pi's Anthropic provider, reserve 1,024 tokens for the reply.
+  // Omit manual thinking if its remaining budget is below Anthropic's minimum.
+  const budget = Math.min(body.thinking.budget_tokens, body.max_tokens - 1_024)
+  if (budget < 1_024) delete body.thinking
+  else body.thinking = { ...body.thinking, budget_tokens: budget }
+}
+
 export async function buildAnthropicRequest(
   modelId: string,
   context: Context,
@@ -807,6 +818,9 @@ export async function buildAnthropicRequest(
   fastModeEnabled = false,
   identity?: ClaudeCodeIdentity,
   controls: {
+    modelLimits?: Partial<
+      Pick<Model<'anthropic-messages'>, 'maxTokens' | 'contextWindow'>
+    >
     /** Convert Pi's typed context without adding Claude Code wire shaping. */
     apiKey?: boolean
     apiKeyModelCompat?: Model<'anthropic-messages'>['compat']
@@ -855,12 +869,22 @@ export async function buildAnthropicRequest(
   // messages can change the prompt, its named sections and the tool set. Resolve
   // them through the local replay port; raw host prompts (including ordered OMP
   // blocks) still enter through normalization.
-  const transcript = collapseSystemMessages(
-    normalizeContext({
-      ...context,
-      systemPrompt: systemPromptText(context.systemPrompt),
-    }),
+  const catalogue = resolveClaudeModelCapabilities(modelId)?.catalogue
+  const requestedMaxTokens =
+    options?.maxTokens ??
+    catalogue?.maxOutputTokens ??
+    controls.modelLimits?.maxTokens ??
+    16_384
+  const normalized = normalizeContext({
+    ...context,
+    systemPrompt: systemPromptText(context.systemPrompt),
+  })
+  const maxTokens = clampPiMaxTokensToContext(
+    normalized.messages,
+    controls.modelLimits?.contextWindow ?? catalogue?.contextWindow,
+    requestedMaxTokens,
   )
+  const transcript = collapseSystemMessages(normalized)
   context = {
     messages: transcript.messages,
     systemPrompt: getCurrentSystemPrompt(transcript.messages),
@@ -971,7 +995,9 @@ export async function buildAnthropicRequest(
 
   let body: AnthropicRequestBody = {
     model: modelId,
-    max_tokens: options?.maxTokens ?? 16_384,
+    // max_tokens is not part of Anthropic's prompt-cache key, so changing the
+    // reply allowance does not invalidate a cached prefix.
+    max_tokens: maxTokens,
     stream: true,
     ...(system.length ? { system } : {}),
     messages,
@@ -1047,6 +1073,7 @@ export async function buildAnthropicRequest(
       }
     }
   }
+  if (maxTokens < requestedMaxTokens) fitManualThinking(body)
 
   const forkEffortApplied = apiKey
     ? undefined
@@ -1138,16 +1165,7 @@ export async function buildAnthropicRequest(
   const cap = readRunOutputCap(options?.sessionId)
   if (cap !== null && cap < body.max_tokens) {
     body.max_tokens = cap
-    if (body.thinking?.type === 'enabled') {
-      // As in Pi's Anthropic provider, reserve 1,024 tokens for the reply.
-      // Omit manual thinking if its remaining budget is below Anthropic's minimum.
-      const budget = Math.min(
-        body.thinking.budget_tokens,
-        Math.max(0, cap - 1024),
-      )
-      if (budget < 1024) delete body.thinking
-      else body.thinking = { ...body.thinking, budget_tokens: budget }
-    }
+    fitManualThinking(body)
   }
   if (
     controls.cacheDiagnosticsPreviousMessageId !== undefined &&

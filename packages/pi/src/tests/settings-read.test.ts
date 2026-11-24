@@ -1136,14 +1136,21 @@ for (const mode of ['local', 'claustrum'] as const)
         const release = releaseSnapshots[fixture]
         const { quota_header_feed_enabled: _removed, ...readers } =
           release.readers
-        const conversationBytes = (send: (typeof release.sends)[number]) => ({
-          ...send,
-          body: promptCacheSnapshot(JSON.parse(send.body)),
-        })
+        const conversationBytes = (
+          send: (typeof release.sends)[number],
+          expectedMaxTokens?: number,
+        ) => {
+          const body = JSON.parse(send.body)
+          if (expectedMaxTokens !== undefined)
+            body.max_tokens = expectedMaxTokens
+          return { ...send, body: promptCacheSnapshot(body) }
+        }
         const expected = JSON.stringify({
           ...release,
           readers,
-          sends: release.sends.map(conversationBytes),
+          // The capture predates the model-specific reply allowance. Expect
+          // today's Opus 5.5 limit while keeping the historical fixture intact.
+          sends: release.sends.map((send) => conversationBytes(send, 128_000)),
         })
         for (const [phase, storage] of [
           ['before', before],
@@ -1154,12 +1161,12 @@ for (const mode of ['local', 'claustrum'] as const)
             join(home, `observe-${phase}`, 'anthropic-auth.json'),
           )
           // Per-warm timings are tested separately and were absent in 2.11.2;
-          // keep every older diagnostic and request byte in the release oracle.
+          // compare the other diagnostics and request bytes with the release fixture.
           const compatible = {
             ...observed,
             // The conversation gained a diagnostics predecessor, which also
             // changes the body signature. Warm bodies still compare byte for byte.
-            sends: observed.sends.map(conversationBytes),
+            sends: observed.sends.map((send) => conversationBytes(send)),
             logs: observed.logs.filter(
               (record) =>
                 !(
