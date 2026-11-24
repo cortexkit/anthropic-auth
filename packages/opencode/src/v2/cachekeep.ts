@@ -218,7 +218,7 @@ function createSharedCacheKeep(
   const prepared: SharedCacheKeep['prepared'] = new Map()
   const leases: SharedCacheKeep['leases'] = new Map()
   const restored = new Set<string>()
-  const restoreAfterTurn = new Set<string>()
+  const restoreAfterTurn = new Map<string, Set<string>>()
   let lastRestoredSend = 0
   let retaining: Promise<void> | undefined
   const persistence = new CacheKeepStore({
@@ -282,10 +282,12 @@ function createSharedCacheKeep(
       shared.persistence.removed(id)
     },
     onRealTurnsSettled: (id) => {
+      const deferred = restoreAfterTurn.get(id)
+      restoreAfterTurn.delete(id)
       if (
-        restoreAfterTurn.delete(id) &&
+        deferred &&
         leases.size &&
-        !manager.trackedRequest(id)
+        [...deferred].some((targetId) => !manager.trackedRequest(targetId))
       )
         void shared.adopt()
     },
@@ -433,10 +435,14 @@ function createSharedCacheKeep(
               manager.trackedRequest(entry.id)
             )
               return undefined
-            // Don't give a foreground turn a saved target it didn't start
-            // with: if the turn fails, it retires the target for this session.
-            if (manager.hasRealTurn(entry.id)) {
-              restoreAfterTurn.add(entry.id)
+            // A failed foreground turn can retire both its own target and
+            // targets it owns. Retry after whichever turn prevents adoption.
+            const ownerId = entry.policyState?.ownerSessionId ?? entry.id
+            const turnId = manager.hasRealTurn(entry.id) ? entry.id : ownerId
+            if (manager.hasRealTurn(turnId)) {
+              const deferred = restoreAfterTurn.get(turnId) ?? new Set<string>()
+              deferred.add(entry.id)
+              restoreAfterTurn.set(turnId, deferred)
               return undefined
             }
             if (entry.cacheExpiresAt <= now) return 'expired'

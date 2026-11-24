@@ -661,8 +661,17 @@ type StoreClaim = {
   acquired: Promise<boolean | UnverifiedClaim>
   retained: boolean
   restoreOnly: boolean
+  retiring?: boolean
   closing?: Promise<void>
   releaseRetry?: ReturnType<typeof setTimeout>
+}
+
+type RealClaimIntent = { item?: StoreClaim }
+
+type WriteAuthority = {
+  item?: StoreClaim
+  intent?: RealClaimIntent
+  external?: CacheKeepClaim
 }
 
 /** Best-effort restart storage. No caller of changed() waits for disk or zlib. */
@@ -680,7 +689,7 @@ export class CacheKeepStore {
   private readonly lastWrite = new Map<string, number>()
   private readonly latest: Map<string, SavedCacheKeepTarget>
   private readonly committed: Map<string, SavedCacheKeepTarget>
-  private readonly pendingRealClaims: Map<string, object>
+  private readonly pendingRealClaims: Map<string, RealClaimIntent>
   private switchingWriter: boolean
   private claimReleases = 0
 
@@ -771,6 +780,11 @@ export class CacheKeepStore {
     return item.closing
   }
 
+  private retainedClaim(key: string) {
+    const item = this.claims?.get(key)
+    return item?.retained && !item.retiring ? item : undefined
+  }
+
   private claimAvailableEvent() {
     return `cortexkit.cachekeep.claim-release-retried:${this.directory}`
   }
@@ -796,6 +810,7 @@ export class CacheKeepStore {
           ? Promise.resolve()
           : this.closeClaim(key, item).catch(() => this.writeFailed()),
       {
+        item,
         canRemove: async () => (await item.claim.isCurrent()) && !item.retained,
         withCurrent: (action: () => Promise<void>) =>
           item.claim.withCurrent(async () => {
@@ -805,19 +820,19 @@ export class CacheKeepStore {
     )
   }
 
-  private async takeRealClaim(id: string) {
-    const intent = this.pendingRealClaims.get(id)
+  private async takeRealClaim(
+    id: string,
+    intent: RealClaimIntent,
+    captured: StoreClaim | undefined,
+  ) {
+    const isPending = () => this.pendingRealClaims.get(id) === intent
+    if (!isPending()) return
     const entry = this.latest.get(id)
     const when = acceptedAt(entry)
     const dropStale = () => {
-      if (
-        this.latest.get(id) === entry &&
-        this.pendingRealClaims.get(id) === intent
-      )
-        this.loseClaim(id)
+      if (this.latest.get(id) === entry && isPending()) this.loseClaim(id)
     }
     const acquired = async (owned: StoreClaim) => {
-      owned.retained = true
       try {
         // A peer may have saved a more recent real turn before releasing. The
         // claim now excludes peer writes, but doesn't make this body newer.
@@ -832,30 +847,32 @@ export class CacheKeepStore {
       }
       // A removal and a new accepted body can queue while this lock is held.
       // Completing the older acquisition must not consume the new one.
+      if (!isPending() || owned.retiring || this.claims?.get(key) !== owned) {
+        if (!owned.retiring) await this.closeClaim(key, owned)
+        return
+      }
+      owned.retained = true
       owned.restoreOnly = false
-      if (this.pendingRealClaims.get(id) === intent)
-        this.pendingRealClaims.delete(id)
+      intent.item = owned
+      this.pendingRealClaims.delete(id)
       return owned
     }
     const key = hash(id)
-    let item = this.claims?.get(key)
-    if (item && !item.retained && (item.closing || item.releaseRetry)) {
-      await this.closeClaim(key, item)
-      item = undefined
-    }
-    if (item) {
-      if ((await item.acquired) === true) {
-        if (await item.claim.promote(when)) return acquired(item)
-        if (item.claim.wasDeleted) {
+    if (captured && this.claims?.get(key) === captured) {
+      if (captured.retained && !captured.retiring) {
+        if (await captured.claim.promote(when)) return acquired(captured)
+        if (captured.claim.wasDeleted) {
           dropStale()
-          await this.closeClaim(key, item)
+          await this.closeClaim(key, captured)
           return
         }
       }
-      await this.closeClaim(key, item)
+      if (!captured.retiring) await this.closeClaim(key, captured)
     }
-    // The restore claim may have yielded to a peer that has since released it.
-    item = this.openClaim(key, 'session', false, when)
+    // If the captured claim yielded, acquire our own token. Never promote a
+    // scan's token just because it appeared while this real turn was queued.
+    if (!isPending()) return
+    const item = this.openClaim(key, 'session', false, when)
     if (!item) return 'ownership-unverified' as const
     const result = await item.acquired
     if (result === true) return acquired(item)
@@ -866,7 +883,8 @@ export class CacheKeepStore {
 
   realTurn(id: string, acquire = true) {
     if (!this.claims || this.disabled) return
-    const item = this.claims.get(hash(id))
+    const key = hash(id)
+    const item = this.retainedClaim(key)
     if (!item?.retained && !acquire) return
     // The old writer or an overlapping last-lease release can still drop this
     // token. Queue a fresh acquisition behind that release before persisting.
@@ -878,11 +896,10 @@ export class CacheKeepStore {
       this.latest.has(id)
     )
       return
-    const intent = {}
+    const intent: RealClaimIntent = {}
     this.pendingRealClaims.set(id, intent)
     this.enqueue(async () => {
-      if (this.pendingRealClaims.get(id) === intent)
-        await this.takeRealClaim(id)
+      await this.takeRealClaim(id, intent, item)
     })
   }
 
@@ -892,11 +909,12 @@ export class CacheKeepStore {
   }
 
   async releaseClaims(shouldRelease: (hash: string) => boolean) {
+    const claims = new Map(this.claims)
     this.claimReleases++
     this.chain = this.chain
       .then(async () => {
-        for (const [key, item] of this.claims ?? []) {
-          if (!shouldRelease(key)) continue
+        for (const [key, item] of claims) {
+          if (this.claims?.get(key) !== item || !shouldRelease(key)) continue
           await this.closeClaim(key, item).catch(() => this.writeFailed())
         }
       })
@@ -968,10 +986,14 @@ export class CacheKeepStore {
     }
   }
 
-  private enqueue(action: () => Promise<void>) {
+  private enqueue(action: () => Promise<void>, cleanup?: () => Promise<void>) {
     this.chain = this.chain
       .then(async () => {
-        if (await this.directoryReady()) await action()
+        try {
+          if (await this.directoryReady()) await action()
+        } finally {
+          await cleanup?.()
+        }
       })
       .catch(() => this.writeFailed())
   }
@@ -1046,12 +1068,13 @@ export class CacheKeepStore {
         if (guard && !(await guard(key))) continue
         // Multi-process hosts must hold the session claim while reading or
         // deleting, including expiry cleanup and abandoned temporary writes.
-        const release = claim
-          ? await claim(key)
-          : await this.scanClaim(
+        const ownRelease = !claim
+          ? await this.scanClaim(
               key,
               temp || mode === 'sweep' ? 'sweep' : 'session',
             )
+          : undefined
+        const release = claim ? await claim(key) : ownRelease
         if ((claim || this.claims) && !release) continue
         let reason: DropReason | undefined
         let entry: SavedCacheKeepTarget | undefined
@@ -1115,6 +1138,9 @@ export class CacheKeepStore {
             candidates.push([name, entry.cacheExpiresAt])
             continue
           }
+          const owned = mode === 'restore' ? ownRelease?.item : undefined
+          if (owned && (this.claims?.get(key) !== owned || owned.closing))
+            continue
           const acceptance = accept(entry)
           if (acceptance === undefined) continue
           const accepted = expired ? 'expired' : acceptance
@@ -1123,8 +1149,7 @@ export class CacheKeepStore {
             throw new Error('Stale restart file')
           }
           if (accepted === true) {
-            const owned = this.claims?.get(key)
-            if (owned && !claim && mode === 'restore') owned.retained = true
+            if (owned) owned.retained = true
             // Retire pre-2.5.4 files only after the accepted record is durable
             // in the private data store.
             if (directory !== this.directory) {
@@ -1296,8 +1321,9 @@ export class CacheKeepStore {
     this.pending.delete(id)
     if (!entry) return this.chain
     this.lastWrite.set(id, this.options.now?.() ?? Date.now())
+    const authority = this.writeAuthority(id)
     this.enqueue(async () => {
-      await this.persist(entry)
+      await this.persist(entry, authority)
     })
     return this.chain
   }
@@ -1320,35 +1346,50 @@ export class CacheKeepStore {
     this.pending.delete(entry.id)
     this.latest.set(entry.id, entry)
     this.lastWrite.set(entry.id, this.options.now?.() ?? Date.now())
+    const authority = this.writeAuthority(entry.id)
     let result: CacheKeepWarmReservation = 'ownership-unverified'
     this.chain = this.chain
       .then(async () => {
         if (!(await this.directoryReady())) return
-        result = await this.persist(entry, true)
+        result = await this.persist(entry, authority, true)
       })
       .catch(() => this.writeFailed())
     await this.chain
     return this.memoryOnly || result
   }
 
+  private writeAuthority(id: string): WriteAuthority {
+    return {
+      item: this.retainedClaim(hash(id)),
+      intent: this.pendingRealClaims.get(id),
+      external: this.options.externalClaim?.(id),
+    }
+  }
+
   private async persist(
     entry: SavedCacheKeepTarget,
+    authority: WriteAuthority,
     reopen = false,
   ): Promise<CacheKeepWarmReservation> {
     const { id } = entry
     const stillLatest = () => this.latest.get(id) === entry
     if (!stillLatest()) return 'ownership-unverified'
     const key = hash(id)
-    let item = this.claims?.get(key)
+    // A write may follow the acquisition it was queued behind, but may not
+    // use a token from an unrelated acquisition that happened in the meantime.
+    const { intent, external } = authority
+    let item = intent?.item ?? authority.item
+    if (item !== this.retainedClaim(key)) item = undefined
     if (
-      this.pendingRealClaims.has(id) &&
-      (item?.restoreOnly || (reopen && !item?.retained))
+      intent &&
+      this.pendingRealClaims.get(id) === intent &&
+      (item?.restoreOnly || (reopen && !item))
     ) {
-      const reopened = await this.takeRealClaim(id)
+      const reopened = await this.takeRealClaim(id, intent, item)
       if (reopened === 'ownership-unverified') return reopened
       item = reopened
     }
-    const claim = item?.retained ? item.claim : this.options.externalClaim?.(id)
+    const claim = item?.claim ?? external
     if ((this.claims || this.options.externalClaim) && !claim) {
       if (reopen && this.latest.get(id) === entry) this.loseClaim(id)
       return 'not-owner'
@@ -1442,17 +1483,28 @@ export class CacheKeepStore {
   }
 
   removed(id: string, removeUnowned: boolean | 'deleted' = false) {
+    const key = hash(id)
+    const item = this.retainedClaim(key)
+    const external = this.options.externalClaim?.(id)
+    // A retired target can only delete under the claim it already held. A
+    // later scan may claim a newer record saved by another keeper.
+    if (item) item.retiring = true
     this.forgetEntry(id)
-    this.enqueue(async () => {
-      const key = hash(id)
-      const item = this.claims?.get(key)
-      const claim = item?.claim ?? this.options.externalClaim?.(id)
-      const path = join(this.directory, `${key}.json.gz`)
-      try {
-        if (item) await item.acquired
+    if (
+      !removeUnowned &&
+      (this.claims || this.options.externalClaim) &&
+      !item &&
+      !external
+    )
+      return
+    this.enqueue(
+      async () => {
+        const owned = item && this.claims?.get(key) === item ? item : undefined
+        const claim = owned?.claim ?? external
+        const path = join(this.directory, `${key}.json.gz`)
         if (this.claims && removeUnowned === 'deleted')
           await this.requestDeletion(claim ?? this.newClaim(key, 'sweep'))
-        else if (this.claims && removeUnowned && !claim)
+        else if (this.claims && removeUnowned && !item && !claim)
           await this.newClaim(key, 'sweep').requestDeletion(false)
         else if (claim)
           await claim.withCurrent(async (assertOwned) => {
@@ -1461,13 +1513,17 @@ export class CacheKeepStore {
           })
         else if (!this.claims && !this.options.externalClaim)
           await rm(path, { force: true })
-      } finally {
-        if (item) await this.closeClaim(key, item)
-      }
-    })
+      },
+      async () => {
+        // Release the retired claim even if the record directory is unusable.
+        if (item && this.claims?.get(key) === item)
+          await this.closeClaim(key, item)
+      },
+    )
   }
 
   clear() {
+    const claims = new Map(this.claims)
     for (const timer of this.timers.values())
       (this.options.clearTimeoutImpl ?? clearTimeout)(timer)
     this.timers.clear()
@@ -1483,9 +1539,9 @@ export class CacheKeepStore {
         if (!FILE.test(name) && !temp) continue
         if (temp && !(await this.staleTemp(path))) continue
         const key = name.slice(0, 64)
-        const own = this.claims?.get(key)
+        const own = claims.get(key)
         if (own) {
-          if ((await own.acquired) === true)
+          if ((await own.acquired) === true && this.claims?.get(key) === own)
             await own.claim.withCurrent(async (assertOwned) => {
               if (temp && !(await this.staleTemp(path))) return
               await assertOwned()
@@ -1503,8 +1559,9 @@ export class CacheKeepStore {
           await release?.()
         }
       }
-      for (const [key, item] of this.claims ?? [])
-        await this.closeClaim(key, item).catch(() => this.writeFailed())
+      for (const [key, item] of claims)
+        if (this.claims?.get(key) === item)
+          await this.closeClaim(key, item).catch(() => this.writeFailed())
     })
   }
 

@@ -4465,6 +4465,140 @@ test('a failed in-flight OC2 turn cannot delete a newer peer record on a freshne
   }
 })
 
+test('an OC2 turn retiring an unowned target cannot unlink a peer record through a later scan claim', async () => {
+  const f = await fixture()
+  const { id, peer, record, tracked } = await seedPeer(f)
+  const next = await f.start()
+  const owner = keeperFor(f.paths.storageId)
+  const { manager, persistence } = sharedKeeper(f)
+  await next.live()
+  await persistence.drain()
+  expect(manager.trackedRequest(id)).toBeDefined()
+  expect(persistence.isCommitted(id)).toBe(false)
+
+  const listed = Promise.withResolvers<void>()
+  const checkRecord = Promise.withResolvers<void>()
+  const writing = Promise.withResolvers<void>()
+  const finishWrite = Promise.withResolvers<void>()
+  const claimed = Promise.withResolvers<boolean>()
+  const readRecord = Promise.withResolvers<void>()
+  const load = persistence.load.bind(persistence)
+  const key = createHash('sha256').update(id).digest('hex')
+  const scanning = spyOn(persistence, 'load').mockImplementationOnce(
+    (now, accept, claim, guard, mode) =>
+      load(
+        now,
+        accept,
+        claim,
+        async (hash) => {
+          if (hash === key) {
+            listed.resolve()
+            await checkRecord.promise
+          }
+          return guard?.(hash) ?? true
+        },
+        mode,
+      ),
+  )
+  const writer = persistence as unknown as {
+    writeEntry: (
+      entry: SavedCacheKeepTarget,
+      assertOwned?: () => Promise<void>,
+      stillLatest?: () => boolean,
+    ) => Promise<boolean>
+  }
+  const write = writer.writeEntry.bind(writer)
+  const holdingWrite = spyOn(writer, 'writeEntry').mockImplementationOnce(
+    async (...args) => {
+      writing.resolve()
+      await finishWrite.promise
+      return write(...args)
+    },
+  )
+  const scan = owner.adopt()
+  let holdingRead: { mockRestore(): void } | undefined
+  try {
+    // The scan has passed its wait on the store queue and listed the record.
+    await listed.promise
+    persistence.changed({ ...tracked, id: 'ses_unrelated' })
+    void persistence.drain()
+    await writing.promise
+    const turn = await next.prepare()
+    await next.respond(turn, Response.json({}, { status: 503 }))
+    expect(manager.trackedRequest(id)).toBeUndefined()
+
+    const newest = 'Peer accepted this after the failed turn retired its target'
+    f.advance(5_000)
+    peer.changed({
+      ...tracked,
+      bodyText: tracked.bodyText.replace('Hello', newest),
+      policyState: { ...tracked.policyState!, lastRealRequestAt: f.now() },
+    })
+    await peer.drain()
+    await peer.releaseClaims(() => true)
+    const saved = await readFile(record)
+
+    // Drain the queued removal while the scan owns the claim but has not read
+    // or adopted the peer's new record yet.
+    const isCurrent = CacheKeepClaim.prototype.isCurrent
+    holdingRead = spyOn(
+      CacheKeepClaim.prototype,
+      'isCurrent',
+    ).mockImplementationOnce(async function (this: CacheKeepClaim) {
+      const current = await isCurrent.call(this)
+      claimed.resolve(current)
+      await readRecord.promise
+      return current
+    })
+    checkRecord.resolve()
+    expect(await claimed.promise).toBe(true)
+    finishWrite.resolve()
+    await persistence.drain()
+    expect(await readFile(record)).toEqual(saved)
+    expect(manager.trackedRequest(id)).toBeUndefined()
+
+    readRecord.resolve()
+    await scan
+    expect(manager.trackedRequest(id)?.bodyText).toContain(newest)
+    expect(await readFile(record)).toEqual(saved)
+  } finally {
+    checkRecord.resolve()
+    finishWrite.resolve()
+    readRecord.resolve()
+    await scan
+    await persistence.drain()
+    holdingRead?.mockRestore()
+    holdingWrite.mockRestore()
+    scanning.mockRestore()
+  }
+})
+
+test('OC2 defers restoring an owned target until its owner’s foreground turn settles', async () => {
+  const f = await fixture()
+  const { id, peer, record, tracked } = await seedPeer(f)
+  const next = await f.start()
+  const owner = keeperFor(f.paths.storageId)
+  const parent = 'ses_owner'
+  await next.live(undefined, {}, parent)
+  const turn = await next.prepare(undefined, {}, parent)
+
+  peer.changed({
+    ...tracked,
+    policyState: { ...tracked.policyState!, ownerSessionId: parent },
+  })
+  await peer.drain()
+  await peer.releaseClaims(() => true)
+  const saved = await readFile(record)
+  await owner.adopt()
+  expect(owner.manager.trackedRequest(id)).toBeUndefined()
+
+  await next.respond(turn)
+  await owner.loading
+  expect(owner.manager.trackedRequest(parent)).toBeDefined()
+  expect(owner.manager.trackedRequest(id)?.bodyText).toBe(tracked.bodyText)
+  expect(await readFile(record)).toEqual(saved)
+})
+
 test('a queued freshness rescan can adopt after a turn finishes during the prior scan', async () => {
   const f = await fixture()
   const { id, peer, tracked } = await seedPeer(f)
