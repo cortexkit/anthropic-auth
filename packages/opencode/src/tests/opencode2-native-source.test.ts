@@ -81,6 +81,7 @@ import {
 } from '../../../core/src/tests/native-refresh-quota-fixture.ts'
 import { holdNativeRelayLock } from '../../../core/src/tests/native-relay-lock-fixture.ts'
 import { requestLockProbe } from '../../../core/src/tests/native-request-lock-fixture.ts'
+import { settingsTestPaths } from '../../../core/src/tests/settings-record-paths-fixture.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { vaultOutageClock } from '../../../core/src/tests/vault-outage-clock.ts'
 import { tokenFingerprint } from '../../../core/src/token-fingerprint'
@@ -2272,7 +2273,10 @@ async function storage(owned = cleanups, waitForReset = false) {
         routing_mode: 'sticky-balanced',
       }),
     )
-    const service = await openSettingsService({ file: settingsFile })
+    const service = await openSettingsService({
+      file: settingsFile,
+      records: (await settingsTestPaths(settingsFile)).records,
+    })
     if (!service) throw new Error('Could not open reset-wait settings')
     owned.push(() => service.dispose())
     settingsService = service

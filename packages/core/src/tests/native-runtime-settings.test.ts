@@ -34,6 +34,7 @@ import { settingsDefinition } from '../settings-definition.ts'
 import type { SettingsMode } from '../settings-mode.ts'
 import { openSettingsService } from '../settings-service.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
+import { settingsTestPaths } from './settings-record-paths-fixture.ts'
 
 const cleanup: (() => void | Promise<void>)[] = []
 afterEach(async () => {
@@ -51,6 +52,7 @@ async function fixture(values: Record<string, unknown> = {}) {
   let reads = 0
   const service = await openSettingsService({
     file,
+    records: (await settingsTestPaths(file)).records,
     dependencies: {
       readFile: async (path) => {
         reads++
@@ -538,7 +540,10 @@ for (const firstToClose of [0, 1]) {
   test(`separate settings leases share one native runtime and survive closing acquisition ${firstToClose + 1}`, async () => {
     const f = await fixture(overrides)
     await f.reader.close()
-    const peerService = await openSettingsService({ file: f.file })
+    const peerService = await openSettingsService({
+      file: f.file,
+      records: (await settingsTestPaths(f.file)).records,
+    })
     if (!peerService) throw new Error('Expected peer settings lease')
     cleanup.push(() => peerService.dispose())
     expect(peerService).not.toBe(f.service)
@@ -601,9 +606,10 @@ test('a runtime that fails to construct releases the settings service it retaine
   const file = join(root, 'settings.jsonc')
   await writeFile(file, '{}')
   let opens = 0
-  const open = () =>
+  const open = async () =>
     openSettingsService({
       file,
+      records: (await settingsTestPaths(file)).records,
       dependencies: {
         open: (options) => {
           opens++

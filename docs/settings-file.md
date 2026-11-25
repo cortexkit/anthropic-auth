@@ -323,8 +323,8 @@ file does not already set that key at the host's level. This includes the
 killswitch, quota floors, unknown-quota policy and same-account wait.
 Missing per-account floors are added with that host's tag
 when they exceed the file's default floors; existing account entries are not
-replaced. A `<target path>.moved.<host>` record (`opencode` or `pi`) records this
-check. Ordinary legacy preferences are never merged. If its legacy protection
+replaced. A `moved.<host>` record (`opencode` or `pi`) records this check.
+Ordinary legacy preferences are never merged. If its legacy protection
 cannot be read, or the protection import cannot be written, the host keeps using
 its old settings. It retries at a later settings check or the next start. Startup
 logs also name legacy values that differ from the file.
@@ -341,9 +341,30 @@ under the `anthropic-auth` key, not in this settings file.
 An existing hand-made user file is authoritative too, subject to the same
 one-time protection check; ordinary legacy preferences are not merged into it.
 A successful move (even with no sources), or finding a hand-made file that
-parses, writes the owner-only `<target path>.moved` marker. The
-`MOVED_READPLEASE` notes are informational; the plugin never uses them to decide
-authority. Do not delete the marker to try to restore settings from stale stores.
+parses, writes the owner-only `moved` marker. The `MOVED_READPLEASE` notes are
+informational; the plugin never uses them to decide authority. Do not delete the
+marker to try to restore settings from stale stores.
+
+### Where the records are kept
+
+The plugin writes four owner-only records: `moved`, `moved.opencode`, `moved.pi`
+and `applied.json`. It writes them under `<state root>/settings/<key>/` and also
+beside the settings file as `<target>.moved`, `<target>.moved.opencode`,
+`<target>.moved.pi` and `<target>.applied.json`. The state root is
+`$XDG_STATE_HOME/cortexkit/anthropic-auth` if `XDG_STATE_HOME` is absolute;
+otherwise it is `~/.local/state/cortexkit/anthropic-auth` on every OS. The key is
+specific to the configured filename in its canonical parent folder; a symlink
+at the filename does not change the key.
+
+A marker in either location counts; an unreadable record is not treated as
+missing. For `applied.json`, each host's newest recorded reading wins. If the
+state folder cannot be used, the plugin warns and keeps using the records beside
+the settings file. Status and stopped-host setup show where the records are kept.
+
+The copies beside the settings file keep 2.17.x working during mixed-version use
+and after rollback. This release removes neither copy. A later release will stop
+writing beside the settings file and remove those copies, with this release as
+the oldest supported rollback.
 
 ### Setup
 
@@ -370,10 +391,9 @@ the recovery order is this host's last-applied copy, then its readable legacy
 store, then the restrictive fallback: killswitch on at the default floors,
 unknown quota refused and same-account wait off.
 
-The owner-only `<target path>.applied.json` beside the user file holds a complete
-last-applied protection set per host and no credentials. It is updated from
-usable user-file values only. It is a recovery copy, not another settings file
-to edit.
+The owner-only `applied.json` records hold a complete last-applied protection
+set per host and no credentials. They are updated from usable user-file values
+only. They are recovery copies, not settings files to edit.
 
 A menu write that recreates a missing file preserves the writer's currently
 applied protection values and the other host's recoverable protection set, then

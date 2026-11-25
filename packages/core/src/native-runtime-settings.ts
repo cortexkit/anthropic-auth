@@ -253,7 +253,11 @@ export function createNativeRuntimeSettings(
       if (
         !userAuthority &&
         (await resolveSettingsMode(
-          { target: current.file, separate: mode() === 'separate' },
+          {
+            target: current.file,
+            records: current.records,
+            separate: mode() === 'separate',
+          },
           options.settingsAuthority?.options,
         )) !== 'user-file'
       )
@@ -392,6 +396,7 @@ export function createNativeRuntimeSettings(
               ? 'user-file'
               : 'legacy',
         file: service?.file ?? fallback?.file ?? file,
+        records: service?.records,
         diagnostic,
       })
     },
@@ -445,7 +450,11 @@ export function createNativeRuntimeSettings(
       if (userAuthority) return true
       return (
         (await resolveSettingsMode(
-          { target: service.file, separate: mode() === 'separate' },
+          {
+            target: service.file,
+            records: service.records,
+            separate: mode() === 'separate',
+          },
           options.settingsAuthority?.options,
         )) === 'user-file'
       )

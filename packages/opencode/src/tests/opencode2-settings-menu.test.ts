@@ -11,6 +11,7 @@ import { parse } from 'jsonc-parser'
 import { listNativeMenuActions } from '../../../core/src/native-menu-model'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { initializeNativeTestAuthority } from '../../../core/src/tests/native-authority-fixture'
+import { settingsTestPaths } from '../../../core/src/tests/settings-record-paths-fixture.ts'
 import { createNativeMenuCapabilities } from '../v2/menu'
 import type { NativeSource } from '../v2/source'
 
@@ -57,6 +58,7 @@ async function fixture(
       ? undefined
       : await core.openSettingsService({
           file,
+          records: (await settingsTestPaths(file)).records,
           host: 'opencode',
           // These menu tests are about a host that uses the file.
           adopted: () => true,

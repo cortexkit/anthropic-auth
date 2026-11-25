@@ -23,7 +23,11 @@ import {
   settingsDefinition,
 } from '../settings-definition.ts'
 import { readPeerLegacySettingsProtection } from '../settings-move-sources.ts'
-import { resolveSettingsPaths, type SettingsHost } from '../settings-paths.ts'
+import {
+  prepareSettingsRecordPaths,
+  resolveSettingsPaths,
+  type SettingsHost,
+} from '../settings-paths.ts'
 import { writeSettingsProtectionCopy } from '../settings-protection-copy.ts'
 import { legacySettingsProtection } from '../settings-protection-legacy.ts'
 import { resolveSettingsRecord } from '../settings-record.ts'
@@ -92,6 +96,9 @@ async function fixture(
   const messages: string[] = []
   const options: NativeSetupSettingsOptions = {
     host,
+    home,
+    env: {},
+    platform: 'linux',
     settings,
     source: paths.own.account,
     paths,
@@ -149,7 +156,7 @@ for (const host of ['opencode', 'pi'] as const) {
     expect(f.writes).toEqual([legacy])
     expect(await readFile(f.paths.own.account, 'utf8')).toBe(before)
     await absent(f.paths.target)
-    await absent(f.paths.marker)
+    await absent(f.paths.records.beside.moved)
     await absent(`${f.paths.target}.applied.json`)
     expect(await readdir(dirname(f.paths.own.account))).toEqual([
       'anthropic-auth.json',
@@ -162,7 +169,8 @@ for (const host of ['opencode', 'pi'] as const) {
         const f = await fixture(host)
         const text = `// outside comment\n{ "unknown": 19, ${invalid ? '"killswitch_enabled": "invalid",' : ''} }\n`
         await writeFile(f.paths.target, text)
-        if (marked) await writeFile(f.paths.marker, 'existing-marker')
+        if (marked)
+          await writeFile(f.paths.records.beside.moved, 'existing-marker')
         let markerBeforeEdit = false
         const outcome = await writeNativeSetupSettings({
           ...f.options,
@@ -188,9 +196,11 @@ for (const host of ['opencode', 'pi'] as const) {
         )
         if (!marked) {
           expect(markerBeforeEdit).toBe(true)
-          expect((await contents(f.paths.marker)).version).toBe(1)
+          expect((await contents(f.paths.records.beside.moved)).version).toBe(1)
         } else
-          expect(await readFile(f.paths.marker, 'utf8')).toBe('existing-marker')
+          expect(await readFile(f.paths.records.beside.moved, 'utf8')).toBe(
+            'existing-marker',
+          )
       })
     }
     for (const text of [
@@ -200,7 +210,7 @@ for (const host of ['opencode', 'pi'] as const) {
       test(`${host}: malformed or duplicate file marker=${marked} refuses all destinations: ${text}`, async () => {
         const f = await fixture(host)
         await writeFile(f.paths.target, text)
-        if (marked) await writeFile(f.paths.marker, 'marker')
+        if (marked) await writeFile(f.paths.records.beside.moved, 'marker')
         expect(await f.write()).toMatchObject({
           target: 'user-file',
           outcome: 'refused',
@@ -208,7 +218,7 @@ for (const host of ['opencode', 'pi'] as const) {
         })
         expect(await readFile(f.paths.target, 'utf8')).toBe(text)
         expect(f.writes).toEqual([])
-        if (!marked) await absent(f.paths.marker)
+        if (!marked) await absent(f.paths.records.beside.moved)
       })
     }
   }
@@ -254,18 +264,22 @@ for (const host of ['opencode', 'pi'] as const) {
         killswitch: { enabled: false },
         routing: { maxSameAccountWait: '0' },
       })
-      await writeFile(f.paths.marker, 'marker')
+      await writeFile(f.paths.records.beside.moved, 'marker')
       const copy = legacySettingsProtection(legacy, host)
       if (rung === 1)
-        await writeSettingsProtectionCopy(f.paths.target, host, {
-          readAt: 1,
-          values: copy,
-        })
+        await writeSettingsProtectionCopy(
+          (await prepareSettingsRecordPaths(f.paths, f.options)).records,
+          host,
+          {
+            readAt: 1,
+            values: copy,
+          },
+        )
       else {
         // A set belonging only to the peer must not recover the acting host.
         // The peer's different set is carried at its own host level.
         await writeSettingsProtectionCopy(
-          f.paths.target,
+          (await prepareSettingsRecordPaths(f.paths, f.options)).records,
           host === 'pi' ? 'opencode' : 'pi',
           { readAt: 1, values: copy },
         )
@@ -279,7 +293,9 @@ for (const host of ['opencode', 'pi'] as const) {
           reason: refusedSettingsRecreationText(f.paths.target),
         })
         await absent(f.paths.target)
-        expect(await readFile(f.paths.marker, 'utf8')).toBe('marker')
+        expect(await readFile(f.paths.records.beside.moved, 'utf8')).toBe(
+          'marker',
+        )
         return
       }
       if (rung === 2) {
@@ -311,13 +327,15 @@ for (const host of ['opencode', 'pi'] as const) {
       expect(
         result.differing.filter((entry) => entry.key === 'killswitch_enabled'),
       ).toEqual([{ key: 'killswitch_enabled', legacy: false, file: true }])
-      expect(await readFile(f.paths.marker, 'utf8')).toBe('marker')
+      expect(await readFile(f.paths.records.beside.moved, 'utf8')).toBe(
+        'marker',
+      )
     })
   }
 
   test(`${host}: marker without file recreates when the peer's copy holds the same set`, async () => {
     const f = await fixture(host, legacy)
-    await writeFile(f.paths.marker, 'marker')
+    await writeFile(f.paths.records.beside.moved, 'marker')
     const peer = host === 'pi' ? 'opencode' : 'pi'
     const own = legacySettingsProtection(legacy, host)
     for (const [copyHost, values] of [
@@ -325,10 +343,14 @@ for (const host of ['opencode', 'pi'] as const) {
       // Same values; its local floors are tagged with the peer itself.
       [peer, legacySettingsProtection(legacy, peer)],
     ] as const)
-      await writeSettingsProtectionCopy(f.paths.target, copyHost, {
-        readAt: 1,
-        values,
-      })
+      await writeSettingsProtectionCopy(
+        (await prepareSettingsRecordPaths(f.paths, f.options)).records,
+        copyHost,
+        {
+          readAt: 1,
+          values,
+        },
+      )
     const result = await f.write()
     expect(result.outcome).toBe('saved')
     const file = await contents(f.paths.target)
@@ -497,7 +519,10 @@ test('setup does not fill floors or account rows stored with the killswitch off 
       'killswitch_account_floors',
     ]),
   )
-  const service = await openSettingsService({ file: f.paths.target })
+  const service = await openSettingsService({
+    file: f.paths.target,
+    records: f.paths.records,
+  })
   try {
     expect(service?.resolve('pi')).toMatchObject({
       killswitch_enabled: true,
@@ -542,6 +567,7 @@ test('a projected settings record can never reach a legacy setup store writer', 
   )
   const service = await openSettingsService({
     file: f.paths.target,
+    records: f.paths.records,
     host: 'opencode',
   })
   if (!service) throw new Error('no service')
@@ -595,7 +621,7 @@ test('recreation compares only imported account floors, ignoring host tags and e
       accounts: { 'vault:shared': { five_hour: 8 }, missing: { five_hour: 4 } },
     },
   })
-  await writeFile(f.paths.marker, 'marker')
+  await writeFile(f.paths.records.beside.moved, 'marker')
   const carried = legacySettingsProtection(
     {
       killswitch: {
@@ -608,10 +634,14 @@ test('recreation compares only imported account floors, ignoring host tags and e
     'pi',
     'claustrum',
   )
-  await writeSettingsProtectionCopy(f.paths.target, 'pi', {
-    readAt: 1,
-    values: carried,
-  })
+  await writeSettingsProtectionCopy(
+    (await prepareSettingsRecordPaths(f.paths, f.options)).records,
+    'pi',
+    {
+      readAt: 1,
+      values: carried,
+    },
+  )
   const result = await f.write()
   expect(result.outcome).toBe('saved')
   expect(result.differing).toEqual([
@@ -632,7 +662,7 @@ test('recreation compares only imported account floors, ignoring host tags and e
 test('a separate install keeps legacy writes even with a malformed shared file and marker', async () => {
   const f = await fixture('pi', legacy)
   await writeFile(f.paths.target, '{')
-  await writeFile(f.paths.marker, 'marker')
+  await writeFile(f.paths.records.beside.moved, 'marker')
   expect(
     await writeNativeSetupSettings({
       ...f.options,
@@ -652,6 +682,7 @@ test('Pi setup writes absent keys at level pi without changing OpenCode values',
   await writeFile(f.paths.target, text)
   const service = await openSettingsService({
     file: f.paths.target,
+    records: f.paths.records,
     host: 'opencode',
   })
   if (!service) throw new Error('no service')
@@ -706,6 +737,7 @@ test('setup floor appends retain a peer write made before the writer lock', asyn
   )
   const service = await openSettingsService({
     file: f.paths.target,
+    records: f.paths.records,
     dependencies: {
       open: (config) => {
         const handle = openSettings(settingsDefinition, config)
@@ -779,6 +811,7 @@ test('a hand edit made after setup reads the file but before its writer lock sur
   // Setup shares this service; its edit runs after the file changes.
   const service = await openSettingsService({
     file: f.paths.target,
+    records: f.paths.records,
     dependencies: {
       open: (config) => {
         const handle = openSettings(settingsDefinition, config)
@@ -807,7 +840,7 @@ for (const peer of [
 ] as const) {
   test(`setup recreating a missing file with a ${peer} Pi ${peer === 'stricter' ? "keeps Pi's own set" : 'refuses'}`, async () => {
     const f = await fixture('opencode', legacy)
-    await writeFile(f.paths.marker, 'marker')
+    await writeFile(f.paths.records.beside.moved, 'marker')
     const store = join(
       dirname(f.paths.defaults.pi.account),
       'anthropic-auth-pool.json',
@@ -865,9 +898,28 @@ test('a committed setup saves the applied copy of the generation it wrote', asyn
     killswitch: { enabled: true, main: { five_hour: 61, seven_day: 61 } },
   })
   await writeFile(f.paths.target, '{}')
-  expect((await f.write()).outcome).toBe('saved')
-  const copy = JSON.parse(
-    await readFile(`${f.paths.target}.applied.json`, 'utf8'),
+  const options = {
+    ...f.options,
+    env: { XDG_STATE_HOME: join(f.home, 'injected-state') },
+    paths: undefined,
+    log: {
+      ...f.options.log!,
+      info: (message: string) => f.messages.push(message),
+    },
+  }
+  const {
+    records: { beside, state },
+  } = await resolveSettingsPaths('opencode', options)
+  if (!state) throw new Error('Missing state layout')
+  expect((await writeNativeSetupSettings(options)).outcome).toBe('saved')
+  const bytes = await readFile(beside.applied, 'utf8')
+  const copy = JSON.parse(bytes)
+  expect(await readFile(state.applied, 'utf8')).toBe(bytes)
+  expect(await readFile(state.moved, 'utf8')).toBe(
+    await readFile(beside.moved, 'utf8'),
+  )
+  expect(f.messages).toContain(
+    `Settings records: beside the settings file in "${dirname(f.paths.target)}" and in "${state.directory}".`,
   )
   expect(Object.keys(copy)).toEqual(['opencode'])
   expect(copy.opencode.values).toMatchObject({
@@ -901,6 +953,7 @@ test('a setup with nothing to write keeps the protection the file already held a
   // OpenCode starts before it has imported the file.
   const service = await openSettingsService({
     file: f.paths.target,
+    records: f.paths.records,
     host: 'opencode',
     protection: f.options.protection,
     adopted: () => false,

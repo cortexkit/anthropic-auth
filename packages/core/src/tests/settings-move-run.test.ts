@@ -11,7 +11,6 @@ import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from '../pool-store.ts'
 import { settingsDefinition } from '../settings-definition.ts'
-import { settingsImportRecordPath } from '../settings-mode.ts'
 import { settingsMoveHolderFiles } from '../settings-move-fence.ts'
 import {
   __resetSettingsMoveFenceLogForTest,
@@ -187,7 +186,7 @@ test('startup publishes before the first resolve, preserves every source, and no
   setSettingsMoveStepHookForTest(async (step: string) => {
     if (step !== 'before-publish') return
     beforePublish = true
-    expect(await absent(f.paths.marker)).toBe(true)
+    expect(await absent(f.paths.records.beside.moved)).toBe(true)
     for (const store of Object.values(f.stores))
       expect(await absent(`${store.config}.MOVED_READPLEASE`)).toBe(true)
   })
@@ -204,18 +203,136 @@ test('startup publishes before the first resolve, preserves every source, and no
       await fs.readFile(`${store.config}.MOVED_READPLEASE`, 'utf8'),
     ).toContain(f.paths.target)
   }
-  const service = await openSettingsService({ file: started.paths.target })
+  const service = await openSettingsService({
+    file: started.paths.target,
+    records: started.paths.records,
+  })
   cleanup.push(() => service?.dispose())
   expect(service?.resolve('opencode').dump_enabled).toBe(true)
-  expect(JSON.parse(await fs.readFile(f.paths.marker, 'utf8')).target).toBe(
-    await fs.realpath(f.paths.target),
-  )
-  expect((await fs.stat(f.paths.marker)).mode & 0o777).toBe(0o600)
+  expect(
+    JSON.parse(await fs.readFile(f.paths.records.beside.moved, 'utf8')).target,
+  ).toBe(await fs.realpath(f.paths.target))
+  expect((await fs.stat(f.paths.records.beside.moved)).mode & 0o777).toBe(0o600)
+  const { beside, state } = started.paths.records
+  if (!state) throw new Error('Missing state layout')
+  for (const [oldPath, newPath] of [
+    [beside.moved, state.moved],
+    [beside.imports.opencode, state.imports.opencode],
+    [beside.imports.pi, state.imports.pi],
+  ] as const) {
+    expect(await fs.readFile(newPath, 'utf8')).toBe(
+      await fs.readFile(oldPath, 'utf8'),
+    )
+  }
   // Restart authority is the marker, not the informational notes or stale stores.
   await fs.unlink(f.paths.target)
   f.reads.length = 0
   expect((await f.start()).outcome).toBe('marker-present')
   expect(f.reads).toEqual([])
+})
+
+test('a refused state folder warns once and publishes only beside the settings file', async () => {
+  const f = await fixture()
+  const directory = f.paths.records.state!.directory
+  await fs.mkdir(dirname(directory), { recursive: true })
+  await fs.writeFile(directory, 'not a directory')
+  await put(f.paths.target, { killswitch_enabled: true })
+  const started = await f.start()
+  expect(started.mode).toBe('user-file')
+  expect(started.paths.records.state).toBeUndefined()
+  const service = await openSettingsService({
+    file: started.paths.target,
+    records: started.paths.records,
+    host: 'opencode',
+    adopted: () => true,
+  })
+  await service?.dispose()
+  await f.start()
+  const { beside } = started.paths.records
+  for (const path of [beside.moved, beside.imports.opencode, beside.applied])
+    expect(await absent(path)).toBe(false)
+  expect(await fs.readFile(directory, 'utf8')).toBe('not a directory')
+  expect(f.messages.filter((message) => message.includes(directory))).toEqual([
+    `Cannot use settings record folder "${directory}"; keeping records beside the settings file.`,
+  ])
+})
+
+test('the 2.17.1 reader sees all four records and keeps both hosts protected after deletion', async () => {
+  const f = await fixture()
+  for (const store of Object.values(f.stores)) {
+    await put(store.config, { killswitch: { enabled: false } })
+  }
+  const moved = await f.start()
+  expect(moved.outcome).toBe('moved')
+  const { target, records } = moved.paths
+  for (const host of ['opencode', 'pi'] as const) {
+    const service = await openSettingsService({
+      file: target,
+      records,
+      host,
+      adopted: () => true,
+    })
+    if (!service) throw new Error('Expected settings service')
+    try {
+      if (host === 'opencode')
+        await service.update(
+          [
+            { setting: 'killswitch_enabled', value: true },
+            { setting: 'killswitch_default_five_hour', value: 73 },
+            { setting: 'quota_minimum_remaining_seven_day', value: 55 },
+          ],
+          host,
+        )
+    } finally {
+      await service.dispose()
+    }
+  }
+  expect(await fs.readFile(records.state!.applied, 'utf8')).toBe(
+    await fs.readFile(records.beside.applied, 'utf8'),
+  )
+  await fs.unlink(target)
+  expect(await publishedSettingsMode(target)).toBe('user-file')
+  for (const host of ['opencode', 'pi'] as const) {
+    expect(await publishedHasImportRecord(target, host)).toBe(true)
+    const values = await publishedReadProtectionCopy(target, host)
+    expect(values).toMatchObject({
+      killswitch_enabled: true,
+      killswitch_default_five_hour: 73,
+      quota_minimum_remaining_seven_day: 55,
+    })
+    if (!values)
+      throw new Error(
+        'Expected the published reader to recover a protection copy',
+      )
+    const storage = overlaySettingsProtection(
+      { version: 1, accounts: [], killswitch: { enabled: false } },
+      { ...values, refusal_fallback: 'client' },
+      host,
+    ) as AccountStorage
+    const now = Date.now()
+    const window = (remainingPercent: number) => ({
+      checkedAt: now,
+      remainingPercent,
+      usedPercent: 100 - remainingPercent,
+    })
+    const blocks: string[] = []
+    const weight = (short: number, week: number) =>
+      stickyRouteCandidateWeight({
+        family: 'general',
+        now,
+        storage,
+        candidate: {
+          accountId: 'main',
+          order: 0,
+          quota: { five_hour: window(short), seven_day: window(week) },
+        },
+        onPolicyBlock: (limit) => blocks.push(limit),
+      })
+    expect(weight(60, 90)).toBe(0)
+    expect(weight(90, 50)).toBe(0)
+    expect(weight(90, 90)).toBeGreaterThan(0)
+    expect(blocks).toEqual(['killswitch', 'quota-floor'])
+  }
 })
 
 test('startup moves settings and writes the marker despite many malformed old port files from dead writers', async () => {
@@ -251,9 +368,9 @@ test('startup moves settings and writes the marker despite many malformed old po
   expect(parse(await fs.readFile(f.paths.target, 'utf8')).dump_enabled).toBe(
     true,
   )
-  expect(JSON.parse(await fs.readFile(f.paths.marker, 'utf8')).target).toBe(
-    await fs.realpath(f.paths.target),
-  )
+  expect(
+    JSON.parse(await fs.readFile(f.paths.records.beside.moved, 'utf8')).target,
+  ).toBe(await fs.realpath(f.paths.target))
   for (const { file, bytes, mtimeMs } of leftovers) {
     expect(await fs.readFile(file, 'utf8')).toBe(bytes)
     expect((await fs.stat(file)).mtimeMs).toBe(mtimeMs)
@@ -268,7 +385,7 @@ for (const host of ['opencode', 'pi'] as const) {
     expect(parse(await fs.readFile(f.paths.target, 'utf8'))).toEqual({
       schema_version: 1,
     })
-    expect(await absent(f.paths.marker)).toBe(false)
+    expect(await absent(f.paths.records.beside.moved)).toBe(false)
     for (const store of Object.values(f.stores)) {
       expect(await absent(`${store.config}.MOVED_READPLEASE`)).toBe(true)
       expect(
@@ -279,7 +396,10 @@ for (const host of ['opencode', 'pi'] as const) {
     f.reads.length = 0
     expect((await f.start()).outcome).toBe('marker-present')
     expect(f.reads.every((path) => path === f.paths.target)).toBe(true)
-    const service = await openSettingsService({ file: started.paths.target })
+    const service = await openSettingsService({
+      file: started.paths.target,
+      records: started.paths.records,
+    })
     cleanup.push(() => service?.dispose())
     expect(service?.resolve(host).killswitch_enabled).toBe(false)
     await service?.update(
@@ -309,7 +429,7 @@ test('concurrent starts have one winner and publish one target and marker', asyn
     ),
   ).toBe(true)
   expect(starts.every((start) => start.mode === 'user-file')).toBe(true)
-  expect(await absent(f.paths.marker)).toBe(false)
+  expect(await absent(f.paths.records.beside.moved)).toBe(false)
 })
 
 for (const failure of ['parse', 'read'] as const) {
@@ -336,7 +456,7 @@ for (const failure of ['parse', 'read'] as const) {
       ),
     ).toHaveLength(1)
     expect(await absent(f.paths.target)).toBe(true)
-    expect(await absent(f.paths.marker)).toBe(true)
+    expect(await absent(f.paths.records.beside.moved)).toBe(true)
     expect(await absent(`${f.stores.opencode.config}.MOVED_READPLEASE`)).toBe(
       true,
     )
@@ -441,7 +561,7 @@ for (const release of [
     expect(started.outcome).toBe('fence-closed')
     expect(f.reads).toEqual([])
     expect(await absent(f.paths.target)).toBe(true)
-    expect(await absent(f.paths.marker)).toBe(true)
+    expect(await absent(f.paths.records.beside.moved)).toBe(true)
     const store = createNativePoolStore({
       paths: f.stores.opencode,
       quota: nativeQuotaCodec,
@@ -513,7 +633,7 @@ test('an older holder registering while the move waits for its holder locks keep
   )
   expect((await started)?.outcome).toBe('fence-closed')
   expect(await absent(f.paths.target)).toBe(true)
-  expect(await absent(f.paths.marker)).toBe(true)
+  expect(await absent(f.paths.records.beside.moved)).toBe(true)
 })
 
 for (const proof of ['dead writer', 'pre-boot mtime'] as const) {
@@ -551,7 +671,7 @@ for (const proof of ['dead writer', 'pre-boot mtime'] as const) {
     )
     expect((await started)?.outcome).toBe('fence-closed')
     expect(await absent(f.paths.target)).toBe(true)
-    expect(await absent(f.paths.marker)).toBe(true)
+    expect(await absent(f.paths.records.beside.moved)).toBe(true)
     expect(await fs.readFile(file, 'utf8')).toBe(bytes)
   })
 }
@@ -657,14 +777,16 @@ test('a named target does not suppress the default target move or overwrite an e
   }
   const named = await f.start()
   expect(named.outcome).toBe('moved')
-  const marker = await fs.readFile(named.paths.marker, 'utf8')
+  const marker = await fs.readFile(named.paths.records.beside.moved, 'utf8')
   const note = await fs.readFile(
     `${f.stores.opencode.config}.MOVED_READPLEASE`,
     'utf8',
   )
   f.options.env = { ...f.options.env, ANTHROPIC_AUTH_SETTINGS_FILE: undefined }
   expect((await f.start()).outcome).toBe('moved')
-  expect(await fs.readFile(named.paths.marker, 'utf8')).toBe(marker)
+  expect(await fs.readFile(named.paths.records.beside.moved, 'utf8')).toBe(
+    marker,
+  )
   expect(
     await fs.readFile(`${f.stores.opencode.config}.MOVED_READPLEASE`, 'utf8'),
   ).toBe(note)
@@ -691,7 +813,7 @@ for (const failure of ['custody', 'seeding'] as const) {
     expect(started.outcome).toBe('source-unavailable')
     expect(f.messages).toHaveLength(1)
     expect(await absent(f.paths.target)).toBe(true)
-    expect(await absent(f.paths.marker)).toBe(true)
+    expect(await absent(f.paths.records.beside.moved)).toBe(true)
   })
 }
 
@@ -721,7 +843,7 @@ test('source lock timeout never marks the target and legacy reads remain availab
       expect(started.mode).toBe('legacy')
       expect(f.messages).toHaveLength(1)
       expect(await absent(f.paths.target)).toBe(true)
-      expect(await absent(f.paths.marker)).toBe(true)
+      expect(await absent(f.paths.records.beside.moved)).toBe(true)
     },
   )
   const store = createNativePoolStore({
@@ -749,7 +871,7 @@ test('an existing user file marks authority and reports an unimported source eve
   expect(started.mode).toBe('user-file')
   expect(started.outcome).toBe('done-already')
   expect(f.reads).toEqual([f.paths.target])
-  expect(await absent(f.paths.marker)).toBe(false)
+  expect(await absent(f.paths.records.beside.moved)).toBe(false)
   expect(
     f.messages.filter((message) => message.includes('were not imported')),
   ).toEqual([expect.stringContaining(f.stores.opencode.config)])
@@ -827,7 +949,7 @@ test('simulated Windows default targets each move and publish their own marker',
     },
   }
   const roaming = await runSettingsMoveAtStartup(options)
-  const roamingMarker = files.get(roaming.paths.marker)
+  const roamingMarker = files.get(roaming.paths.records.beside.moved)
   options.env = { ...options.env, XDG_CONFIG_HOME: win32.join(home, '.config') }
   const xdg = await runSettingsMoveAtStartup(options)
   expect(roaming.paths.target).toBe(
@@ -840,13 +962,13 @@ test('simulated Windows default targets each move and publish their own marker',
   expect(preparations).toEqual(moves)
   for (const started of [roaming, xdg]) {
     expect(started.mode).toBe('user-file')
-    expect(JSON.parse(files.get(started.paths.marker)!)).toEqual({
+    expect(JSON.parse(files.get(started.paths.records.beside.moved)!)).toEqual({
       version: 1,
       target: started.paths.target,
       at: 123,
     })
   }
-  expect(files.get(roaming.paths.marker)).toBe(roamingMarker)
+  expect(files.get(roaming.paths.records.beside.moved)).toBe(roamingMarker)
   expect((await runSettingsMoveAtStartup(options)).outcome).toBe(
     'marker-present',
   )
@@ -875,14 +997,12 @@ for (const invalid of [false, true]) {
         outcome: 'import-pending',
         mayOpenService: true,
       })
-      expect(await absent(f.paths.marker)).toBe(true)
-      expect(
-        await absent(settingsImportRecordPath(f.paths.target, 'opencode')),
-      ).toBe(true)
+      expect(await absent(f.paths.records.beside.moved)).toBe(true)
+      expect(await absent(f.paths.records.beside.imports.opencode)).toBe(true)
       return
     }
     expect(started.outcome).toBe('done-already')
-    expect(await absent(f.paths.marker)).toBe(false)
+    expect(await absent(f.paths.records.beside.moved)).toBe(false)
     const records = f.messages.filter((message) =>
       message.includes('were not imported'),
     )
@@ -921,8 +1041,11 @@ for (const closed of [false, true]) {
       outcome: 'import-pending',
       mayOpenService: true,
     })
-    expect(await absent(f.paths.marker)).toBe(true)
-    const service = await openSettingsService({ file: f.paths.target })
+    expect(await absent(f.paths.records.beside.moved)).toBe(true)
+    const service = await openSettingsService({
+      file: f.paths.target,
+      records: f.paths.records,
+    })
     cleanup.push(() => service?.dispose())
     expect(service!.resolve('opencode').dump_enabled).toBe(false)
   })
@@ -938,7 +1061,10 @@ test('later starts compare only their current-mode explicit values without mergi
   expect(
     f.messages.filter((message) => message.includes('were not imported')),
   ).toHaveLength(0)
-  const service = await openSettingsService({ file: f.paths.target })
+  const service = await openSettingsService({
+    file: f.paths.target,
+    records: f.paths.records,
+  })
   await service!.update([{ setting: 'dump_enabled', value: false }], 'opencode')
   await service!.dispose()
   for (let start = 0; start < 2; start++) {
@@ -975,7 +1101,7 @@ test('later-host import writes stricter protection at its host level before reco
   expect(moved.outcome).toBe('moved')
   expect(f.reads).not.toContain(f.stores.pi.config)
   const record = (host: SettingsHost) =>
-    settingsImportRecordPath(moved.paths.target, host)
+    moved.paths.records.beside.imports[host]
   // The explicit target moved only OpenCode's store.
   expect(
     Object.keys(
@@ -990,10 +1116,16 @@ test('later-host import writes stricter protection at its host level before reco
     outcome: 'marker-present',
   })
   expect(await absent(record('pi'))).toBe(false)
+  expect(await fs.readFile(moved.paths.records.state!.imports.pi, 'utf8')).toBe(
+    await fs.readFile(record('pi'), 'utf8'),
+  )
   expect(
     parse(await fs.readFile(moved.paths.target, 'utf8')).killswitch_enabled,
   ).toEqual({ pi: true })
-  const service = await openSettingsService({ file: moved.paths.target })
+  const service = await openSettingsService({
+    file: moved.paths.target,
+    records: moved.paths.records,
+  })
   expect(service!.resolve('pi').killswitch_enabled).toBe(true)
   expect(service!.resolve('opencode').killswitch_enabled).toBe(false)
   await service!.dispose()
@@ -1018,7 +1150,10 @@ test('later-host import compares effective values: implicit killswitch floors 5/
   expect(moved.outcome).toBe('moved')
   f.options.host = 'pi'
   expect(await f.start()).toMatchObject({ mode: 'user-file' })
-  const service = await openSettingsService({ file: moved.paths.target })
+  const service = await openSettingsService({
+    file: moved.paths.target,
+    records: moved.paths.records,
+  })
   cleanup.push(() => service?.dispose())
   expect(service!.resolve('pi')).toMatchObject({
     killswitch_enabled: true,
@@ -1046,6 +1181,7 @@ test('later-host import refuses a concurrent protection change without writing o
   let raced = false
   const interceptor = await openSettingsService({
     file: moved.paths.target,
+    records: moved.paths.records,
     dependencies: {
       open: (config) => {
         const handle = openSettings(settingsDefinition, config)
@@ -1070,9 +1206,7 @@ test('later-host import refuses a concurrent protection change without writing o
   })
   expect(raced).toBe(true)
   expect(await io.readFile(moved.paths.target, 'utf8')).toBe(tightened)
-  expect(await absent(settingsImportRecordPath(moved.paths.target, 'pi'))).toBe(
-    true,
-  )
+  expect(await absent(moved.paths.records.beside.imports.pi)).toBe(true)
   expect(
     f.messages.filter((message) =>
       message.includes('writing its legacy protection'),
@@ -1080,9 +1214,7 @@ test('later-host import refuses a concurrent protection change without writing o
   ).toHaveLength(1)
   await interceptor?.dispose()
   expect(await f.start()).toMatchObject({ mode: 'user-file' })
-  expect(await absent(settingsImportRecordPath(moved.paths.target, 'pi'))).toBe(
-    false,
-  )
+  expect(await absent(moved.paths.records.beside.imports.pi)).toBe(false)
 })
 
 test('an import check whose file turns unusable while the legacy store is read neither records the import nor adopts the file', async () => {
@@ -1098,7 +1230,10 @@ test('an import check whose file turns unusable while the legacy store is read n
       // legacy store; the startup lease publishes the unusable reading and
       // serves its recovered set instead of the file's.
       await fs.writeFile(f.paths.target, '{broken')
-      const observer = await openSettingsService({ file: f.paths.target })
+      const observer = await openSettingsService({
+        file: f.paths.target,
+        records: f.paths.records,
+      })
       await observer!.refresh()
       expect(observer!.snapshot().status).toBe('unparseable')
       await observer!.dispose()
@@ -1111,17 +1246,16 @@ test('an import check whose file turns unusable while the legacy store is read n
     mayOpenService: true,
   })
   expect(published).toBe(true)
-  expect(
-    await absent(settingsImportRecordPath(f.paths.target, 'opencode')),
-  ).toBe(true)
+  expect(await absent(f.paths.records.beside.imports.opencode)).toBe(true)
   // Once the save finishes, the next check imports the stricter legacy
   // killswitch before adopting the file.
   await put(f.paths.target, weaker)
   expect(await f.start()).toMatchObject({ mode: 'user-file' })
-  expect(
-    await absent(settingsImportRecordPath(f.paths.target, 'opencode')),
-  ).toBe(false)
-  const service = await openSettingsService({ file: f.paths.target })
+  expect(await absent(f.paths.records.beside.imports.opencode)).toBe(false)
+  const service = await openSettingsService({
+    file: f.paths.target,
+    records: f.paths.records,
+  })
   cleanup.push(() => service?.dispose())
   expect(service!.resolve('opencode').killswitch_enabled).toBe(true)
 })
@@ -1132,9 +1266,7 @@ test('a default-target move records both hosts, so a later start adopts without 
   await put(f.stores.pi.config, { killswitch: { enabled: true } })
   expect((await f.start()).outcome).toBe('moved')
   for (const host of ['opencode', 'pi'] as const)
-    expect(await absent(settingsImportRecordPath(f.paths.target, host))).toBe(
-      false,
-    )
+    expect(await absent(f.paths.records.beside.imports[host])).toBe(false)
   f.options.host = 'pi'
   expect(await f.start()).toMatchObject({
     mode: 'user-file',
@@ -1147,9 +1279,7 @@ test('a hand-made file is adopted and recorded when the host store protects no m
   await put(f.stores.opencode.config, { killswitch: { enabled: true } })
   await put(f.paths.target, { schema_version: 1, killswitch_enabled: true })
   expect(await f.start()).toMatchObject({ mode: 'user-file' })
-  expect(
-    await absent(settingsImportRecordPath(f.paths.target, 'opencode')),
-  ).toBe(false)
+  expect(await absent(f.paths.records.beside.imports.opencode)).toBe(false)
 })
 
 test('a peer store with unreadable custody keeps the start in legacy, and a later start moves its protection', async () => {
@@ -1163,7 +1293,7 @@ test('a peer store with unreadable custody keeps the start in legacy, and a late
   const first = await f.start()
   expect(first).toMatchObject({ mode: 'legacy', outcome: 'source-unavailable' })
   expect(await absent(f.paths.target)).toBe(true)
-  expect(await absent(f.paths.marker)).toBe(true)
+  expect(await absent(f.paths.records.beside.moved)).toBe(true)
   expect(await absent(`${f.stores.opencode.config}.MOVED_READPLEASE`)).toBe(
     true,
   )
@@ -1174,7 +1304,10 @@ test('a peer store with unreadable custody keeps the start in legacy, and a late
   ).toHaveLength(1)
   f.options.readMode = async () => 'local'
   expect((await f.start()).outcome).toBe('moved')
-  const service = await openSettingsService({ file: f.paths.target })
+  const service = await openSettingsService({
+    file: f.paths.target,
+    records: f.paths.records,
+  })
   cleanup.push(() => service?.dispose())
   expect(service!.resolve('pi').killswitch_enabled).toBe(true)
   expect(service!.resolve('opencode').dump_enabled).toBe(true)
@@ -1190,7 +1323,7 @@ for (const local of ['absent', 'present'] as const) {
     const started = await f.start()
     if (local === 'absent') {
       expect(started).toMatchObject({ mode: 'user-file', outcome: 'moved' })
-      expect(await absent(f.paths.marker)).toBe(false)
+      expect(await absent(f.paths.records.beside.moved)).toBe(false)
     } else {
       expect(started).toMatchObject({
         mode: 'legacy',
@@ -1209,7 +1342,7 @@ test('a peer with no store is still skipped when its custody is unreadable', asy
     return 'local'
   }
   expect((await f.start()).outcome).toBe('moved')
-  expect(await absent(f.paths.marker)).toBe(false)
+  expect(await absent(f.paths.records.beside.moved)).toBe(false)
 })
 
 for (const sources of ['none', 'other-target-note'] as const) {
@@ -1242,3 +1375,12 @@ for (const sources of ['none', 'other-target-note'] as const) {
       )
   })
 }
+
+import type { AccountStorage } from '../accounts.ts'
+import { overlaySettingsProtection } from '../settings-record.ts'
+import { stickyRouteCandidateWeight } from '../sticky-routing.ts'
+import {
+  publishedHasImportRecord,
+  publishedReadProtectionCopy,
+  publishedSettingsMode,
+} from './settings-rollback-v2.17.1.ts'

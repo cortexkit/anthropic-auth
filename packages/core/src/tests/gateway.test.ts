@@ -35,6 +35,7 @@ import {
 } from '../oauth-origin.ts'
 import { settingsDefinition } from '../settings-definition.ts'
 import { openSettingsService } from '../settings-service.ts'
+import { settingsTestPaths } from './settings-record-paths-fixture.ts'
 
 const SECRET = 'gw-header-secret-canary'
 const originalFetch = globalThis.fetch
@@ -291,6 +292,7 @@ async function settingsFixture(
   await prepare?.(root, file)
   const service = await openSettingsService({
     file,
+    records: (await settingsTestPaths(file)).records,
     dependencies: {
       gatewaySettingsFile: () => defaultFile(root, file),
       open: (options) => {
@@ -589,8 +591,9 @@ test('the gateway settings file comes from the OS account, never from HOME, USER
         const { gatewaySettingsFile } = await import(${modulePath('gateway.ts')})
         const { openSettingsService } = await import(${modulePath('settings-service.ts')})
         const { createNativeRuntimeSettings } = await import(${modulePath('native-runtime-settings.ts')})
+        const { settingsTestPaths } = await import(${modulePath('tests/settings-record-paths-fixture.ts')})
         const file = process.env.ANTHROPIC_AUTH_SETTINGS_FILE
-        const service = await openSettingsService({ file })
+        const service = await openSettingsService({ file, records: (await settingsTestPaths(file)).records })
         const reader = createNativeRuntimeSettings({
           host: 'opencode',
           settingsService: service,

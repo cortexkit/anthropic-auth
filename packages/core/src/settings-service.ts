@@ -29,7 +29,11 @@ import {
   settingsCheckPendingText,
   settingsDefinition,
 } from './settings-definition.ts'
-import type { SettingsHost } from './settings-paths.ts'
+import {
+  type SettingsHost,
+  type SettingsRecordPaths,
+  settingsRecordLocations,
+} from './settings-paths.ts'
 import {
   readSettingsProtectionCopy,
   writeSettingsProtectionCopy,
@@ -188,6 +192,7 @@ export interface SettingsGeneration {
 }
 
 export interface SettingsService {
+  readonly records: SettingsRecordPaths
   readonly file: string
   /** An independently disposable reference; settings stay live until all references are disposed. */
   retain(): SettingsService
@@ -224,6 +229,7 @@ export type SettingsChangeListener = (
 type CoreSettingsHandle = SettingsHandle<typeof settingsDefinition.settings>
 export interface SettingsServiceOptions {
   file: string
+  records: SettingsRecordPaths
   /** Acting host: enables persistence and startup recovery of only its own copy set. */
   host?: SettingsHost
   separateInstall?: boolean
@@ -1420,7 +1426,7 @@ class SharedSettingsService {
  * be read is skipped whole; keys are never mixed across sources.
  */
 export async function recoverSettingsProtection(
-  file: string,
+  records: SettingsRecordPaths | undefined,
   host: SettingsHost,
   recovery: SettingsProtectionRecovery = {},
   actingHost?: SettingsHost,
@@ -1429,8 +1435,8 @@ export async function recoverSettingsProtection(
     [
       1,
       recovery.readAppliedCopy ??
-        (actingHost === host
-          ? () => readSettingsProtectionCopy(file, host)
+        (records && actingHost === host
+          ? () => readSettingsProtectionCopy(records, host)
           : undefined),
     ],
     [2, recovery.readLegacyProtection],
@@ -1473,7 +1479,7 @@ class SettingsProtectionLease {
   constructor(
     private readonly shared: SharedSettingsService,
     private readonly recovery: SettingsProtectionRecovery = {},
-    private readonly options?: SettingsServiceOptions,
+    private readonly options: SettingsServiceOptions,
   ) {}
 
   /** Whether the acting host uses the file; see `SettingsServiceOptions.adopted`. */
@@ -1545,7 +1551,7 @@ class SettingsProtectionLease {
   }
 
   private write(entry: NonNullable<SettingsProtectionLease['unsaved']>) {
-    const host = this.options?.host
+    const { host, records } = this.options
     if (!host || this.closed) return
     const { identity } = entry
     this.copied = identity
@@ -1557,7 +1563,7 @@ class SettingsProtectionLease {
     const task = Promise.resolve()
       .then(() =>
         write(
-          entry.file,
+          records,
           host,
           { readAt: entry.readAt, values: entry.values },
           this.options?.lockTimeoutMs,
@@ -1572,7 +1578,7 @@ class SettingsProtectionLease {
           logged.add(key)
           logger.warn(
             'settings',
-            `Could not save applied protection settings for ${host} at "${entry.file}.applied.json"; the previous copy is unchanged until a retry succeeds.`,
+            `Could not save applied protection settings for ${host} ${settingsRecordLocations(records)}; the save will be retried.`,
           )
         }
         // Not done: the next generation or a retry within a minute submits again.
@@ -1647,7 +1653,7 @@ class SettingsProtectionLease {
     const readCopy =
       this.recovery.readAppliedCopy ??
       ((peer: SettingsHost) =>
-        readSettingsProtectionCopy(this.shared.file, peer))
+        readSettingsProtectionCopy(this.options.records, peer))
     try {
       const values = await readCopy(host)
       if (values) return { values, rung: 1 }
@@ -1719,7 +1725,7 @@ class SettingsProtectionLease {
           : previous
     }
     return recoverSettingsProtection(
-      this.shared.file,
+      this.options.records,
       host,
       this.recovery,
       this.options?.host,
@@ -1774,6 +1780,7 @@ function referenceCountedSettingsService(
     }
     return {
       file: service.file,
+      records: service.records,
       retain() {
         use()
         return reference()
@@ -1865,6 +1872,7 @@ export async function openSettingsService(
   }
   return referenceCountedSettingsService({
     file,
+    records: options.records,
     resolve(host, model) {
       use()
       const context = lease.snapshot().contexts[host]

@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import {
   openSettings,
   SettingsRefusal,
@@ -44,6 +44,7 @@ import {
 import { legacySettingsProtection } from '../settings-protection-legacy.ts'
 import { openSettingsService } from '../settings-service.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
+import { settingsTestPaths } from './settings-record-paths-fixture.ts'
 
 const cleanup: (() => void | Promise<void>)[] = []
 afterEach(async () => {
@@ -104,6 +105,7 @@ async function fixture(
   let adopted = options.adopted ?? !(options.adoption || options.importPending)
   const service = await openSettingsService({
     file,
+    records: (await settingsTestPaths(file)).records,
     host: options.host ?? 'opencode',
     adopted: () => adopted,
     dependencies: {
@@ -253,6 +255,7 @@ async function fixture(
 async function adoptPeer(file: string) {
   const peer = await openSettingsService({
     file,
+    records: (await settingsTestPaths(file)).records,
     host: 'pi',
     adopted: () => true,
   })
@@ -287,6 +290,26 @@ test('menu writes only cache_keep_subagents and preserves real JSONC comments, o
   ])
   expect(await f.runtime.getSettingsPath()).toBe(f.file)
 })
+
+for (const missing of [false, true]) {
+  test(`a ${missing ? 'recreating' : 'regular'} protection menu write saves both applied records`, async () => {
+    const f = await fixture('{"killswitch_enabled":false}')
+    if (missing) await rm(f.file)
+    const result = await f.runtime.updateSettings((settings) => {
+      settings.killswitch = { enabled: true, main: { five_hour: 81 } }
+    })
+    expect(result.outcome).toBe('saved')
+    await f.runtime.close()
+    await f.service.dispose()
+    const { beside, state } = f.service.records
+    const applied = await readFile(beside.applied, 'utf8')
+    expect(await readFile(state!.applied, 'utf8')).toBe(applied)
+    expect(JSON.parse(applied).opencode.values).toMatchObject({
+      killswitch_enabled: true,
+      killswitch_default_five_hour: 81,
+    })
+  })
+}
 
 test('flat writes use the deciding host entry or override default, never a model entry, in one edit', async () => {
   const f = await fixture(
@@ -809,6 +832,7 @@ test('recreation with differing peers writes host levels and each host resolves 
   )
   const peer = await openSettingsService({
     file: f.file,
+    records: (await settingsTestPaths(f.file)).records,
     host: 'pi',
     adopted: () => true,
   })
@@ -1079,12 +1103,23 @@ test('a failed copy write never replaces the applied protection carried by a rec
   )
   await adoptPeer(f.file)
   const old = legacySettingsProtection({}, 'opencode')
-  await writeSettingsProtectionCopy(f.file, 'opencode', {
-    readAt: 1,
-    values: old,
-  })
+  await writeSettingsProtectionCopy(
+    (await settingsTestPaths(f.file)).records,
+    'opencode',
+    {
+      readAt: 1,
+      values: old,
+    },
+  )
   expect(
-    (await readSettingsProtectionCopy(f.file, 'opencode'))?.killswitch_enabled,
+    (
+      await readSettingsProtectionCopy(
+        (
+          await settingsTestPaths(f.file)
+        ).records,
+        'opencode',
+      )
+    )?.killswitch_enabled,
   ).toBe(false)
   await rm(f.file)
   const result = await f.runtime.updateSettings((settings) => {
@@ -1098,7 +1133,12 @@ test('a failed copy write never replaces the applied protection carried by a rec
   })
   await f.runtime.close()
   await f.service.dispose()
-  expect(await readSettingsProtectionCopy(f.file, 'opencode')).toEqual(old)
+  expect(
+    await readSettingsProtectionCopy(
+      (await settingsTestPaths(f.file)).records,
+      'opencode',
+    ),
+  ).toEqual(old)
   expect(
     records.filter((record) =>
       record.message.includes('Could not save applied protection'),
@@ -1194,13 +1234,14 @@ test('restart after deletion keeps user-file authority, defaults non-protection 
   await f.runtime.close()
   await f.service.dispose()
   await rm(f.file)
-  expect(await resolveSettingsMode({ target: f.file, separate: false })).toBe(
+  expect(await resolveSettingsMode(await settingsTestPaths(f.file))).toBe(
     'user-file',
   )
   const records: LogTestRecord[] = []
   __setLogTestSink((record) => records.push(record))
   const service = await openSettingsService({
     file: f.file,
+    records: (await settingsTestPaths(f.file)).records,
     host: 'opencode',
     protection: {
       readLegacyProtection: async () =>
@@ -1554,7 +1595,7 @@ for (const noSources of [false, true]) {
       log: { info: () => {}, warn: () => {} },
     })
     expect(moved.outcome).toBe('moved')
-    await writeSettingsMoveMarker(f.file)
+    await writeSettingsMoveMarker(await settingsTestPaths(f.file))
     // The service fixture suppresses watch notifications, including file creation.
     expect(
       f.runtime.resolveSettings!({ version: 1, accounts: [], ...before }).prime,
@@ -1659,7 +1700,11 @@ for (const first of ['writer', 'move'] as const) {
                   throw error
                 },
               )
-              if (writing && path.endsWith('.moved')) checked.resolve()
+              if (
+                writing &&
+                (path.endsWith('.moved') || basename(path) === 'moved')
+              )
+                checked.resolve()
               return present
             },
           },
@@ -1712,7 +1757,7 @@ for (const first of ['writer', 'move'] as const) {
         log: { info: () => {}, warn: () => {} },
       })
       expect(result.outcome).toBe('moved')
-      await writeSettingsMoveMarker(f.file)
+      await writeSettingsMoveMarker(await settingsTestPaths(f.file))
     }
     const write = () =>
       f.runtime.updateSettings((settings) => {
@@ -1778,7 +1823,11 @@ test('a legacy write waiting behind the mover redirects to the file when the tim
                 throw error
               },
             )
-            if (writing && path.endsWith('.moved')) checked.resolve()
+            if (
+              writing &&
+              (path.endsWith('.moved') || basename(path) === 'moved')
+            )
+              checked.resolve()
             return present
           },
         },
@@ -1867,7 +1916,9 @@ test('every user-file watch callback checks authority even without a new resolve
         fs: {
           exists: async (path) => {
             probes++
-            return marked && path.endsWith('.moved')
+            return (
+              marked && (path.endsWith('.moved') || basename(path) === 'moved')
+            )
           },
         },
       },

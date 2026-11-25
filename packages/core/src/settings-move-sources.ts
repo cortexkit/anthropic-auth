@@ -13,6 +13,9 @@ import {
 import { nativePoolStoreLocks } from './pool-store.ts'
 import { createSettingsMoveSource } from './settings-move-source.ts'
 import {
+  getDefaultSettingsStorePaths,
+  getSettingsFileOverride,
+  getSettingsStorePaths,
   hasPrivateSettingsConfigHome,
   resolveSettingsPaths,
   type SettingsHost,
@@ -150,18 +153,17 @@ export async function readPeerLegacySettingsProtection(
     throw new Error(
       'A move under a private config home reads only its own store, so the peer store is unknown',
     )
-  const paths = await resolveSettingsPaths(options.host, options)
-  // For the peer host, `own` is where this environment puts its store.
+  const own = getSettingsStorePaths(options.host, options)
+  const store = getDefaultSettingsStorePaths(options.host, options)
   for (const key of ['account', 'state'] as const)
     if (
-      (await canonicalPath(paths.own[key], options)) !==
-      (await canonicalPath(paths.defaults[options.host][key], options))
+      (await canonicalPath(own[key], options)) !==
+      (await canonicalPath(store[key], options))
     )
       throw new Error(
         'The peer path overrides set here leave its store unknown',
       )
-  const explicitTarget = paths.sourceRule === 'own'
-  const store = paths.defaults[options.host]
+  const explicitTarget = getSettingsFileOverride(options) !== undefined
   const mode = await (options.readMode ?? readNativeEnrollmentMode)(
     options.host,
     enrollmentEnv(options),
@@ -204,15 +206,14 @@ export async function readPeerLegacySettingsProtection(
 export async function readOwnLegacySettingsProtection(
   options: SettingsMoveSourcesOptions,
 ): Promise<SettingsProtectionValues | undefined> {
-  const paths =
-    options.paths ?? (await resolveSettingsPaths(options.host, options))
+  const own = options.paths?.own ?? getSettingsStorePaths(options.host, options)
   const mode = await (options.readMode ?? readNativeEnrollmentMode)(
     options.host,
     enrollmentEnv(options),
   )
   const pool =
     options.ownPoolPaths ??
-    (await resolveNativePoolPaths(paths.own.account, paths.own.state))
+    (await resolveNativePoolPaths(own.account, own.state))
   const read = async (config: string) => {
     try {
       return await readFile(config, 'utf8')

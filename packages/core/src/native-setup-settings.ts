@@ -26,10 +26,12 @@ import {
 } from './settings-mode.ts'
 import { readSettingsMoveSource } from './settings-move-source.ts'
 import {
+  prepareSettingsRecordPaths,
   resolveSettingsPaths,
   type SettingsHost,
   type SettingsPathOptions,
   type SettingsPaths,
+  settingsRecordLocations,
 } from './settings-paths.ts'
 import { legacySettingsProtection } from './settings-protection-legacy.ts'
 import {
@@ -71,7 +73,7 @@ export interface NativeSetupSettingsOptions extends SettingsPathOptions {
   writeLegacySettings: (settings: Record<string, unknown>) => Promise<void>
   /** Startup recovery; readLegacyProtection reads this host's active local or vault settings store. */
   protection?: SettingsProtectionRecovery
-  log?: { warn(message: string): void }
+  log?: { warn(message: string): void; info?(message: string): void }
 }
 
 type AccountFloor = SettingsValues['killswitch_account_floors'][number]
@@ -317,18 +319,21 @@ function planSetupEdits(input: {
 export async function writeNativeSetupSettings(
   options: NativeSetupSettingsOptions,
 ): Promise<NativeSetupSettingsResult> {
-  const paths =
-    options.paths ?? (await resolveSettingsPaths(options.host, options))
-  const mode = await resolveSettingsMode(paths, options.authority)
+  const warn = (message: string) => {
+    if (options.log) options.log.warn(message)
+    else logger.warn('settings', message)
+  }
+  const authority = { ...options, ...options.authority }
+  const paths = await prepareSettingsRecordPaths(
+    options.paths ?? (await resolveSettingsPaths(options.host, options)),
+    { ...authority, warn },
+  )
+  const mode = await resolveSettingsMode(paths, authority)
   const result: NativeSetupSettingsResult = {
     target: mode === 'user-file' ? 'user-file' : 'legacy-store',
     outcome: 'saved',
     skipped: [],
     differing: [],
-  }
-  const warn = (message: string) => {
-    if (options.log) options.log.warn(message)
-    else logger.warn('settings', message)
   }
   let service: Awaited<ReturnType<typeof openSettingsService>>
   let committing = false
@@ -341,8 +346,12 @@ export async function writeNativeSetupSettings(
       if (Object.keys(moved).length) await options.writeLegacySettings(moved)
       return result
     }
+    const locations = `Settings records: ${settingsRecordLocations(paths.records)}.`
+    if (options.log?.info) options.log.info(locations)
+    else logger.info('settings', locations)
     service = await openSettingsService({
       file: paths.target,
+      records: paths.records,
       host: options.host,
       protection: options.protection,
       // Setup's lease counts as adopted only for the generation setup's own
@@ -372,7 +381,7 @@ export async function writeNativeSetupSettings(
         ),
       }
     const missing = generation.status === 'missing'
-    if (!missing) await writeSettingsMoveMarker(paths.target, options.authority)
+    if (!missing) await writeSettingsMoveMarker(paths, authority)
     const values = readSettingsMoveSource(JSON.stringify(moved), {
       host: options.host,
       path: options.source,

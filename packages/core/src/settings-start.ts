@@ -18,7 +18,9 @@ import {
 import {
   getSettingsFilePath,
   getSettingsStorePaths,
+  prepareSettingsRecordPaths,
   resolveSettingsPaths,
+  SettingsPathResolutionError,
   type SettingsPaths,
 } from './settings-paths.ts'
 import {
@@ -181,8 +183,9 @@ export async function startSettings(
   // the service's lease checks this flag before saving either, whatever copy
   // writer a host's own open seam supplies.
   let adopted = false
-  const serviceOptions = (file: string): SettingsServiceOptions => ({
-    file,
+  const serviceOptions = (paths: SettingsPaths): SettingsServiceOptions => ({
+    file: paths.target,
+    records: paths.records,
     host: options.host,
     protection: options.protection,
     lockTimeoutMs: options.lockTimeoutMs,
@@ -191,18 +194,39 @@ export async function startSettings(
     adopted: () => adopted,
   })
 
-  let paths: SettingsPaths | undefined
-  const resolvePaths = async () => {
-    paths ??=
-      options.paths ?? (await resolveSettingsPaths(options.host, options))
-    return paths
-  }
   const logged = new Set<string>()
   const warnOnce = (message: string) => {
     if (logged.has(message)) return
     logged.add(message)
     if (options.log) options.log.warn(message)
     else logger.warn('settings', message)
+  }
+  let paths: SettingsPaths | undefined
+  let unresolvedPaths: SettingsPathResolutionError | undefined
+  const resolvePaths = async () => {
+    if (!paths) {
+      let resolved: SettingsPaths
+      try {
+        resolved =
+          options.paths ?? (await resolveSettingsPaths(options.host, options))
+      } catch (error) {
+        if (error instanceof SettingsPathResolutionError) {
+          unresolvedPaths = error
+          diagnostic.records = error.records
+        }
+        warnOnce(
+          'Settings file paths could not be resolved; settings startup falls back to the last applied protection settings.',
+        )
+        throw error
+      }
+      paths = await prepareSettingsRecordPaths(resolved, {
+        ...options,
+        ...options.authority,
+        warn: warnOnce,
+      })
+    }
+    diagnostic.records = paths.records
+    return paths
   }
   const adopt: SettingsAdoptionCheck = async (service) => {
     const outcome = await importSettingsHostStore(
@@ -243,9 +267,10 @@ export async function startSettings(
   let moved = false
   if (!refused) {
     try {
-      const started = await move(options)
+      const started = await move({ ...options, paths: await resolvePaths() })
       file = started.paths.target
       paths = started.paths
+      diagnostic.records = paths.records
       diagnostic.outcome = started.outcome
       diagnostic.blockers = started.blockers
       diagnostic.sourceReason = started.sourceReason
@@ -255,12 +280,12 @@ export async function startSettings(
       adopted = moved && !started.importPending
       if (!started.mayOpenService)
         return { mode: started.mode, file, diagnostic }
-      const service = track(await open(serviceOptions(file)))
+      const service = track(await open(serviceOptions(paths)))
       if (!service) return { mode: started.mode, file, diagnostic }
       if (started.importPending) markSettingsImportPending(service)
       return { mode: started.mode, file, service, diagnostic }
     } catch {
-      if (!warned) {
+      if (paths && !warned) {
         warned = true
         logger.warn(
           'settings',
@@ -272,7 +297,7 @@ export async function startSettings(
   const openService = async () => {
     if (!file) return undefined
     try {
-      return track(await open(serviceOptions(file)))
+      return track(await open(serviceOptions(await resolvePaths())))
     } catch {
       return undefined
     }
@@ -367,7 +392,7 @@ export async function startSettings(
       unknown = true
       if (!file) {
         try {
-          file = getSettingsFilePath(options)
+          file = unresolvedPaths?.target ?? getSettingsFilePath(options)
         } catch {
           // Without a path only the legacy store and the strictest set remain.
         }
@@ -377,11 +402,10 @@ export async function startSettings(
   if (mode === 'legacy') return { mode, file, reopen: reopenLegacy, diagnostic }
   if (mode !== 'user-file') return { mode, file, diagnostic }
   const recovered = await recoverSettingsProtection(
-    file,
+    paths?.records ?? unresolvedPaths?.records,
     options.host,
     options.protection,
-    // Without a file path there is no applied copy to read.
-    file ? options.host : undefined,
+    options.host,
   )
   return {
     mode,

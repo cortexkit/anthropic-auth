@@ -4,7 +4,6 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openSettings } from '@cortexkit/common-auth/settings'
-
 import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
 import { createNativePoolStore } from '../pool-store.ts'
 import { settingsDefinition } from '../settings-definition.ts'
@@ -20,6 +19,7 @@ import {
   type SettingsProtectionValues,
   type SettingsServiceOptions,
 } from '../settings-service.ts'
+import { settingsTestPaths } from './settings-record-paths-fixture.ts'
 
 const cleanup: (() => undefined | Promise<unknown>)[] = []
 afterEach(async () => {
@@ -65,6 +65,7 @@ async function fixture(source: unknown = complete, name = 'settings.jsonc') {
     file,
     typeof source === 'string' ? source : JSON.stringify(source),
   )
+  const { records } = await settingsTestPaths(file)
   const dependencies: SettingsServiceOptions['dependencies'] = {
     open: (options) => ({
       ...openSettings(settingsDefinition, options),
@@ -77,6 +78,7 @@ async function fixture(source: unknown = complete, name = 'settings.jsonc') {
   ) => {
     const service = await openSettingsService({
       file,
+      records,
       host,
       // These tests are about a host that uses the file.
       adopted: () => true,
@@ -87,7 +89,7 @@ async function fixture(source: unknown = complete, name = 'settings.jsonc') {
     cleanup.push(() => service.dispose())
     return service
   }
-  return { file, root, open }
+  return { file, root, open, records }
 }
 
 test('a copy from before refusal fallback was configurable recovers the client default', async () => {
@@ -105,14 +107,52 @@ test('a copy from before refusal fallback was configurable recovers the client d
   expect(service.resolve('pi').killswitch_default_five_hour).toBe(21)
 })
 
+test('applied records merge per host by readAt, keep old ties, and reject unreadable copies', async () => {
+  const f = await fixture()
+  const { beside, state } = f.records
+  if (!state) throw new Error('Missing state layout')
+  const { refusal_fallback, ...values } = complete
+  const entry = (readAt: number, floor: number) => ({
+    readAt,
+    refusal_fallback,
+    values: { ...values, killswitch_default_five_hour: floor },
+  })
+  const floor = async (host: SettingsHost) =>
+    (await readSettingsProtectionCopy(f.records, host))
+      ?.killswitch_default_five_hour
+  expect(await floor('pi')).toBeUndefined()
+  await writeFile(
+    state.applied,
+    JSON.stringify({ opencode: entry(4, 80), pi: entry(1, 15) }),
+  )
+  expect(await floor('opencode')).toBe(80)
+  await writeFile(beside.applied, JSON.stringify({ pi: entry(2, 70) }))
+  expect(await floor('opencode')).toBe(80)
+  expect(await floor('pi')).toBe(70)
+  await writeFile(
+    beside.applied,
+    JSON.stringify({ opencode: entry(4, 50), pi: entry(2, 70) }),
+  )
+  expect(await floor('opencode')).toBe(50)
+  await rm(state.applied)
+  expect(await floor('pi')).toBe(70)
+  await mkdir(state.applied)
+  await expect(floor('pi')).rejects.toThrow()
+  await rm(state.applied, { recursive: true })
+  await writeFile(state.applied, JSON.stringify({ pi: entry(3, 90) }))
+  await rm(beside.applied)
+  await mkdir(beside.applied)
+  await expect(floor('pi')).rejects.toThrow()
+})
+
 test('a missing settings file is not recreated from two conflicting applied fallback modes', async () => {
   const f = await fixture()
   await rm(f.file)
-  await writeSettingsProtectionCopy(f.file, 'pi', {
+  await writeSettingsProtectionCopy(f.records, 'pi', {
     readAt: 1,
     values: complete,
   })
-  await writeSettingsProtectionCopy(f.file, 'opencode', {
+  await writeSettingsProtectionCopy(f.records, 'opencode', {
     readAt: 2,
     values: { ...complete, refusal_fallback: 'server' },
   })
@@ -202,7 +242,7 @@ test('every newer rung-0 reading schedules a copy, including unchanged protectio
   expect(entries[1]!).toBeGreaterThan(entries[0]!)
   expect(entries[2]!).toBeGreaterThan(entries[1]!)
   expect(
-    (await readSettingsProtectionCopy(f.file, 'pi'))
+    (await readSettingsProtectionCopy(f.records, 'pi'))
       ?.killswitch_default_five_hour,
   ).toBe(61)
 })
@@ -241,7 +281,12 @@ test('two detached writes delayed out of order in one process keep the later rea
   expect(restart.resolve('pi').killswitch_default_five_hour).toBe(73)
 })
 
-function child(file: string, host: SettingsHost, delay = false) {
+function child(
+  file: string,
+  records: Awaited<ReturnType<typeof settingsTestPaths>>['records'],
+  host: SettingsHost,
+  delay = false,
+) {
   const serviceModule = new URL('../settings-service.ts', import.meta.url).href
   const copyModule = new URL('../settings-protection-copy.ts', import.meta.url)
     .href
@@ -252,7 +297,7 @@ function child(file: string, host: SettingsHost, delay = false) {
     import { writeSettingsProtectionCopy } from ${JSON.stringify(copyModule)};
     import { settingsDefinition } from ${JSON.stringify(definitionModule)};
     import { openSettings } from '@cortexkit/common-auth/settings';
-    const service = await openSettingsService({file:${JSON.stringify(file)},host:${JSON.stringify(host)},adopted:()=>true,dependencies:{
+    const service = await openSettingsService({file:${JSON.stringify(file)},records:${JSON.stringify(records)},host:${JSON.stringify(host)},adopted:()=>true,dependencies:{
       open: options => ({...openSettings(settingsDefinition, options),watch:()=>()=>{}}),
       writeAppliedCopy: async (...args) => {
         ${delay ? "console.log('read'); await new Promise(resolve => process.stdin.once('data',resolve)); process.stdin.pause();" : ''}
@@ -281,7 +326,7 @@ async function finished(process: ReturnType<typeof child>) {
 
 test('two same-host processes committing delayed writes out of read order keep the newer values after restart', async () => {
   const f = await fixture()
-  const older = child(f.file, 'pi', true)
+  const older = child(f.file, f.records, 'pi', true)
   const reader = older.stdout.getReader()
   expect(new TextDecoder().decode((await reader.read()).value)).toContain(
     'read',
@@ -291,7 +336,7 @@ test('two same-host processes committing delayed writes out of read order keep t
     f.file,
     JSON.stringify({ ...complete, killswitch_default_five_hour: 84 }),
   )
-  const newer = child(f.file, 'pi')
+  const newer = child(f.file, f.records, 'pi')
   await finished(newer)
   older.stdin.write('continue\n')
   older.stdin.end()
@@ -322,7 +367,7 @@ for (const reread of ['unrelated-change', 'same-bytes'] as const) {
     await written.promise
     // Process B reads the weaker file and stalls before saving its copy.
     await writeFile(f.file, JSON.stringify(weaker))
-    const b = child(f.file, 'pi', true)
+    const b = child(f.file, f.records, 'pi', true)
     const reader = b.stdout.getReader()
     expect(new TextDecoder().decode((await reader.read()).value)).toContain(
       'read',
@@ -410,7 +455,7 @@ test('a failed copy write is retried off the request path and logged once', asyn
   await retry()
   expect(pending()).toEqual([])
   await service.dispose()
-  expect(await readSettingsProtectionCopy(f.file, 'pi')).toEqual(complete)
+  expect(await readSettingsProtectionCopy(f.records, 'pi')).toEqual(complete)
   expect(
     records.filter((record) =>
       record.message.includes('Could not save applied protection'),
@@ -450,7 +495,7 @@ test('a failed copy of a stricter reading is retried after the file turns corrup
   }
   await settle(1)
   expect(
-    (await readSettingsProtectionCopy(f.file, 'pi'))
+    (await readSettingsProtectionCopy(f.records, 'pi'))
       ?.killswitch_default_five_hour,
   ).toBe(21)
   // The stricter reading's copy write fails.
@@ -487,14 +532,14 @@ for (const order of ['opencode-first', 'pi-first', 'concurrent'] as const) {
     })
     if (order === 'concurrent')
       await Promise.all([
-        finished(child(f.file, 'opencode')),
-        finished(child(f.file, 'pi')),
+        finished(child(f.file, f.records, 'opencode')),
+        finished(child(f.file, f.records, 'pi')),
       ])
     else
       for (const host of order === 'opencode-first'
         ? (['opencode', 'pi'] as const)
         : (['pi', 'opencode'] as const))
-        await finished(child(f.file, host))
+        await finished(child(f.file, f.records, host))
     await writeFile(f.file, '{broken')
     const [oc, pi] = await Promise.all([f.open('opencode'), f.open('pi')])
     expect(oc.snapshot().protection.opencode.rung).toBe(1)
@@ -531,12 +576,12 @@ for (const missing of [false, true]) {
         }
         const path = `${f.file}.applied.json`
         if (copy === 'valid')
-          await writeSettingsProtectionCopy(f.file, 'pi', {
+          await writeSettingsProtectionCopy(f.records, 'pi', {
             readAt: 1,
             values: complete,
           })
         if (copy === 'other-host-only')
-          await writeSettingsProtectionCopy(f.file, 'opencode', {
+          await writeSettingsProtectionCopy(f.records, 'opencode', {
             readAt: 1,
             values: complete,
           })
@@ -665,14 +710,18 @@ for (const contents of ['{bad-copy', 'null', '[]', '"invalid"', '17']) {
       const f = await fixture()
       await writeFile(`${f.file}.applied.json`, contents)
       // A corrupt copy is unknown, not absent: the reader throws.
-      await expect(readSettingsProtectionCopy(f.file, host)).rejects.toThrow()
-      await writeSettingsProtectionCopy(f.file, host, {
+      await expect(
+        readSettingsProtectionCopy(f.records, host),
+      ).rejects.toThrow()
+      await writeSettingsProtectionCopy(f.records, host, {
         readAt: 1,
         values: complete,
       })
-      expect(await readSettingsProtectionCopy(f.file, host)).toEqual(complete)
+      expect(await readSettingsProtectionCopy(f.records, host)).toEqual(
+        complete,
+      )
       const other = host === 'pi' ? 'opencode' : 'pi'
-      expect(await readSettingsProtectionCopy(f.file, other)).toBeUndefined()
+      expect(await readSettingsProtectionCopy(f.records, other)).toBeUndefined()
       expect(
         Object.keys(
           JSON.parse(await readFile(`${f.file}.applied.json`, 'utf8')),
@@ -684,7 +733,7 @@ for (const contents of ['{bad-copy', 'null', '[]', '"invalid"', '17']) {
 
 test('copy publication retries a transient Windows sharing violation before replacing the old set', async () => {
   const f = await fixture()
-  await writeSettingsProtectionCopy(f.file, 'pi', {
+  await writeSettingsProtectionCopy(f.records, 'pi', {
     readAt: 1,
     values: complete,
   })
@@ -694,7 +743,7 @@ test('copy publication retries a transient Windows sharing violation before repl
   let now = 0
   const sleeps: number[] = []
   await writeSettingsProtectionCopy(
-    f.file,
+    f.records,
     'pi',
     { readAt: 2, values: next },
     undefined,
@@ -713,14 +762,14 @@ test('copy publication retries a transient Windows sharing violation before repl
       },
     },
   )
-  expect(attempts).toBe(2)
+  expect(attempts).toBe(3)
   expect(sleeps).toEqual([10])
-  expect(await readSettingsProtectionCopy(f.file, 'pi')).toEqual(next)
+  expect(await readSettingsProtectionCopy(f.records, 'pi')).toEqual(next)
 })
 
 test('copy publication keeps the old set when Windows sharing violations exhaust retries', async () => {
   const f = await fixture()
-  await writeSettingsProtectionCopy(f.file, 'pi', {
+  await writeSettingsProtectionCopy(f.records, 'pi', {
     readAt: 1,
     values: complete,
   })
@@ -732,7 +781,7 @@ test('copy publication keeps the old set when Windows sharing violations exhaust
   let now = 0
   await expect(
     writeSettingsProtectionCopy(
-      f.file,
+      f.records,
       'pi',
       { readAt: 2, values: complete },
       undefined,
@@ -755,7 +804,7 @@ test('copy publication keeps the old set when Windows sharing violations exhaust
 
 test('a Windows retry rechecks copy lock ownership before attempting replacement again', async () => {
   const f = await fixture()
-  await writeSettingsProtectionCopy(f.file, 'pi', {
+  await writeSettingsProtectionCopy(f.records, 'pi', {
     readAt: 1,
     values: complete,
   })
@@ -764,7 +813,7 @@ test('a Windows retry rechecks copy lock ownership before attempting replacement
   let attempts = 0
   let now = 0
   const result = await writeSettingsProtectionCopy(
-    f.file,
+    f.records,
     'pi',
     { readAt: 2, values: complete },
     undefined,
@@ -837,28 +886,31 @@ test('whole-set copy validation rejects missing fields, bad scalars, bad entries
       `${f.file}.applied.json`,
       JSON.stringify({ pi: { readAt: 1, values } }),
     )
-    await expect(readSettingsProtectionCopy(f.file, 'pi')).rejects.toThrow()
+    await expect(readSettingsProtectionCopy(f.records, 'pi')).rejects.toThrow()
   }
   for (const readAt of [undefined, 'yesterday', -1]) {
     await writeFile(
       `${f.file}.applied.json`,
       JSON.stringify({ pi: { readAt, values: complete } }),
     )
-    await expect(readSettingsProtectionCopy(f.file, 'pi')).rejects.toThrow()
+    await expect(readSettingsProtectionCopy(f.records, 'pi')).rejects.toThrow()
   }
   // Only a copy file that doesn't exist, or has no entry for the host, is absent.
   await writeFile(
     `${f.file}.applied.json`,
     JSON.stringify({ opencode: { readAt: 1, values: complete } }),
   )
-  expect(await readSettingsProtectionCopy(f.file, 'pi')).toBeUndefined()
+  expect(await readSettingsProtectionCopy(f.records, 'pi')).toBeUndefined()
   await rm(`${f.file}.applied.json`)
-  expect(await readSettingsProtectionCopy(f.file, 'pi')).toBeUndefined()
+  expect(await readSettingsProtectionCopy(f.records, 'pi')).toBeUndefined()
   // A copy path that exists but can't be read is unknown, not absent.
   await mkdir(`${f.file}.applied.json`)
-  await expect(readSettingsProtectionCopy(f.file, 'pi')).rejects.toThrow()
+  await expect(readSettingsProtectionCopy(f.records, 'pi')).rejects.toThrow()
   await expect(
-    writeSettingsProtectionCopy(f.file, 'pi', { readAt: 1, values: complete }),
+    writeSettingsProtectionCopy(f.records, 'pi', {
+      readAt: 1,
+      values: complete,
+    }),
   ).rejects.toBeInstanceOf(Error)
   expect((await stat(`${f.file}.applied.json`)).isDirectory()).toBe(true)
 })
@@ -867,15 +919,17 @@ test('a writer preserves even an invalid other-host entry without reading it as 
   const f = await fixture('{broken')
   const other = { readAt: 123, values: { unknown: 'keep-this' } }
   await writeFile(`${f.file}.applied.json`, JSON.stringify({ opencode: other }))
-  await writeSettingsProtectionCopy(f.file, 'pi', {
+  await writeSettingsProtectionCopy(f.records, 'pi', {
     readAt: 2,
     values: complete,
   })
   expect(
     JSON.parse(await readFile(`${f.file}.applied.json`, 'utf8')).opencode,
   ).toEqual(other)
-  await expect(readSettingsProtectionCopy(f.file, 'opencode')).rejects.toThrow()
-  expect(await readSettingsProtectionCopy(f.file, 'pi')).toEqual(complete)
+  await expect(
+    readSettingsProtectionCopy(f.records, 'opencode'),
+  ).rejects.toThrow()
+  expect(await readSettingsProtectionCopy(f.records, 'pi')).toEqual(complete)
 })
 
 test('an atomic copy write failure logs once and keeps the previous copy byte-identical', async () => {
@@ -903,7 +957,7 @@ test('an atomic copy write failure logs once and keeps the previous copy byte-id
     await running.dispose()
     expect(await readFile(`${f.file}.applied.json`, 'utf8')).toBe(before)
     expect(records.map((record) => record.message)).toEqual([
-      `Could not save applied protection settings for pi at "${f.file}.applied.json"; the previous copy is unchanged until a retry succeeds.`,
+      `Could not save applied protection settings for pi beside the settings file in "${f.root}" and in "${f.records.state!.directory}"; the save will be retried.`,
     ])
   } finally {
     rename.mockRestore()

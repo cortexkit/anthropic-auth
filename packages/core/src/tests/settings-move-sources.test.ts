@@ -28,6 +28,7 @@ import {
 } from '../settings-move-sources.ts'
 import {
   getDefaultSettingsStorePaths,
+  prepareSettingsRecordPaths,
   resolveSettingsPaths,
   type SettingsHost,
 } from '../settings-paths.ts'
@@ -168,7 +169,10 @@ async function fixture(host: SettingsHost = 'opencode') {
       log: { info: () => {}, warn: (message) => messages.push(message) },
     })
     if (result.outcome === 'moved')
-      await writeSettingsMoveMarker(paths.target, options)
+      await writeSettingsMoveMarker(
+        await prepareSettingsRecordPaths(paths, options),
+        options,
+      )
     else if (result.outcome === 'busy' || result.outcome === 'failed')
       messages.push(`Settings move ${result.outcome}`)
     return {
@@ -364,7 +368,7 @@ for (const failure of ['mode', 'seed'] as const) {
     expect(f.reads).toEqual([])
     expect(f.messages).toHaveLength(1)
     expect(await absent(moved.paths.target)).toBe(true)
-    expect(await absent(moved.paths.marker)).toBe(true)
+    expect(await absent(moved.paths.records.beside.moved)).toBe(true)
     expect(await resolveSettingsMode(moved.paths, f.options)).toBe('legacy')
     expect(
       JSON.parse(await fs.readFile(f.defaults.opencode.config, 'utf8')).dump
@@ -585,7 +589,7 @@ test('a source lock timeout publishes nothing and leaves legacy values readable'
       expect(f.reads).toEqual([])
       expect(f.messages).toHaveLength(1)
       expect(await absent(moved.paths.target)).toBe(true)
-      expect(await absent(moved.paths.marker)).toBe(true)
+      expect(await absent(moved.paths.records.beside.moved)).toBe(true)
       expect(await resolveSettingsMode(moved.paths, f.options)).toBe('legacy')
     },
   )
@@ -631,7 +635,7 @@ test('a separate install prepares nothing and never probes custody or seeds a va
   expect(f.reads).toEqual([])
   expect(f.seeds()).toBe(0)
   expect(await absent(moved.paths.target)).toBe(true)
-  expect(await absent(moved.paths.marker)).toBe(true)
+  expect(await absent(moved.paths.records.beside.moved)).toBe(true)
 })
 
 for (const host of ['opencode', 'pi'] as const) {

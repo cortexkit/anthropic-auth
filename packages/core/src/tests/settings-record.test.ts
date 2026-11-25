@@ -22,6 +22,7 @@ import {
   type SettingsServiceOptions,
   type SettingsValues,
 } from '../settings-service.ts'
+import { settingsTestPaths } from './settings-record-paths-fixture.ts'
 
 const cleanup: (() => Promise<unknown>)[] = []
 afterEach(async () => {
@@ -39,6 +40,7 @@ async function fixture(
   let reads = 0
   const service = await openSettingsService({
     file,
+    records: (await settingsTestPaths(file)).records,
     ...overrides,
     dependencies: {
       readFile: async (path) => {
@@ -469,8 +471,12 @@ for (const choice of ['default', 'on', 'off'] as const) {
 }
 
 test('legacy mode and a separate install preserve booleans and absence without defaults', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'settings-record-separate-'))
+  cleanup.push(() => rm(root, { recursive: true, force: true }))
+  const file = join(root, 'not-read.jsonc')
   const separate = await openSettingsService({
-    file: '/not-read/settings.jsonc',
+    file,
+    records: (await settingsTestPaths(file)).records,
     separateInstall: true,
     dependencies: {
       readFile: async () => {

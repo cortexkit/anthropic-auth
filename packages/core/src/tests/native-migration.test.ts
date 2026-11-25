@@ -2019,7 +2019,7 @@ test('setup resume after credential commit re-decides authority when the marker 
   expect(f.calls).toEqual([])
   expect((await readNativeMigrationJournal(f.paths))?.phase).toBe('committed')
   await writeFile(f.target, '{}')
-  await writeFile(f.settingsPaths.marker, 'peer-move-marker')
+  await writeFile(f.settingsPaths.records.beside.moved, 'peer-move-marker')
   expect((await runNativeMigration(f.input)).phase).toBe('retired')
   expect(f.legacyWrites).toEqual([])
   expect(JSON.parse(await readFile(f.target, 'utf8'))).toMatchObject({

@@ -7,6 +7,7 @@ import {
   type SettingsRefusalCode,
 } from '@cortexkit/common-auth/settings'
 import { parse } from 'jsonc-parser'
+import { settingsTestPaths } from '../../../core/src/tests/settings-record-paths-fixture.ts'
 import * as commands from '../native-command'
 import { getPluginTestHandles } from './plugin-test-handles'
 import { applyMenuAction, openClaudeMenu } from './support/opencode1-client'
@@ -93,6 +94,7 @@ async function fixture(
   if (mode !== 'separate') {
     service = await core.openSettingsService({
       file,
+      records: (await settingsTestPaths(file)).records,
       host: 'opencode',
       // These menu tests are about a host that uses the file.
       adopted: () => true,

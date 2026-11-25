@@ -34,8 +34,6 @@ import {
   readThreeWayBoolean,
   registerNativePoolHolder,
   resolveNativePoolPaths,
-  resolveSettingsPaths,
-  type SettingsPaths,
   setDumpEnabled,
   setLogLevel,
   signRequestBody,
@@ -364,31 +362,15 @@ export async function setupAnthropicAuth(
         OPENCODE_ANTHROPIC_AUTH_STATE_FILE: paths.legacyState,
       }
     : env
-  // A failure to resolve the settings paths must not abort this start:
-  // startSettings then resolves them itself and falls back as for any other
-  // settings startup failure. Only fixed text is logged, since the error may
-  // name a path.
-  let settingsPaths: SettingsPaths | undefined
-  try {
-    settingsPaths = await resolveSettingsPaths('opencode', {
-      env: settingsEnv,
-    })
-  } catch {
-    logger.warn(
-      'settings',
-      'Settings file paths could not be resolved; settings startup falls back to the last applied protection settings.',
-    )
-  }
   // The reload key only tells plugin instances apart; it is never resolved as
-  // a path. Without any settings path it records null, never an empty string,
-  // which path code would resolve against the working directory.
-  let settingsTarget = settingsPaths?.target
-  if (settingsTarget === undefined)
-    try {
-      settingsTarget = getSettingsFilePath({ env: settingsEnv })
-    } catch {
-      // Leave it undefined; startSettings resolves the path itself.
-    }
+  // a path. Name the target without touching disk; startSettings resolves the
+  // records only after its credential preflight passes.
+  let settingsTarget: string | undefined
+  try {
+    settingsTarget = getSettingsFilePath({ env: settingsEnv })
+  } catch {
+    // Leave it undefined; startSettings handles resolution failure.
+  }
   const requests = createReloadableRequestHooks(
     ctx,
     JSON.stringify([
@@ -416,7 +398,6 @@ export async function setupAnthropicAuth(
   const settingsStartup = await startSettings({
     host: 'opencode',
     env: settingsEnv,
-    paths: settingsPaths,
     ownPoolPaths: paths,
     initializeVaultSettings: () =>
       withLegacy(async (legacy) => {

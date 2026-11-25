@@ -12,6 +12,7 @@ export interface SettingsMoveBlockerIdentity {
 }
 
 export interface SettingsMoveDiagnostic {
+  records?: SettingsRecordPaths
   outcome:
     | SettingsMoveStartupResult['outcome']
     | 'authority-refused'
@@ -91,15 +92,21 @@ const sourceWords: Record<
 export function formatSettingsModeStatus(options: {
   mode: SettingsMode
   file: string
+  records?: SettingsRecordPaths
   diagnostic?: SettingsMoveDiagnostic
 }): string {
   const target = options.file
     ? `\`${options.file}\``
     : 'the shared settings file'
-  if (options.mode === 'user-file') return `Settings: shared file ${target}`
   if (options.mode === 'separate')
     return 'Settings: using the old settings; this separate install keeps its own settings and does not move them to the shared file'
   const diagnostic = options.diagnostic
+  const records = options.records ?? diagnostic?.records
+  const locations = records
+    ? `\nSettings records: ${settingsRecordLocations(records)}`
+    : ''
+  if (options.mode === 'user-file')
+    return `Settings: shared file ${target}${locations}`
   const kinds = [...new Set(diagnostic?.blockers?.map(({ kind }) => kind))]
   const reason = kinds.length
     ? kinds.map((kind) => blockerWords[kind]).join('; ')
@@ -108,5 +115,10 @@ export function formatSettingsModeStatus(options: {
       : diagnostic
         ? outcomeWords[diagnostic.outcome]
         : 'the settings move to complete at a later start'
-  return `Settings: using the old settings; the move to ${target} waits for: ${reason}`
+  return `Settings: using the old settings; the move to ${target} waits for: ${reason}${locations}`
 }
+
+import {
+  type SettingsRecordPaths,
+  settingsRecordLocations,
+} from './settings-paths.ts'

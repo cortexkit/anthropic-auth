@@ -344,7 +344,7 @@ export async function writeNativeLocalSetupSettings(
       home: options.env.HOME,
       source: plan.legacyConfigPath,
       settings,
-      log: { warn: report },
+      log: { warn: report, info: report },
       writeLegacySettings: async (moved) => {
         await legacy.updateSettings((stored) => ({ ...stored, ...moved }))
       },

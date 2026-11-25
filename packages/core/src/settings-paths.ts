@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+import { lstat, mkdir } from 'node:fs/promises'
 import {
   isAbsoluteForPlatform,
   settingsFilePath,
@@ -12,10 +14,15 @@ import {
 } from './accounts.ts'
 import { logger } from './logger.ts'
 import {
+  ensureWindowsOwnerOnlyDirectory,
+  type OwnerOnlyOptions,
+} from './owner-only.ts'
+import {
   type PathResolutionOptions,
   resolvePathOptions,
 } from './path-options.ts'
 import { canonicalPath } from './pool-paths.ts'
+import { anthropicAuthStateRoot } from './state-layout-paths.ts'
 
 export type SettingsHost = 'opencode' | 'pi'
 
@@ -28,10 +35,22 @@ export interface SettingsStorePaths {
   state: string
 }
 
+interface SettingsRecordFiles {
+  directory: string
+  moved: string
+  imports: Record<SettingsHost, string>
+  applied: string
+}
+
+export interface SettingsRecordPaths {
+  beside: SettingsRecordFiles
+  state?: SettingsRecordFiles
+}
+
 export interface SettingsPaths {
   /** The configured filename; retain it for watches and writes. */
   target: string
-  marker: string
+  records: SettingsRecordPaths
   separate: boolean
   sourceRule: 'default' | 'own'
   /** Only the acting process's stores, including its overrides. */
@@ -40,9 +59,90 @@ export interface SettingsPaths {
   defaults: Record<SettingsHost, SettingsStorePaths>
 }
 
+/** The configured target is known, but its install or canonical identity is not. */
+export class SettingsPathResolutionError extends Error {
+  readonly records: SettingsRecordPaths
+
+  constructor(
+    readonly target: string,
+    beside: SettingsRecordFiles,
+    cause: unknown,
+  ) {
+    super('Could not resolve settings paths', { cause })
+    this.records = { beside }
+  }
+}
+
+function recordFiles(directory: string, prefix: string): SettingsRecordFiles {
+  return {
+    directory,
+    moved: `${prefix}moved`,
+    imports: {
+      opencode: `${prefix}moved.opencode`,
+      pi: `${prefix}moved.pi`,
+    },
+    applied: `${prefix}applied.json`,
+  }
+}
+
+const preparedRecords = new WeakMap<SettingsPaths, Promise<SettingsPaths>>()
+const warnedStateFolders = new Set<string>()
+
+/** Check the private state directory before reading or publishing records there. */
+export function prepareSettingsRecordPaths(
+  resolved: SettingsPaths,
+  options: SettingsPathOptions & { ownership?: OwnerOnlyOptions },
+): Promise<SettingsPaths> {
+  const directory = resolved.records.state?.directory
+  if (!directory) return Promise.resolve(resolved)
+  let prepared = preparedRecords.get(resolved)
+  if (!prepared) {
+    const { platform } = resolvePathOptions(options)
+    prepared = (async () => {
+      try {
+        if (
+          !(await ensureWindowsOwnerOnlyDirectory(directory, {
+            ...options.ownership,
+            platform,
+          }))
+        ) {
+          await mkdir(directory, { recursive: true, mode: 0o700 })
+          const stat = await lstat(directory)
+          if (
+            !stat.isDirectory() ||
+            (stat.mode & 0o777) !== 0o700 ||
+            (process.getuid && stat.uid !== process.getuid())
+          )
+            throw new Error('Settings record directory is not owner-only')
+        }
+        return resolved
+      } catch {
+        if (!warnedStateFolders.has(directory)) {
+          warnedStateFolders.add(directory)
+          const message = `Cannot use settings record folder "${directory}"; keeping records beside the settings file.`
+          if (options.warn) options.warn(message)
+          else logger.warn('settings', message)
+        }
+        return { ...resolved, records: { beside: resolved.records.beside } }
+      }
+    })()
+    preparedRecords.set(resolved, prepared)
+  }
+  return prepared
+}
+
+export function settingsRecordLocations(records: SettingsRecordPaths): string {
+  const beside = `beside the settings file in "${records.beside.directory}"`
+  return records.state
+    ? `${beside} and in "${records.state.directory}"`
+    : beside
+}
+
 const ignoredOverrides = new WeakMap<object, Set<string>>()
 
-function settingsOverride(options: SettingsPathOptions): string | undefined {
+export function getSettingsFileOverride(
+  options: SettingsPathOptions,
+): string | undefined {
   const { env, platform } = resolvePathOptions(options)
   const value = env.ANTHROPIC_AUTH_SETTINGS_FILE
   if (value === undefined) return undefined
@@ -81,7 +181,7 @@ export function getSettingsFilePath(options: SettingsPathOptions = {}): string {
   const context = resolvePathOptions(options)
   return settingsFilePath({
     plugin: 'anthropic-auth',
-    override: settingsOverride(options),
+    override: getSettingsFileOverride(options),
     env: context.env,
     homedir: context.home,
     platform: context.platform,
@@ -153,7 +253,7 @@ export async function isSeparateSettingsInstall(
   host: SettingsHost,
   options: SettingsPathOptions = {},
 ): Promise<boolean> {
-  if (settingsOverride(options)) return false
+  if (getSettingsFileOverride(options)) return false
   const own = getSettingsStorePaths(host, options)
   const defaults = getDefaultSettingsStorePaths(host, options)
   for (const key of ['account', 'state'] as const) {
@@ -166,24 +266,74 @@ export async function isSeparateSettingsInstall(
   return false
 }
 
+async function canonicalSettingsParent(
+  folder: string,
+  {
+    paths,
+    realpath,
+  }: Pick<ReturnType<typeof resolvePathOptions>, 'paths' | 'realpath'>,
+): Promise<string> {
+  try {
+    return await realpath(folder)
+  } catch (error) {
+    const parent = paths.dirname(folder)
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || parent === folder)
+      throw error
+    const canonical = await canonicalSettingsParent(parent, { paths, realpath })
+    return paths.join(canonical, paths.basename(folder))
+  }
+}
+
 /** Resolve once at startup; callers keep the result off the request path. */
 export async function resolveSettingsPaths(
   host: SettingsHost,
   options: SettingsPathOptions = {},
 ): Promise<SettingsPaths> {
   const target = getSettingsFilePath(options)
-  return {
-    target,
-    marker: `${target}.moved`,
-    separate: await isSeparateSettingsInstall(host, options),
-    sourceRule:
-      settingsOverride(options) || (await hasPrivateSettingsConfigHome(options))
-        ? 'own'
-        : 'default',
-    own: getSettingsStorePaths(host, options),
-    defaults: {
-      opencode: getDefaultSettingsStorePaths('opencode', options),
-      pi: getDefaultSettingsStorePaths('pi', options),
-    },
+  const context = resolvePathOptions(options)
+  const { paths, env, home } = context
+  const parent = paths.dirname(target)
+  const beside = recordFiles(parent, `${target}.`)
+  try {
+    const separate = await isSeparateSettingsInstall(host, options)
+    const records: SettingsRecordPaths = { beside }
+    if (!separate) {
+      // Resolve parent aliases but keep the configured filename, even if it is a
+      // symlink. Removing the file or symlink must not change the record key.
+      const identity = paths.join(
+        await canonicalSettingsParent(parent, context),
+        paths.basename(target),
+      )
+      const key = createHash('sha256')
+        .update(identity)
+        .digest('hex')
+        .slice(0, 16)
+      const directory = paths.join(
+        anthropicAuthStateRoot(
+          { xdgStateHome: env.XDG_STATE_HOME, home },
+          paths,
+        ),
+        'settings',
+        key,
+      )
+      records.state = recordFiles(directory, `${directory}${paths.sep}`)
+    }
+    return {
+      target,
+      records,
+      separate,
+      sourceRule:
+        getSettingsFileOverride(options) ||
+        (await hasPrivateSettingsConfigHome(options))
+          ? 'own'
+          : 'default',
+      own: getSettingsStorePaths(host, options),
+      defaults: {
+        opencode: getDefaultSettingsStorePaths('opencode', options),
+        pi: getDefaultSettingsStorePaths('pi', options),
+      },
+    }
+  } catch (error) {
+    throw new SettingsPathResolutionError(target, beside, error)
   }
 }

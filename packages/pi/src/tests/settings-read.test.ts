@@ -22,6 +22,7 @@ import { nativeAccountSettings } from '../../../core/src/native-account-view.ts'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import { promptCacheSnapshot } from '../../../core/src/tests/prompt-cache-snapshot.ts'
+import { settingsTestPaths } from '../../../core/src/tests/settings-record-paths-fixture.ts'
 import { buildAnthropicRequest } from '../convert.ts'
 import {
   closePiNativeRuntime,
@@ -225,9 +226,17 @@ test('keep-warm settings resolution uses model values from the live cached runti
 test('service awaits the move and first resolve; requests make no settings filesystem calls', async () => {
   const native = runtime()
   const service = await native.service()
+  const { records } = await core.resolveSettingsPaths('pi', {
+    env: process.env,
+    home,
+  })
+  const state = records.state!
   expect(await service.getSettingsPath()).toBe(file)
   expect(JSON.parse(await fs.readFile(`${file}.moved`, 'utf8')).target).toBe(
     file,
+  )
+  expect(await fs.readFile(state.moved, 'utf8')).toBe(
+    await fs.readFile(`${file}.moved`, 'utf8'),
   )
   expect((await native.requestView()).policyStorage.quota?.enabled).toBe(
     'default',
@@ -239,7 +248,11 @@ test('service awaits the move and first resolve; requests make no settings files
     await native.requestView(undefined, 'claude-opus-5-5[1m]')
     expect(settingsReads).toBe(before)
     expect(
-      readFile.mock.calls.filter(([path]) => String(path).startsWith(file)),
+      readFile.mock.calls.filter(
+        ([path]) =>
+          String(path).startsWith(file) ||
+          String(path).startsWith(state.directory),
+      ),
     ).toEqual([])
   } finally {
     readFile.mockRestore()
@@ -339,8 +352,15 @@ test('Pi reopens a failed legacy settings service on the authority timer without
   expect(opens).toBe(1)
   expect(ticks).toHaveLength(1)
   await write({ dump_enabled: false })
-  await core.writeSettingsMoveMarker(file, { env: process.env, home })
-  await core.writeSettingsImportRecord(file, 'pi', { env: process.env, home })
+  await core.writeSettingsMoveMarker(
+    await settingsTestPaths(file, { home, env: process.env }),
+    { env: process.env, home },
+  )
+  await core.writeSettingsImportRecord(
+    await settingsTestPaths(file, { home, env: process.env }),
+    'pi',
+    { env: process.env, home },
+  )
   unavailable = false
   await ticks[0]?.()
   expect(
@@ -365,14 +385,23 @@ test('Pi serves legacy settings after a failed import write without retrying unt
     storagePath,
   )
   await write({ killswitch_enabled: false, routing_mode: 'main-first' })
-  await core.writeSettingsMoveMarker(file, { env: process.env, home })
-  await core.writeSettingsImportRecord(file, 'opencode', {
-    env: process.env,
-    home,
-  })
+  await core.writeSettingsMoveMarker(
+    await settingsTestPaths(file, { home, env: process.env }),
+    { env: process.env, home },
+  )
+  await core.writeSettingsImportRecord(
+    await settingsTestPaths(file, { home, env: process.env }),
+    'opencode',
+    {
+      env: process.env,
+      home,
+    },
+  )
   let attempts = 0
   const failing = await core.openSettingsService({
     file,
+    records: (await settingsTestPaths(file, { home, env: process.env }))
+      .records,
     dependencies: {
       writeAppliedCopy: async () => {},
       open: (options) => {
@@ -486,11 +515,18 @@ test('Pi imports stricter legacy protection at its own level and adopts the file
     killswitch_default_five_hour: 7,
     routing_mode: 'main-first',
   })
-  await core.writeSettingsMoveMarker(file, { env: process.env, home })
-  await core.writeSettingsImportRecord(file, 'opencode', {
-    env: process.env,
-    home,
-  })
+  await core.writeSettingsMoveMarker(
+    await settingsTestPaths(file, { home, env: process.env }),
+    { env: process.env, home },
+  )
+  await core.writeSettingsImportRecord(
+    await settingsTestPaths(file, { home, env: process.env }),
+    'opencode',
+    {
+      env: process.env,
+      home,
+    },
+  )
   const paths = await resolveNativePoolPaths(storagePath)
   const legacy = await fs.readFile(paths.config, 'utf8')
   const native = runtime()
@@ -504,7 +540,11 @@ test('Pi imports stricter legacy protection at its own level and adopts the file
     JSON.parse(await fs.readFile(`${file}.moved.pi`, 'utf8')),
   ).toMatchObject({ version: 1, host: 'pi' })
   expect(await fs.readFile(paths.config, 'utf8')).toBe(legacy)
-  const settings = await core.openSettingsService({ file })
+  const settings = await core.openSettingsService({
+    file,
+    records: (await settingsTestPaths(file, { home, env: process.env }))
+      .records,
+  })
   if (!settings) throw new Error('Expected the shared settings service')
   try {
     expect(settings.resolve('pi').killswitch_enabled).toBe(true)
@@ -531,14 +571,18 @@ test('Pi keeps the stricter applied-copy floor after a moved file cannot open an
     },
     storagePath,
   )
-  await core.writeSettingsProtectionCopy(file, 'pi', {
-    readAt: Date.now(),
-    values: {
-      ...core.legacySettingsProtection({}, 'pi'),
-      killswitch_enabled: true,
-      killswitch_default_five_hour: 61,
+  await core.writeSettingsProtectionCopy(
+    (await settingsTestPaths(file, { home, env: process.env })).records,
+    'pi',
+    {
+      readAt: Date.now(),
+      values: {
+        ...core.legacySettingsProtection({}, 'pi'),
+        killswitch_enabled: true,
+        killswitch_default_five_hour: 61,
+      },
     },
-  })
+  )
   const options = settingsOptions()
   const open = options.service?.dependencies?.open
   if (!open) throw new Error('Expected the settings open test dependency')
@@ -566,6 +610,10 @@ test('Pi keeps the stricter applied-copy floor after a moved file cannot open an
   const native = runtime(options)
   await native.service()
   expect(await fs.stat(`${file}.moved`)).toBeDefined()
+  const { records } = await core.resolveSettingsPaths('pi', {
+    env: process.env,
+    home,
+  })
   const reads = spyOn(fs, 'readFile')
   try {
     const snapshot = (await native.requestView()).policyStorage
@@ -574,7 +622,11 @@ test('Pi keeps the stricter applied-copy floor after a moved file cannot open an
     expect(core.getRoutingMode(snapshot)).toBe('fallback-first')
     expect(core.isDumpPersistentlyEnabled(snapshot)).toBe(true)
     expect(
-      reads.mock.calls.filter(([path]) => String(path).startsWith(file)),
+      reads.mock.calls.filter(
+        ([path]) =>
+          String(path).startsWith(file) ||
+          String(path).startsWith(records.state!.directory),
+      ),
     ).toEqual([])
     expect(opens).toBe(2)
   } finally {
@@ -1508,7 +1560,9 @@ test('the stream applies model settings and mirrors dump_enabled from every snap
 
 for (const peer of ['never ran', 'stricter'] as const) {
   test(`Pi ${peer === 'never ran' ? 'refuses to recreate a missing explicit-target settings file when no OpenCode store is found' : "recreates a missing settings file when OpenCode's store is stricter"}`, async () => {
-    await core.writeSettingsMoveMarker(file)
+    await core.writeSettingsMoveMarker(
+      await settingsTestPaths(file, { home, env: process.env }),
+    )
     // The test preload points OpenCode's state file elsewhere; an OpenCode
     // path override set here would leave OpenCode's store unknown.
     delete process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE

@@ -44,7 +44,12 @@ import {
   readOwnLegacySettingsProtection,
   type SettingsMoveSourcesOptions,
 } from './settings-move-sources.ts'
-import { resolveSettingsPaths, type SettingsPaths } from './settings-paths.ts'
+import {
+  prepareSettingsRecordPaths,
+  resolveSettingsPaths,
+  type SettingsPaths,
+  settingsRecordLocations,
+} from './settings-paths.ts'
 import {
   openSettingsService,
   SETTINGS_PROTECTION_KEYS,
@@ -157,8 +162,7 @@ export async function importSettingsHostStore(
   const generation = service.snapshot()
   // An imported host's protection is in the file, or in its applied copy
   // while the file is unusable.
-  if (await hasSettingsImportRecord(paths.target, host, authority))
-    return 'adopt'
+  if (await hasSettingsImportRecord(paths, host, authority)) return 'adopt'
   if (generation.status === 'missing') return 'pending'
   // A file this check can't compare against must not be adopted: its values
   // would replace the legacy set, without an import, once it becomes usable.
@@ -239,7 +243,7 @@ export async function importSettingsHostStore(
     }
   }
   try {
-    await writeSettingsImportRecord(paths.target, host, authority)
+    await writeSettingsImportRecord(paths, host, authority)
   } catch {
     // Without the record the same check simply runs again next time.
   }
@@ -256,9 +260,11 @@ export async function importSettingsHostStore(
 export async function runSettingsMoveAtStartup(
   options: SettingsMoveStartupOptions,
 ): Promise<SettingsMoveStartupResult> {
-  const paths =
-    options.paths ?? (await resolveSettingsPaths(options.host, options))
   const authority = { ...options, ...options.authority }
+  const paths = await prepareSettingsRecordPaths(
+    options.paths ?? (await resolveSettingsPaths(options.host, options)),
+    { ...authority, warn: options.log?.warn ?? options.warn },
+  )
   let blockers: SettingsMoveBlockerIdentity[] = []
   const noteClosedFence = () => {
     if (loggedClosedFence) return
@@ -300,11 +306,12 @@ export async function runSettingsMoveAtStartup(
     outcome: SettingsMoveStartupResult['outcome'] | undefined,
     move?: MoveResult,
   ): Promise<SettingsMoveStartupResult> => {
-    const marked = await hasSettingsMoveMarker(paths.target, authority)
+    const marked = await hasSettingsMoveMarker(paths, authority)
     // This lease only runs the import check, before any host adopts the
     // file through it, and has no acting host whose protection it records.
     const service = await openSettingsService({
       file: paths.target,
+      records: paths.records,
       adopted: () => false,
     })
     if (!service) throw new Error('Settings service did not open')
@@ -320,9 +327,11 @@ export async function runSettingsMoveAtStartup(
         generation.protection[options.host].usable
       ) {
         try {
-          await writeSettingsMoveMarker(paths.target, authority)
+          await writeSettingsMoveMarker(paths, authority)
         } catch {
-          warn(`Could not write settings move marker ${paths.target}.moved.`)
+          warn(
+            `Could not write the settings move marker ${settingsRecordLocations(paths.records)}.`,
+          )
         }
       }
       const imported = await importSettingsHostStore(
@@ -476,17 +485,18 @@ export async function runSettingsMoveAtStartup(
     sources,
     map: mapSettingsMoveSources,
     fence: async () =>
-      !(await hasSettingsMoveMarker(paths.target, authority)) &&
-      (await fence()),
+      !(await hasSettingsMoveMarker(paths, authority)) && (await fence()),
     log: { info: () => {}, warn },
   })
   if (move.outcome === 'moved') {
     // The mover has published the file and attempted all informational notes.
     // Failure to persist the marker cannot make the published file non-authoritative.
     try {
-      await writeSettingsMoveMarker(paths.target, authority)
+      await writeSettingsMoveMarker(paths, authority)
     } catch {
-      warn(`Could not write settings move marker ${paths.target}.moved.`)
+      warn(
+        `Could not write the settings move marker ${settingsRecordLocations(paths.records)}.`,
+      )
     }
     // Every host whose store this move read now has its settings in the
     // file, including protection it held only as an implicit default (see
@@ -494,7 +504,7 @@ export async function runSettingsMoveAtStartup(
     for (const host of new Set(sources.map((source) => source.host))) {
       try {
         await writeSettingsImportRecord(
-          paths.target,
+          paths,
           host as SettingsMoveStartupOptions['host'],
           authority,
         )

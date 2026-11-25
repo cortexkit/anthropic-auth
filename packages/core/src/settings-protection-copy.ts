@@ -11,7 +11,7 @@ import {
   isRefusalFallbackMode,
   type RefusalFallbackMode,
 } from './settings-definition.ts'
-import type { SettingsHost } from './settings-paths.ts'
+import type { SettingsHost, SettingsRecordPaths } from './settings-paths.ts'
 import {
   SETTINGS_PROTECTION_KEYS,
   type SettingsProtectionValues,
@@ -99,8 +99,8 @@ function validEntry(value: unknown): value is StoredProtectionCopyEntry {
   return true
 }
 
-async function readCopy(file: string): Promise<Record<string, unknown>> {
-  const text = await readFile(`${file}.applied.json`, 'utf8')
+async function readCopy(path: string): Promise<Record<string, unknown>> {
+  const text = await readFile(path, 'utf8')
   let copy: unknown
   try {
     copy = JSON.parse(text)
@@ -120,12 +120,32 @@ async function readCopy(file: string): Promise<Record<string, unknown>> {
  * unknown set from an absent one. Never returns a partial protection set.
  */
 export async function readSettingsProtectionCopy(
-  file: string,
+  records: SettingsRecordPaths,
   host: SettingsHost,
 ): Promise<SettingsProtectionValues | undefined> {
+  const beside = await readProtectionEntry(records.beside.applied, host)
+  const state =
+    records.state && (await readProtectionEntry(records.state.applied, host))
+  // Unlike an existence marker, either unreadable copy could hide a newer
+  // set, so read errors propagate even if the other copy has a valid entry.
+  // On a tie keep the beside-file entry, the only one 2.17.x plugins can read.
+  const entry =
+    state && (!beside || state.readAt > beside.readAt) ? state : beside
+  return (
+    entry && {
+      ...entry.values,
+      refusal_fallback: entry.refusal_fallback ?? DEFAULT_REFUSAL_FALLBACK_MODE,
+    }
+  )
+}
+
+async function readProtectionEntry(
+  path: string,
+  host: SettingsHost,
+): Promise<StoredProtectionCopyEntry | undefined> {
   let text: string
   try {
-    text = await readFile(`${file}.applied.json`, 'utf8')
+    text = await readFile(path, 'utf8')
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
     throw error
@@ -137,15 +157,12 @@ export async function readSettingsProtectionCopy(
   const entry = copy[host]
   if (!validEntry(entry))
     throw new Error('The applied protection copy entry is invalid')
-  return {
-    ...entry.values,
-    refusal_fallback: entry.refusal_fallback ?? DEFAULT_REFUSAL_FALLBACK_MODE,
-  }
+  return entry
 }
 
 /** Merge only the writer's host while holding the copy's cross-process lock. */
 export async function writeSettingsProtectionCopy(
-  file: string,
+  records: SettingsRecordPaths,
   host: SettingsHost,
   entry: SettingsProtectionCopyEntry,
   lockTimeoutMs = 5_000,
@@ -155,7 +172,31 @@ export async function writeSettingsProtectionCopy(
   const stored = { readAt: entry.readAt, values, refusal_fallback }
   if (!validEntry(stored)) throw new Error('Invalid protection copy entry')
   const publication = capturePublicationOptions(publicationOptions)
-  const path = `${file}.applied.json`
+  // Keep the old copy current first. Its lock serializes writes with 2.17.x plugins.
+  await writeProtectionEntry(
+    records.beside.applied,
+    host,
+    stored,
+    lockTimeoutMs,
+    publication,
+  )
+  if (records.state)
+    await writeProtectionEntry(
+      records.state.applied,
+      host,
+      stored,
+      lockTimeoutMs,
+      publication,
+    )
+}
+
+async function writeProtectionEntry(
+  path: string,
+  host: SettingsHost,
+  entry: StoredProtectionCopyEntry,
+  lockTimeoutMs: number,
+  publication: ReturnType<typeof capturePublicationOptions>,
+): Promise<void> {
   await withLock(
     path,
     {
@@ -167,7 +208,7 @@ export async function writeSettingsProtectionCopy(
     async (lease) => {
       let copy: Record<string, unknown>
       try {
-        copy = await readCopy(file)
+        copy = await readCopy(path)
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
         copy = {}
@@ -179,7 +220,7 @@ export async function writeSettingsProtectionCopy(
       const other = host === 'opencode' ? 'pi' : 'opencode'
       const merged = {
         ...(Object.hasOwn(copy, other) ? { [other]: copy[other] } : {}),
-        [host]: stored,
+        [host]: entry,
       }
       const temp = `${path}.${process.pid}.${randomUUID()}.tmp`
       try {

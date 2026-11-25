@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import {
   lstat,
   mkdir,
@@ -34,6 +35,7 @@ import {
   getSettingsStorePaths,
   hasPrivateSettingsConfigHome,
   isSeparateSettingsInstall,
+  prepareSettingsRecordPaths,
   resolveSettingsPaths,
   type SettingsHost,
 } from '../settings-paths.ts'
@@ -115,7 +117,7 @@ test('the shared default target and both hosts defaults stay inside the supplied
     expect(paths.target).toBe(
       join(root, '.config', 'cortexkit', 'anthropic-auth.jsonc'),
     )
-    expect(paths.marker).toBe(`${paths.target}.moved`)
+    expect(paths.records.beside.moved).toBe(`${paths.target}.moved`)
     expect(paths.sourceRule).toBe('default')
     expect(paths.separate).toBe(false)
     expect(paths.defaults.opencode).toEqual({
@@ -250,7 +252,7 @@ for (const host of ['opencode', 'pi'] as const) {
       expect(paths.target).toBe(options.env.ANTHROPIC_AUTH_SETTINGS_FILE)
       expect(paths.separate).toBe(false)
       expect(paths.sourceRule).toBe('own')
-      expect(touched).toEqual([])
+      expect(touched.every((path) => path !== paths.target)).toBe(true)
       expect(paths.own.account).toBe(
         storeOverride
           ? join(root, 'own', 'accounts.json')
@@ -295,6 +297,48 @@ test('Pi directory precedence and custom state naming match the extension withou
   expect(getSettingsStorePaths('pi', options).state).toBe(
     join(root, 'custom.json.state.json'),
   )
+})
+
+test('state record paths key the canonical parent and configured leaf, not the symlink target', async () => {
+  const { root, options } = await sandbox({ XDG_STATE_HOME: 'relative-state' })
+  const alias = join(root, 'alias')
+  await symlink(root, alias, 'dir')
+  const configured = join(alias, 'settings.jsonc')
+  const identity = join(root, 'settings.jsonc')
+  const other = join(root, 'other.jsonc')
+  await writeFile(other, '{}')
+  await symlink(other, identity)
+  options.env.ANTHROPIC_AUTH_SETTINGS_FILE = configured
+  const key = createHash('sha256').update(identity).digest('hex').slice(0, 16)
+  const directory = join(
+    root,
+    '.local',
+    'state',
+    'cortexkit',
+    'anthropic-auth',
+    'settings',
+    key,
+  )
+  const expected = {
+    directory,
+    moved: join(directory, 'moved'),
+    imports: {
+      opencode: join(directory, 'moved.opencode'),
+      pi: join(directory, 'moved.pi'),
+    },
+    applied: join(directory, 'applied.json'),
+  }
+  expect(
+    (await resolveSettingsPaths('opencode', options)).records?.state,
+  ).toEqual(expected)
+  await rm(identity)
+  expect((await resolveSettingsPaths('pi', options)).records?.state).toEqual(
+    expected,
+  )
+  options.env.ANTHROPIC_AUTH_SETTINGS_FILE = other
+  expect(
+    (await resolveSettingsPaths('pi', options)).records.state?.directory,
+  ).not.toBe(directory)
 })
 
 test('canonical comparisons use aliases of the nearest existing parent for missing descendants', async () => {
@@ -364,6 +408,7 @@ for (const xdg of ['unset', 'relative', 'home-config', 'private'] as const) {
       platform: 'win32',
       env: {
         USERPROFILE: home,
+        XDG_STATE_HOME: xdg === 'private' ? 'D:\\state' : 'relative-state',
         APPDATA: win32.join(home, 'AppData', 'Roaming'),
         XDG_CONFIG_HOME:
           xdg === 'home-config'
@@ -390,6 +435,20 @@ for (const xdg of ['unset', 'relative', 'home-config', 'private'] as const) {
             : 'AppData\\Roaming'
       expect(paths.target).toBe(
         win32.join(home, base, 'cortexkit', 'anthropic-auth.jsonc'),
+      )
+      const key = createHash('sha256')
+        .update(paths.target)
+        .digest('hex')
+        .slice(0, 16)
+      const directory = win32.join(
+        xdg === 'private' ? 'D:\\state' : win32.join(home, '.local', 'state'),
+        'cortexkit',
+        'anthropic-auth',
+        'settings',
+        key,
+      )
+      expect(paths.records?.state?.applied).toBe(
+        win32.join(directory, 'applied.json'),
       )
       expect(paths.sourceRule).toBe(xdg === 'private' ? 'own' : 'default')
       expect(paths.separate).toBe(false)
@@ -427,9 +486,16 @@ test('marker publication is owner-only, target-specific and canonical before mis
   await symlink(root, alias, 'dir')
   const target = join(alias, 'not-yet', 'nested', 'settings.jsonc')
   const markerOptions = { ...options, fs, now: () => 123456789 }
-  expect(await hasSettingsMoveMarker(target, markerOptions)).toBe(false)
-  await writeSettingsMoveMarker(target, markerOptions)
-  expect(await hasSettingsMoveMarker(target, markerOptions)).toBe(true)
+  const paths = await prepareSettingsRecordPaths(
+    await resolveSettingsPaths('pi', {
+      ...options,
+      env: { ...options.env, ANTHROPIC_AUTH_SETTINGS_FILE: target },
+    }),
+    options,
+  )
+  expect(await hasSettingsMoveMarker(paths, markerOptions)).toBe(false)
+  await writeSettingsMoveMarker(paths, markerOptions)
+  expect(await hasSettingsMoveMarker(paths, markerOptions)).toBe(true)
   expect(JSON.parse(await readFile(`${target}.moved`, 'utf8'))).toEqual({
     version: 1,
     target: join(root, 'not-yet', 'nested', 'settings.jsonc'),
@@ -437,19 +503,35 @@ test('marker publication is owner-only, target-specific and canonical before mis
   })
   expect((await lstat(`${target}.moved`)).mode & 0o777).toBe(0o600)
   const bytes = await readFile(`${target}.moved`, 'utf8')
-  await writeSettingsMoveMarker(target, { ...markerOptions, now: () => 999 })
+  expect(await readFile(paths.records.state!.moved, 'utf8')).toBe(bytes)
+  expect((await lstat(paths.records.state!.moved)).mode & 0o777).toBe(0o600)
+  expect((await lstat(paths.records.state!.directory)).mode & 0o777).toBe(0o700)
+  await writeSettingsMoveMarker(paths, { ...markerOptions, now: () => 999 })
   expect(await readFile(`${target}.moved`, 'utf8')).toBe(bytes)
   const other = join(root, 'other.jsonc')
-  expect(await hasSettingsMoveMarker(other, markerOptions)).toBe(false)
+  expect(
+    await hasSettingsMoveMarker(
+      await resolveSettingsPaths('pi', {
+        ...options,
+        env: { ...options.env, ANTHROPIC_AUTH_SETTINGS_FILE: other },
+      }),
+      markerOptions,
+    ),
+  ).toBe(false)
   expect(touched.some((path) => path.endsWith('MOVED_READPLEASE'))).toBe(false)
 })
 
 test('concurrent marker publishers keep the first marker', async () => {
   const { root, options, fs } = await sandbox()
   const target = join(root, 'shared.jsonc')
+  options.env.ANTHROPIC_AUTH_SETTINGS_FILE = target
+  const paths = await prepareSettingsRecordPaths(
+    await resolveSettingsPaths('pi', options),
+    options,
+  )
   await Promise.all([
-    writeSettingsMoveMarker(target, { ...options, fs, now: () => 1 }),
-    writeSettingsMoveMarker(target, { ...options, fs, now: () => 2 }),
+    writeSettingsMoveMarker(paths, { ...options, fs, now: () => 1 }),
+    writeSettingsMoveMarker(paths, { ...options, fs, now: () => 2 }),
   ])
   const marker = JSON.parse(await readFile(`${target}.moved`, 'utf8'))
   expect([1, 2]).toContain(marker.at)
@@ -457,26 +539,69 @@ test('concurrent marker publishers keep the first marker', async () => {
   expect(marker.version).toBe(1)
 })
 
+test('move and import markers prove presence from either location without backfill', async () => {
+  const { options } = await sandbox()
+  const paths = await resolveSettingsPaths('pi', options)
+  const { beside, state } = paths.records
+  if (!state) throw new Error('Missing state layout')
+  for (const [oldPath, newPath, check] of [
+    [
+      beside.moved,
+      state.moved,
+      (input: SettingsModeFs['exists']) =>
+        hasSettingsMoveMarker(paths, { fs: { exists: input } }),
+    ],
+    [
+      beside.imports.pi,
+      state.imports.pi,
+      (input: SettingsModeFs['exists']) =>
+        hasSettingsImportRecord(paths, 'pi', { fs: { exists: input } }),
+    ],
+  ] as const) {
+    for (const [old, next, expected] of [
+      [false, false, false],
+      [true, false, true],
+      [false, true, true],
+      [true, true, true],
+      ['unreadable', true, true],
+      [true, 'unreadable', true],
+      ['unreadable', false, 'unknown'],
+      [false, 'unreadable', 'unknown'],
+    ] as const) {
+      const result = check(async (path) => {
+        expect([oldPath, newPath]).toContain(path)
+        const value = path === oldPath ? old : next
+        if (value === 'unreadable') throw new Error('unreadable')
+        return value
+      })
+      if (expected === 'unknown')
+        await expect(result).rejects.toThrow('unreadable')
+      else expect(await result).toBe(expected)
+    }
+  }
+  await expect(lstat(state.directory)).rejects.toMatchObject({ code: 'ENOENT' })
+})
+
 test('Windows marker creation delegates owner-only creation to the native backend', async () => {
   const home = 'C:\\sandbox\\home'
   const target = win32.join(home, 'missing', 'settings.jsonc')
   const writes: { path: string; bytes: string }[] = []
-  await writeSettingsMoveMarker(target, {
+  const options = {
     home,
-    env: { USERPROFILE: home },
-    platform: 'win32',
-    realpath: async (path) => {
+    env: { USERPROFILE: home, ANTHROPIC_AUTH_SETTINGS_FILE: target },
+    platform: 'win32' as const,
+    realpath: async (path: string) => {
       expect(path === home || path.startsWith(`${home}\\`)).toBe(true)
       if (path === home) return home
       throw Object.assign(new Error('absent'), { code: 'ENOENT' })
     },
     now: () => 42,
     fs: {
-      exists: async (path) => {
+      exists: async (path: string) => {
         expect(path).toBe(`${target}.moved`)
         return false
       },
-      mkdir: async (path) => {
+      mkdir: async (path: string) => {
         expect(path).toBe(win32.dirname(target))
       },
     },
@@ -488,12 +613,20 @@ test('Windows marker creation delegates owner-only creation to the native backen
         readPrivateFile: async () => {
           throw new Error('unexpected read')
         },
-        createPrivateFile: async (path, bytes) => {
+        createPrivateFile: async (
+          path: string,
+          bytes?: string | Uint8Array,
+        ) => {
           writes.push({ path, bytes: Buffer.from(bytes ?? '').toString() })
         },
       },
     },
-  })
+  }
+  const paths = await resolveSettingsPaths('pi', options)
+  await writeSettingsMoveMarker(
+    { ...paths, records: { beside: paths.records.beside } },
+    options,
+  )
   expect(writes).toHaveLength(1)
   expect(writes[0]?.path).toBe(`${target}.moved`)
   expect(JSON.parse(writes[0]?.bytes ?? '')).toEqual({
@@ -514,7 +647,10 @@ for (const file of [false, true]) {
           await writeFile(`${target}.moved`, 'existence alone is authoritative')
         expect(
           await resolveSettingsMode(
-            { target, separate: false },
+            await resolveSettingsPaths('pi', {
+              ...options,
+              env: { ...options.env, ANTHROPIC_AUTH_SETTINGS_FILE: target },
+            }),
             {
               ...options,
               fs,
@@ -531,9 +667,13 @@ test('a note never establishes authority, and a deleted file stays in user-file 
   const { root, options, fs, touched } = await sandbox()
   const target = join(root, 'settings.jsonc')
   await writeFile(join(root, 'anthropic-auth.json.MOVED_READPLEASE'), target)
-  const paths = { target, separate: false }
+  options.env.ANTHROPIC_AUTH_SETTINGS_FILE = target
+  const paths = await prepareSettingsRecordPaths(
+    await resolveSettingsPaths('pi', options),
+    options,
+  )
   expect(await resolveSettingsMode(paths, { ...options, fs })).toBe('legacy')
-  await writeSettingsMoveMarker(target, { ...options, fs })
+  await writeSettingsMoveMarker(paths, { ...options, fs })
   await writeFile(target, '{}')
   await rm(target)
   expect(await resolveSettingsMode(paths, { ...options, fs })).toBe('user-file')
@@ -549,11 +689,18 @@ test.skipIf(process.platform !== 'win32')(
     const shared = join(root, 'cortexkit')
     await mkdir(shared)
     const target = join(shared, 'anthropic-auth.jsonc')
-    await writeSettingsMoveMarker(target)
-    expect(await hasSettingsMoveMarker(target)).toBe(true)
+    const options = {
+      env: { USERPROFILE: root, ANTHROPIC_AUTH_SETTINGS_FILE: target },
+    }
+    const paths = await prepareSettingsRecordPaths(
+      await resolveSettingsPaths('pi', options),
+      options,
+    )
+    await writeSettingsMoveMarker(paths, options)
+    expect(await hasSettingsMoveMarker(paths)).toBe(true)
     // A host's import record is written the same way, beside the marker.
-    await writeSettingsImportRecord(target, 'pi')
-    expect(await hasSettingsImportRecord(target, 'pi')).toBe(true)
-    expect(await hasSettingsImportRecord(target, 'opencode')).toBe(false)
+    await writeSettingsImportRecord(paths, 'pi', options)
+    expect(await hasSettingsImportRecord(paths, 'pi')).toBe(true)
+    expect(await hasSettingsImportRecord(paths, 'opencode')).toBe(false)
   },
 )

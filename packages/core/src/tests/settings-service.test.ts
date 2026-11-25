@@ -11,7 +11,6 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openSettings } from '@cortexkit/common-auth/settings'
-
 import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
 import { CLAUDE_MODEL_CAPABILITIES } from '../model-capabilities.ts'
 import { acquireNativeAccountRuntime } from '../native-account-runtime.ts'
@@ -30,6 +29,7 @@ import {
   type SettingsProtectionValues,
   type SettingsServiceOptions,
 } from '../settings-service.ts'
+import { settingsTestPaths } from './settings-record-paths-fixture.ts'
 
 const cleanup: (() => void | Promise<void>)[] = []
 afterEach(async () => {
@@ -62,6 +62,7 @@ async function fixture(source = '{}', realWatch = false) {
   let trigger = () => {}
   let onGet: ((key: string, count: number) => Promise<void>) | undefined
   const options: SettingsServiceOptions = {
+    records: (await settingsTestPaths(file)).records,
     file,
     // A host lease opened here uses the file unless a test says otherwise.
     adopted: () => true,
@@ -346,7 +347,8 @@ for (const restore of [false, true]) {
       )
     }
     expect(
-      (await readSettingsProtectionCopy(f.file, 'pi'))?.killswitch_enabled,
+      (await readSettingsProtectionCopy(f.options.records, 'pi'))
+        ?.killswitch_enabled,
     ).toBe(!restore)
   })
 }
@@ -398,7 +400,7 @@ test('a delayed read and repeated triggers serialize passes and publish only the
   expect(service.resolve('pi').prime_enabled).toBe(true)
   await service.dispose()
   expect(
-    (await readSettingsProtectionCopy(f.file, 'pi'))
+    (await readSettingsProtectionCopy(f.options.records, 'pi'))
       ?.killswitch_default_five_hour,
   ).toBe(72)
 })
@@ -1426,7 +1428,7 @@ test('adoption saves the adopted set as the applied copy and as last-good at onc
     '{"killswitch_enabled":true,"killswitch_default_five_hour":61}',
   )
   // An older, weaker copy of OpenCode's set is all that is on disk.
-  await writeSettingsProtectionCopy(f.file, 'opencode', {
+  await writeSettingsProtectionCopy(f.options.records, 'opencode', {
     readAt: 1,
     values: weaker,
   })
