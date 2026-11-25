@@ -1457,7 +1457,8 @@ async function sendAnthropicRequestAttempt(
   const bodyMode = options.apiAccount ? 'off' : mode
   const sanitized = sanitizeClaudeCodeRequestBody(body, bodyMode)
   if (typeof body.model === 'string') physicalModel = body.model
-  if (bodyMode === 'server') applyServerSideFallbackToBody(body, true)
+  const serverSideFallbackSent =
+    bodyMode === 'server' && applyServerSideFallbackToBody(body, true).enabled
   options.onResolvedToolNames?.(toolNames)
   options.onForkEffortApplied?.(
     'forkEffortApplied' in built ? built.forkEffortApplied : undefined,
@@ -2731,17 +2732,15 @@ async function sendAnthropicRequestAttempt(
           (!!physicalRound && isFresh(piBillingPayer(physicalRound.attempt)))),
       signal: init.signal ?? undefined,
     })
-  if (
-    mode === 'server' &&
-    'fallbacks' in body &&
-    body.fallbacks === 'default' &&
-    response.ok &&
-    response.body
-  ) {
+  if (serverSideFallbackSent && response.ok && response.body) {
     const rewriter = createServerSideFallbackStreamRewriter({
-      requestedModel,
-      serverSideFallbackSent: true,
-      onOutcome: (outcome) => logServedServerFallback(relayAffinity, outcome),
+      requestedModel: physicalModel,
+      serverSideFallbackSent,
+      onOutcome: (outcome) => {
+        // Sticky routing can change the serving model without a fallback block.
+        if (outcome.fallback) threadRequest?.fail('response_fallback')
+        logServedServerFallback(relayAffinity, outcome)
+      },
     })
     const decoder = new TextDecoder()
     const encoder = new TextEncoder()
@@ -4188,6 +4187,8 @@ export function streamCortexKitAnthropic(
       const completion = createAnthropicStreamCompletion(response)
       for await (const event of parseSse(response, completion)) {
         if (event.type === 'message_start') {
+          // Keep the requested model in the transcript so Pi replays signed
+          // thinking on the next turn, even when Anthropic serves a fallback model.
           output.responseId = event.message?.id
           recordCacheUsage?.(event.message?.usage)
           updateUsage(model, output, event.message?.usage)
@@ -4207,7 +4208,9 @@ export function streamCortexKitAnthropic(
           } else if (block?.type === 'thinking') {
             output.content.push({
               type: 'thinking',
-              thinking: '',
+              // The server fallback rewriter emits marker text in the start frame.
+              thinking:
+                typeof block.thinking === 'string' ? block.thinking : '',
               thinkingSignature: '',
               index: event.index,
             } as Block)

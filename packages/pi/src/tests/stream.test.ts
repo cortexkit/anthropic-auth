@@ -25,6 +25,7 @@ import {
 import { getPiAccountStoragePath } from '../paths.ts'
 import {
   __executePiWithFallbackForTest,
+  __prewarmPiCacheKeepForTest,
   beginPiPrimaryTurn,
   buildExplicitBaseMessagesUrl,
   clearPiStickyQuotaRetries,
@@ -291,6 +292,362 @@ describe('Pi client refusal fallback', () => {
     },
   )
 })
+
+const serverFallbackSource = { ...anthropicModel, id: 'claude-fable-5-2' }
+const serverFallbackTarget = 'claude-opus-5-5'
+
+function sseFixture(frames: Record<string, unknown>[]) {
+  return new Response(
+    frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join(''),
+    { headers: { 'content-type': 'text/event-stream' } },
+  )
+}
+
+async function piServerFallbackFixture(mode: 'server' | 'off') {
+  tempDir = await mkdtemp(join(tmpdir(), 'pi-server-fallback-'))
+  const storagePath = join(tempDir, 'accounts.json')
+  process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+  await saveNativePiFixture(
+    {
+      version: 1,
+      accounts: [],
+      cacheKeep: { enabled: false },
+      quota: {
+        enabled: false,
+        checkIntervalMinutes: 5,
+        minimumRemaining: {},
+        failClosedOnUnknownQuota: false,
+      },
+    },
+    storagePath,
+  )
+  const settingsPath = join(tempDir, 'settings.jsonc')
+  await writeFile(settingsPath, JSON.stringify({ refusal_fallback: mode }))
+  const previousSettingsPath = process.env.ANTHROPIC_AUTH_SETTINGS_FILE
+  process.env.ANTHROPIC_AUTH_SETTINGS_FILE = settingsPath
+  const sessionId = `pi-server-fallback-${mode}`
+  const notices: (string | undefined)[] = []
+  const sent: {
+    text: string
+    body: Record<string, unknown>
+    beta: string[]
+  }[] = []
+  const records: LogTestRecord[] = []
+  const previousLogLevel = core.getLogLevel()
+  core.setLogLevel('debug')
+  __setLogTestSink((record) => records.push(record))
+  beginPiPrimaryTurn(storagePath, sessionId)
+  return {
+    storagePath,
+    sessionId,
+    sent,
+    records,
+    notices,
+    respond(makeResponse: (request: (typeof sent)[number]) => Response) {
+      globalThis.fetch = mock(async (input, init) => {
+        if (!String(input).includes('/v1/messages'))
+          throw new Error('Unexpected server fallback fixture request')
+        const text =
+          init?.body instanceof Uint8Array
+            ? gunzipSync(init.body).toString()
+            : String(init?.body)
+        const request = {
+          text,
+          body: JSON.parse(text),
+          beta: (new Headers(init?.headers).get('anthropic-beta') ?? '').split(
+            ',',
+          ),
+        }
+        sent.push(request)
+        return makeResponse(request)
+      }) as unknown as typeof fetch
+    },
+    send(context = anthropicContext) {
+      return streamCortexKitAnthropic(
+        serverFallbackSource,
+        context,
+        {
+          sessionId,
+          // Refusal fallback mode decides what to send, not the hook's value.
+          onPayload: (payload: unknown) => ({
+            ...(payload as object),
+            fallbacks: 'caller-value',
+          }),
+          onResponse: () => {},
+          onProviderStreamEvent: () => {},
+        },
+        undefined,
+        { setWorkingMessage: (message) => notices.push(message) },
+        'agent-loop',
+      ).result()
+    },
+    close() {
+      endPiPrimaryTurn(storagePath, sessionId, true)
+      forgetPiMessageThread(sessionId)
+      __setLogTestSink(null)
+      core.setLogLevel(previousLogLevel)
+      if (previousSettingsPath === undefined)
+        delete process.env.ANTHROPIC_AUTH_SETTINGS_FILE
+      else process.env.ANTHROPIC_AUTH_SETTINGS_FILE = previousSettingsPath
+    },
+  }
+}
+
+test('Pi server fallback replays the boundary and signed thinking but never continues the fallback thread', async () => {
+  const f = await piServerFallbackFixture('server')
+  const boundary = {
+    type: 'fallback',
+    from: { model: serverFallbackSource.id },
+    to: { model: serverFallbackTarget },
+  }
+  const iterations = [
+    {
+      type: 'message',
+      model: serverFallbackSource.id,
+      input_tokens: 3,
+      output_tokens: 2,
+    },
+    {
+      type: 'fallback_message',
+      model: serverFallbackTarget,
+      input_tokens: 4,
+      output_tokens: 6,
+    },
+  ]
+  const thinking = (index: number, text: string) => [
+    {
+      type: 'content_block_start',
+      index,
+      content_block: { type: 'thinking', thinking: '' },
+    },
+    {
+      type: 'content_block_delta',
+      index,
+      delta: { type: 'thinking_delta', thinking: text },
+    },
+    {
+      type: 'content_block_delta',
+      index,
+      delta: { type: 'signature_delta', signature: `signed-${text}` },
+    },
+    { type: 'content_block_stop', index },
+  ]
+  f.respond(({ body }) => {
+    if (body.max_tokens === 0)
+      return Response.json({ usage: { input_tokens: 1 } })
+    const turn = f.sent.length
+    return sseFixture([
+      {
+        type: 'message_start',
+        message: {
+          id: `msg_pi_server_fallback_${turn}`,
+          model: turn === 2 ? serverFallbackTarget : serverFallbackSource.id,
+          usage: { input_tokens: 3 },
+        },
+      },
+      ...(turn === 1
+        ? [
+            ...thinking(0, 'before'),
+            { type: 'content_block_start', index: 1, content_block: boundary },
+            { type: 'content_block_stop', index: 1 },
+            ...thinking(2, 'after'),
+          ]
+        : thinking(0, 'sticky')),
+      {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: {
+          output_tokens: 8,
+          ...(turn === 1 && { iterations }),
+        },
+      },
+      { type: 'message_stop' },
+    ])
+  })
+  try {
+    const first = await f.send()
+    expect(first.stopReason).toBe('stop')
+    expect(first.model).toBe(serverFallbackSource.id)
+    expect(first.content).toEqual([
+      {
+        type: 'thinking',
+        thinking: 'before',
+        thinkingSignature: 'signed-before',
+      },
+      {
+        type: 'thinking',
+        thinking: core.SERVER_FALLBACK_MARKER_TEXT,
+        thinkingSignature: `cortexkit-server-fallback-v1:${serverFallbackSource.id}|${serverFallbackTarget}`,
+      },
+      {
+        type: 'thinking',
+        thinking: 'after',
+        thinkingSignature: 'signed-after',
+      },
+      {
+        type: 'thinking',
+        thinking: core.SERVER_FALLBACK_USAGE_MARKER_TEXT,
+        thinkingSignature: `cortexkit-server-fallback-usage-v1:${JSON.stringify({ iterations })}`,
+      },
+    ])
+    const messages = [...anthropicContext.messages]
+    const appendTurn = (reply: typeof first) => {
+      messages.push(JSON.parse(JSON.stringify(reply)), {
+        role: 'user',
+        content: 'Continue.',
+        timestamp: messages.length + 1,
+      })
+      return { ...anthropicContext, messages: [...messages] }
+    }
+    const sticky = await f.send(appendTurn(first))
+    expect(sticky.stopReason).toBe('stop')
+    expect(sticky.model).toBe(serverFallbackSource.id)
+    expect((await f.send(appendTurn(sticky))).stopReason).toBe('stop')
+    expect(f.sent).toHaveLength(3)
+    expect(f.sent.map(({ body }) => body.thread)).toEqual([
+      { type: 'create' },
+      { type: 'create' },
+      { type: 'create' },
+    ])
+    const expectedReply = [
+      { type: 'thinking', thinking: 'before', signature: 'signed-before' },
+      boundary,
+      { type: 'thinking', thinking: 'after', signature: 'signed-after' },
+    ]
+    expect(f.sent[1]?.body.messages).toContainEqual({
+      role: 'assistant',
+      content: expectedReply,
+    })
+    expect(f.sent[2]?.body.messages).toContainEqual({
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'sticky', signature: 'signed-sticky' },
+      ],
+    })
+    expect(
+      f.records.filter(({ channel }) => channel === 'server-fallback'),
+    ).toMatchObject(
+      [true, false].map((handoff) => ({
+        level: 'info',
+        payload: {
+          session: f.sessionId,
+          requestedModel: serverFallbackSource.id,
+          servedModel: serverFallbackTarget,
+          handoff,
+        },
+      })),
+    )
+
+    expect(
+      await __prewarmPiCacheKeepForTest({
+        sessionId: `${f.sessionId}-warm`,
+        url: 'https://api.anthropic.com/v1/messages?beta=true',
+        headers: new Headers(),
+        bodyText: f.sent[1]!.text,
+        oauthAccountId: 'main',
+        oauthAccountIdentity: fixtureAccountIdentity('main'),
+        accountStoragePath: f.storagePath,
+      }),
+    ).toMatchObject({ ok: true })
+    expect(f.sent[3]?.body).toMatchObject({ max_tokens: 0 })
+    expect(f.sent[3]?.body.messages).toContainEqual({
+      role: 'assistant',
+      content: expectedReply,
+    })
+    for (const { body, beta, text } of f.sent) {
+      expect(body.fallbacks).toBe('default')
+      expect(beta).toContain(core.SERVER_SIDE_FALLBACK_BETA)
+      expect(text).not.toContain('cortexkit-server-fallback-')
+      expect(await core.hasValidRequestBodySignature(text)).toBe(true)
+    }
+  } finally {
+    f.close()
+  }
+})
+
+test.each([
+  { mode: 'server', tool: 'closed', stopReason: 'toolUse' },
+  { mode: 'server', tool: 'open', stopReason: 'error' },
+  { mode: 'server', tool: 'absent', stopReason: 'error' },
+  { mode: 'off', tool: 'closed', stopReason: 'error' },
+] as const)(
+  'Pi $mode mode with a $tool tool ends a refusal as $stopReason',
+  async ({ mode, tool, stopReason }) => {
+    const f = await piServerFallbackFixture(mode)
+    const token = 'synthetic-pi-server-refusal-credit'
+    f.respond(() =>
+      sseFixture([
+        {
+          type: 'message_start',
+          message: {
+            id: 'msg_pi_server_refusal',
+            model: serverFallbackSource.id,
+            usage: { input_tokens: 3 },
+          },
+        },
+        ...(tool === 'absent'
+          ? []
+          : [
+              {
+                type: 'content_block_start',
+                index: 0,
+                content_block: {
+                  type: 'tool_use',
+                  id: 'toolu_server_refusal',
+                  name: 'Read',
+                  input: {},
+                },
+              },
+              ...(tool === 'closed'
+                ? [{ type: 'content_block_stop', index: 0 }]
+                : []),
+            ]),
+        {
+          type: 'message_delta',
+          delta: {
+            stop_reason: 'refusal',
+            stop_details: {
+              type: 'refusal',
+              category: 'cyber',
+              fallback_credit_token: token,
+            },
+          },
+          usage: { output_tokens: 2 },
+        },
+        { type: 'message_stop' },
+      ]),
+    )
+    try {
+      const result = await f.send()
+      expect(result.stopReason).toBe(stopReason)
+      if (stopReason === 'toolUse') {
+        expect(result.errorMessage).toBeUndefined()
+        expect(result.content).toMatchObject([
+          { type: 'toolCall', id: 'toolu_server_refusal' },
+        ])
+      } else {
+        expect(result.errorMessage).toContain(
+          'stop_reason: refusal, category: cyber',
+        )
+      }
+      expect(f.sent).toHaveLength(1)
+      expect(f.sent[0]?.body.fallbacks).toBe(
+        mode === 'server' ? 'default' : undefined,
+      )
+      expect(f.sent[0]?.beta).toContain(core.SERVER_SIDE_FALLBACK_BETA)
+      expect(piRefusalRoundStatus(f.sessionId)).toBeUndefined()
+      expect(f.notices.filter(Boolean)).toEqual([])
+      expect(
+        f.records.filter(({ channel }) => channel === 'server-fallback'),
+      ).toEqual([])
+      expect(JSON.stringify({ result, records: f.records })).not.toContain(
+        token,
+      )
+    } finally {
+      f.close()
+    }
+  },
+)
 
 test.each(['stateless', 'threaded'] as const)(
   'Pi %s refusal round replays signed thinking, routes side requests and returns to source',
