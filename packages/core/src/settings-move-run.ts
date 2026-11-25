@@ -54,6 +54,11 @@ import {
 
 let loggedClosedFence = false
 
+/** Reset the process-wide diagnostic before testing its first emission. */
+export function __resetSettingsMoveFenceLogForTest(): void {
+  loggedClosedFence = false
+}
+
 export interface SettingsMoveStartupOptions extends SettingsMoveSourcesOptions {
   log?: SettingsMoveSourcesOptions['log'] & { info?: (message: string) => void }
   fence: Pick<

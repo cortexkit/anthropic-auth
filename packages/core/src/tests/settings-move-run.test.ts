@@ -1,4 +1,4 @@
-import { afterEach, expect, spyOn, test } from 'bun:test'
+import { afterEach, test as bunTest, expect, spyOn } from 'bun:test'
 import * as fs from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, win32 } from 'node:path'
@@ -14,6 +14,7 @@ import { settingsDefinition } from '../settings-definition.ts'
 import { settingsImportRecordPath } from '../settings-mode.ts'
 import { settingsMoveHolderFiles } from '../settings-move-fence.ts'
 import {
+  __resetSettingsMoveFenceLogForTest,
   runSettingsMoveAtStartup,
   type SettingsMoveStartupOptions,
 } from '../settings-move-run.ts'
@@ -31,11 +32,25 @@ const { setSettingsMoveStepHookForTest } = await import(
 )
 const io = { ...fs }
 const cleanup: (() => Promise<unknown> | undefined)[] = []
-afterEach(async () => {
+let teardown = Promise.resolve()
+
+async function restoreFixture() {
   setSettingsFsForTest()
   setSettingsMoveStepHookForTest()
   for (const close of cleanup.splice(0).reverse()) await close()
-})
+}
+
+function test(name: string, run: () => Promise<void>) {
+  bunTest(name, () => {
+    // Bun reports a timeout without stopping the callback. Keep the fixture's
+    // shared filesystem spies and temp directory until the callback settles.
+    const done = teardown.catch(() => undefined).then(run)
+    teardown = done.then(restoreFixture, restoreFixture)
+    return done
+  })
+}
+
+afterEach(() => teardown)
 
 async function put(path: string, value: unknown) {
   await fs.mkdir(dirname(path), { recursive: true })
@@ -359,6 +374,7 @@ test('an invalid protection field moves its restrictive replacement and other va
 })
 
 test('a closed settings fence logs blocker identities once per process without file contents', async () => {
+  __resetSettingsMoveFenceLogForTest()
   const f = await fixture()
   const secret = 'private-token-from-artifact'
   const dir = join(f.root, 'rpc')
