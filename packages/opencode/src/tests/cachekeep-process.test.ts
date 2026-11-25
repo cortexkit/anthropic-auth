@@ -261,6 +261,21 @@ test.each(['opencode1', 'opencode2'] as const)(
     }),
 )
 
+test('OpenCode 1 replaces an older in-process lease without releaseSourceWarm', () =>
+  withRestoredOwner('opencode1', async ({ owner, start, saved }) => {
+    Object.defineProperty(owner.manager, 'releaseSourceWarm', {
+      value: undefined,
+    })
+    const successor = await start()
+    expect(await successor.prepare('New plugin turn')).toEqual({
+      tracked: true,
+    })
+    expect(owner.manager.trackedCount()).toBe(0)
+    expect(successor.manager.trackedCount()).toBe(1)
+    await successor.dispose()
+    expect((await saved())[0]).toContain('New plugin turn')
+  }))
+
 test.each(['opencode1', 'opencode2'] as const)(
   '%s forgets a saved session from a non-owner after its startup scan',
   (host) =>

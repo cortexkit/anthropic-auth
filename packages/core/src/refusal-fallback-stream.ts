@@ -300,7 +300,11 @@ function createPrefillCapture(maxBytes: number) {
   >()
   let bytes = 0
   let overflow = false
+  let incomplete = false
   return {
+    markIncomplete() {
+      incomplete = true
+    },
     push(index: number, frame: Frame) {
       if (overflow) return
       if (frame.type === 'content_block_start') {
@@ -322,7 +326,10 @@ function createPrefillCapture(maxBytes: number) {
         ) {
           block = { type: 'redacted_thinking', data: start.data }
         }
-        if (!block) return
+        if (!block) {
+          incomplete = true
+          return
+        }
         blocks.set(index, { block, closed: false })
       } else {
         const entry = blocks.get(index)
@@ -357,16 +364,17 @@ function createPrefillCapture(maxBytes: number) {
       }
     },
     complete() {
-      if (overflow) return null
+      if (overflow || incomplete) return null
       const content: RefusalFallbackPrefillBlock[] = []
       for (const { block, closed } of blocks.values()) {
         // The join closes visible text even if Anthropic refused mid-block.
         // Thinking must have arrived signed and closed from Anthropic.
         if (
-          block.type === 'text' ||
-          (closed && (block.type === 'redacted_thinking' || block.signature))
+          block.type !== 'text' &&
+          (!closed || (block.type === 'thinking' && !block.signature))
         )
-          content.push(block)
+          return null
+        content.push(block)
       }
       return content
     },
@@ -732,6 +740,11 @@ export function joinRefusalFallbackStream(
       if (frame.type === 'message_start') {
         source.rememberStart(frame)
         const message = record(frame.payload?.message)
+        // Inline blocks reach the host but aren't captured by the block events.
+        if (Array.isArray(message?.content) && message.content.length > 0) {
+          sourceHasContent = true
+          prefill?.markIncomplete()
+        }
         emit([
           message && message.model !== options.sourceModel
             ? encode(

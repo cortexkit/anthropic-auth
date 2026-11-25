@@ -7782,6 +7782,7 @@ const anthropicAuthPlugin = async (
               return current
             }
             let usedDirectFetch = false
+            let lastSendRelayed = false
             let directAttempt = scopedAttempt
 
             const billingFor = async (payer: NativeOAuthAuthorization) => {
@@ -8015,6 +8016,7 @@ const anthropicAuthPlugin = async (
               billing: AnthropicBillingRequest | undefined,
               protectedOrigin?: RefusalFallbackDispatchOptions['protectedOrigin'],
               resend = false,
+              resendViaRelay = false,
             ): RefusalFallbackDispatchOptions | undefined => {
               const model = modelForIdentity
               if (
@@ -8031,7 +8033,7 @@ const anthropicAuthPlugin = async (
               const fresh = () =>
                 resend ? !primary || isCurrentPrimary(payer) : isFresh(payer)
               let retryAuthorization: NativeOAuthAuthorization | undefined
-              return {
+              const options: RefusalFallbackDispatchOptions = {
                 sourceModel: model,
                 origin: {
                   accountId,
@@ -8052,8 +8054,6 @@ const anthropicAuthPlugin = async (
                   chargeBasis: 'subscription_included',
                 },
                 authorize: async ({ model, signal }) => {
-                  if (protectedOrigin && !relayConfig?.fallbackToDirect)
-                    return { kind: 'denied' }
                   await requireCurrentNativeActivation(separateLocalLogin)
                   const candidate = await authorizeOAuth(
                     oauthAccountId,
@@ -8063,11 +8063,11 @@ const anthropicAuthPlugin = async (
                     'serve',
                   )
                   await requireCurrentNativeActivation(separateLocalLogin)
-                  if (
+                  const transportBlocked =
                     protectedOrigin &&
-                    !(await nativeAccounts.getRelayConfig())?.fallbackToDirect
-                  )
-                    return { kind: 'denied' }
+                    (!relayConfig?.fallbackToDirect ||
+                      !(await nativeAccounts.getRelayConfig())
+                        ?.fallbackToDirect)
                   const snapshot = await nativeAccounts.read(model)
                   const account = snapshot.accounts.find(
                     (row) => row.id === oauthAccountId,
@@ -8092,60 +8092,121 @@ const anthropicAuthPlugin = async (
                     routingRelay.admitted(relayAffinity, account)
                   if (
                     (!routed && !quotaSnapshotPassesPolicy(quota, policy)) ||
-                    (!resend && !targetModelAllowed(quota, policy, model))
+                    !targetModelAllowed(quota, policy, model)
                   )
                     return { kind: 'denied' }
-                  retryAuthorization = candidate
-                  return {
-                    kind: 'authorized',
+                  const binding = {
                     accountId: resend
                       ? oauthAccountId
                       : candidate.accountIdentity,
                     credentialId: candidate.credentialId,
                     url: finalUrl(currentGateway()),
+                  }
+                  if (transportBlocked) return { kind: 'defer', ...binding }
+                  retryAuthorization = candidate
+                  return {
+                    kind: 'authorized',
+                    ...binding,
                     accessToken: candidate.accessToken,
                   }
                 },
                 send: async ({ url, headers, body, bodyText, signal }) => {
-                  const scope = createProviderErrorResponseScope(
-                    [
-                      retryAuthorization?.accessToken ?? '',
-                      ...claudeGatewayHeaderValues(gateway),
-                    ],
-                    'event-stream',
-                  )
-                  try {
-                    const response = scope.redactResponse(
-                      await fetchOAuthPhysical(gateway)(url, {
+                  if (resendViaRelay) {
+                    if (!relayConfig) throw new Error('Relay is unavailable')
+                    const relayHeaders = new Headers(headers)
+                    relayHeaders.delete('content-length')
+                    relayHeaders.delete('content-encoding')
+                    return sendViaRelay({
+                      config: relayConfig,
+                      input: url,
+                      requireUpstreamUrl: requireOAuthDestination,
+                      init: { method, signal },
+                      headers: relayHeaders,
+                      body: bodyText,
+                      affinity: relayAffinity,
+                      authorizeAttempt: async () => {
+                        if (!fresh()) throw new Error('Source resend is stale')
+                        return { headers: relayHeaders }
+                      },
+                      fallback: async () => {
+                        if (
+                          !relayConfig?.fallbackToDirect ||
+                          !(await nativeAccounts.getRelayConfig())
+                            ?.fallbackToDirect ||
+                          !fresh()
+                        )
+                          throw new Error('Direct source resend is not allowed')
+                        const origin = options.origin
+                        const sourceModel = parseRequestModel(bodyText)
+                        if (!sourceModel)
+                          throw new Error('Source resend is missing its model')
+                        const decision = await options.authorize({
+                          model: sourceModel,
+                          origin,
+                          wait: false,
+                          signal,
+                        })
+                        if (
+                          decision.kind !== 'authorized' ||
+                          decision.accountId !== origin.accountId ||
+                          decision.credentialId !== origin.credentialId ||
+                          decision.url !== url ||
+                          !fresh()
+                        )
+                          throw new Error(
+                            'Direct source resend is not authorized',
+                          )
+                        headers.set(
+                          'authorization',
+                          `Bearer ${decision.accessToken}`,
+                        )
+                        return sendDirect()
+                      },
+                    })
+                  }
+                  return sendDirect()
+
+                  async function sendDirect() {
+                    const scope = createProviderErrorResponseScope(
+                      [
+                        retryAuthorization?.accessToken ?? '',
+                        ...claudeGatewayHeaderValues(gateway),
+                      ],
+                      'event-stream',
+                    )
+                    try {
+                      const response = scope.redactResponse(
+                        await fetchOAuthPhysical(gateway)(url, {
+                          method,
+                          headers,
+                          body: body as RequestInit['body'],
+                          signal,
+                        }),
+                      )
+                      await dumpDirectRequest({
+                        affinity: relayAffinity,
+                        route,
+                        status: response.status,
+                        bodyText,
+                        url,
                         method,
                         headers,
-                        body: body as RequestInit['body'],
-                        signal,
-                      }),
-                    )
-                    await dumpDirectRequest({
-                      affinity: relayAffinity,
-                      route,
-                      status: response.status,
-                      bodyText,
-                      url,
-                      method,
-                      headers,
-                    })
-                    return response
-                  } catch (error) {
-                    const safe = scope.redactError(error)
-                    scope.dispose()
-                    await dumpDirectRequest({
-                      affinity: relayAffinity,
-                      route,
-                      error: PHYSICAL_SEND_FAILED,
-                      bodyText,
-                      url,
-                      method,
-                      headers,
-                    })
-                    throw safe
+                      })
+                      return response
+                    } catch (error) {
+                      const safe = scope.redactError(error)
+                      scope.dispose()
+                      await dumpDirectRequest({
+                        affinity: relayAffinity,
+                        route,
+                        error: PHYSICAL_SEND_FAILED,
+                        bodyText,
+                        url,
+                        method,
+                        headers,
+                      })
+                      throw safe
+                    }
                   }
                 },
                 observePhysicalResponse: (response, attempt) => {
@@ -8171,10 +8232,12 @@ const anthropicAuthPlugin = async (
                   return response
                 },
               }
+              return options
             }
 
             const directFetch = async () => {
               usedDirectFetch = true
+              lastSendRelayed = false
               // Validate current local credentials or obtain new vault
               // authorization before every direct send, including relay rescue.
               // Tokens checked earlier may have expired or been revoked.
@@ -8548,6 +8611,7 @@ const anthropicAuthPlugin = async (
                   roundPlan?.kind !== 'routed',
                 authorizeAttempt: async () => {
                   const nextAuthorization = await authorizePhysical()
+                  lastSendRelayed = true
                   const nextAttempt = nextAuthorization.scopedAttempt
                   nativeAuthorization = nextAuthorization
                   served = {
@@ -8756,6 +8820,7 @@ const anthropicAuthPlugin = async (
                   undefined,
                   undefined,
                   true,
+                  lastSendRelayed,
                 )
                 if (options) {
                   // Install the template callback before the terminal resend:

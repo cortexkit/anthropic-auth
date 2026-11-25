@@ -1561,21 +1561,32 @@ describe('OC2 shared routing relay', () => {
     },
   )
 
-  test.each(['general floor', 'target scope', 'killswitch'] as const)(
+  test.each([
+    'general floor',
+    'target scope',
+    'killswitch',
+    'at killswitch',
+    'at killswitch below general floor',
+  ] as const)(
     'OC2 refusal target admission on a shared-routed account: %s',
     async (policy) => {
       const f = await vault()
       const native = source(f.runtime, f.paths)
       const input = { ...scope, modelID: 'claude-fable-5-2' }
       const target = 'claude-opus-4-8'
+      const atKillswitch = policy.startsWith('at killswitch')
+      const remainingPercent = atKillswitch ? 20 : 10
       await f.store.updateSettings((settings) => ({
         ...settings,
         quota: {
           enabled: true,
-          minimumRemaining: { five_hour: 20, seven_day: 0 },
+          minimumRemaining: {
+            five_hour: policy === 'at killswitch below general floor' ? 30 : 20,
+            seven_day: 0,
+          },
         },
         killswitch: {
-          enabled: policy === 'killswitch',
+          enabled: policy === 'killswitch' || atKillswitch,
           main: { five_hour: 20 },
         },
       }))
@@ -1585,7 +1596,11 @@ describe('OC2 shared routing relay', () => {
         quota: {
           accountIdentity: identity,
           checkedAt,
-          five_hour: { usedPercent: 90, remainingPercent: 10, checkedAt },
+          five_hour: {
+            usedPercent: 100 - remainingPercent,
+            remainingPercent,
+            checkedAt,
+          },
           seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt },
           scoped:
             policy === 'target scope'

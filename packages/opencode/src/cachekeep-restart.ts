@@ -179,7 +179,7 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
         shared.owners.delete(hash)
         shared.restored.delete(hash)
         owner?.manager.releaseTarget(id)
-        owner?.manager.releaseSourceWarm(id)
+        owner?.manager.releaseSourceWarm?.(id)
       },
     }),
     leases: new Set<Lease>(),
@@ -220,7 +220,7 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
         shared.owners.set(hash, lease)
         shared.restored.delete(hash)
         previous?.manager.releaseTarget(entry.id)
-        previous?.manager.releaseSourceWarm(entry.id)
+        previous?.manager.releaseSourceWarm?.(entry.id)
       }
       shared.store.changed(
         entry,

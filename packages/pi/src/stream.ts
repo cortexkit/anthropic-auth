@@ -2077,14 +2077,29 @@ async function sendAnthropicRequestAttempt(
     let candidate: PiNativeAttempt | undefined
     let dump: DumpHandle | null = null
     let scope: ProviderErrorResponseScope | undefined
+    let direct = false
+    let upstreamStatus: number | undefined
     const authorize: RefusalFallbackDispatchOptions['authorize'] = async ({
       model,
+      origin,
       signal,
     }) => {
       candidate = undefined
       try {
-        if (relayedOrigin && !relayConfig?.fallbackToDirect)
+        if (refusalRetry && relayedOrigin && !relayConfig?.fallbackToDirect) {
+          // Check the existing payer and target without obtaining credentials
+          // for a direct request that the relay policy already forbids.
+          const view = await native.view(signal, model)
+          const account = view.accounts.find((row) => row.id === routeId)
+          if (
+            targetAllowed(model, view, true) &&
+            account?.accountIdentity === origin.accountId &&
+            piCredentialId(account) === origin.credentialId &&
+            resolvedUrl() === origin.url
+          )
+            return { kind: 'defer', ...origin }
           return { kind: 'denied' }
+        }
         // This is the same routed step. Reuse its account choice, but check
         // the retry model's protections separately on the final account view.
         const routingChoice = refusalRetry ? options.routingChoice : undefined
@@ -2097,11 +2112,10 @@ async function sendAnthropicRequestAttempt(
               routingChoice,
             )
           : await native.authorize(routeId, signal, model, 'serve')
-        if (
+        const transportBlocked =
+          refusalRetry &&
           relayedOrigin &&
           !(await (await native.service()).getRelayConfig())?.fallbackToDirect
-        )
-          return { kind: 'denied' }
         const view = await native.view(signal, model)
         const account = view.accounts.find((row) => row.id === routeId)
         const payer = piBillingPayer(attempt)
@@ -2113,11 +2127,12 @@ async function sendAnthropicRequestAttempt(
           return { kind: 'denied' }
         const url = resolvedUrl()
         if (!url) return { kind: 'denied' }
+        const binding = { ...payer, url }
+        if (transportBlocked) return { kind: 'defer', ...binding }
         candidate = attempt
         return {
           kind: 'authorized',
-          ...piBillingPayer(attempt),
-          url,
+          ...binding,
           accessToken: piAttemptAccessToken(attempt),
         }
       } catch {
@@ -2135,30 +2150,94 @@ async function sendAnthropicRequestAttempt(
       requirePiOAuthOrigin(url, currentGateway)
       signal.throwIfAborted()
       assertHostAuthorityStable()
-      const response = await fetchResponse(url, {
-        method: 'POST',
-        body,
-        headers,
-        signal,
-        redirect: 'error',
-      })
-      scope = createProviderErrorResponseScope(
-        [
-          ...(candidate ? [piAttemptAccessToken(candidate)] : []),
-          ...claudeGatewayHeaderValues(currentGateway),
-        ],
-        'event-stream',
-      )
-      dump = await dumpDirectRequest({
-        affinity: relayAffinity,
-        route: options.route ?? 'oauth',
-        status: response.status,
-        bodyText,
-        url,
-        method: 'POST',
-        headers,
-      })
-      return response
+      if (!refusalRetry && relayedOrigin) {
+        const config = relayConfig
+        if (!config || !candidate) throw new Error('Relay is unavailable')
+        const payer = piBillingPayer(candidate)
+        const relayHeaders = new Headers(headers)
+        relayHeaders.delete('content-length')
+        relayHeaders.delete('content-encoding')
+        return sendViaRelay({
+          config,
+          input: url,
+          requireUpstreamUrl: (url) =>
+            requirePiOAuthOrigin(url, currentGateway),
+          init: { method: 'POST', signal },
+          headers: relayHeaders,
+          body: bodyText,
+          affinity: relayAffinity,
+          authorizeAttempt: async () => {
+            if (!currentPrimary(payer) || resolvedUrl() !== url)
+              throw new Error('Source resend is stale')
+            assertHostAuthorityStable()
+            return {
+              headers: relayHeaders,
+              onUpstreamStatus: (status) => {
+                upstreamStatus = status
+              },
+            }
+          },
+          onDumpCreated: (handle) => {
+            dump = handle
+          },
+          fallback: async () => {
+            if (
+              !config.fallbackToDirect ||
+              !(await (await native.service()).getRelayConfig())
+                ?.fallbackToDirect
+            )
+              throw new Error('Direct source resend is not allowed')
+            const origin = { ...payer, url }
+            const decision = await authorize({
+              model: requestedModel,
+              origin,
+              wait: false,
+              signal,
+            })
+            if (
+              decision.kind !== 'authorized' ||
+              decision.accountId !== payer.accountId ||
+              decision.credentialId !== payer.credentialId ||
+              decision.url !== url ||
+              !currentPrimary(payer)
+            )
+              throw new Error('Direct source resend is not authorized')
+            headers.set('authorization', `Bearer ${decision.accessToken}`)
+            signal.throwIfAborted()
+            assertHostAuthorityStable()
+            return sendDirect()
+          },
+        })
+      }
+      return sendDirect()
+
+      async function sendDirect() {
+        direct = true
+        const response = await fetchResponse(url, {
+          method: 'POST',
+          body,
+          headers,
+          signal,
+          redirect: 'error',
+        })
+        scope = createProviderErrorResponseScope(
+          [
+            ...(candidate ? [piAttemptAccessToken(candidate)] : []),
+            ...claudeGatewayHeaderValues(currentGateway),
+          ],
+          'event-stream',
+        )
+        dump = await dumpDirectRequest({
+          affinity: relayAffinity,
+          route: options.route ?? 'oauth',
+          status: response.status,
+          bodyText,
+          url,
+          method: 'POST',
+          headers,
+        })
+        return response
+      }
     }
     const observe = (
       guarded: Response,
@@ -2166,10 +2245,14 @@ async function sendAnthropicRequestAttempt(
       onComplete?: () => void,
     ) => {
       const safe = scope?.redactResponse(guarded) ?? guarded
-      if (candidate) {
+      if (candidate && (direct || upstreamStatus !== undefined || safe.ok)) {
         observeResponseHeaders(candidate, safe.headers, safe.status, model)
         if (safe.ok) markServed(candidate)
-        void report(candidate, safe.status, 'direct')
+        void report(
+          candidate,
+          safe.status,
+          direct ? 'direct' : 'relay_status_field',
+        )
       }
       return observePiFallbackAttempt(safe, dump, () => onComplete?.())
     }
@@ -2688,7 +2771,7 @@ async function sendAnthropicRequestAttempt(
   if (targetPlan && roundRequest && physicalRound && response.status === 400) {
     const { attempt, url, headers, lifecycle } = physicalRound
     const payer = piBillingPayer(attempt)
-    const extra = extraSender()
+    const extra = extraSender(false, lastTransport === 'relay')
     const sourceBilling = await billingInput(
       attempt,
       undefined,

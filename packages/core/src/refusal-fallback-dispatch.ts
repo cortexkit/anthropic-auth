@@ -41,6 +41,8 @@ export type RefusalFallbackExtraSendAuthority = (request: {
 
 export type RefusalFallbackExtraSendDecision =
   | { kind: 'denied' | 'wait' }
+  // The payer and target are eligible, but the current transport can't retry.
+  | ({ kind: 'defer' } & RefusalFallbackBinding)
   | ({ kind: 'authorized'; accessToken: string } & RefusalFallbackBinding)
 
 export type RefusalFallbackPhysicalAttempt = Readonly<{
@@ -323,12 +325,15 @@ export function dispatchRefusalFallback(
         signal,
       })
       if (
-        decision.kind !== 'authorized' ||
-        !decision.accessToken ||
+        (decision.kind !== 'authorized' && decision.kind !== 'defer') ||
         decision.accountId !== origin.accountId ||
         decision.credentialId !== origin.credentialId ||
         decision.url !== origin.url
       )
+        return { kind: 'none', reason: 'not-authorized' }
+      if (!isFresh()) break
+      if (decision.kind === 'defer') return { kind: 'defer' }
+      if (!decision.accessToken)
         return { kind: 'none', reason: 'not-authorized' }
       const headers = new Headers(originHeaders)
       headers.set('authorization', `Bearer ${decision.accessToken}`)

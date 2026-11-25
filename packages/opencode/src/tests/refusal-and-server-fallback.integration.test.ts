@@ -794,6 +794,117 @@ describe('auth.loader', () => {
     },
   )
 
+  test.each(['killswitch', 'model scope'] as const)(
+    'OC1 final read blocks the target-400 source resend on a late %s change',
+    async (policy) => {
+      await useTempAccountFile(
+        createFallbackStorage({ accounts: [], quota: { enabled: false } }),
+      )
+      const sent: string[] = []
+      let rejectedTarget = false
+      globalThis.fetch = mock(
+        withNativeAdmission(
+          (input: string | URL | Request, init?: RequestInit) => {
+            if (!extractUrl(input).includes('/v1/messages'))
+              return Response.json({})
+            const { model } = JSON.parse(String(init?.body))
+            sent.push(model)
+            if (sent.length === 3) {
+              expect(model).toBe('claude-opus-5')
+              rejectedTarget = true
+              return Response.json(
+                { error: { message: 'rejected target' } },
+                { status: 400 },
+              )
+            }
+            return refusalThinkingReply(model)
+          },
+        ),
+      ) as unknown as typeof fetch
+      const plugin = await getPlugin()
+      const runtime = getPluginTestHandles(plugin).nativeAccounts
+      const read = runtime.read.bind(runtime)
+      let finalReads = 0
+      const readSpy = spyOn(runtime, 'read').mockImplementation(
+        async (...args) => {
+          const snapshot = await read(...args)
+          if (!rejectedTarget || args[0] !== SOURCE_MODEL) return snapshot
+          finalReads++
+          const checkedAt = Date.now()
+          return {
+            ...snapshot,
+            policyStorage: {
+              ...snapshot.policyStorage,
+              killswitch: {
+                enabled: policy === 'killswitch',
+                main: { five_hour: 20 },
+              },
+            },
+            accounts: snapshot.accounts.map((account) => ({
+              ...account,
+              quota: {
+                ...account.quota,
+                checkedAt,
+                five_hour: { checkedAt, usedPercent: 90, remainingPercent: 10 },
+                ...(policy === 'model scope' && {
+                  scoped: [
+                    {
+                      id: 'fable',
+                      title: 'Fable',
+                      modelId: SOURCE_MODEL,
+                      modelName: SOURCE_MODEL,
+                      usedPercent: 100,
+                      remainingPercent: 0,
+                      checkedAt,
+                    },
+                  ],
+                }),
+              },
+            })),
+          }
+        },
+      )
+      getBodyLifetime(testContext).deferCleanup(() => readSpy.mockRestore())
+      const host = await plugin.auth.loader(
+        async () => ({ type: 'oauth', ...syntheticMainHostAuth() }),
+        { models: {} },
+      )
+      const first = [{ role: 'user', content: 'hello' }]
+      const send = (messages: Array<{ role: string; content: unknown }>) =>
+        host.fetch(MESSAGES_URL, {
+          method: 'POST',
+          headers: {
+            'x-session-affinity': `ses_refusal_resend_final_${policy.replace(' ', '_')}`,
+          },
+          body: JSON.stringify({
+            model: SOURCE_MODEL,
+            stream: true,
+            max_tokens: 256,
+            messages,
+          }),
+        })
+      expect(await (await send(first)).text()).toContain(TARGET_SIGNATURE)
+      const response = await send([
+        ...first,
+        {
+          role: 'assistant',
+          content: ['synthetic-source-signature', TARGET_SIGNATURE].map(
+            (signature) => ({
+              type: 'thinking',
+              thinking: 'synthetic',
+              signature,
+            }),
+          ),
+        },
+        { role: 'user', content: 'again' },
+      ])
+      expect(finalReads).toBe(1)
+      expect(sent).toEqual([SOURCE_MODEL, 'claude-opus-5', 'claude-opus-5'])
+      expect(response.status).toBe(400)
+      expect(await response.text()).toContain('rejected target')
+    },
+  )
+
   const exerciseRoundWarm = async (
     restart: 'valid' | 'unsupported' | 'legacy' | false,
     loseResend = false,

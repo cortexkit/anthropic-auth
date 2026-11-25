@@ -2172,6 +2172,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       const originHeaders = new Headers(upstreamHeaders)
       originHeaders.delete('content-length')
       const context = contextOf(attempt, data)
+      const relayOrigin = dispatch?.kind === 'http-relay' ? dispatch : undefined
       const physical: PhysicalSend = {
         headers: originHeaders,
         bodyText: body,
@@ -2283,6 +2284,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         | {
             context: NativeAnthropicAttemptContext<P>
             scope: ProviderErrorResponseScope
+            upstream: boolean
           }
         | undefined
       const fallback: RefusalFallbackDispatchOptions = {
@@ -2310,39 +2312,46 @@ export function createNativeAnthropicAdapter<Q, P>(
               roundPlan?.kind === 'round' || roundPlan?.kind === 'routed',
             )
           if (!fresh()) return { kind: 'denied' }
-          const relayedOrigin = clientSource && dispatch?.kind === 'http-relay'
           candidate = await authorizeResend(
             model,
             clientSource ? 'refusal' : 'source-resend',
             signal,
           )
           if (!candidate || !fresh()) return { kind: 'denied' }
-          if (
-            relayedOrigin &&
-            (!(await source.allowsDirectRefusalRetry?.(context)) || !fresh())
-          )
-            return { kind: 'denied' }
+          const transportBlocked =
+            clientSource &&
+            relayOrigin &&
+            !(await source.allowsDirectRefusalRetry?.(context))
+          if (!fresh()) return { kind: 'denied' }
           const gateway = candidate.gateway
           const nextUrl = gateway && claudeGatewayModelUrl(url, gateway)
           if (
             !nextUrl &&
             candidate.dispatch &&
             candidate.dispatch.kind !== 'direct' &&
-            !(relayedOrigin && candidate.dispatch.kind === 'http-relay')
+            !(
+              clientSource &&
+              relayOrigin &&
+              candidate.dispatch.kind === 'http-relay'
+            )
           )
             return { kind: 'denied' }
           const resolved = nextUrl?.toString() ?? url
           requireOAuthDestination(resolved, nextUrl ? gateway : undefined)
-          return {
-            kind: 'authorized',
+          const binding = {
             accountId,
             credentialId: candidate.credentialId,
             url: resolved,
+          }
+          if (transportBlocked) return { kind: 'defer', ...binding }
+          return {
+            kind: 'authorized',
+            ...binding,
             accessToken: candidate.accessToken,
           }
         },
         send: async ({ url, headers, body, bodyText, signal }) => {
-          const authorization = candidate
+          let authorization = candidate
           if (
             !authorization ||
             !isCurrent(
@@ -2357,30 +2366,123 @@ export function createNativeAnthropicAdapter<Q, P>(
             isRecord(payload) && typeof payload.model === 'string'
               ? payload.model
               : input.modelID
-          const retryContext = {
-            ...context,
-            modelID,
-            attemptId: randomUUID(),
-            provenance: authorization.provenance,
-            dispatch: 'direct' as const,
-          }
-          const scope = createProviderErrorResponseScope(
-            [
-              authorization.accessToken,
-              ...claudeGatewayHeaderValues(authorization.gateway),
-            ],
-            'event-stream',
-          )
-          retry = { context: retryContext, scope }
+          const attemptId = randomUUID()
+          const relay = !clientSource ? relayOrigin : undefined
+          const makeScope = (auth: NonNullable<typeof authorization>) =>
+            createProviderErrorResponseScope(
+              [
+                auth.accessToken,
+                ...claudeGatewayHeaderValues(auth.gateway),
+                ...(relay ? [relay.token] : []),
+              ],
+              'event-stream',
+            )
+          let scope = makeScope(authorization)
+          let usedRelay = false
+          let envelope: Record<string, unknown> | undefined
           let status: number | undefined
           try {
-            const response = await (deps.fetch ?? globalThis.fetch)(url, {
-              method: prepared.method,
-              headers,
-              body: body as RequestInit['body'],
-              signal,
-              redirect: 'error',
-            })
+            const fetchImpl = deps.fetch ?? globalThis.fetch
+            let response: Response | undefined
+            let upstream = true
+            if (relay) {
+              const upstreamHeaders = new Headers(headers)
+              upstreamHeaders.delete('content-encoding')
+              upstreamHeaders.delete('x-relay-token')
+              envelope = {
+                protocol: 1,
+                type: 'request',
+                affinity: input.sessionID,
+                upstream: {
+                  url,
+                  method: prepared.method,
+                  headers: Object.fromEntries(upstreamHeaders),
+                },
+                mode: 'full_sync',
+                revision: 1,
+                body: bodyText,
+                next_hash: `sha256:${createHash('sha256').update(bodyText).digest('hex')}`,
+              }
+              try {
+                if (relayProxyApplies(relay.url))
+                  throw new Error(RELAY_PROXY_REFUSAL)
+                usedRelay = true
+                const clientRequestId = headers.get('x-client-request-id')
+                response = await fetchImpl(relay.url, {
+                  method: 'POST',
+                  headers: {
+                    'content-type': 'application/json',
+                    'x-relay-token': relay.token,
+                    ...(clientRequestId
+                      ? { 'x-client-request-id': clientRequestId }
+                      : {}),
+                  },
+                  body: JSON.stringify(envelope),
+                  signal,
+                  redirect: 'error',
+                })
+              } catch (error) {
+                if (!(await source.allowsDirectRefusalRetry?.(context)))
+                  throw error
+              }
+              upstream =
+                !!response &&
+                /^req_[A-Za-z0-9_-]+$/.test(
+                  response.headers.get('request-id') ?? '',
+                )
+              if (
+                !response ||
+                (!upstream &&
+                  (response.status === 401 || response.status >= 500) &&
+                  (await source.allowsDirectRefusalRetry?.(context)))
+              ) {
+                void response?.body?.cancel().catch(() => {})
+                response = undefined
+                signal.throwIfAborted()
+                const fresh = await authorizeResend(
+                  modelID,
+                  'source-resend',
+                  signal,
+                )
+                if (
+                  !fresh ||
+                  !isCurrent(true) ||
+                  fresh.gateway ||
+                  (fresh.dispatch && fresh.dispatch.kind !== 'direct')
+                )
+                  throw refuse(input)
+                authorization = fresh
+                headers.set('authorization', `Bearer ${fresh.accessToken}`)
+                scope.dispose()
+                scope = makeScope(fresh)
+                assertHostAuthorityStable()
+              } else if (!upstream && response.status === 401) {
+                void response.body?.cancel().catch(() => {})
+                throw new NativeAnthropicTransportRefusal()
+              }
+            }
+            if (!response) {
+              usedRelay = false
+              upstream = true
+              response = await fetchImpl(url, {
+                method: prepared.method,
+                headers,
+                body: body as RequestInit['body'],
+                signal,
+                redirect: 'error',
+              })
+            }
+            retry = {
+              context: {
+                ...context,
+                modelID,
+                attemptId,
+                provenance: authorization.provenance,
+                dispatch: usedRelay ? 'http-relay' : 'direct',
+              },
+              scope,
+              upstream,
+            }
             status = response.status
             return response
           } catch (error) {
@@ -2392,23 +2494,35 @@ export function createNativeAnthropicAdapter<Q, P>(
             try {
               notifyFinal(
                 headers,
-                retryContext.attemptId,
+                attemptId,
                 await withoutFallbackCredit(bodyText),
               )
               if (await dumpEnabledForSend()) {
                 setDumpEnabledCore(true)
-                await dumpDirectRequest({
-                  affinity: input.sessionID,
-                  route: input.accountId,
-                  status,
-                  ...(status === undefined && {
-                    error: DUMP_PHYSICAL_SEND_FAILED,
-                  }),
-                  bodyText,
-                  url,
-                  method: prepared.method,
-                  headers,
-                })
+                if (usedRelay && envelope && status !== undefined)
+                  await dumpRelayRequest({
+                    affinity: input.sessionID,
+                    transport: 'http',
+                    protocol: 1,
+                    mode: 'full_sync',
+                    status,
+                    bodyText,
+                    payload: envelope,
+                    relayBytes: JSON.stringify(envelope).length,
+                  })
+                else if (!usedRelay)
+                  await dumpDirectRequest({
+                    affinity: input.sessionID,
+                    route: input.accountId,
+                    status,
+                    ...(status === undefined && {
+                      error: DUMP_PHYSICAL_SEND_FAILED,
+                    }),
+                    bodyText,
+                    url,
+                    method: prepared.method,
+                    headers,
+                  })
               }
             } catch {}
           }
@@ -2416,15 +2530,16 @@ export function createNativeAnthropicAdapter<Q, P>(
         observePhysicalResponse(response, physicalAttempt, reusableBodyText) {
           if (!physicalAttempt.refusalRetry) return response
           if (!retry) return response
-          const { scope, context } = retry
+          const { scope, context, upstream } = retry
           retry = undefined
           const safe = scope.redactResponse(response)
           try {
-            source.quotaFromHeaders?.(safe.headers, {
-              ...context,
-              status: safe.status,
-              reportRouting: false,
-            })
+            if (upstream)
+              source.quotaFromHeaders?.(safe.headers, {
+                ...context,
+                status: safe.status,
+                reportRouting: false,
+              })
           } catch {}
           return !handle && reusableBodyText
             ? complete(safe, reusableBodyText, context)

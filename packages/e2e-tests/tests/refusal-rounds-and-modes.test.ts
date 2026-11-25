@@ -128,6 +128,12 @@ function reply(
     })
 }
 
+const fromUpstream = (step: Step): Step => async (body, request) => {
+  const response = await step(body, request)
+  response?.headers.set('request-id', 'req_refusal_round_fixture')
+  return response
+}
+
 function tool(body: Body, directory: string, id: string, open = false) {
   const name = (body.tools as Array<{ name: string }>).find((entry) =>
     /^(?:mcp_)?(?:bash|shell)$/i.test(entry.name),
@@ -880,6 +886,56 @@ for (const host of Object.keys(launch) as Host[]) {
           ])
           expect(JSON.stringify([refused, next])).not.toContain(sentinel)
         },
+      )
+
+      scenario(
+        'a cold refusal that cannot retry directly starts a round on the relay',
+        async (session, mock) => {
+          mock.queue.push(
+            fromUpstream(reply([], { stop: 'refusal', credit: sentinel })),
+            fromUpstream(reply([block('The next turn was served on the relay.')])),
+          )
+          const refused = await session.prompt('Refuse before sending content.')
+          expect(assistantSteps(host, refused.stored).at(-1)?.finish).toBe(
+            finishRefusal[host],
+          )
+          expect(mock.models()).toEqual([source])
+          await session.prompt('Start the deferred round now.')
+          expect(mock.models()).toEqual([source, target])
+          expect(mock.primary[1]?.body).not.toHaveProperty('fallback_credit_token')
+        },
+        { viaRelay: true },
+      )
+
+      scenario(
+        'a relayed round target 400 resends the requested model through the relay',
+        async (session, mock) => {
+          mock.queue.push(
+            fromUpstream(reply([block('Visible prefix.')], { stop: 'refusal' })),
+            fromUpstream(() =>
+              Response.json(
+                {
+                  type: 'error',
+                  error: {
+                    type: 'invalid_request_error',
+                    message: 'Invalid request on target',
+                  },
+                },
+                { status: 400 },
+              )),
+            fromUpstream(reply([block('Source answer through the relay.')])),
+          )
+          await session.prompt('Defer the refusal after visible text.')
+          expect(mock.models()).toEqual([source])
+          const resent = await session.prompt('Use the round, then resend.')
+          expect(mock.models()).toEqual([source, target, source])
+          expect(JSON.stringify(resent.stored)).toContain(
+            'Source answer through the relay.',
+          )
+          expect(mock.primary[2]?.body).not.toHaveProperty('fallback_credit_token')
+          expect(mock.primary[2]?.body).not.toHaveProperty('fallbacks')
+        },
+        { viaRelay: true },
       )
 
       scenario(

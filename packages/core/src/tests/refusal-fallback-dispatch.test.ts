@@ -232,20 +232,17 @@ test('a retry that refuses before content does not announce a serving model', as
   expect(committed).toEqual([])
 })
 
-test('claimed prefill copies closed signed blocks and synthetically closed text, never open or unsigned thinking', async () => {
+test('claimed prefill copies closed signed blocks and synthetically closed text', async () => {
   const { options, sends } = await setup()
   const response = origin(
     block(0, { type: 'thinking', thinking: '' }),
     delta(0, { type: 'thinking_delta', thinking: 'signed thought' }),
     delta(0, { type: 'signature_delta', signature: 'signed' }),
     close(0),
-    block(1, { type: 'thinking', thinking: 'unsigned' }),
-    close(1),
     block(2, { type: 'redacted_thinking', data: 'opaque-signed-data' }),
     close(2),
     block(3, { type: 'text', text: 'closed' }),
     close(3),
-    block(4, { type: 'thinking', thinking: 'open', signature: 'not-closed' }),
     block(5, { type: 'text', text: 'part' }),
     delta(5, { type: 'text_delta', text: 'ial' }),
   )
@@ -266,6 +263,74 @@ test('claimed prefill copies closed signed blocks and synthetically closed text,
     },
   ])
   expect(await hasValidRequestBodySignature(at(sends).bodyText)).toBe(true)
+})
+
+const signedThought = { type: 'thinking', thinking: 'first', signature: 'sig' }
+const inlineText = { type: 'text', text: 'inline answer prefix' }
+
+test.each([
+  [
+    'unsigned thinking after signed thinking',
+    start(fable),
+    [block(1, { type: 'thinking', thinking: 'unsigned' }), close(1)],
+    'unsigned',
+  ],
+  [
+    'unclosed thinking after signed thinking',
+    start(fable),
+    [block(1, { type: 'thinking', thinking: 'unclosed', signature: 'sig' })],
+    'unclosed',
+  ],
+  [
+    'inline message-start content before signed thinking',
+    {
+      ...start(fable),
+      message: { ...start(fable).message, content: [inlineText] },
+    },
+    [],
+    inlineText.text,
+  ],
+] as const)(
+  'defers a credited refusal with %s',
+  async (_label, message, tail, visible) => {
+    const { options, sends } = await setup()
+    const deferred: string[] = []
+    options.lifecycle = {
+      onDeferredRefusal: ({ category }) => deferred.push(category ?? ''),
+    }
+    const output = await dispatchRefusalFallback(
+      stream(
+        message,
+        block(0, signedThought),
+        close(0),
+        ...tail,
+        refuse(),
+        stop,
+      ),
+      options,
+    ).text()
+    expect(output).toContain(visible)
+    assertStandingRefusal(output)
+    expect(sends).toHaveLength(0)
+    expect(deferred).toEqual(['cyber'])
+  },
+)
+
+test('defers a credited refusal with only inline message-start content', async () => {
+  const { options, sends } = await setup()
+  const deferred: string[] = []
+  options.lifecycle = {
+    onDeferredRefusal: ({ category }) => deferred.push(category ?? ''),
+  }
+  const message = { ...start(fable).message, content: [inlineText] }
+  const output = await dispatchRefusalFallback(
+    stream({ type: 'message_start', message }, refuse(), stop),
+    options,
+  ).text()
+  expect(output).toContain(JSON.stringify(message))
+  assertStandingRefusal(output)
+  expect(sends).toHaveLength(0)
+  expect(deferred).toEqual(['cyber'])
 })
 
 test.each([

@@ -540,17 +540,16 @@ export function createNativeAnthropicSource(
     sessionID: string,
     kind: NonNullable<NativeAnthropicSendScope['extraSend']>['kind'],
   ): NativeAccountPolicy => {
-    const policy = nativeAccountPolicy(account, snapshot, modelID)
-    if (kind === 'refusal' && routingRelay.admitted(sessionID, account)) {
-      // The shared router already admitted this payer for the step's general
-      // quota floor. The retry model's killswitch and scoped quota still apply.
-      if (
-        policy.quotaPolicyLimits?.length === 1 &&
-        policy.quotaPolicyLimits[0] === 'quota-floor'
-      )
-        return { status: 'allowed' }
-      return policy
-    }
+    let policy = nativeAccountPolicy(account, snapshot, modelID)
+    // Shared routing waives only the general quota floor, not the retry
+    // model's scoped quota or either killswitch check.
+    if (
+      kind === 'refusal' &&
+      routingRelay.admitted(sessionID, account) &&
+      policy.quotaPolicyLimits?.length === 1 &&
+      policy.quotaPolicyLimits[0] === 'quota-floor'
+    )
+      policy = { status: 'allowed' }
     if (
       policy.status !== 'allowed' ||
       !isKillswitchEnabled(snapshot.policyStorage)
