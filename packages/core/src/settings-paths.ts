@@ -61,7 +61,7 @@ export interface SettingsPaths {
   defaults: Record<SettingsHost, SettingsStorePaths>
 }
 
-/** The configured target is known, but its install is not. */
+/** The configured target is known, but whether it is a separate install is not. */
 export class SettingsPathResolutionError extends Error {
   readonly records: SettingsRecordPaths
 

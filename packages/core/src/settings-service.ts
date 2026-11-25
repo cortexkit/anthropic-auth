@@ -1448,7 +1448,7 @@ export async function recoverSettingsProtection(
       if (values) return { values, rung }
     } catch (error) {
       if (rung === 1 && error instanceof UnknownSettingsStateCopyError) break
-      // Skip this source whole, as before.
+      // Skip this source whole.
     }
   }
   return { values: mostRestrictiveSettingsProtection(), rung: 3 }
