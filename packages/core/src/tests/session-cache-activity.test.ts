@@ -35,6 +35,23 @@ test('unknown TTL uses the five-minute default', () => {
   expect(activity.holdUntil('session', 'account', 2000, 'max')).toBe(301_000)
 })
 
+test('warm retry preference requires a live response or prewarm in the candidate pool', () => {
+  const activity = new SessionCacheActivity()
+  const warm = { id: 'warm' }
+  const cold = { id: 'cold' }
+  const select = (candidates: { id: string }[], now: number) =>
+    activity.warmRetryAccount('session', candidates, (row) => row.id, now)
+  activity.record('session', warm.id, 500, 1000)
+  expect(select([cold, warm], 1499)).toBe(warm)
+  expect(select([cold], 1499)).toBeUndefined()
+  expect(select([cold, warm], 1500)).toBeUndefined()
+  activity.recordPrewarm('session', warm.id, 2000)
+  expect(select([cold, warm], 2500)).toBe(warm)
+  activity.record('session', cold.id, 500, 2500)
+  activity.recordPrewarm('session', warm.id, 2600)
+  expect(select([cold, warm], 2700)).toBe(cold)
+})
+
 test('a successful prewarm ten minutes ago protects a turn accepted seventy minutes ago', () => {
   const now = Date.parse('2026-11-02T10:00:00Z')
   const activity = new SessionCacheActivity()

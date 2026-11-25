@@ -76,7 +76,11 @@ const anthropicContext = {
 } as any
 
 describe('Pi shared routing relay', () => {
-  async function fixture(mode = 'normal', retry401 = false) {
+  async function fixture(
+    mode = 'normal',
+    retry401 = false,
+    warmRetryMode?: 'sticky-balanced' | 'main-first',
+  ) {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-routing-relay-'))
     const storagePath = join(tempDir, 'accounts.json')
     process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
@@ -94,7 +98,7 @@ describe('Pi shared routing relay', () => {
       {
         version: 1,
         main: { type: 'opencode', provider: 'anthropic' },
-        routing: { mode: 'sticky-balanced' },
+        routing: { mode: warmRetryMode ?? 'sticky-balanced' },
         quota: {
           enabled: true,
           checkIntervalMinutes: 5,
@@ -115,6 +119,18 @@ describe('Pi shared routing relay', () => {
                 ? undefined
                 : quota(mode === 'floor' ? 10 : 80),
           },
+          ...(warmRetryMode
+            ? [
+                {
+                  id: 'warm',
+                  type: 'oauth' as const,
+                  access: 'sk-ant-oat01-warm-access',
+                  refresh: 'warm-refresh',
+                  expires: now + 3_600_000,
+                  quota: quota(40),
+                },
+              ]
+            : []),
         ],
       },
       storagePath,
@@ -160,7 +176,11 @@ describe('Pi shared routing relay', () => {
         return Response.json({
           oauth_account: {
             account_uuid: fixtureAccountIdentity(
-              authorization.includes('fallback') ? 'fallback' : 'main',
+              authorization.includes('fallback')
+                ? 'fallback'
+                : authorization.includes('warm')
+                  ? 'warm'
+                  : 'main',
             ),
           },
         })
@@ -181,6 +201,17 @@ describe('Pi shared routing relay', () => {
       )
       if (retry401 && sends.length === 1)
         return new Response('{}', { status: 401 })
+      if (warmRetryMode && sends.length === 2)
+        return new Response('{}', {
+          status: 429,
+          headers: {
+            'anthropic-ratelimit-unified-7d-utilization': '0.64',
+            'anthropic-ratelimit-unified-7d_fable-utilization': '1',
+            'anthropic-ratelimit-unified-7d_fable-reset': String(
+              Math.floor(Date.now() / 1000) + 86_400,
+            ),
+          },
+        })
       return new Response(
         'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
         { headers: { 'content-type': 'text/event-stream' } },
@@ -194,7 +225,9 @@ describe('Pi shared routing relay', () => {
         anthropicModel,
         anthropicContext,
         {
-          sessionId: 'ses_pi_routing_relay',
+          sessionId: warmRetryMode
+            ? `ses_pi_warm_retry_${warmRetryMode}`
+            : 'ses_pi_routing_relay',
           apiKey: 'sk-ant-oat01-main-access',
           signal,
         },
@@ -203,6 +236,34 @@ describe('Pi shared routing relay', () => {
       )
     return { send, sends, bodies }
   }
+
+  test.each(['sticky-balanced', 'main-first'] as const)(
+    'Pi %s scoped Fable retry prefers the last accepted cache account',
+    async (mode) => {
+      const f = await fixture('normal', false, mode)
+      let accountId = fixtureAccountIdentity('warm')
+      globals[routingKey] = () => ({
+        accountFor: async () => ({
+          account_id: accountId,
+          credential_id: 'local',
+        }),
+      })
+      try {
+        expect((await f.send().result()).stopReason).toBe('stop')
+        expect(f.sends).toEqual(['Bearer sk-ant-oat01-warm-access'])
+        accountId = fixtureAccountIdentity('main')
+        if (mode === 'main-first') delete globals[routingKey]
+        expect((await f.send().result()).stopReason).toBe('stop')
+        expect(f.sends).toEqual([
+          'Bearer sk-ant-oat01-warm-access',
+          'Bearer sk-ant-oat01-main-access',
+          'Bearer sk-ant-oat01-warm-access',
+        ])
+      } finally {
+        sessionCacheActivity.forget(`ses_pi_warm_retry_${mode}`)
+      }
+    },
+  )
 
   test.each([
     'account_limit_exhausted',

@@ -1404,6 +1404,8 @@ export class StickySessionRouter {
     storage: AccountStorage | null
     inputBytes: number
     preferredAccountId?: string
+    /** Prefer live cache activity over the sticky assignment when choosing our own retry. */
+    preferWarmRetryAccount?: boolean
     excludeAccountIds?: ReadonlySet<string>
     /** Leave the current pin intact when selection cannot offer an account. */
     preserveOnNoCandidate?: boolean
@@ -1435,12 +1437,47 @@ export class StickySessionRouter {
       const identity = identityForAccount(this.logicalAccountId(assignment))
       return identity !== undefined && assignment.accountIdentity === identity
     }
+    const canSelect = (candidate: StickyRouteCandidate) =>
+      !input.excludeAccountIds?.has(candidate.accountId) &&
+      (!input.accountIdentities ||
+        identityForAccount(candidate.accountId) !== undefined)
+    const warm =
+      input.preferWarmRetryAccount && !input.routingAccountId
+        ? sessionCacheActivity.warmRetryAccount(
+            input.sessionId,
+            input.candidates.filter(canSelect),
+            (candidate) => candidate.accountId,
+            this.now(),
+          )
+        : undefined
+    const warmRetry =
+      warm &&
+      !stickyQuotaBlockerInForce({
+        quota: warm.quota,
+        modelId: input.modelId,
+        now: this.now(),
+      }) &&
+      (stickyRouteCandidateWeight({
+        candidate: warm,
+        family: input.family,
+        modelId: input.modelId,
+        storage: input.storage,
+        now: this.now(),
+      }) > 0 ||
+        (!knownQuota(warm.quota) &&
+          input.candidates.every(
+            (candidate) =>
+              !canSelect(candidate) || !knownQuota(candidate.quota),
+          )))
+        ? warm
+        : undefined
     const cached = this.state.assignments[key]
     if (
       cached &&
       this.assignmentIsActive(cached) &&
       matchesAffinity(cached) &&
       matchesAccountIdentity(cached) &&
+      (!warmRetry || this.logicalAccountId(cached) === warmRetry.accountId) &&
       input.retainAccountIds.has(this.logicalAccountId(cached)) &&
       !input.excludeAccountIds?.has(this.logicalAccountId(cached))
     ) {
@@ -1472,6 +1509,7 @@ export class StickySessionRouter {
       current &&
       matchesAffinity(current) &&
       matchesAccountIdentity(current) &&
+      (!warmRetry || this.logicalAccountId(current) === warmRetry.accountId) &&
       input.retainAccountIds.has(this.logicalAccountId(current)) &&
       !input.excludeAccountIds?.has(this.logicalAccountId(current))
     ) {
@@ -1489,12 +1527,7 @@ export class StickySessionRouter {
     if (affinityChanged || identityChanged) {
       delete state.assignments[key]
     }
-    const candidates = input.candidates.filter(
-      (candidate) =>
-        !input.excludeAccountIds?.has(candidate.accountId) &&
-        (!input.accountIdentities ||
-          identityForAccount(candidate.accountId) !== undefined),
-    )
+    const candidates = input.candidates.filter(canSelect)
     const preferred =
       !affinityChanged && !identityChanged && input.preferredAccountId
         ? candidates.find(
@@ -1511,7 +1544,9 @@ export class StickySessionRouter {
         : undefined
     const selected = input.routingAccountId
       ? candidates.find((row) => row.accountId === input.routingAccountId)
-      : (preferred ?? this.selectCandidate({ ...input, candidates, state }))
+      : (warmRetry ??
+        preferred ??
+        this.selectCandidate({ ...input, candidates, state }))
     if (!selected) {
       if (current && !input.preserveOnNoCandidate) {
         delete state.assignments[key]
