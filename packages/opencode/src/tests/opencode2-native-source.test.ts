@@ -3670,7 +3670,9 @@ describe('OC2 installed quota reroutes', () => {
           window: '7d',
           pool:
             storedPool === 'Claude-Fable-Pool' ? 'claude-fable-pool' : 'fable',
-          resets_at: reset * 1000,
+          // A reset taken from the stored reading isn't sent: the relay would
+          // label it as read from the refusal's headers.
+          ...(storedPool !== 'stored-only' && { resets_at: reset * 1000 }),
         },
       ])
       expect(

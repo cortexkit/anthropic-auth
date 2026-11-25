@@ -82,7 +82,6 @@ test.each([
               outcome: 'exhausted',
               window: '7d',
               pool: 'fable',
-              resets_at: Date.parse(resetsAt),
             },
           ]
         : fixture === '5h headers'

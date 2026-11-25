@@ -151,12 +151,14 @@ export function reportRoutingResponse(
           noReportReason = 'unknown_scoped_pool'
           return
         }
+        // No resetsAt: the relay labels any reset as read from the refusal's
+        // headers, and this one came from the stored reading. Routing reads the
+        // same reset from the vault's quota service.
         send({
           ...identity,
           outcome: 'exhausted',
           window: '7d',
           pool: storedPool,
-          resetsAt,
         })
         return
       }
