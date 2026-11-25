@@ -1711,6 +1711,9 @@ export class CacheKeepManager {
     for (const target of [...this.targets.values()])
       if (
         target !== keep &&
+        // Keep the requested model's warm target when the fallback model
+        // finishes a turn. sourceWarmCurrent controls its separate lifetime.
+        !target.sourceWarmCurrent &&
         (target.id === sessionId ||
           target.policyState?.ownerSessionId === sessionId)
       )

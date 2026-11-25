@@ -445,3 +445,90 @@ test('released-tool start clears only the earlier template until the first round
     h.cacheKeep.stop()
   }
 })
+
+test('tracking the completed round template leaves the source warm registered', async () => {
+  const h = harness()
+  try {
+    h.send().lifecycle.onCompleted?.(completion)
+    h.start()
+    await settle()
+    expect(h.cacheKeep.trackedRequest(warmId())).toBeDefined()
+
+    const turn = h.cacheKeep.beginRealTurn('session')
+    const target = h.send(
+      { bodyText: JSON.stringify(refusedBody) },
+      {
+        onCacheKeepTemplate: (template) => {
+          if (!template) throw new Error('expected accepted target template')
+          turn.track({
+            url: route.url,
+            headers,
+            storage: stored,
+            cacheMode: 'hybrid',
+            bodyText: template.bodyText,
+          })
+        },
+      },
+    )
+    expect(target.plan.kind).toBe('round')
+    target.lifecycle.onCompleted?.(completion)
+    expect(h.cacheKeep.trackedRequest('session')?.bodyText).toBe(
+      target.plan.bodyText,
+    )
+    expect(h.cacheKeep.trackedRequest(warmId())).toBeDefined()
+  } finally {
+    h.cacheKeep.stop()
+  }
+})
+
+test.each([
+  'disabled',
+  'schedule',
+  'policy-refused',
+  'evicted',
+  'session-forgotten',
+  'retries-exhausted',
+  'cost-cap',
+] as const)(
+  'a source warm retired by %s is not resurrected by target activity or another refusal',
+  async (reason) => {
+    const h = harness()
+    try {
+      h.send().lifecycle.onCompleted?.(completion)
+      h.start()
+      await settle()
+      expect(h.cacheKeep.untrack(warmId(), reason)).toBe(true)
+      const input = { bodyText: JSON.stringify(refusedBody) }
+      for (let i = 0; i < 10; i++) {
+        const target = h.send(input)
+        expect(target.plan.kind).toBe('round')
+        target.lifecycle.onCompleted?.(completion)
+      }
+      h.start()
+      await settle()
+      expect(h.cacheKeep.trackedRequest(warmId())).toBeUndefined()
+
+      const freshSource = h.send({
+        ...input,
+        oauth: { ...h.input().oauth!, targetAllowed: () => false },
+      })
+      expect(freshSource.plan.kind).toBe('source')
+      freshSource.lifecycle.onCompleted?.(completion)
+      h.start({
+        bodyText: JSON.stringify({
+          ...refusedBody,
+          messages: [
+            ...refusedBody.messages,
+            { role: 'user', content: 'a new refusal' },
+          ],
+        }),
+      })
+      await settle()
+      expect(
+        JSON.parse(h.cacheKeep.trackedRequest(warmId())!.bodyText).messages,
+      ).toEqual(refusedBody.messages)
+    } finally {
+      h.cacheKeep.stop()
+    }
+  },
+)
