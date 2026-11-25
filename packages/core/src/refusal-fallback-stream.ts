@@ -2,6 +2,8 @@ import {
   createFallbackResponseHold,
   FallbackCreditResponseTooLargeError,
 } from './fallback-credit.ts'
+import { captureRefusalFallbackReply } from './refusal-fallback-reply.ts'
+import { createRecoveryThinkingObserver } from './refusal-fallback-thinking.ts'
 import {
   createSseFramer,
   DEFAULT_SSE_MAX_FRAME_BYTES,
@@ -41,23 +43,30 @@ export type RefusalFallbackStreamRetry =
       response: Response
       onCommitted?: () => void
       onCompleted?: (completion: RefusalFallbackCompletion) => void
+      onThinkingDigest?: (digest: string) => void
+      onFinished?: () => void
     }
   | { kind: 'none'; reason: string }
 
 export type RefusalFallbackCompletion = {
   stopReason: 'end_turn' | 'tool_use' | 'max_tokens'
   usage?: Readonly<Payload>
+  /** Joined host-visible reply, in wire order. Null if it could not be compared safely. */
+  reply?: readonly Payload[] | null
 }
 
 export type RefusalFallbackCompletedRefusal = {
   category?: string
   usage?: Readonly<Payload>
   releasedTool: boolean
+  reply?: RefusalFallbackCompletion['reply']
 }
 
 export type RefusalFallbackLifecycle = {
   onCompleted?: (completion: RefusalFallbackCompletion) => void
   onRefusal?: (refusal: RefusalFallbackCompletedRefusal) => void
+  captureReply?: boolean
+  onThinkingDigest?: (digest: string) => void
 }
 
 type HeartbeatClock = {
@@ -423,6 +432,16 @@ export function joinRefusalFallbackStream(
   let lastByte = 0
 
   const source = createAttempt(maxBytes, updateHeartbeat)
+  const reply = options.lifecycle?.captureReply
+    ? captureRefusalFallbackReply(DEFAULT_SSE_MAX_FRAME_BYTES)
+    : undefined
+  function observeThinking(callback: ((digest: string) => void) | undefined) {
+    return (
+      callback &&
+      createRecoveryThinkingObserver((digest) => notify(callback, digest))
+    )
+  }
+  let provenance = observeThinking(options.lifecycle?.onThinkingDigest)
   const prefill =
     retry && options.takeSourceRefusalCredit
       ? createPrefillCapture(maxBytes)
@@ -442,7 +461,11 @@ export function joinRefusalFallbackStream(
   ) {
     if (!callback || abort.signal.aborted || !isFresh()) return
     const completion = attempt.takeCompletion()
-    if (completion) notify(callback, completion)
+    if (completion)
+      notify(callback, {
+        ...completion,
+        ...(reply && { reply: reply.complete() }),
+      })
   }
 
   function updateHeartbeat() {
@@ -475,9 +498,17 @@ export function joinRefusalFallbackStream(
   }
 
   function closeOpen(output: Uint8Array[]) {
-    for (const index of openHost)
+    for (const index of openHost) {
       output.push(encode({ type: 'content_block_stop', index }))
+      provenance?.close(index)
+    }
     openHost.clear()
+  }
+
+  function capture(index: number, frame: Frame) {
+    if (!frame.payload) return
+    reply?.push(index, frame.payload)
+    provenance?.push(frame.payload, index)
   }
 
   function releaseBlock(
@@ -490,6 +521,7 @@ export function joinRefusalFallbackStream(
     let stopped = false
     for (const bytes of attempt.hold.release(upstreamIndex)) {
       const frame = parse(bytes)
+      capture(index, frame)
       output.push(indexed(frame, index))
       stopped = frame.type === 'content_block_stop'
     }
@@ -571,6 +603,7 @@ export function joinRefusalFallbackStream(
       openHost.add(hostIndex)
       if (attempt === source && !source.releasedTool)
         prefill?.push(hostIndex, frame)
+      capture(hostIndex, frame)
       output.push(indexed(frame, hostIndex))
       emit(output)
     } else if (block?.kind === 'tool_use' || block?.kind === 'refusal') {
@@ -589,6 +622,7 @@ export function joinRefusalFallbackStream(
       if (frame.type === 'content_block_stop') openHost.delete(block.hostIndex)
       if (attempt === source && !source.releasedTool)
         prefill?.push(block.hostIndex, frame)
+      capture(block.hostIndex, frame)
       emit([indexed(frame, block.hostIndex)])
     }
   }
@@ -604,6 +638,7 @@ export function joinRefusalFallbackStream(
     const retrySignal = AbortSignal.any([abort.signal, retryAbort.signal])
     let committed = false
     let onCommitted: (() => void) | undefined
+    let onFinished: (() => void) | undefined
     const stale = new Error('Stale fallback response')
     const beforeContent = () => {
       const output: Uint8Array[] = []
@@ -625,10 +660,13 @@ export function joinRefusalFallbackStream(
       if (result.kind === 'none') return false
       const { response: target } = result
       onCommitted = result.onCommitted
+      onFinished = result.onFinished
       if (!target.ok || retrySignal.aborted || !target.body) {
         void target.body?.cancel().catch(() => {})
         return false
       }
+      if (result.onThinkingDigest)
+        provenance = observeThinking(result.onThinkingDigest)
       const attempt = createAttempt(maxBytes, updateHeartbeat)
       retryAttempt = attempt
       for await (const frame of readFrames(
@@ -656,8 +694,8 @@ export function joinRefusalFallbackStream(
           emit(output)
         } else if (frame.type === 'message_stop') {
           if (committed) {
-            emit([frame.bytes])
             complete(attempt, result.onCompleted)
+            emit([frame.bytes])
           }
           break
         } else if (
@@ -674,6 +712,9 @@ export function joinRefusalFallbackStream(
       return false
     } finally {
       if (!committed) retryAbort.abort()
+      provenance?.finish()
+      provenance = undefined
+      notify(onFinished, undefined)
       retryAttempt?.clear()
       retryAttempt = undefined
     }
@@ -740,6 +781,7 @@ export function joinRefusalFallbackStream(
           notify(options.lifecycle?.onRefusal, {
             ...refusal,
             releasedTool: source.releasedTool,
+            ...(reply && source.releasedTool && { reply: reply.complete() }),
           })
         const creditToken = options.takeSourceRefusalCredit?.()
         const hasPrefillClaim = details?.fallback_has_prefill_claim === true
@@ -780,11 +822,11 @@ export function joinRefusalFallbackStream(
       else {
         if (frame.type === 'error' || frame.event === 'error')
           source.invalidateCompletion()
-        emit([frame.bytes])
         if (frame.type === 'message_stop') {
           complete(source, options.lifecycle?.onCompleted)
           source.clear()
         }
+        emit([frame.bytes])
       }
     }
   }
@@ -804,6 +846,8 @@ export function joinRefusalFallbackStream(
     demand = undefined
     source.clear()
     prefill?.clear()
+    reply?.clear()
+    provenance?.finish()
     retryAttempt?.clear()
     end?.()
     resolve?.()

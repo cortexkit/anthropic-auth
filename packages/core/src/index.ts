@@ -372,6 +372,14 @@ export * from './refusal-fallback-dispatch.ts'
 export * from './refusal-fallback-round.ts'
 export * from './refusal-fallback-stream.ts'
 export * from './refusal-fallback-targets.ts'
+export {
+  RecoveryThinkingStore,
+  recoveryThinkingStoreDirectory,
+} from './refusal-fallback-thinking.ts'
+export type {
+  RefusalFallbackCacheRoute,
+  RefusalFallbackSourceWarmInput,
+} from './refusal-fallback-warm.ts'
 export * from './relay.ts'
 export * from './relay-location.ts'
 export * from './relocation-guard.ts'

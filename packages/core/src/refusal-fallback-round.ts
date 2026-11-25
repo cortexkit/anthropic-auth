@@ -1,4 +1,5 @@
 import { applyEdits, modify } from 'jsonc-parser'
+import type { CacheKeepManager } from './cachekeep.ts'
 import {
   type ClaudeRefusalRecoveryFamily,
   resolveClaudeModelCapabilities,
@@ -11,10 +12,14 @@ import {
 } from './refusal-fallback-dispatch.ts'
 import {
   estimateRefusalFallbackInput,
+  extendsRefusalFallbackPrefix,
   type RefusalFallbackEstimateBase,
+  type RefusalFallbackPrefix,
   refusalBodyRecord,
-  refusalFallbackEstimateBase,
+  refusalFallbackCheckpoint,
+  refusalFallbackPrefix,
 } from './refusal-fallback-prefix.ts'
+import type { RefusalFallbackCompletion } from './refusal-fallback-stream.ts'
 import {
   fitRefusalFallbackTarget,
   foldRefusalFallbackEffort,
@@ -22,6 +27,15 @@ import {
   measuredInputTokens,
   selectRefusalFallbackTarget,
 } from './refusal-fallback-targets.ts'
+import {
+  RecoveryThinkingStore,
+  stripRecoveryRoundThinking,
+} from './refusal-fallback-thinking.ts'
+import {
+  type RefusalFallbackCacheRoute,
+  RefusalFallbackSourceWarm,
+  type RefusalFallbackSourceWarmInput,
+} from './refusal-fallback-warm.ts'
 import type { RefusalFallbackMode } from './settings-definition.ts'
 
 declare const requestHandle: unique symbol
@@ -63,14 +77,17 @@ export type RefusalFallbackRoundInput = {
   /** The final route chosen for the source; omit for ineligible and non-OAuth routes. */
   oauth?: {
     accountId: string
+    /** Stable credential binding, not the rotating OAuth bearer. Required for source warming. */
+    credentialId?: string
     targetAllowed: (model: string) => boolean
+    sourceWarm?: RefusalFallbackSourceWarmInput
   }
   /** Result of comparing the host's normalized history with the round checkpoint. */
   compacted?: boolean
   /**
-   * Apply thinking policy before swapping models. On the source route, filtering
-   * may only touch the latest assistant turn that holds thinking from both the
-   * requested model and the round's fallback model; older turns stay as sent.
+   * Optional host adjustment before Core's thinking filter. Core removes recorded
+   * target thinking after source thinking in every turn, preserving a nonempty
+   * message. Target routes exempt the live round's digests.
    */
   filterBody?: (
     bodyText: string,
@@ -95,10 +112,13 @@ export type RefusalFallbackRoundPlan =
 type Round = Omit<RoundInfo, 'stepsLeft'> & {
   identity: symbol
   accountId: string
+  credentialId?: string
   mode: 'client'
   stepsLeft: number
   folded: boolean
   base?: RefusalFallbackEstimateBase
+  checkpoint: RefusalFallbackPrefix | null
+  releaseThinking: () => void
 }
 
 type FamilyState = {
@@ -110,7 +130,9 @@ type FamilyState = {
 
 type Session = {
   model: string
+  lifetime: object
   latest?: symbol
+  accountId?: string
   families: Map<ClaudeRefusalRecoveryFamily, FamilyState>
 }
 
@@ -119,15 +141,25 @@ type Request = {
   sessionId: string
   session: Session
   family: FamilyState
+  familyId: ClaudeRefusalRecoveryFamily
   accountId: string
   round?: Round
   sourceBodyText: string
   baseBodyText: string
+  templateBodyText: string
+  cacheRoute?: RefusalFallbackCacheRoute
+  sourceWarm?: RefusalFallbackSourceWarmInput
+  credentialId?: string
   identity: symbol
   folded: boolean
   phase: 'planned' | 'sent' | 'refusal' | 'finished'
   category?: string
   handling400?: boolean
+  publishTemplate?: (
+    bodyText: string,
+    servingModel: string,
+    usage?: RefusalFallbackCompletion['usage'],
+  ) => void
 }
 
 function parse(bodyText: string) {
@@ -136,14 +168,6 @@ function parse(bodyText: string) {
   } catch {
     return undefined
   }
-}
-
-function base(text: string, usage?: Readonly<Record<string, unknown>>) {
-  const body = parse(text)
-  const tokens = measuredInputTokens(usage)
-  return body && tokens !== undefined
-    ? refusalFallbackEstimateBase(body, tokens)
-    : undefined
 }
 
 function update(text: string, field: string, value: unknown) {
@@ -170,28 +194,110 @@ function earlyEnd(
 ): RefusalFallbackRoundEnd | undefined {
   if (mode !== round.mode) return 'mode'
   if (!oauth) return 'route'
-  if (oauth.accountId !== round.accountId) return 'account'
-  if (!oauth.targetAllowed(round.servingModel)) return 'quota'
+  if (
+    oauth.accountId !== round.accountId ||
+    oauth.credentialId !== round.credentialId
+  )
+    return 'account'
   if (compacted) return 'compaction'
 }
 
-function sourceBound(input: RefusalFallbackRoundInput): string {
-  return (
-    input.filterBody?.(input.bodyText, { kind: 'source' }) ?? input.bodyText
-  )
+function cacheRoute(
+  input: RefusalFallbackRoundInput,
+): RefusalFallbackCacheRoute | undefined {
+  const { oauth, mode, requestedModel } = input
+  if (!oauth?.credentialId || !oauth.sourceWarm) return undefined
+  return {
+    accountId: oauth.accountId,
+    credentialId: oauth.credentialId,
+    url: oauth.sourceWarm.url,
+    mode,
+    requestedModel,
+  }
+}
+
+export type RefusalFallbackRoundEngineOptions = {
+  thinkingStore?: RecoveryThinkingStore
+  cacheKeep?: CacheKeepManager
+  now?: () => number
+}
+
+export type RefusalFallbackCacheKeepTemplate = Readonly<{
+  bodyText: string
+  servingModel: string
+  usage?: RefusalFallbackCompletion['usage']
+}>
+
+export type RefusalFallbackRoundLifecycleOptions = {
+  isFresh: () => boolean
+  targetAllowed: (model: string) => boolean
+  /** If the host changes tool IDs or names on replay, project them back to its wire namespace. */
+  projectReply?: (
+    blocks: readonly Record<string, unknown>[],
+  ) => readonly Record<string, unknown>[]
+  /** Sign the accepted pre-thread body, then check `isCurrent` before tracking it. Null retires only the live template. */
+  onCacheKeepTemplate?: (
+    template: RefusalFallbackCacheKeepTemplate | null,
+    isCurrent: () => boolean,
+  ) => void
 }
 
 /** Process-local client round state. The host owns routing, headers, threads and transport. */
 export class RefusalFallbackRoundEngine {
   readonly #sessions = new Map<string, Session>()
+  readonly #sessionLifetimes = new Map<string, object>()
   readonly #requests = new WeakMap<RefusalFallbackRoundRequest, Request>()
+  readonly #thinking: RecoveryThinkingStore
+  readonly #warm: RefusalFallbackSourceWarm | undefined
 
   constructor(
     private readonly observe?: (event: RefusalFallbackRoundEvent) => void,
-  ) {}
+    options: RefusalFallbackRoundEngineOptions = {},
+  ) {
+    this.#thinking =
+      options.thinkingStore ?? new RecoveryThinkingStore({ persist: false })
+    if (options.cacheKeep)
+      this.#warm = new RefusalFallbackSourceWarm(
+        options.cacheKeep,
+        options.now ?? Date.now,
+      )
+  }
+
+  loadThinking(sessionId: string): Promise<void> {
+    return this.#thinking.loadSession(sessionId)
+  }
 
   forgetSession(sessionId: string): void {
     this.#sessions.delete(sessionId)
+    this.#sessionLifetimes.delete(sessionId)
+    this.#thinking.forgetSession(sessionId)
+    this.#warm?.forgetSession(sessionId)
+  }
+
+  /** Call on sign-out or credential replacement, including with the same account UUID. */
+  forgetAccount(accountId: string): void {
+    this.#warm?.forgetAccount(accountId)
+    for (const session of this.#sessions.values())
+      if (session.accountId === accountId) session.latest = undefined
+  }
+
+  #filter(
+    input: RefusalFallbackRoundInput,
+    familyId?: ClaudeRefusalRecoveryFamily,
+    round?: symbol,
+  ): string {
+    const text =
+      input.filterBody?.(
+        input.bodyText,
+        round ? { kind: 'target', round } : { kind: 'source' },
+      ) ?? input.bodyText
+    if (!familyId) return text
+    const digests = this.#thinking.peek(input.sessionId, familyId)
+    if (!digests?.size) return text
+    const body = parse(text)
+    return body && stripRecoveryRoundThinking(body, digests, round)
+      ? update(text, 'messages', body.messages)
+      : text
   }
 
   #emit(
@@ -220,6 +326,8 @@ export class RefusalFallbackRoundEngine {
   #end(family: FamilyState, round: Round, reason: RefusalFallbackRoundEnd) {
     if (family.round !== round) return
     family.round = undefined
+    round.releaseThinking()
+    if (reason === 'compaction') this.#warm?.forgetSession(round.sessionId)
     this.#emit(round, 'round_ended', reason)
   }
 
@@ -240,6 +348,9 @@ export class RefusalFallbackRoundEngine {
     const unchanged = { kind: 'source', bodyText: input.bodyText } as const
     if (input.kind !== 'primary') return unchanged
     const { requestedModel, sessionId, oauth } = input
+    const route = cacheRoute(input)
+    this.#warm?.checkPlan(sessionId, route)
+    if (input.compacted) this.#warm?.forgetSession(sessionId)
     let session = this.#sessions.get(sessionId)
     let endedForModel = false
     if (session && session.model !== requestedModel) {
@@ -256,7 +367,7 @@ export class RefusalFallbackRoundEngine {
       resolveClaudeModelCapabilities(requestedModel)?.refusalRecoveryFamily
     if (!familyId)
       return endedForModel
-        ? { kind: 'source', bodyText: sourceBound(input) }
+        ? { kind: 'source', bodyText: this.#filter(input) }
         : unchanged
     const existing = session?.families.get(familyId)
     const round = existing?.round
@@ -268,6 +379,7 @@ export class RefusalFallbackRoundEngine {
           input,
           session,
           existing,
+          familyId,
           round,
           oauth,
           'round',
@@ -276,14 +388,13 @@ export class RefusalFallbackRoundEngine {
         if (target !== 'source') this.#end(existing, round, target)
       }
     }
-    if (input.mode !== 'client' || !oauth) {
-      return round || endedForModel
-        ? { kind: 'source', bodyText: sourceBound(input) }
-        : unchanged
-    }
-    const bodyText = sourceBound(input)
+    const bodyText = this.#filter(input, familyId)
+    if (input.mode !== 'client' || !oauth) return { kind: 'source', bodyText }
+    this.#warm?.checkSourceHistory(sessionId, parse(bodyText))
     if (!session) {
-      session = { model: requestedModel, families: new Map() }
+      const lifetime = this.#sessionLifetimes.get(sessionId) ?? {}
+      this.#sessionLifetimes.set(sessionId, lifetime)
+      session = { model: requestedModel, lifetime, families: new Map() }
       this.#sessions.set(sessionId, session)
     }
     const family = existing ?? { clean: 0, level: 0, recent: false }
@@ -296,9 +407,14 @@ export class RefusalFallbackRoundEngine {
         sessionId,
         session,
         family,
+        familyId,
         accountId: oauth.accountId,
+        credentialId: oauth.credentialId,
+        cacheRoute: route,
+        sourceWarm: oauth.sourceWarm,
         sourceBodyText: bodyText,
         baseBodyText: bodyText,
+        templateBodyText: bodyText,
         folded: false,
       }),
     }
@@ -308,53 +424,66 @@ export class RefusalFallbackRoundEngine {
   planRouted(input: RefusalFallbackRoundInput): RefusalFallbackRoundPlan {
     const unchanged = { kind: 'source', bodyText: input.bodyText } as const
     const { kind, mode, requestedModel, oauth } = input
-    if (
-      !oauth ||
-      mode !== 'client' ||
-      ['primary', 'keep-warm', 'cachekeep', 'prime'].includes(kind)
-    )
+    if (['primary', 'keep-warm', 'cachekeep', 'prime'].includes(kind))
       return unchanged
-    const session = this.#sessions.get(input.sessionId)
-    if (session?.model !== requestedModel) return unchanged
     const familyId =
       resolveClaudeModelCapabilities(requestedModel)?.refusalRecoveryFamily
-    const family = familyId && session.families.get(familyId)
+    const source = () => ({
+      kind: 'source' as const,
+      bodyText: this.#filter(input, familyId),
+    })
+    if (!oauth || mode !== 'client' || !familyId) return source()
+    const session = this.#sessions.get(input.sessionId)
+    if (session?.model !== requestedModel) return source()
+    const family = session.families.get(familyId)
     const round = family?.round
     if (
       family &&
       round &&
       round.accountId === oauth.accountId &&
+      round.credentialId === oauth.credentialId &&
       oauth.targetAllowed(round.servingModel)
     ) {
       const plan = this.#planTarget(
         input,
         session,
         family,
+        familyId,
         round,
         oauth,
         'routed',
       )
       if (typeof plan !== 'string') return plan
     }
-    return { kind: 'source', bodyText: sourceBound(input) }
+    return source()
   }
 
   #planTarget(
     input: RefusalFallbackRoundInput,
     session: Session,
     family: FamilyState,
+    familyId: ClaudeRefusalRecoveryFamily,
     round: Round,
     oauth: NonNullable<RefusalFallbackRoundInput['oauth']>,
     kind: 'round' | 'routed',
-  ): RefusalFallbackRoundPlan | 'window' | 'budget' | 'source' {
+  ):
+    | RefusalFallbackRoundPlan
+    | 'window'
+    | 'budget'
+    | 'compaction'
+    | 'quota'
+    | 'source' {
     const servingModel = round.servingModel
-    const baseBodyText =
-      input.filterBody?.(input.bodyText, {
-        kind: 'target',
-        round: round.identity,
-      }) ?? input.bodyText
+    const baseBodyText = this.#filter(input, familyId, round.identity)
     const prepared = parse(baseBodyText)
     if (!prepared) return 'window'
+    if (
+      kind === 'round' &&
+      (!round.checkpoint ||
+        !extendsRefusalFallbackPrefix(prepared, round.checkpoint))
+    )
+      return 'compaction'
+    if (kind === 'round' && !oauth.targetAllowed(servingModel)) return 'quota'
     let folded = round.folded
     if (!folded && !isRefusalFallbackBodyValid(servingModel, prepared)) {
       if (kind === 'routed') return 'source'
@@ -375,7 +504,7 @@ export class RefusalFallbackRoundEngine {
     bodyText = update(bodyText, 'max_tokens', maxTokens)
     bodyText = update(bodyText, 'fallbacks', undefined)
     bodyText = update(bodyText, 'fallback_credit_token', undefined)
-    const sourceBodyText = sourceBound(input)
+    const sourceBodyText = this.#filter(input, familyId)
     return {
       kind,
       bodyText,
@@ -385,11 +514,16 @@ export class RefusalFallbackRoundEngine {
         kind,
         session,
         family,
+        familyId,
         round,
         sessionId: input.sessionId,
         accountId: oauth.accountId,
+        credentialId: oauth.credentialId,
+        cacheRoute: cacheRoute(input),
+        sourceWarm: oauth.sourceWarm,
         sourceBodyText,
         baseBodyText,
+        templateBodyText: bodyText,
         folded,
       }),
     }
@@ -408,6 +542,7 @@ export class RefusalFallbackRoundEngine {
     request.phase = 'sent'
     if (request.kind !== 'routed') {
       request.session.latest = request.identity
+      request.session.accountId = request.accountId
       if (request.round && request.folded) request.round.folded = true
     }
     return true
@@ -430,7 +565,7 @@ export class RefusalFallbackRoundEngine {
     request: Request,
     category: string,
     target: { model: string; folded: boolean },
-    inputBase: RefusalFallbackEstimateBase | undefined,
+    step: Pick<Round, 'base' | 'checkpoint'>,
     retry: boolean,
   ) {
     const { family, session, sessionId, accountId } = request
@@ -438,20 +573,91 @@ export class RefusalFallbackRoundEngine {
     family.clean = 0
     family.recent = true
     const round: Round = {
-      identity: Symbol(),
+      identity: request.identity,
       sessionId,
       requestedModel: session.model,
       servingModel: target.model,
       category,
       accountId,
+      credentialId: request.credentialId,
       mode: 'client',
       stepsLeft: 10 * 2 ** family.level - (retry ? 1 : 0),
       folded: target.folded,
-      base: inputBase,
+      releaseThinking: this.#thinking.retainSession(sessionId),
+      ...step,
     }
     family.round = round
     this.#emit(round, 'round_started')
     if (retry) this.#emit(round, 'step_served')
+    const refused = this.#warm && parse(request.baseBodyText)
+    if (refused)
+      this.#warm?.register(
+        sessionId,
+        refused,
+        () =>
+          this.#sessions.get(sessionId) === session && family.round === round,
+      )
+  }
+
+  #step(
+    request: Request,
+    { usage, reply }: Pick<RefusalFallbackCompletion, 'usage' | 'reply'>,
+    projectReply: RefusalFallbackRoundLifecycleOptions['projectReply'],
+  ): Pick<Round, 'base' | 'checkpoint'> {
+    const body = parse(request.baseBodyText)
+    if (!body) return { checkpoint: null }
+    const prefix = refusalFallbackPrefix(body)
+    const inputTokens = measuredInputTokens(usage)
+    const base =
+      inputTokens === undefined ? undefined : { ...prefix, inputTokens }
+    try {
+      return {
+        base,
+        checkpoint:
+          reply === null
+            ? null
+            : refusalFallbackCheckpoint(
+                prefix,
+                reply && projectReply ? projectReply(reply) : reply,
+              ),
+      }
+    } catch {
+      return { base, checkpoint: null }
+    }
+  }
+
+  #sourceCompleted(
+    request: Request,
+    bodyText: string,
+    completion: RefusalFallbackCompletion,
+  ) {
+    if (++request.family.clean >= 10) {
+      request.family.level = 0
+      request.family.recent = false
+    }
+    const usage = completion.usage
+    this.#warm?.completeSource(
+      request.sessionId,
+      request.familyId,
+      request.cacheRoute,
+      request.sourceWarm,
+      bodyText,
+      parse(bodyText),
+      usage && {
+        input_tokens:
+          typeof usage.input_tokens === 'number'
+            ? usage.input_tokens
+            : undefined,
+        cache_read_input_tokens:
+          typeof usage.cache_read_input_tokens === 'number'
+            ? usage.cache_read_input_tokens
+            : undefined,
+        cache_creation_input_tokens:
+          typeof usage.cache_creation_input_tokens === 'number'
+            ? usage.cache_creation_input_tokens
+            : undefined,
+      },
+    )
   }
 
   /** Pass to dispatch for source plans, or to the protected join for round plans. */
@@ -460,27 +666,84 @@ export class RefusalFallbackRoundEngine {
     {
       isFresh,
       targetAllowed,
-    }: { isFresh: () => boolean; targetAllowed: (model: string) => boolean },
+      projectReply,
+      onCacheKeepTemplate,
+    }: RefusalFallbackRoundLifecycleOptions,
   ): RefusalFallbackDispatchLifecycle | undefined {
     const request = this.#requests.get(handle)
     if (!request || request.kind === 'routed') return undefined
     const fresh = () => this.#isCurrentPrimary(request) && isFresh()
+    const templateIsCurrent = () => this.#isNewestPrimary(request) && isFresh()
+    const publish = (
+      bodyText: string | null,
+      servingModel: string,
+      usage?: RefusalFallbackCompletion['usage'],
+    ) => {
+      if (!onCacheKeepTemplate || !templateIsCurrent()) return
+      try {
+        if (bodyText === null) onCacheKeepTemplate(null, templateIsCurrent)
+        else {
+          const body = parse(bodyText)
+          if (!body || refusalBodyRecord(body.thread)?.type === 'continue')
+            return
+          if (body.thread !== undefined)
+            bodyText = update(bodyText, 'thread', undefined)
+          if (body.fallback_credit_token !== undefined)
+            bodyText = update(bodyText, 'fallback_credit_token', undefined)
+          onCacheKeepTemplate(
+            { bodyText, servingModel, usage },
+            templateIsCurrent,
+          )
+        }
+      } catch {
+        // Transport-side CacheKeep bookkeeping cannot interrupt the response.
+      }
+    }
+    const sessionStillExists = () =>
+      this.#sessionLifetimes.get(request.sessionId) === request.session.lifetime
+    const record = (digest: string, round: symbol) => {
+      // Staleness does not discard thinking received by the host, but deletion
+      // must not recreate a forgotten session.
+      if (!sessionStillExists()) return
+      this.#thinking.record(request.sessionId, request.familyId, digest, round)
+    }
+    let releaseRetryThinking: (() => void) | undefined
+    if (onCacheKeepTemplate) request.publishTemplate = publish
     return {
+      captureReply: true,
+      ...(request.round && {
+        onThinkingDigest: (digest) =>
+          record(digest, request.round?.identity ?? request.identity),
+      }),
       onCompleted: (completion) => {
         if (request.phase !== 'sent' || !fresh()) return
         request.phase = 'finished'
         if (request.round) {
           const round = request.round
-          round.base = base(request.baseBodyText, completion.usage)
+          Object.assign(round, this.#step(request, completion, projectReply))
           round.stepsLeft--
           this.#emit(round, 'step_served')
           if (round.stepsLeft === 0) this.#end(request.family, round, 'count')
-        } else if (++request.family.clean >= 10) {
-          request.family.level = 0
-          request.family.recent = false
-        }
+        } else
+          this.#sourceCompleted(request, request.templateBodyText, completion)
+        publish(
+          request.templateBodyText,
+          request.round?.servingModel ?? request.session.model,
+          completion.usage,
+        )
       },
       ...(request.kind === 'source' && {
+        onRetryThinkingDigest: (digest) => {
+          if (!sessionStillExists()) return
+          releaseRetryThinking ??= this.#thinking.retainSession(
+            request.sessionId,
+          )
+          record(digest, request.identity)
+        },
+        onRetryFinished: () => {
+          releaseRetryThinking?.()
+          releaseRetryThinking = undefined
+        },
         onRefusal: (refusal) => {
           if (request.phase !== 'sent' || !fresh()) return
           request.phase = 'refusal'
@@ -508,14 +771,16 @@ export class RefusalFallbackRoundEngine {
             target.kind === 'target' &&
             targetAllowed(target.model) &&
             fresh()
-          )
+          ) {
             this.#start(
               request,
               refusal.category,
               { model: target.model, folded },
-              base(request.baseBodyText, refusal.usage),
+              this.#step(request, refusal, projectReply),
               false,
             )
+            publish(null, target.model)
+          }
         },
         onRetryCompleted: (completion, target) => {
           if (request.phase !== 'refusal' || !request.category || !fresh())
@@ -525,9 +790,11 @@ export class RefusalFallbackRoundEngine {
             request,
             request.category,
             target,
-            base(request.baseBodyText, completion.usage),
+            this.#step(request, completion, projectReply),
             true,
           )
+          if (target.bodyText)
+            publish(target.bodyText, target.model, completion.usage)
         },
       }),
     }
@@ -576,6 +843,17 @@ export class RefusalFallbackRoundEngine {
           this.#end(request.family, round, 'target-400')
       },
       isNewest,
+      request.kind === 'round'
+        ? (completion, bodyText) => {
+            if (!isNewest()) return
+            this.#sourceCompleted(request, bodyText, completion)
+            request.publishTemplate?.(
+              bodyText,
+              request.session.model,
+              completion.usage,
+            )
+          }
+        : undefined,
     )
   }
 }

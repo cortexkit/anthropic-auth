@@ -54,8 +54,10 @@ export type RefusalFallbackPhysicalAttempt = Readonly<{
 export type RefusalFallbackDispatchLifecycle = RefusalFallbackLifecycle & {
   onRetryCompleted?: (
     completion: RefusalFallbackCompletion,
-    target: Readonly<{ model: string; folded: boolean }>,
+    target: Readonly<{ model: string; folded: boolean; bodyText?: string }>,
   ) => void
+  onRetryThinkingDigest?: (digest: string) => void
+  onRetryFinished?: () => void
 }
 
 export type RefusalFallbackDispatchOptions = {
@@ -289,9 +291,10 @@ export function dispatchRefusalFallback(
       retryBody = replace(retryBody, ['max_tokens'], choice.maxTokens)
       retryBody = replace(retryBody, ['fallbacks'], undefined)
       retryBody = replace(retryBody, ['fallback_credit_token'], undefined)
-      const reusableBodyText = options.observePhysicalResponse
-        ? await signRequestBody(replace(retryBody, ['thread'], undefined))
-        : undefined
+      const reusableBodyText =
+        options.observePhysicalResponse || options.lifecycle?.onRetryCompleted
+          ? await signRequestBody(replace(retryBody, ['thread'], undefined))
+          : undefined
       if (thread === 'continue')
         retryBody = replace(retryBody, ['thread'], { type: 'create' })
       if (token) {
@@ -370,11 +373,14 @@ export function dispatchRefusalFallback(
           response: billed,
           onCommitted: () =>
             options.onRetryCommitted?.({ model: attempt.model, attempt }),
+          onThinkingDigest: options.lifecycle?.onRetryThinkingDigest,
+          onFinished: options.lifecycle?.onRetryFinished,
           ...(options.lifecycle?.onRetryCompleted && {
             onCompleted: (completion: RefusalFallbackCompletion) =>
               options.lifecycle?.onRetryCompleted?.(completion, {
                 model: attempt.model,
                 folded,
+                bodyText: reusableBodyText,
               }),
           }),
         }
@@ -422,6 +428,10 @@ export async function resendRefusalFallbackSource(
   isCurrent: () => boolean,
   settle400: () => void,
   isNewest: () => boolean,
+  onSourceCompleted?: (
+    completion: RefusalFallbackCompletion,
+    bodyText: string,
+  ) => void,
 ): Promise<Response> {
   const signal = options.signal ?? new AbortController().signal
   const fresh = () => !signal.aborted && isCurrent()
@@ -481,10 +491,17 @@ export async function resendRefusalFallbackSource(
     maxPendingBytes: options.maxPendingBytes,
   })
   const observed = options.observeResendResponse?.(guarded, model) ?? guarded
+  const bodyText = prepared.bodyText
   return eventStream(guarded)
     ? joinRefusalFallbackStream(observed, {
         sourceModel: options.sourceModel,
         isFresh: () => !signal.aborted && isNewest(),
+        ...(onSourceCompleted && {
+          lifecycle: {
+            onCompleted: (completion) =>
+              onSourceCompleted(completion, bodyText),
+          },
+        }),
         signal,
         maxPendingBytes: options.maxPendingBytes,
       })

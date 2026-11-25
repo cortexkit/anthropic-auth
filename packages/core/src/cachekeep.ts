@@ -456,6 +456,8 @@ export type CacheKeepTarget = {
    * untrack() when the round ends or its prefix becomes unusable.
    */
   sourceWarm?: boolean
+  /** In-process validity check for a kept source prefix; never serialized. */
+  sourceWarmCurrent?: (bodyText: string) => boolean
 } & Pick<CacheKeepTrackedSession, 'ttlMs' | 'lastTouchAt' | 'lastTouchKind'>
 
 type AcceptedCacheUsage = {
@@ -1273,6 +1275,14 @@ export class CacheKeepManager {
       : this.immediateTargets.get(target.id) === target
   }
 
+  private isCurrentSourceWarm(target: CacheKeepTarget): boolean {
+    try {
+      return target.sourceWarmCurrent?.(target.bodyText) ?? true
+    } catch {
+      return false
+    }
+  }
+
   isRestoredTarget(target: Readonly<CacheKeepTarget>): boolean {
     return this.restoredTargets.has(target)
   }
@@ -1487,6 +1497,11 @@ export class CacheKeepManager {
     const current = this.targets.get(target.id)
     if (!current || !this.isCurrentTarget(target))
       throw new CacheKeepWarmRefusal('stopped')
+    const checkSourceWarm = () => {
+      if (!this.isCurrentSourceWarm(current))
+        throw new CacheKeepWarmRefusal('routing-moved')
+    }
+    checkSourceWarm()
     const state = current.policyState
     if (this.realTurnBusy(state?.ownerSessionId ?? target.id))
       throw new CacheKeepWarmWait()
@@ -1502,6 +1517,7 @@ export class CacheKeepManager {
           )
         : loaded
     if (!this.isCurrentTarget(target)) throw new CacheKeepWarmRefusal('stopped')
+    checkSourceWarm()
     if (this.realTurnBusy(state?.ownerSessionId ?? target.id))
       throw new CacheKeepWarmWait()
     const now = this.options.now?.() ?? Date.now()
@@ -1565,6 +1581,7 @@ export class CacheKeepManager {
     }
     if (state) this.admittedWarmCosts.set(state, admittedCost)
     if (!this.isCurrentTarget(target)) throw new CacheKeepWarmRefusal('stopped')
+    checkSourceWarm()
     const fresh = this.realTurnBusy(state?.ownerSessionId ?? target.id)
       ? { action: 'wait' as const, until: 0 }
       : this.policyDecision(current, this.options.now?.() ?? Date.now(), true)
@@ -1786,6 +1803,7 @@ export class CacheKeepManager {
     accountStoragePath?: string
     isSubagent?: boolean
     sourceWarm?: boolean
+    sourceWarmCurrent?: CacheKeepTarget['sourceWarmCurrent']
     /** Source targets use a synthetic id but belong to a real host session. */
     ownerSessionId?: string
     acceptedAt?: number
@@ -2030,6 +2048,10 @@ export class CacheKeepManager {
               : (previous?.policyState?.hasWarmed ?? false),
           },
       ...(input.sourceWarm === true && { sourceWarm: true }),
+      ...(input.sourceWarm &&
+        input.sourceWarmCurrent && {
+          sourceWarmCurrent: input.sourceWarmCurrent,
+        }),
     })
     const target = this.targets.get(input.sessionId)
     if (!target)
@@ -2171,6 +2193,14 @@ export class CacheKeepManager {
       // An earlier prewarm's await can let a real request replace or retire
       // this target; only the current one is decided and sent.
       if (this.targets.get(target.id) !== target) return
+      if (!this.isCurrentSourceWarm(target)) {
+        this.removeTarget(
+          target,
+          'routing-moved',
+          this.options.now?.() ?? Date.now(),
+        )
+        return
+      }
       if (this.realTurnBusy(target.policyState?.ownerSessionId ?? target.id))
         return
       const attemptAt = this.options.now?.() ?? Date.now()
@@ -2519,7 +2549,7 @@ export class CacheKeepManager {
       // fallback-beta bodies also need credit redaction before billing.
       const send = async (attemptHeaders: Headers): Promise<Response> => {
         ensureActive()
-        if (!this.isCurrentTarget(target))
+        if (!this.isCurrentTarget(target) || !this.isCurrentSourceWarm(target))
           throw new CacheKeepWarmRefusal('stopped')
         checkRouting()
         if (this.targets.has(target.id) || target.policyState) {
@@ -2534,6 +2564,12 @@ export class CacheKeepManager {
         try {
           const dispatch = async () => {
             ensureActive()
+            if (
+              target.sourceWarmCurrent &&
+              (!this.isCurrentTarget(target) ||
+                !this.isCurrentSourceWarm(target))
+            )
+              throw new CacheKeepWarmRefusal('routing-moved')
             const raw = await fetchImpl(target.url, {
               method: 'POST',
               headers: attemptHeaders,

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { isServerFallbackUsageMarker } from './server-fallback-usage.ts'
 import { TURN_END_NOTE_CONTENT } from './turn-end-note.ts'
 
 type Body = Record<string, unknown>
@@ -50,33 +51,48 @@ function normalizeMessage(value: unknown): unknown {
       ? [{ type: 'text', text: message.content }]
       : message.content
   if (!Array.isArray(blocks)) return message
-  const content: unknown[] = []
+  const filtered: unknown[] = []
   for (const raw of blocks) {
     const block = withoutCacheControl(raw)
     const record = refusalBodyRecord(block)
     if (
-      (record?.type === 'thinking' && !record.signature) ||
-      (record?.type === 'redacted_thinking' && !record.data) ||
-      (plainText(block) && block.text.trim() === '')
+      isServerFallbackUsageMarker(block) ||
+      (record?.type === 'thinking' &&
+        (typeof record.signature !== 'string' || !record.signature)) ||
+      (record?.type === 'redacted_thinking' &&
+        (typeof record.data !== 'string' || !record.data)) ||
+      (record?.type === 'text' &&
+        typeof record.text === 'string' &&
+        record.text.trim() === '')
     )
       continue
+    if (record?.type === 'tool_result' && Array.isArray(record.content)) {
+      filtered.push({
+        ...record,
+        content: record.content.map(withoutCacheControl),
+      })
+    } else if (
+      record?.type === 'tool_use' &&
+      typeof record.input === 'string'
+    ) {
+      try {
+        filtered.push({ ...record, input: JSON.parse(record.input) })
+      } catch {
+        filtered.push(block)
+      }
+    } else filtered.push(block)
+  }
+  if (message.role === 'assistant' && filtered.length === 0) return undefined
+  const content: unknown[] = []
+  for (const block of filtered) {
     const previous = content.at(-1)
     if (plainText(block) && plainText(previous)) {
       content[content.length - 1] = {
         type: 'text',
         text: previous.text + block.text,
       }
-    } else if (
-      record?.type === 'tool_result' &&
-      Array.isArray(record.content)
-    ) {
-      content.push({
-        ...record,
-        content: record.content.map(withoutCacheControl),
-      })
     } else content.push(block)
   }
-  if (message.role === 'assistant' && content.length === 0) return undefined
   return { ...message, content }
 }
 
@@ -122,19 +138,62 @@ function comparisonBody(body: Body) {
   return { fixed: digest(canonical({ system, tools })), messages }
 }
 
-export type RefusalFallbackEstimateBase = Readonly<{
+export type RefusalFallbackPrefix = Readonly<{
   fixed: string
   messages: readonly string[]
-  inputTokens: number
 }>
 
-// Retain only digests and measured usage after the response finishes.
+export type RefusalFallbackEstimateBase = RefusalFallbackPrefix &
+  Readonly<{
+    inputTokens: number
+  }>
+
+/** Keep comparison digests, not a second copy of the conversation. */
+export function refusalFallbackPrefix(body: Body): RefusalFallbackPrefix {
+  const { fixed, messages } = comparisonBody(body)
+  return { fixed, messages: messages.map(digest) }
+}
+
+export function refusalFallbackCheckpoint(
+  base: RefusalFallbackPrefix,
+  reply: readonly Body[] | undefined,
+): RefusalFallbackPrefix {
+  const message =
+    reply && normalizeMessage({ role: 'assistant', content: reply })
+  return message === undefined
+    ? base
+    : {
+        fixed: base.fixed,
+        messages: [...base.messages, digest(canonical(message))],
+      }
+}
+
 export function refusalFallbackEstimateBase(
   body: Body,
   inputTokens: number,
 ): RefusalFallbackEstimateBase {
-  const { fixed, messages } = comparisonBody(body)
-  return { fixed, messages: messages.map(digest), inputTokens }
+  return { ...refusalFallbackPrefix(body), inputTokens }
+}
+
+function extendsPrefix(
+  { fixed, messages }: ReturnType<typeof comparisonBody>,
+  base: RefusalFallbackPrefix,
+) {
+  return (
+    fixed === base.fixed &&
+    messages.length >= base.messages.length &&
+    base.messages.every((hash, index) => {
+      const message = messages[index]
+      return message !== undefined && hash === digest(message)
+    })
+  )
+}
+
+export function extendsRefusalFallbackPrefix(
+  body: Body,
+  base: RefusalFallbackPrefix,
+): boolean {
+  return extendsPrefix(comparisonBody(body), base)
 }
 
 export function estimateRefusalFallbackInput(
@@ -143,16 +202,9 @@ export function estimateRefusalFallbackInput(
   base: RefusalFallbackEstimateBase | undefined,
 ): number {
   if (base) {
-    const { fixed, messages } = comparisonBody(body)
-    if (
-      fixed === base.fixed &&
-      messages.length >= base.messages.length &&
-      base.messages.every((hash, index) => {
-        const message = messages[index]
-        return message !== undefined && hash === digest(message)
-      })
-    ) {
-      const suffix = messages.slice(base.messages.length)
+    const comparison = comparisonBody(body)
+    if (extendsPrefix(comparison, base)) {
+      const suffix = comparison.messages.slice(base.messages.length)
       return base.inputTokens + Buffer.byteLength(`[${suffix.join(',')}]`) / 4
     }
   }

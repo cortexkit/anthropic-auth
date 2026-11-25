@@ -1,4 +1,7 @@
 import { expect, test } from 'bun:test'
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { hasValidRequestBodySignature, signRequestBody } from '../cch.ts'
 import { dispatchRefusalFallback } from '../refusal-fallback-dispatch.ts'
 import {
@@ -12,6 +15,10 @@ import {
   type RefusalFallbackRoundPlan,
 } from '../refusal-fallback-round.ts'
 import { joinRefusalFallbackStream } from '../refusal-fallback-stream.ts'
+import {
+  RecoveryThinkingStore,
+  recoveryThinkingDigest,
+} from '../refusal-fallback-thinking.ts'
 import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback-usage.ts'
 import { TURN_END_NOTE_CONTENT } from '../turn-end-note.ts'
 
@@ -46,9 +53,14 @@ const usage = { input_tokens: 20, cache_read_input_tokens: 200 }
 const completion = { stopReason: 'end_turn', usage } as const
 const refusal = { category: 'cyber', releasedTool: false, usage }
 
-function fixture() {
+function fixture(
+  options?: ConstructorParameters<typeof RefusalFallbackRoundEngine>[1],
+) {
   const events: RefusalFallbackRoundEvent[] = []
-  const engine = new RefusalFallbackRoundEngine((event) => events.push(event))
+  const engine = new RefusalFallbackRoundEngine(
+    (event) => events.push(event),
+    options,
+  )
   const input: RefusalFallbackRoundInput = {
     sessionId: 's',
     requestedModel: fable,
@@ -59,13 +71,17 @@ function fixture() {
   }
   const plan = (overrides?: Partial<RefusalFallbackRoundInput>) =>
     engine.plan({ ...input, ...overrides })
-  const send = (plan: RefusalFallbackRoundPlan) => {
+  const send = (
+    plan: RefusalFallbackRoundPlan,
+    overrides?: Partial<Parameters<typeof engine.lifecycle>[1]>,
+  ) => {
     const handle = plan.request
     if (!handle || !engine.markSent(handle))
       throw new Error('Expected a sendable request')
     const lifecycle = engine.lifecycle(handle, {
       isFresh: allowed,
       targetAllowed: allowed,
+      ...overrides,
     })
     return { handle, lifecycle }
   }
@@ -335,6 +351,65 @@ const sse = (...events: unknown[]) =>
   })
 const bad = () =>
   Response.json({ error: { message: 'wrong request' } }, { status: 400 })
+
+const sourceThought = {
+  type: 'thinking',
+  thinking: 'source private thought',
+  signature: 'source signature',
+}
+const targetThought = {
+  type: 'thinking',
+  thinking: 'target private thought',
+  signature: 'target signature',
+}
+const redacted = { type: 'redacted_thinking', data: 'target redacted data' }
+const textBlock = (text: string) => ({ type: 'text', text })
+const assistant = (...content: unknown[]) => ({ role: 'assistant', content })
+const user = (content: string) => ({ role: 'user', content })
+const replay = (...messages: unknown[]) => JSON.stringify({ ...body, messages })
+
+function retryWithThinking(
+  input: RefusalFallbackRoundPlan,
+  lifecycle: NonNullable<ReturnType<RefusalFallbackRoundEngine['lifecycle']>>,
+  events: unknown[],
+  options?: {
+    credited?: boolean
+    onCommit?: () => void
+    signal?: AbortSignal
+    capture?: (bodyText: string) => void
+  },
+) {
+  const { options: dispatch } = resendOptions()
+  const refusalFrame = options?.credited
+    ? {
+        ...refused,
+        delta: {
+          ...refused.delta,
+          stop_details: {
+            ...refused.delta.stop_details,
+            fallback_credit_token: 'one-use-credit',
+            fallback_has_prefill_claim: true,
+          },
+        },
+      }
+    : refused
+  return dispatchRefusalFallback(
+    sse(start(fable), block(sourceThought), close, refusalFrame, stop),
+    {
+      ...dispatch,
+      origin: { ...dispatch.origin, bodyText: input.bodyText },
+      isFresh: allowed,
+      signal: options?.signal,
+      onRetryCommitted: options?.onCommit,
+      billing: { sessionId: 's', requestKind: 'primary' },
+      lifecycle,
+      async send({ bodyText }) {
+        options?.capture?.(bodyText)
+        return sse(start(opus), ...events)
+      },
+    },
+  )
+}
 const sendHeaders = new Headers({
   authorization: 'Bearer initial',
   'anthropic-beta': `${SERVER_SIDE_FALLBACK_BETA},per-turn-control-test`,
@@ -734,9 +809,17 @@ test('dispatch forwards a released tool and starts a folded round without an ext
     name: 'lookup',
     input: {},
   })
+  const delta = {
+    type: 'content_block_delta',
+    index: 0,
+    delta: {
+      type: 'input_json_delta',
+      partial_json: '{"query":"kept","limit":5}',
+    },
+  }
   const source = 'claude-opus-5'
   const reply = dispatchRefusalFallback(
-    sse(start(source), tool, close, refused, stop),
+    sse(start(source), tool, delta, close, refused, stop),
     {
       ...options,
       sourceModel: source,
@@ -761,7 +844,28 @@ test('dispatch forwards a released tool and starts a folded round without an ext
     },
   ])
   expect(
-    plan({ requestedModel: source, bodyText: initial.bodyText }),
+    plan({
+      requestedModel: source,
+      bodyText: JSON.stringify({
+        ...JSON.parse(initial.bodyText),
+        messages: [
+          marker,
+          prompt,
+          {
+            role: 'assistant',
+            content: [
+              { ...tool.content_block, input: { limit: 5, query: 'kept' } },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              { type: 'tool_result', tool_use_id: 'toolu_1', content: 'found' },
+            ],
+          },
+        ],
+      }),
+    }),
   ).toMatchObject({ kind: 'round', folded: true })
 })
 
@@ -815,3 +919,345 @@ test('dispatch with no round lifecycle preserves the joined wire bytes and physi
   expect(sent).toHaveLength(2)
   expect(sent[0]).toBe(sent[1])
 })
+
+test('two rounds keep the retry prefix identical and a second refusal does not restore stripped thinking', async () => {
+  const thinkingStore = new RecoveryThinkingStore({ persist: false })
+  const { plan, send, events } = fixture({ thinkingStore })
+  const templates: Array<string | null> = []
+  const track = (template: { bodyText: string } | null) =>
+    templates.push(template?.bodyText ?? null)
+  const sends: string[] = []
+  const initial = plan()
+  const first = send(initial, { onCacheKeepTemplate: track }).lifecycle!
+  await retryWithThinking(
+    initial,
+    first,
+    [
+      block(targetThought),
+      close,
+      block(redacted),
+      close,
+      block(textBlock('first answer')),
+      close,
+      end,
+      stop,
+    ],
+    {
+      credited: true,
+      capture: (text) => sends.push(text),
+    },
+  ).text()
+  const template = templates[0]!
+  expect(await hasValidRequestBodySignature(template)).toBe(true)
+  expect(JSON.parse(template)).toMatchObject({
+    model: opus,
+    messages: [prompt],
+  })
+  expect(template).not.toContain('one-use-credit')
+  expect(JSON.parse(sends[0]!).messages).toEqual([
+    prompt,
+    assistant(sourceThought),
+  ])
+  for (let i = 0; i < 129; i++)
+    thinkingStore.record(
+      `other-${i}`,
+      'fable-5-2',
+      recoveryThinkingDigest('thinking', 'another session'),
+    )
+  expect(thinkingStore.peek('s', 'fable-5-2')?.size).toBe(2)
+
+  const mixed = assistant(
+    sourceThought,
+    targetThought,
+    redacted,
+    textBlock('first answer'),
+  )
+  const next = user('next question')
+  const liveText = replay(prompt, mixed, next)
+  const live = plan({ bodyText: liveText })
+  expect(live.kind).toBe('round')
+  expect(JSON.parse(live.bodyText).messages[1]).toEqual(mixed)
+  for (let i = 0; i < 9; i++)
+    send(plan({ bodyText: liveText })).lifecycle?.onCompleted?.(completion)
+  expect(events.at(-1)).toMatchObject({ kind: 'round_ended', reason: 'count' })
+
+  const source = plan({ bodyText: liveText })
+  const stripped = assistant(sourceThought, textBlock('first answer'))
+  expect(JSON.parse(source.bodyText).messages).toEqual([prompt, stripped, next])
+  const second = send(source, { onCacheKeepTemplate: track }).lifecycle!
+  const secondTarget = { ...targetThought, signature: 'round two signature' }
+  await retryWithThinking(
+    source,
+    second,
+    [
+      block(secondTarget),
+      close,
+      block(textBlock('second answer')),
+      close,
+      end,
+      stop,
+    ],
+    {
+      credited: true,
+      capture: (text) => sends.push(text),
+    },
+  ).text()
+  const secondRetry = JSON.parse(sends[1]!)
+  expect(secondRetry.messages).toEqual([
+    prompt,
+    stripped,
+    next,
+    assistant(sourceThought),
+  ])
+  const nextRound = plan({
+    bodyText: replay(
+      prompt,
+      mixed,
+      next,
+      assistant(sourceThought, secondTarget, textBlock('second answer')),
+      user('third question'),
+    ),
+  })
+  expect(nextRound.kind).toBe('round')
+  const routed = JSON.parse(nextRound.bodyText).messages
+  expect(JSON.stringify(routed.slice(0, 3))).toBe(
+    JSON.stringify(secondRetry.messages.slice(0, 3)),
+  )
+  expect(nextRound.bodyText).not.toContain('target signature')
+  expect(nextRound.bodyText).not.toContain('target redacted data')
+  expect(nextRound.bodyText).toContain('round two signature')
+  expect(templates).toHaveLength(2)
+  expect(
+    events.some(
+      (event) => event.kind === 'round_ended' && event.reason === 'compaction',
+    ),
+  ).toBe(false)
+})
+
+test.each(['refused', 'stale', 'broken', 'aborted'] as const)(
+  'thinking from a %s retry is persisted as ended provenance and removed after restart',
+  async (outcome) => {
+    const directory = await mkdtemp(join(tmpdir(), 'refusal-thinking-'))
+    try {
+      const thinkingStore = new RecoveryThinkingStore({ directory })
+      const { engine, plan, send, events } = fixture({ thinkingStore })
+      await engine.loadThinking('s')
+      const initial = plan()
+      const templates: unknown[] = []
+      const lifecycle = send(initial, {
+        onCacheKeepTemplate: (value) => templates.push(value),
+      }).lifecycle!
+      const abort = new AbortController()
+      const response = retryWithThinking(
+        initial,
+        lifecycle,
+        [
+          block(targetThought),
+          close,
+          block(redacted),
+          close,
+          ...(outcome === 'refused'
+            ? [refused, stop]
+            : outcome === 'broken'
+              ? []
+              : [end, stop]),
+        ],
+        {
+          signal: abort.signal,
+          onCommit:
+            outcome === 'stale'
+              ? () => {
+                  send(plan())
+                }
+              : undefined,
+        },
+      )
+      if (outcome === 'aborted') {
+        const reader = response.body!.getReader()
+        let stops = 0
+        while (stops < 3) {
+          const next = await reader.read()
+          if (next.done) throw new Error('stream ended before thinking arrived')
+          if (
+            new TextDecoder().decode(next.value).includes('content_block_stop')
+          )
+            stops++
+        }
+        abort.abort()
+        await expect(reader.read()).rejects.toThrow()
+      } else expect(await response.text()).toContain('target signature')
+      expect(events).toEqual([])
+      expect(templates).toEqual([])
+
+      const hostReplay = replay(
+        prompt,
+        assistant(
+          sourceThought,
+          targetThought,
+          redacted,
+          textBlock('older turn'),
+        ),
+        user('next'),
+        assistant(sourceThought, targetThought, textBlock('later turn')),
+        user('ask'),
+      )
+      const expected = [
+        prompt,
+        assistant(sourceThought, textBlock('older turn')),
+        user('next'),
+        assistant(sourceThought, textBlock('later turn')),
+        user('ask'),
+      ]
+      expect(
+        JSON.parse(plan({ bodyText: hostReplay }).bodyText).messages,
+      ).toEqual(expected)
+      await thinkingStore.flush()
+      const [file] = await readdir(directory)
+      const disk = await readFile(join(directory, file!), 'utf8')
+      expect(JSON.parse(disk)).toEqual({
+        version: 1,
+        families: {
+          'fable-5-2': [
+            expect.stringMatching(/^[\w-]{43}$/),
+            expect.stringMatching(/^[\w-]{43}$/),
+          ],
+        },
+      })
+      expect(disk).not.toContain('private thought')
+      expect(disk).not.toContain('signature')
+      expect(disk).not.toContain('redacted data')
+      const restart = fixture({
+        thinkingStore: new RecoveryThinkingStore({ directory }),
+      })
+      await restart.engine.loadThinking('s')
+      const restored = restart.plan({ bodyText: hostReplay })
+      expect(restored.kind).toBe('source')
+      expect(JSON.parse(restored.bodyText).messages).toEqual(expected)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  },
+)
+
+test.each([
+  'older reply',
+  'latest reply',
+  'system message',
+  'system',
+  'tools',
+] as const)(
+  'an edit to the %s ends the round even when block types are unchanged',
+  async (edit) => {
+    const { plan, send, events } = fixture()
+    const system = {
+      role: 'system',
+      content: 'host-provided note',
+      clear_at: 'next_user_message',
+    }
+    const earlier = assistant(textBlock('earlier answer'))
+    const ask = user('question')
+    const tools = [{ name: 'lookup', description: 'lookup text' }]
+    const original = {
+      ...body,
+      tools,
+      messages: [prompt, earlier, system, ask],
+    }
+    const request = plan({ bodyText: JSON.stringify(original) })
+    await retryWithThinking(request, send(request).lifecycle!, [
+      block(textBlock('latest answer')),
+      close,
+      end,
+      stop,
+    ]).text()
+    const latest = assistant(sourceThought, textBlock('latest answer'))
+    const next = {
+      ...original,
+      messages: [...original.messages, latest, user('followup')],
+    }
+    expect(plan({ bodyText: JSON.stringify(next) }).kind).toBe('round')
+    if (edit === 'older reply')
+      next.messages[1] = assistant(textBlock('earlier edit'))
+    if (edit === 'latest reply')
+      next.messages[4] = assistant(sourceThought, textBlock('latest edit'))
+    if (edit === 'system message')
+      next.messages[2] = { ...system, content: 'a changed host note' }
+    if (edit === 'system')
+      next.system = [...original.system, textBlock('changed instructions')]
+    if (edit === 'tools')
+      next.tools = [{ ...tools[0]!, description: 'changed lookup' }]
+    expect(plan({ bodyText: JSON.stringify(next) }).kind).toBe('source')
+    expect(events.at(-1)).toMatchObject({
+      kind: 'round_ended',
+      reason: 'compaction',
+    })
+  },
+)
+
+test.each([false, true])(
+  '10 append-only responses extend the projected reply checkpoint (folded: %s)',
+  async (folded) => {
+    const { plan, send, events } = fixture()
+    const servingModel = folded ? opus : 'claude-opus-5'
+    const built = { ...body, thinking: { type: 'adaptive' } }
+    const messages: unknown[] = [prompt]
+    const current = () =>
+      plan({ bodyText: JSON.stringify({ ...built, messages }) })
+    const before = send(current()).lifecycle!
+    const tool = {
+      type: 'tool_use',
+      id: 'toolu_1',
+      name: 'mcp_lookup',
+      input: { query: 'example' },
+    }
+    if (folded) {
+      before.onRefusal?.({ ...refusal, releasedTool: true, reply: [tool] })
+    } else {
+      before.onRefusal?.(refusal)
+      before.onRetryCompleted?.(
+        { ...completion, reply: [tool] },
+        { model: servingModel, folded },
+      )
+    }
+    messages.push(assistant(tool), {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'toolu_1', content: 'result' },
+      ],
+    })
+    const note = {
+      role: 'system',
+      clear_at: 'next_user_message',
+      content: TURN_END_NOTE_CONTENT,
+    }
+    messages.push(marker, note)
+    for (let i = 0; i < (folded ? 10 : 9); i++) {
+      const primary = current()
+      expect(primary).toMatchObject({ kind: 'round', folded })
+      const replyBlocks = [
+        block(textBlock(`part ${i}`)),
+        close,
+        block({ type: 'thinking', thinking: 'unsigned' }),
+        close,
+        block(textBlock(' answer')),
+        close,
+      ]
+      await joinRefusalFallbackStream(
+        sse(start(servingModel), ...replyBlocks, end, stop),
+        {
+          sourceModel: fable,
+          isFresh: allowed,
+          lifecycle: send(primary).lifecycle,
+        },
+      ).text()
+      messages.push(
+        { role: 'assistant', content: `part ${i} answer` },
+        user(`turn ${i}`),
+      )
+    }
+    expect(events.at(-1)).toMatchObject({
+      kind: 'round_ended',
+      reason: 'count',
+      stepsLeft: 0,
+    })
+  },
+)
