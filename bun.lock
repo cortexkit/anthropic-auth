@@ -27,7 +27,7 @@
       "name": "@cortexkit/anthropic-auth-core",
       "version": "2.17.1",
       "dependencies": {
-        "@cortexkit/claustrum-client": "0.21.0",
+        "@cortexkit/claustrum-client": "0.22.0",
         "@cortexkit/private-files": "0.2.2",
         "@cortexkit/subc-client": "^0.24",
         "jsonc-parser": "^3.3.1",
@@ -53,7 +53,7 @@
       "dependencies": {
         "@clack/prompts": "^1.9.0",
         "@cortexkit/anthropic-auth-core": "2.17.1",
-        "@cortexkit/claustrum-client": "0.21.0",
+        "@cortexkit/claustrum-client": "0.22.0",
         "@cortexkit/private-files": "0.2.2",
         "@cortexkit/subc-client": "^0.24",
         "@opentui/core": "0.9.7",
@@ -251,7 +251,7 @@
 
     "@cortexkit/anthropic-auth-e2e": ["@cortexkit/anthropic-auth-e2e@workspace:packages/e2e-tests"],
 
-    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.21.0", "", { "dependencies": { "@cortexkit/store": "^0.2.3", "@cortexkit/subc-client": "^0.24.0" } }, "sha512-36wFsjQOFlma7Mcd4JxYd86PTSu2oBYF4CL6dOJqISe+U+trzlSq1wrrezUr0aio+8qkquoIXGYJ/hDOSRvkPw=="],
+    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.22.0", "", { "dependencies": { "@cortexkit/store": "^0.2.3", "@cortexkit/subc-client": "^0.26.8" } }, "sha512-obIzV3mgTZpLhOoHF3bJPodeH1L7WG+r/i/h589AQblxoJj1He7SV106mQ7p+MppC+UsALRIsFeocVZ2ZzfHAw=="],
 
     "@cortexkit/common-auth": ["@cortexkit/common-auth@0.59.0", "", { "dependencies": { "@cortexkit/private-files": "^0.2.2", "jsonc-parser": "^3.3.1" }, "peerDependencies": { "@cortexkit/claustrum-client": ">=0.6.2", "@cortexkit/opencode-sidebar": ">=0.1.0 <0.4.0", "@cortexkit/subc-client": "^0.16.0 || ^0.22.0 || ^0.24.0 || ^0.26.8", "@opencode/plugin": ">=2.0.21", "@opentui/core": ">=0.4.5", "@opentui/solid": ">=0.4.5", "solid-js": ">=1.9.12 <2" }, "optionalPeers": ["@cortexkit/claustrum-client", "@cortexkit/opencode-sidebar", "@cortexkit/subc-client", "@opencode/plugin", "@opentui/core", "@opentui/solid", "solid-js"] }, "sha512-u1mfeY1/9+k4RAZ88HWHTEwxYAwT3RJqwJe7O5PLH9S4FrrL4y0FWIsogphOVwuPrV8XPk49aiq985PcBjwjkQ=="],
 
@@ -1248,6 +1248,8 @@
     "@babel/traverse/@babel/parser": ["@babel/parser@7.29.7", "", { "dependencies": { "@babel/types": "^7.29.7" }, "bin": "./bin/babel-parser.js" }, "sha512-hnORnjP/1P/zFEndoeX+n+t1RwWRJiJpM/jO7FW32Kn9r5+sJB2JWOdYo4L6k78j15eCwY3Gm/7364B1EMwtNg=="],
 
     "@babel/traverse/@babel/types": ["@babel/types@7.29.7", "", { "dependencies": { "@babel/helper-string-parser": "^7.29.7", "@babel/helper-validator-identifier": "^7.29.7" } }, "sha512-4zBIxpPzowiZpusoFkyGVwakdRJUyuH5PxQ/PrqghfdFWWasvnCdPfQXHrenDai+gyLARulZjZowCOj6fjT4pA=="],
+
+    "@cortexkit/claustrum-client/@cortexkit/subc-client": ["@cortexkit/subc-client@0.26.11", "", {}, "sha512-KuTm/i9GXxkPqhA3+2NcQFfcOYrBZYnpBJQ6a1S4372xQxVAuEWIlDTniWOx0uh+6GU48kJIM2MR7fBlTUmHcw=="],
 
     "@effect/opentelemetry/effect": ["effect@4.1.0", "", {}, "sha512-lGx2MJJyrXA8RZb2UpQ/0Nkb5Utaimby7oD92+18noBxLPE85IFOvptdzau8dvcxAOwfwHo9iqapbKeFzqQM/Q=="],
 
