@@ -34,6 +34,16 @@ The user setting replaces both retired switches. Neither variable has any effect
 
 Only a response that ends with a refusal can trigger client fallback. A refusal content block by itself does not trigger it. The plugin retries only when there is a supported route for that model and refusal category, the request fits the serving model, and the same OAuth account can send it without waiting. Anthropic can include a fallback credit with the refusal that lets the retry reuse the cached prefix. The plugin keeps the credit private. Without a credit, a retry can still go ahead, but cache writes can be billed normally.
 
+Which models can serve a refused step, tried in this order:
+
+| Requested model | Biology refusal | Cybersecurity refusal |
+| --- | --- | --- |
+| Fable 5, Fable 5.1, Fable 5.2 | Opus 5, then Opus 4.8 | Opus 4.8, then Opus 5 |
+| Opus 5.5 | Opus 4.8, then Opus 5 | Opus 4.8, then Opus 5 |
+| Opus 5 | Opus 4.8 | Opus 4.8 |
+
+Other models (Opus 4.8, Sonnet, Haiku and Mythos) have no client fallback, and their refusals stand.
+
 The plugin joins retry output to the current response, so the host does not start a separate step. If no retry can deliver content, the original refusal stands. For a still-current refusal after a completed tool call, the plugin instead finishes the step as `tool_use` without retrying. The completed call runs once, and its result goes with the next request. An unfinished call held from the refused attempt is not released to the host.
 
 A successful retry counts as the first response of a round. If the round starts after a completed tool call instead, it starts with the next request and has its full length left. Rounds last **10, 20, then 40 completed responses** if refusals keep recurring, and never grow past 40. Ten consecutive clean primary responses on the requested model reset the next round to 10. The plugin returns to the requested model when the round ends; it can return early after a settings, account or model change, history compaction, or if the serving model can no longer take the request. Host notices and Status tell you the requested and serving models, the category and the number of steps left.

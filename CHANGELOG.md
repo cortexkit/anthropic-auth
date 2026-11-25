@@ -2,6 +2,15 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+- New default on OpenCode 1, OpenCode 2 and Pi: client refusal fallback. When Claude refuses a step for safety on Fable 5.x, Opus 5.5 or Opus 5, the plugin retries it on a supported fallback model (Opus 4.8 or Opus 5) inside the same reply. When Anthropic grants a fallback credit, the retry reuses the cached prompt. The session then stays on that model for a short round (10, then 20, then 40 responses while refusals recur) and returns to the requested model. If the retry can't answer, the original refusal is shown. OpenCode 1 and 2 previously used Anthropic's server-side fallback by default (#861).
+- New `refusal_fallback` setting in the shared settings file: `client` (default), `server` (Anthropic's server-side fallback, now on Pi too) or `off`. It replaces `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` and `OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK`, which no longer have any effect. In `server` mode a refusal the server doesn't absorb now stands; OpenCode 1 no longer adds its own recovery round on top.
+- During a round, the requested model's cache is kept warm, and the first request back reads it again instead of rewriting the conversation. A round's keep-warm survives a restart.
+- Requests to the requested model drop the fallback model's reasoning wherever Anthropic would refuse the mixed turn, including after a restart.
+- OpenCode and Pi show the requested model, the serving model and the steps left in a round. Pi prices fallback replies at the serving model's rates. Billing reports carry the refused attempt and its retry as separate rows.
+- Fallback credit tokens never appear in logs, request dumps or saved keep-warm templates.
+
 ## 2.17.1
 
 - Shared routing learns when Claude refuses a request because its Fable quota window is full, even if the refusal and the last quota check each tell only part of the story. OpenCode 2 also reports the HTTP error status and Claude request ID for failed attempts.
