@@ -159,13 +159,24 @@ test('credited retry changes only the permitted wire fields and bills both physi
   const bodyText = await signRequestBody(raw)
   const { options, sends, reports } = await setup({ bodyText })
   let reusable = ''
+  let observedRetry: unknown
+  const committed: unknown[] = []
   options.observePhysicalResponse = (response, attempt, body) => {
-    if (attempt.refusalRetry) reusable = body ?? ''
+    if (attempt.refusalRetry) {
+      reusable = body ?? ''
+      observedRetry = attempt
+    }
     return response
+  }
+  options.onRetryCommitted = ({ model, attempt }) => {
+    committed.push({ model, attempt })
+    throw new Error('Observer failures cannot break the answer')
   }
   const output = await dispatchRefusalFallback(origin(), options).text()
   expect(output).toContain('answer')
   expect(output).not.toContain('refusal')
+  expect(committed).toEqual([{ model: opus48, attempt: observedRetry }])
+  expect((committed[0] as { attempt: unknown }).attempt).toBe(observedRetry)
   expect(sends).toHaveLength(1)
   const send = at(sends)
   expect(send.url).toBe(binding.url)
@@ -209,6 +220,16 @@ test('credited retry changes only the permitted wire fields and bills both physi
   ])
   expect(at(reports)[0].attemptId).not.toBe(at(reports, 1)[0].attemptId)
   expect(JSON.stringify(reports)).not.toContain(credit)
+})
+
+test('a retry that refuses before content does not announce a serving model', async () => {
+  const { options, replies, sends } = await setup()
+  const committed: unknown[] = []
+  options.onRetryCommitted = (info) => committed.push(info)
+  replies.push(() => stream(start(opus48), refuse(null, false), stop))
+  assertStandingRefusal(await dispatchRefusalFallback(origin(), options).text())
+  expect(sends).toHaveLength(1)
+  expect(committed).toEqual([])
 })
 
 test('claimed prefill copies closed signed blocks and synthetically closed text, never open or unsigned thinking', async () => {

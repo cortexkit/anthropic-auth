@@ -36,7 +36,7 @@ export type RefusalFallbackStreamRefusal = {
 }
 
 export type RefusalFallbackStreamRetry =
-  | { kind: 'retry'; response: Response }
+  | { kind: 'retry'; response: Response; onCommitted?: () => void }
   | { kind: 'none'; reason: string }
 
 type HeartbeatClock = {
@@ -531,12 +531,18 @@ export function joinRefusalFallbackStream(
     const retryAbort = new AbortController()
     const retrySignal = AbortSignal.any([abort.signal, retryAbort.signal])
     let committed = false
+    let onCommitted: (() => void) | undefined
     const stale = new Error('Stale fallback response')
     const beforeContent = () => {
       const output: Uint8Array[] = []
       if (!committed) {
         if (!isFresh()) throw stale
         committed = true
+        try {
+          onCommitted?.()
+        } catch {
+          // A host observer cannot interrupt a committed answer.
+        }
         closeOpen(output)
         source.clear()
       }
@@ -546,6 +552,7 @@ export function joinRefusalFallbackStream(
       const result = await retry(refusal, retrySignal)
       if (result.kind === 'none') return false
       const { response: target } = result
+      onCommitted = result.onCommitted
       if (!target.ok || retrySignal.aborted || !target.body) {
         void target.body?.cancel().catch(() => {})
         return false

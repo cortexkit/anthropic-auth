@@ -75,6 +75,221 @@ const anthropicContext = {
   tools: [],
 } as any
 
+describe('Pi client refusal fallback', () => {
+  test.each([
+    'client',
+    'client payload replacement',
+    'off',
+    'target exhausted',
+  ] as const)(
+    '%s preserves the beta and checks the target before retrying',
+    async (scenario) => {
+      const mode = scenario === 'off' ? 'off' : 'client'
+      const retries = scenario.startsWith('client')
+      tempDir = await mkdtemp(join(tmpdir(), 'pi-refusal-fallback-'))
+      const storagePath = join(tempDir, 'accounts.json')
+      process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+      await saveNativePiFixture({ version: 1, accounts: [] }, storagePath)
+      const native = getPiNativeRuntime(storagePath)
+      const runtime = await native.service()
+      const read = runtime.read.bind(runtime)
+      await runtime.updateSettings((settings) => ({
+        ...settings,
+        quota: { enabled: false },
+        cacheKeep: { enabled: false },
+      }))
+      const source = { ...anthropicModel, id: 'claude-fable-5-2' }
+      const target = 'claude-opus-4-8'
+      const readSpy = spyOn(runtime, 'read').mockImplementation(
+        async (...args) => {
+          const snapshot = await read(...args)
+          const checkedAt = Date.now()
+          return {
+            ...snapshot,
+            refusalFallbackMode: mode,
+            ...(scenario === 'target exhausted' && {
+              accounts: snapshot.accounts.map((account) =>
+                account.id === 'main'
+                  ? {
+                      ...account,
+                      quota: {
+                        checkedAt,
+                        scoped: [
+                          {
+                            id: 'opus',
+                            modelId: target,
+                            modelName: 'Claude Opus 4.8',
+                            title: 'Opus',
+                            checkedAt,
+                            usedPercent: 100,
+                            remainingPercent: 0,
+                          },
+                        ],
+                      },
+                    }
+                  : account,
+              ),
+            }),
+          }
+        },
+      )
+      const authSpy = spyOn(native, 'authorize')
+      const rates = { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 }
+      const token = 'pi-unique-refusal-credit-sentinel'
+      const sent: {
+        body: Record<string, unknown>
+        headers: Headers
+        text: string
+      }[] = []
+      const targetUsage = {
+        input_tokens: 31,
+        cache_read_input_tokens: 11,
+        cache_creation_input_tokens: 1000,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 400,
+          ephemeral_1h_input_tokens: 600,
+        },
+      }
+      globalThis.fetch = mock(
+        async (input: string | URL | Request, init?: RequestInit) => {
+          if (!String(input).includes('/v1/messages'))
+            throw new Error('unexpected request')
+          const text =
+            init?.body instanceof Uint8Array
+              ? gunzipSync(init.body).toString()
+              : String(init?.body)
+          const body = JSON.parse(text)
+          sent.push({ text, body, headers: new Headers(init?.headers) })
+          const retry = body.model === target
+          return new Response(
+            [
+              {
+                type: 'message_start',
+                message: {
+                  model: body.model,
+                  usage: retry
+                    ? targetUsage
+                    : { input_tokens: 17, cache_creation_input_tokens: 9 },
+                },
+              },
+              ...(retry
+                ? [
+                    {
+                      type: 'content_block_start',
+                      index: 0,
+                      content_block: { type: 'text', text: '' },
+                    },
+                    {
+                      type: 'content_block_delta',
+                      index: 0,
+                      delta: { type: 'text_delta', text: 'target answer' },
+                    },
+                    { type: 'content_block_stop', index: 0 },
+                  ]
+                : []),
+              {
+                type: 'message_delta',
+                delta: retry
+                  ? { stop_reason: 'end_turn' }
+                  : {
+                      stop_reason: 'refusal',
+                      stop_details: {
+                        type: 'refusal',
+                        category: 'cyber',
+                        fallback_credit_token: token,
+                      },
+                    },
+                usage: { output_tokens: retry ? 7 : 3 },
+              },
+              { type: 'message_stop' },
+            ]
+              .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+              .join(''),
+            {
+              headers: { 'content-type': 'text/event-stream' },
+            },
+          )
+        },
+      ) as unknown as typeof fetch
+      const sessionId = `ses_pi_refusal_${scenario.replaceAll(' ', '_')}`
+      beginPiPrimaryTurn(storagePath, sessionId)
+      try {
+        const result = await streamCortexKitAnthropic(
+          source,
+          anthropicContext,
+          {
+            sessionId,
+            ...((mode === 'off' ||
+              scenario === 'client payload replacement') && {
+              onPayload: (payload: unknown) => ({
+                ...(payload as object),
+                fallbacks: { unwanted: true },
+              }),
+            }),
+          },
+          undefined,
+          undefined,
+          'agent-loop',
+          (id) => (id === target ? rates : undefined),
+        ).result()
+        expect(sent.map(({ body }) => body.model)).toEqual(
+          retries ? [source.id, target] : [source.id],
+        )
+        for (const { body, headers, text } of sent) {
+          expect(headers.get('anthropic-beta')?.split(',')).toContain(
+            core.SERVER_SIDE_FALLBACK_BETA,
+          )
+          expect(body).not.toHaveProperty('fallbacks')
+          expect(body).not.toHaveProperty('thread')
+          expect(await core.hasValidRequestBodySignature(text)).toBe(true)
+        }
+        expect(JSON.stringify(result)).not.toContain(token)
+        expect(authSpy.mock.calls.filter((call) => call[2] === target)).toEqual(
+          mode === 'off'
+            ? []
+            : [['main', expect.any(AbortSignal), target, 'serve']],
+        )
+        if (!retries) {
+          expect(result.stopReason).toBe('error')
+          expect(result.errorMessage).toContain('stop_reason: refusal')
+          return
+        }
+        expect(sent[1]?.body.fallback_credit_token).toBe(token)
+        expect(result.model).toBe(source.id)
+        expect(result.stopReason).toBe('stop')
+        expect(result.content).toEqual([
+          { type: 'text', text: 'target answer' },
+        ])
+        expect(result.usage).toMatchObject({
+          input: 31,
+          output: 7,
+          cacheRead: 11,
+          cacheWrite: 1000,
+          cacheWrite1h: 600,
+        })
+        expect(rates.input).not.toBe(source.cost.input)
+        expect(result.usage.cost.cacheWrite).toBeCloseTo(
+          (400 * rates.cacheWrite + 600 * rates.input * 2) / 1_000_000,
+          10,
+        )
+        expect(result.usage.cost.total).toBeCloseTo(
+          (31 * rates.input +
+            7 * rates.output +
+            11 * rates.cacheRead +
+            400 * rates.cacheWrite +
+            600 * rates.input * 2) /
+            1_000_000,
+          10,
+        )
+      } finally {
+        authSpy.mockRestore()
+        readSpy.mockRestore()
+        endPiPrimaryTurn(storagePath, sessionId, true)
+      }
+    },
+  )
+})
+
 describe('Pi shared routing relay', () => {
   async function fixture(mode = 'normal', retry401 = false) {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-routing-relay-'))
@@ -436,10 +651,10 @@ test('Pi OAuth sends the Claude Code accept-encoding on the wire', async () => {
   }
 })
 
-test.each(['success', 'provider error', 'malformed'])(
+test.each(['success', 'provider error', 'malformed', 'guarded malformed'])(
   'streamed reply dumps keep only text edge counts (%s)',
   async (outcome) => {
-    const error = outcome !== 'success'
+    const error = outcome === 'provider error' || outcome === 'malformed'
     tempDir = await mkdtemp(join(tmpdir(), 'pi-dump-edges-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')
     const dumpDir = join(tempDir, 'dumps')
@@ -506,12 +721,16 @@ test.each(['success', 'provider error', 'malformed'])(
           )
         return new Response(
           events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') +
-            (outcome === 'malformed' ? 'data: malformed\n\n' : ''),
+            (outcome.includes('malformed') ? 'data: malformed\n\n' : ''),
           { headers: { 'content-type': 'text/event-stream' } },
         )
       }) as unknown as typeof fetch
       const stream = streamCortexKitAnthropic(
-        anthropicModel,
+        // Keep one case without the server-side fallback beta: its credit guard
+        // drops malformed frames before Pi's parser can report invalid JSON.
+        outcome === 'malformed'
+          ? { ...anthropicModel, id: 'claude-sonnet-4-6' }
+          : anthropicModel,
         anthropicContext,
         { apiKey: 'sk-ant-oat-pi-dump', sessionId: 'ses_pi_dump_edges' },
       )
@@ -698,7 +917,8 @@ test.each([
           'content-encoding': 'identity',
           'content-length': String(Buffer.byteLength(body)),
         },
-        response_bytes: Buffer.byteLength(body),
+        response_bytes:
+          scenario === 'unterminated stop' ? 0 : Buffer.byteLength(body),
         sse_events: scenario.startsWith('partial') ? 2 : 0,
         send_to_headers_ms: expect.any(Number),
         timing_source: 'physical_fetch',

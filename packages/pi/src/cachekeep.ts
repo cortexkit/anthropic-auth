@@ -463,6 +463,7 @@ export class PiCacheKeep {
     input: TrackInput,
     snapshot: NativeAccountSnapshot,
     requestTurn?: CacheKeepRealTurn,
+    isFresh: () => boolean = () => true,
   ) {
     let turn = requestTurn ?? currentCacheKeepRealTurn()
     try {
@@ -480,7 +481,7 @@ export class PiCacheKeep {
     if (turn) this.pendingTurns.add(turn)
     const tracking = (async () => {
       const session = await this.claim(storagePath, sessionId, true)
-      if (!session) return
+      if (!session || !isFresh()) return
       const account =
         snapshot.accounts.find((row) => row.id === input.oauthAccountId) ??
         snapshot.accounts.find(
@@ -498,7 +499,10 @@ export class PiCacheKeep {
       const result = turn?.track({
         ...input,
         acceptedAt,
-        hostMetadata: { accountIdentity: accountKey(account) },
+        hostMetadata: {
+          ...input.hostMetadata,
+          accountIdentity: accountKey(account),
+        },
       })
       if (result?.tracked) this.restored.delete(sessionId)
       if (this.stopping) this.manager.stop()

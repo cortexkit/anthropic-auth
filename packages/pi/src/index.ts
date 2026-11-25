@@ -22,7 +22,9 @@ import {
   sessionCacheActivity,
 } from '@cortexkit/anthropic-auth-core'
 import type {
+  Api,
   Context,
+  Model,
   Provider,
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
@@ -57,6 +59,7 @@ import {
   clearPiStickyQuotaRetries,
   endPiPrimaryTurn,
   forgetPiMessageThread,
+  invalidatePiPrimaryModel,
   observePiUserPrompt,
   startPiCacheKeepSession,
   stopPiCacheKeep,
@@ -219,6 +222,15 @@ export default async function cortexKitPiAnthropicAuth(
         sessionId,
         isPiLaneStartMessage(event.message),
       )
+  })
+  pi.on('model_select', (event, ctx) => {
+    if (
+      event.previousModel?.id === event.model.id &&
+      event.previousModel?.provider === event.model.provider
+    )
+      return
+    const sessionId = ctx.sessionManager.getSessionId()
+    if (sessionId) invalidatePiPrimaryModel(storagePath, sessionId)
   })
   pi.on('agent_settled', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
@@ -400,6 +412,8 @@ export default async function cortexKitPiAnthropicAuth(
               : undefined) ?? quotaWait?.setWorkingMessage,
         },
         origin,
+        (id): Model<Api>['cost'] | undefined =>
+          configuration.models.find((candidate) => candidate.id === id)?.cost,
       ),
   } satisfies ProviderConfig
 

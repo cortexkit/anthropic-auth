@@ -90,6 +90,11 @@ export type RefusalFallbackDispatchOptions = {
     report: AnthropicBillingReport,
     attempt: RefusalFallbackPhysicalAttempt,
   ) => void
+  /** Called once when the retry supplies its first host-visible content. */
+  onRetryCommitted?: (info: {
+    model: string
+    attempt: RefusalFallbackPhysicalAttempt
+  }) => void
   /** The relay already guarded and billed the origin; this takes the token that credits the retry for the refused work. */
   protectedOrigin?: { takeRefusalCredit: () => string | undefined }
   /** Observe guarded bytes without reading ahead, before billing the response. A relay has already billed its protected origin. */
@@ -155,6 +160,8 @@ async function wrongModel(response: Response, requestHeaders: Headers) {
  * before reading or observing its body. The supplied sender also returns a raw
  * response so that billing, observers and the join only see guarded bytes.
  * Round and routed responses don't call this wrapper: they join without retry.
+ * `onRetryCommitted` identifies the serving attempt, not just a successful
+ * HTTP response: stale retries and failures before content never notify it.
  */
 export function dispatchRefusalFallback(
   response: Response,
@@ -348,7 +355,12 @@ export function dispatchRefusalFallback(
         guarded
       const billed = observeAnthropicBillingResponse(billing, observed, sse)
       if (billed.ok && sse && billed.body)
-        return { kind: 'retry', response: billed }
+        return {
+          kind: 'retry',
+          response: billed,
+          onCommitted: () =>
+            options.onRetryCommitted?.({ model: attempt.model, attempt }),
+        }
       try {
         if (!folded && (await wrongModel(billed, headers))) continue
         return { kind: 'none', reason: 'retry-rejected' }
