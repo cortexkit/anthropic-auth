@@ -228,7 +228,8 @@ export type SpawnOptions = {
   /** Stand-in child used by preparation tests; ordinary runs use the locked host binary. */
   executable?: string
   hybridCache?: boolean
-  refusalFallbackMode?: 'client' | 'server'
+  refusalFallbackMode?: 'client' | 'server' | 'off'
+  fixtureSettings?: Record<string, unknown>
   relay?: {
     url: string
     token: string
@@ -1040,6 +1041,7 @@ export async function spawnOpencode(
             claude_cache_enabled: 'on',
             claude_cache_mode: 'hybrid',
           }),
+          ...options.fixtureSettings,
         }),
       )
       childEnv.ANTHROPIC_AUTH_SETTINGS_FILE = settingsFile

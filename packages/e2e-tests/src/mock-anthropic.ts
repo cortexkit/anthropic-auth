@@ -1,5 +1,4 @@
 import { gunzipSync } from 'node:zlib'
-import type { RefusalMock } from './mock-refusal'
 
 export type MockUsage = {
   input_tokens: number
@@ -80,7 +79,14 @@ export class MockAnthropicServer {
   private captured: CapturedAnthropicRequest[] = []
   private tokenRequestCount = 0
 
-  constructor(private readonly refusal?: RefusalMock) {}
+  constructor(
+    private readonly refusal?: {
+      respond(
+        body: CapturedAnthropicRequest['body'],
+        request: CapturedAnthropicRequest,
+      ): Response | undefined | Promise<Response | undefined>
+    },
+  ) {}
 
   async start() {
     this.server = Bun.serve({
@@ -145,7 +151,8 @@ export class MockAnthropicServer {
     request.headers.forEach((value, key) => {
       headers[key] = value
     })
-    this.captured.push({ url: request.url, headers, body })
+    const captured = { url: request.url, headers, body }
+    this.captured.push(captured)
 
     if (
       JSON.stringify(body).includes('Generate a title for this conversation')
@@ -187,7 +194,7 @@ export class MockAnthropicServer {
       )
     }
 
-    const refusal = this.refusal?.respond(body)
+    const refusal = await this.refusal?.respond(body, captured)
     if (refusal) return refusal
 
     const response = this.queue.shift() ?? {

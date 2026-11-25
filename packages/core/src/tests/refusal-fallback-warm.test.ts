@@ -346,6 +346,62 @@ test.each(['matching prefix', 'edited prefix', 'changed lifetime'] as const)(
   },
 )
 
+test('return marker replaces the earliest non-tool marker at the four-marker limit', () => {
+  const marker = { type: 'ephemeral', ttl: '1h' }
+  const tools = [
+    { name: 'read', input_schema: { type: 'object' }, cache_control: marker },
+  ]
+  const source = { ...body, tools }
+  const current = {
+    ...source,
+    tools,
+    system: [{ ...body.system[0], cache_control: marker }],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'accepted prefix' }] },
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'saved reply', cache_control: marker }],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'new prompt', cache_control: marker }],
+      },
+    ],
+  }
+  const expected = structuredClone(current)
+  const first = expected.messages[0]!.content[0]!
+  Object.assign(first, { cache_control: marker })
+  expect(restoreRefusalFallbackReturnMarker(current, source)).toBe(true)
+  expect(current.tools).toEqual(expected.tools)
+  expect(current.messages).toEqual(expected.messages)
+  expect(current.system[0]).not.toHaveProperty('cache_control')
+  expect(current.system[0]).toMatchObject(body.system[0]!)
+  expect(JSON.stringify(current).match(/"cache_control":/g)).toHaveLength(4)
+})
+
+test('return marker leaves the body unchanged if a five-minute marker precedes the restored hour', () => {
+  const current = {
+    ...body,
+    system: [{ ...body.system[0], cache_control: { type: 'ephemeral' } }],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'accepted prefix' }] },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text: 'newest reply',
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          },
+        ],
+      },
+    ],
+  }
+  const original = structuredClone(current)
+  expect(restoreRefusalFallbackReturnMarker(current, body)).toBe(false)
+  expect(current).toEqual(original)
+})
+
 test.each(['mode', 'credential', 'destination', 'sign-out', 'delete'] as const)(
   '%s while registration waits leaves no warm target',
   async (change) => {

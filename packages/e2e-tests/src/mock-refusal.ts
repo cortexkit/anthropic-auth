@@ -220,7 +220,7 @@ export const thinking = (model: string) => ({
 })
 const text = (value: string) => ({ type: 'text', text: value })
 
-function fixtureStream({
+export function fixtureStream({
   model,
   content,
   stop,
@@ -228,6 +228,12 @@ function fixtureStream({
   credit,
   claim,
   onStop,
+  beforeContent,
+  beforeBlock,
+  beforeStop,
+  category = 'cyber',
+  usage,
+  headers,
 }: {
   model: string
   content: FixtureBlock[]
@@ -236,18 +242,30 @@ function fixtureStream({
   credit?: string
   claim?: boolean
   onStop?: () => void
+  beforeContent?: () => Promise<void>
+  beforeBlock?: (index: number) => Promise<void>
+  beforeStop?: () => Promise<void>
+  category?: string | null
+  usage?: {
+    input_tokens: number
+    cache_creation_input_tokens: number
+    cache_read_input_tokens: number
+  }
+  headers?: Record<string, string>
 }) {
-  const input = credited
-    ? {
-        input_tokens: 9,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 277,
-      }
-    : {
-        input_tokens: 11,
-        cache_creation_input_tokens: 222,
-        cache_read_input_tokens: 5,
-      }
+  const input =
+    usage ??
+    (credited
+      ? {
+          input_tokens: 9,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 277,
+        }
+      : {
+          input_tokens: 11,
+          cache_creation_input_tokens: 222,
+          cache_read_input_tokens: 5,
+        })
   const encoder = new TextEncoder()
   let cancelled = false
   return new Response(
@@ -272,7 +290,11 @@ function fixtureStream({
           },
         })
         send('ping')
+        if (beforeContent) await beforeContent()
+        if (cancelled) return
         for (const [index, { block, open, slow }] of content.entries()) {
+          if (beforeBlock) await beforeBlock(index)
+          if (cancelled) return
           const delta = (value: Body) =>
             send('content_block_delta', { index, delta: value })
           if (block.type === 'thinking') {
@@ -307,6 +329,8 @@ function fixtureStream({
           }
           if (!open) send('content_block_stop', { index })
         }
+        if (beforeStop) await beforeStop()
+        if (cancelled) return
         onStop?.()
         send('message_delta', {
           delta: {
@@ -316,7 +340,7 @@ function fixtureStream({
               ? {
                   stop_details: {
                     type: 'refusal',
-                    category: 'cyber',
+                    category: category ?? undefined,
                     fallback_credit_token: credit,
                     fallback_has_prefill_claim: claim ?? false,
                   },
@@ -336,6 +360,7 @@ function fixtureStream({
       headers: {
         'content-type': 'text/event-stream',
         'cache-control': 'no-cache',
+        ...headers,
       },
     },
   )

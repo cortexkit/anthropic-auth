@@ -38,7 +38,13 @@ export class MockRelayServer {
   private acceptedCount = 0
   private responseStartDelayMs = 0
 
-  async start(options: { token?: string; responseStartDelayMs?: number } = {}) {
+  async start(
+    options: {
+      token?: string
+      responseStartDelayMs?: number
+      anthropicOrigin?: string
+    } = {},
+  ) {
     this.token = options.token ?? this.token
     this.responseStartDelayMs = options.responseStartDelayMs ?? 0
     this.server = Bun.serve<{ affinity: string }>({
@@ -47,7 +53,7 @@ export class MockRelayServer {
       fetch: (request, server) => {
         const url = new URL(request.url)
         if (request.method === 'POST' && url.pathname === '/') {
-          return this.handleHttp(request)
+          return this.handleHttp(request, options.anthropicOrigin)
         }
         if (url.pathname === '/ws') {
           if (url.searchParams.get('token') !== this.token) {
@@ -141,7 +147,7 @@ export class MockRelayServer {
     return applyPatches(previous.body, payload.patch ?? [])
   }
 
-  private async handleHttp(request: Request) {
+  private async handleHttp(request: Request, anthropicOrigin?: string) {
     if (request.headers.get('x-relay-token') !== this.token)
       return new Response('unauthorized', { status: 401 })
     const payload = (await request.json()) as RelayPayload
@@ -152,7 +158,17 @@ export class MockRelayServer {
       revision: payload.revision,
     })
     this.acceptedCount += 1
-    const upstream = await fetch(payload.upstream.url, {
+    const url = new URL(payload.upstream.url)
+    if (
+      anthropicOrigin &&
+      url.origin !== 'https://api.anthropic.com' &&
+      url.origin !== anthropicOrigin
+    )
+      return new Response('Unexpected relay destination', { status: 422 })
+    const destination = anthropicOrigin
+      ? new URL(url.pathname + url.search, anthropicOrigin)
+      : url
+    const upstream = await fetch(destination, {
       method: payload.upstream.method,
       headers: payload.upstream.headers,
       body,

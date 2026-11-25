@@ -144,6 +144,9 @@ export type WirePart = {
   id?: string
   tool_use_id?: string
   is_error?: boolean
+  cache_control?: { type: string; ttl?: string }
+  from?: { model: string }
+  to?: { model: string }
 }
 type WireMessage = { role: string; content: string | WirePart[] }
 
