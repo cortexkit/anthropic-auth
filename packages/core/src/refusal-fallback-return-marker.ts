@@ -20,11 +20,18 @@ function lifetime(control: Body) {
   return control.ttl ?? '5m'
 }
 
-function markedHolders(body: Body) {
+function markedHolders(
+  body: Body,
+  candidate?: { message: Body; blockIndex: number; control: Body },
+) {
   const marked: { holder: Body; control: Body; replaceable: boolean }[] = []
-  const add = (value: unknown, replaceable: boolean) => {
+  const add = (
+    value: unknown,
+    replaceable: boolean,
+    controlOverride?: Body,
+  ) => {
     const holder = refusalBodyRecord(value)
-    const control = holder && cacheControl(holder)
+    const control = controlOverride ?? (holder && cacheControl(holder))
     if (holder && control) marked.push({ holder, control, replaceable })
   }
   if (Array.isArray(body.tools)) for (const tool of body.tools) add(tool, false)
@@ -34,7 +41,14 @@ function markedHolders(body: Body) {
     for (const value of body.messages) {
       const message = refusalBodyRecord(value)
       if (message)
-        for (const block of contentBlocks(message) ?? []) add(block, true)
+        for (const [index, block] of (contentBlocks(message) ?? []).entries())
+          add(
+            block,
+            true,
+            candidate?.message === message && candidate.blockIndex === index
+              ? candidate.control
+              : undefined,
+          )
     }
   return marked
 }
@@ -92,19 +106,20 @@ export function restoreRefusalFallbackReturnMarker(body: Body, source: Body) {
         .filter((entry) => entry.replaceable && entry !== tail)
         .slice(0, excess)
       if (displaced.length !== excess) return false
-      message.content = blocks
-      block.cache_control = { ...control }
-      const ordered = markedHolders(body).filter(
+      const ordered = markedHolders(body, {
+        message,
+        blockIndex,
+        control,
+      }).filter(
         ({ holder }) => !displaced.some((entry) => entry.holder === holder),
       )
       let short = false
       for (const entry of ordered) {
         if (lifetime(entry.control) === '5m') short = true
-        else if (short) {
-          delete block.cache_control
-          return false
-        }
+        else if (short) return false
       }
+      message.content = blocks
+      block.cache_control = { ...control }
       for (const { holder } of displaced) {
         delete holder.cache_control
         delete holder.cacheControl

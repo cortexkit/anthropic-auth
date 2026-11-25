@@ -1408,21 +1408,34 @@ const anthropicAuthPlugin = async (
   })
   const readRefusalFallbackMode = () =>
     nativeAccounts.getRefusalFallbackMode?.() ?? DEFAULT_REFUSAL_FALLBACK_MODE
-  const primaryRequestByTrace = new WeakMap<
-    PerfTrace,
-    { sessionId: string; sequence: number; model?: string }
+  type CacheRequest = {
+    sessionId: string
+    sequence: number
+    model?: string
+    kind: 'primary' | 'start'
+  }
+  const cacheRequestByTrace = new WeakMap<PerfTrace, CacheRequest>()
+  const latestSessionSends = new Map<
+    string,
+    { cache: number; primary: number }
   >()
-  const latestPrimaryRequest = new Map<string, number>()
-  function notePrimarySent(trace: PerfTrace | undefined) {
-    const primary = trace && primaryRequestByTrace.get(trace)
-    if (!primary) return
-    if ((latestPrimaryRequest.get(primary.sessionId) ?? 0) >= primary.sequence)
-      return
-    latestPrimaryRequest.delete(primary.sessionId)
-    latestPrimaryRequest.set(primary.sessionId, primary.sequence)
-    if (latestPrimaryRequest.size > HEADER_ROUTING_OBSERVATION_LIMIT) {
-      const oldest = latestPrimaryRequest.keys().next().value
-      if (oldest !== undefined) latestPrimaryRequest.delete(oldest)
+  function noteSessionRequestSent(trace: PerfTrace | undefined) {
+    const request = trace && cacheRequestByTrace.get(trace)
+    if (!request) return
+    const latest = latestSessionSends.get(request.sessionId)
+    const cache = Math.max(latest?.cache ?? 0, request.sequence)
+    // A synthetic /claude-start can warm CacheKeep without making an in-flight
+    // conversation turn stale for refusal fallback.
+    const primary = Math.max(
+      latest?.primary ?? 0,
+      request.kind === 'primary' ? request.sequence : 0,
+    )
+    if (latest && cache === latest.cache && primary === latest.primary) return
+    latestSessionSends.delete(request.sessionId)
+    latestSessionSends.set(request.sessionId, { cache, primary })
+    if (latestSessionSends.size > HEADER_ROUTING_OBSERVATION_LIMIT) {
+      const oldest = latestSessionSends.keys().next().value
+      if (oldest !== undefined) latestSessionSends.delete(oldest)
     }
   }
   try {
@@ -6350,7 +6363,7 @@ const anthropicAuthPlugin = async (
         roundNotices.forget(sessionId)
         pendingRoundDesktopNotices.delete(sessionId)
         desktopNoticeIdle.delete(sessionId)
-        latestPrimaryRequest.delete(sessionId)
+        latestSessionSends.delete(sessionId)
         stickyQuotaRetries.clear(sessionId)
         sessionCacheActivity.forget(sessionId)
         messageThreads.forget(sessionId)
@@ -7229,7 +7242,8 @@ const anthropicAuthPlugin = async (
             )
             account = { ...account, ...apiCredential }
             configureApiRouteHeaders(requestHeaders, account)
-            const primary = trace && primaryRequestByTrace.get(trace)
+            const request = trace && cacheRequestByTrace.get(trace)
+            const primary = request?.kind === 'primary' ? request : undefined
             if (primary?.model && typeof body === 'string') {
               await rounds.loadThinking(primary.sessionId)
               warmRoutes.delete(primary.sessionId)
@@ -7263,7 +7277,7 @@ const anthropicAuthPlugin = async (
                 billingRequestKind,
                 'metered_api',
               )
-              notePrimarySent(trace)
+              if (primary) noteSessionRequestSent(trace)
               const send = () =>
                 fetch(rewritten.input, {
                   ...init,
@@ -7437,7 +7451,9 @@ const anthropicAuthPlugin = async (
             requestHeaders.delete(EFFORT_PLAN_REQUEST_HEADER)
             requestHeaders.delete(BILLING_LINEAGE_REQUEST_HEADER)
             const requestClass = takeRequestClassHeader(requestHeaders)
-            const primary = trace && primaryRequestByTrace.get(trace)
+            const cacheRequest = trace && cacheRequestByTrace.get(trace)
+            const primary =
+              cacheRequest?.kind === 'primary' ? cacheRequest : undefined
             const billingRequestKind = takeBillingRequestKind(requestHeaders)
             let body = await fetchBody(input, init)
             const previousDiagnosticsMessage = relayAffinity
@@ -7661,15 +7677,16 @@ const anthropicAuthPlugin = async (
             let ordinaryTemplate: string | undefined
             const clientStreamSource =
               refusalFallbackMode === 'client' &&
+              !laneStartRequest &&
               streaming &&
               Boolean(
                 resolveClaudeModelCapabilities(modelForIdentity)
                   ?.refusalFallbacks?.length,
               )
             const cacheStorage =
-              primary && fullBodyText ? await getRequestStorage() : null
+              cacheRequest && fullBodyText ? await getRequestStorage() : null
             const keepCompletedReply = Boolean(
-              primary &&
+              cacheRequest &&
                 fullBodyText &&
                 (readSessionCachePolicy(relayAffinity, true)?.keep_warm !==
                   undefined ||
@@ -7807,12 +7824,16 @@ const anthropicAuthPlugin = async (
               method?.toUpperCase() === 'POST'
                 ? modelGateway(requestUrl)
                 : undefined
-            const isCurrentPrimary = (payer: NativeOAuthAuthorization) => {
+            const isCurrentSessionRequest = (
+              request: CacheRequest | undefined,
+              payer: NativeOAuthAuthorization,
+              kind: 'cache' | 'primary',
+            ) => {
               if (
-                !primary ||
+                !request ||
                 init?.signal?.aborted ||
-                latestPrimaryRequest.get(primary.sessionId) !==
-                  primary.sequence ||
+                latestSessionSends.get(request.sessionId)?.[kind] !==
+                  request.sequence ||
                 finalUrl(currentGateway()) !== finalUrl(gateway)
               )
                 return false
@@ -7830,9 +7851,15 @@ const anthropicAuthPlugin = async (
                     : account.credentialId) === payer.credentialId,
               )
             }
+            const isCurrentPrimary = (payer: NativeOAuthAuthorization) =>
+              isCurrentSessionRequest(primary, payer, 'primary')
             const isFresh = (payer: NativeOAuthAuthorization) =>
               isCurrentPrimary(payer) &&
               readRefusalFallbackMode() === refusalFallbackMode
+            const isCurrentCacheRequest = (payer: NativeOAuthAuthorization) =>
+              isCurrentSessionRequest(cacheRequest, payer, 'cache') &&
+              (laneStartRequest ||
+                readRefusalFallbackMode() === refusalFallbackMode)
             const targetAllowed = (model: string) => {
               const snapshot = nativeAccounts.peek?.()
               if (!snapshot) return true // The physical authorization still checks quota.
@@ -7865,7 +7892,7 @@ const anthropicAuthPlugin = async (
               if (
                 !keepCompletedReply ||
                 !template ||
-                !primary ||
+                !cacheRequest ||
                 roundPlan?.request
               )
                 return response
@@ -7874,7 +7901,7 @@ const anthropicAuthPlugin = async (
                   payer,
                   template,
                   usage,
-                  () => isFresh(payer),
+                  () => isCurrentCacheRequest(payer),
                   true,
                 ),
               )
@@ -7889,14 +7916,14 @@ const anthropicAuthPlugin = async (
               preparedTemplate = false,
             ) => {
               if (
-                !primary ||
+                !cacheRequest ||
                 !keepCompletedReply ||
                 !isCurrent() ||
                 !cacheKeepRestart.active()
               )
                 return
               if (bodyText === null) {
-                cacheKeepRestart.forget(primary.sessionId)
+                cacheKeepRestart.forget(cacheRequest.sessionId)
                 return
               }
               const storeTemplate = (template: string) => {
@@ -7905,7 +7932,7 @@ const anthropicAuthPlugin = async (
                 const sourceModel = parseRequestModel(sourceBodyText)
                 const servingModel = parseRequestModel(template)
                 const tracked = cacheKeepManager.track({
-                  sessionId: primary.sessionId,
+                  sessionId: cacheRequest.sessionId,
                   url: requestUrl,
                   headers: requestHeaders,
                   bodyText: template,
@@ -7931,14 +7958,18 @@ const anthropicAuthPlugin = async (
                 if (tracked.tracked) {
                   if (usage)
                     cacheKeepManager.recordAcceptedUsage(
-                      primary.sessionId,
+                      cacheRequest.sessionId,
                       template,
                       usage,
                     )
                 } else
-                  cacheKeepRestart.forget(primary.sessionId, false, acceptedAt)
+                  cacheKeepRestart.forget(
+                    cacheRequest.sessionId,
+                    false,
+                    acceptedAt,
+                  )
                 trace?.mark('cachekeep_track', {
-                  session: primary.sessionId,
+                  session: cacheRequest.sessionId,
                   tracked: tracked.tracked,
                   reason: tracked.tracked ? undefined : tracked.reason,
                   bodyBytes: template.length,
@@ -7964,7 +7995,7 @@ const anthropicAuthPlugin = async (
                           payer,
                           template?.bodyText ?? null,
                           template?.usage,
-                          isCurrent,
+                          () => isCurrent() && isCurrentCacheRequest(payer),
                           roundPlan?.kind === 'source' &&
                             template?.servingModel !== modelForIdentity,
                         )
@@ -8161,7 +8192,7 @@ const anthropicAuthPlugin = async (
                   let response: Response
                   try {
                     markRoundSent()
-                    notePrimarySent(trace)
+                    noteSessionRequestSent(trace)
                     response = scope.redactResponse(
                       await fetchOAuthPhysical(gateway)(finalUrl(gateway), {
                         ...init,
@@ -8407,7 +8438,9 @@ const anthropicAuthPlugin = async (
                 modelForIdentity &&
                 requestAuthority.credentialId
               ) {
-                const newest = latestPrimaryRequest.get(primary.sessionId)
+                const newest = latestSessionSends.get(
+                  primary.sessionId,
+                )?.primary
                 if (newest === undefined || newest <= primary.sequence) {
                   warmRoutes.delete(primary.sessionId)
                   warmRoutes.set(primary.sessionId, {
@@ -8529,7 +8562,7 @@ const anthropicAuthPlugin = async (
                     }
                   }
                   markRoundSent()
-                  notePrimarySent(trace)
+                  noteSessionRequestSent(trace)
                   return {
                     headers: relayHeaders,
                     billing,
@@ -9828,15 +9861,17 @@ const anthropicAuthPlugin = async (
               }
               if (
                 sessionId &&
-                !laneStartRequest &&
                 takeRequestClassHeader(new Headers(incomingHeaders)) === 'main'
               ) {
-                primaryRequestByTrace.set(trace, {
+                cacheRequestByTrace.set(trace, {
                   sessionId,
                   sequence: requestSequence,
-                  model:
-                    requestModel ??
-                    parseRequestModel(await fetchBody(input, init)),
+                  kind: laneStartRequest ? 'start' : 'primary',
+                  ...(!laneStartRequest && {
+                    model:
+                      requestModel ??
+                      parseRequestModel(await fetchBody(input, init)),
+                  }),
                 })
               }
               const wrapResponse = (response: Response) => {

@@ -275,6 +275,11 @@ describe('OC1 shared routing relay', () => {
     'OC1 %s scoped Fable retry prefers the last accepted cache account',
     async (mode) => {
       let sends = 0
+      const reply = {
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }
       const f = await fixture(
         'three accounts for warm retry',
         () =>
@@ -289,7 +294,7 @@ describe('OC1 shared routing relay', () => {
                   ),
                 },
               })
-            : new Response('ok'),
+            : Response.json(reply),
         undefined,
         mode,
         false,
@@ -307,11 +312,11 @@ describe('OC1 shared routing relay', () => {
         messages: [{ role: 'user', content: 'hello' }],
         max_tokens: 10,
       }
-      expect(await (await f.send(payload)).text()).toBe('ok')
+      expect(await (await f.send(payload)).json()).toEqual(reply)
       expect(f.sends).toEqual(['Bearer sk-ant-oat01-third-access'])
       accountId = syntheticMainAccountUuid
       if (mode === 'main-first') delete globals[key]
-      expect(await (await f.send(payload)).text()).toBe('ok')
+      expect(await (await f.send(payload)).json()).toEqual(reply)
       expect(f.sends).toEqual([
         'Bearer sk-ant-oat01-third-access',
         'Bearer sk-ant-oat01-main-access',

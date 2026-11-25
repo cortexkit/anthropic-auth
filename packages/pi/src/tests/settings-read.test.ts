@@ -1145,12 +1145,27 @@ for (const mode of ['local', 'claustrum'] as const)
             body.max_tokens = expectedMaxTokens
           return { ...send, body: promptCacheSnapshot(body) }
         }
+        const clientFallbackHeaders = <T extends { headers: string[][] }>(
+          request: T,
+        ) => ({
+          ...request,
+          headers: request.headers.map(([name, value]) => [
+            name,
+            name === 'anthropic-beta'
+              ? `${value},server-side-fallback-2026-07-01`
+              : value,
+          ]),
+        })
         const expected = JSON.stringify({
           ...release,
           readers,
           // The capture predates the model-specific reply allowance. Expect
           // today's Opus 5.5 limit while keeping the historical fixture intact.
-          sends: release.sends.map((send) => conversationBytes(send, 128_000)),
+          sends: release.sends.map((send) =>
+            clientFallbackHeaders(conversationBytes(send, 128_000)),
+          ),
+          // Client mode carries the beta on both sends without opting in on the body.
+          warms: release.warms.map(clientFallbackHeaders),
         })
         for (const [phase, storage] of [
           ['before', before],
@@ -1176,6 +1191,8 @@ for (const mode of ['local', 'claustrum'] as const)
             ),
           }
           expect(JSON.stringify(compatible), phase).toBe(expected)
+          for (const request of [...observed.sends, ...observed.warms])
+            expect(JSON.parse(request.body)).not.toHaveProperty('fallbacks')
           expect(observed.sends).toHaveLength(1)
           expect(JSON.parse(observed.sends[0]!.body).diagnostics).toEqual({
             previous_message_id: null,

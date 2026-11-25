@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import type { AccountStorage } from '../accounts.ts'
 import { CacheKeepManager } from '../cachekeep.ts'
 import { hasValidRequestBodySignature } from '../cch.ts'
+import { restoreRefusalFallbackReturnMarker } from '../refusal-fallback-return-marker.ts'
 import {
   RefusalFallbackRoundEngine,
   type RefusalFallbackRoundInput,
@@ -231,6 +232,38 @@ test('warm uses only the last full accepted source prefix, waits until near expi
   } finally {
     h.cacheKeep.stop()
   }
+})
+
+test('return marker with an invalid lifetime order leaves string content unchanged', () => {
+  const source = structuredClone(body)
+  const returning = {
+    ...structuredClone(source),
+    messages: [
+      { role: 'user', content: 'accepted prefix' },
+      { role: 'assistant', content: 'continued' },
+      ...structuredClone(source.messages),
+    ],
+  }
+  expect(
+    restoreRefusalFallbackReturnMarker(structuredClone(returning), source),
+  ).toBe(true)
+
+  const invalid = {
+    ...returning,
+    system: [
+      {
+        type: 'text',
+        text: 'instructions',
+        cache_control: { type: 'ephemeral' },
+      },
+    ],
+  }
+  const matchingSource = { ...source, system: invalid.system }
+  const before = JSON.stringify(invalid)
+  expect(restoreRefusalFallbackReturnMarker(invalid, matchingSource)).toBe(
+    false,
+  )
+  expect(JSON.stringify(invalid)).toBe(before)
 })
 
 test.each(['matching prefix', 'edited prefix', 'changed lifetime'] as const)(

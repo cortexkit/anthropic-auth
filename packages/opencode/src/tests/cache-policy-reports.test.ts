@@ -384,7 +384,7 @@ describe('OC1 final response cache reports', () => {
         }
         globalThis.fetch = mock(
           withNativeAdmission(ctx, async () =>
-            Response.json({ content: [], usage: {} }),
+            Response.json({ content: [], stop_reason: 'end_turn', usage: {} }),
           ),
         ) as unknown as typeof fetch
         const originalTrack = CacheKeepManager.prototype.track

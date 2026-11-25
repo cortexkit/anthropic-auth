@@ -2051,9 +2051,12 @@ describe('auth.loader', () => {
           new Headers(init?.headers).get('authorization') ?? '',
         )
         return Promise.resolve(
-          new Response('ok\n\ndata: {"type":"message_stop"}\n\n', {
-            status: 200,
-          }),
+          new Response(
+            'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_warm_cutover","usage":{"input_tokens":1,"output_tokens":0}}}\n\n' +
+              'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n' +
+              'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            { headers: { 'content-type': 'text/event-stream' } },
+          ),
         )
       }),
     ) as unknown as typeof fetch

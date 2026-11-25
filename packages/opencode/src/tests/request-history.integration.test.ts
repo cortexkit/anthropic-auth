@@ -1066,6 +1066,7 @@ describe('claude-start integration', () => {
   test('claude-start request shapes only its correlated OAuth turn and emits diagnostics', async () => {
     const sent: Array<{ body: Record<string, unknown>; headers: Headers }> = []
     const records: LogTestRecord[] = []
+    let terminal: 'max_tokens' | 'refusal' | undefined = 'max_tokens'
     globalThis.fetch = mock(
       withNativeAdmission((_input: unknown, init?: RequestInit) => {
         sent.push({
@@ -1090,7 +1091,10 @@ describe('claude-start integration', () => {
                 },
                 diagnostics: { cache_miss_reason: null },
               },
-            })}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`,
+            })}\n\n` +
+              (terminal
+                ? `event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"${terminal}"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`
+                : ''),
             { status: 200 },
           ),
         )
@@ -1103,20 +1107,6 @@ describe('claude-start integration', () => {
     // Diagnostics records emit at debug level; enable it after plugin
     // load so boot-time level application cannot reset it.
     setLogLevel('debug')
-    const headers: Record<string, string> = {}
-    await plugin['chat.message'](
-      { sessionID: 'ses-start' },
-      {
-        message: { id: 'msg-start' },
-        parts: [{ type: 'text', text: LANE_START_TEXT, synthetic: true }],
-      },
-    )
-    await plugin['chat.headers'](
-      { sessionID: 'ses-start', message: { id: 'msg-start' } },
-      { headers },
-    )
-    expect(headers).toEqual({ [LANE_START_REQUEST_HEADER]: '1' })
-
     const result = await plugin.auth.loader(
       () =>
         Promise.resolve({
@@ -1127,19 +1117,35 @@ describe('claude-start integration', () => {
         }),
       { models: {} },
     )
-    await (
-      await result.fetch(MESSAGES_URL, {
-        method: 'POST',
-        headers: { 'x-session-affinity': 'ses-start', ...headers },
-        body: JSON.stringify({
-          model: 'claude-opus-4-8',
-          stream: true,
-          max_tokens: 99,
-          thinking: { type: 'enabled', budget_tokens: 10 },
-          messages: [{ role: 'user', content: 'start' }],
-        }),
-      })
-    ).text()
+    const sendStart = async (sessionID: string) => {
+      const headers: Record<string, string> = {}
+      await plugin['chat.message'](
+        { sessionID },
+        {
+          message: { id: 'msg-start' },
+          parts: [{ type: 'text', text: LANE_START_TEXT, synthetic: true }],
+        },
+      )
+      await plugin['chat.headers'](
+        { sessionID, message: { id: 'msg-start' } },
+        { headers },
+      )
+      expect(headers).toEqual({ [LANE_START_REQUEST_HEADER]: '1' })
+      await (
+        await result.fetch(MESSAGES_URL, {
+          method: 'POST',
+          headers: { 'x-session-affinity': sessionID, ...headers },
+          body: JSON.stringify({
+            model: 'claude-opus-4-8',
+            stream: true,
+            max_tokens: 99,
+            thinking: { type: 'enabled', budget_tokens: 10 },
+            messages: [{ role: 'user', content: 'start' }],
+          }),
+        })
+      ).text()
+    }
+    await sendStart('ses-start')
 
     expect(sent).toHaveLength(1)
     expect(sent[0]?.body).toMatchObject({ max_tokens: 1, stream: true })
@@ -1161,19 +1167,34 @@ describe('claude-start integration', () => {
       session_id: 'ses-start',
     })
 
-    await expectHandledCommandResponse(
-      plugin['command.execute.before']({
-        command: 'claude',
-        arguments: '',
-        sessionID: 'ses-start',
-      }),
+    const readMenu = async () => {
+      await expectHandledCommandResponse(
+        plugin['command.execute.before']({
+          command: 'claude',
+          arguments: '',
+          sessionID: 'ses-start',
+        }),
+      )
+      const latest = (
+        client.session.promptAsync as unknown as {
+          mock: { calls: Array<[{ body: { parts: Array<{ text: string }> } }]> }
+        }
+      ).mock.calls.at(-1)?.[0]
+      return latest?.body.parts[0]?.text
+    }
+    expect(await readMenu()).toContain('ses-start')
+
+    terminal = undefined
+    await expect(sendStart('ses-missing-terminal')).rejects.toThrow(
+      'stream ended before message_stop',
     )
-    const latest = (
-      client.session.promptAsync as unknown as {
-        mock: { calls: Array<[{ body: { parts: Array<{ text: string }> } }]> }
-      }
-    ).mock.calls.at(-1)?.[0]
-    expect(latest?.body.parts[0]?.text).toContain('ses-start')
+    terminal = 'refusal'
+    await sendStart('ses-refused-start')
+    expect(sent).toHaveLength(3)
+    const menu = await readMenu()
+    expect(menu).toContain('ses-start')
+    expect(menu).not.toContain('ses-missing-terminal')
+    expect(menu).not.toContain('ses-refused-start')
     setLogLevel('info')
   })
 
