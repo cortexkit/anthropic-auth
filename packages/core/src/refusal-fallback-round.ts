@@ -231,11 +231,20 @@ export type RefusalFallbackCacheKeepTemplate = Readonly<{
 export type RefusalFallbackRoundLifecycleOptions = {
   isFresh: () => boolean
   targetAllowed: (model: string) => boolean
-  /** If the host changes tool IDs or names on replay, project them back to its wire namespace. */
+  /**
+   * Map the reply's tool IDs and names back to the form the host sends on the
+   * wire (for example OpenCode's `mcp_` prefix), when the host renames them on
+   * replay, so the recorded history matches what the next request carries.
+   */
   projectReply?: (
     blocks: readonly Record<string, unknown>[],
   ) => readonly Record<string, unknown>[]
-  /** Sign the accepted pre-thread body, then check `isCurrent` before tracking it. Null retires only the live template. */
+  /**
+   * Receives the body keep-warm should resend for this session (the accepted
+   * request before thread handling). The host computes its billing signature,
+   * then checks `isCurrent` before tracking it with CacheKeep. `null` removes
+   * only the session's current keep-warm body, not a separate source-model warm.
+   */
   onCacheKeepTemplate?: (
     template: RefusalFallbackCacheKeepTemplate | null,
     isCurrent: () => boolean,

@@ -324,7 +324,10 @@ export class RecoveryThinkingStore {
     )?.families.get(family)
   }
 
-  /** Keep live tags in memory until their retry or round ends. */
+  /**
+   * Keep this session's in-memory round associations (which live round each
+   * recorded digest belongs to) until the retry or round that holds them ends.
+   */
   retainSession(sessionId: string): () => void {
     const record = this.session(sessionId)
     record.pins++
@@ -338,7 +341,8 @@ export class RecoveryThinkingStore {
   record(sessionId: string, family: string, digest: string, round?: symbol) {
     if (!FAMILY.test(family) || !DIGEST.test(digest)) return
     const record = this.session(sessionId)
-    // A signature already seen in another round must not be reclaimed.
+    // A digest already recorded keeps its first round association; a later
+    // round never takes it over.
     const known = record.families.get(family)
     addDigest(
       record.families,
