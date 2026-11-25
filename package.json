@@ -35,7 +35,7 @@
     "@earendil-works/pi-coding-agent": "1.6.0",
     "@earendil-works/pi-tui": "1.6.0",
     "@opencode-ai/plugin": "1.19.6",
-    "@tsconfig/bun": "1.0.11",
+    "@tsconfig/bun": "1.0.12",
     "@types/bun": "1.4.5",
     "dedent": "^1.7.2",
     "jsonc-parser": "^3.3.1",
