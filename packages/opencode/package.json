@@ -84,7 +84,7 @@
     "@opentui/core": "0.9.7",
     "@opentui/solid": "0.9.7",
     "jsonc-parser": "^3.3.1",
-    "solid-js": "1.9.17",
+    "solid-js": "2.0.3",
     "xxhash-wasm": "^1.1.0"
   },
   "devDependencies": {
