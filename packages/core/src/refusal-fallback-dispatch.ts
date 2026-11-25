@@ -56,12 +56,20 @@ export type RefusalFallbackDispatchOptions = {
     /** Headers sent upstream, excluding runtime-generated framing like Content-Length. */
     headers: Headers
     bodyText: string
-    /** Full source-shaped pre-thread request, required for a refused continue. */
+    /**
+     * The source model's full request body as built before message-thread
+     * handling (all messages, not a thread continuation). A refused continue
+     * can't be retried from its own body, so it needs this one.
+     */
     fullBodyText?: string
   }
   /** True only if no newer primary was sent and the mode, model and binding still match. */
   isFresh: () => boolean
-  /** Re-authorize OAuth and check account and model quota and killswitch floors, without waiting. */
+  /**
+   * Get a fresh OAuth token for the target model and apply the user's quota
+   * protections (minimum remaining quota per account and per model), without
+   * waiting for a reset.
+   */
   authorize: RefusalFallbackExtraSendAuthority
   /** Start one direct or gateway send immediately. No redirect, replay or recovery. */
   send: (request: {

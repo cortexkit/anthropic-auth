@@ -33,7 +33,7 @@ export type AnthropicBillingRequest = Omit<
    * produced. Must not wait or do I/O; `undefined` leaves `cache.warming` out.
    */
   cacheWarming?: () => AnthropicBillingWarming | undefined
-  /** Local consumer; never serialized into a routing report. */
+  /** In-process consumer of each billing report; nothing it adds is sent to shared routing. */
   onReport?: (report: AnthropicBillingReport) => void
 }
 
