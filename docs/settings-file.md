@@ -359,7 +359,7 @@ at the filename does not change the key.
 A marker in either location counts; an unreadable record is not treated as
 missing. For `applied.json`, each host's newest recorded reading wins. If the
 state folder cannot be used, the plugin warns and keeps using the records beside
-the settings file. Status and stopped-host setup show where the records are kept.
+the settings file. `/claude` Status, and the setup command (run with OpenCode and Pi stopped), show where the records are kept.
 
 The copies beside the settings file keep 2.17.x working during mixed-version use
 and after rollback. This release removes neither copy. A later release will stop
