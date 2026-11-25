@@ -33,9 +33,12 @@ bun test tests/mock-refusal.test.ts tests/refusal-joined-reply.test.ts tests/ref
 
 Each case starts with disposable host state and synthetic credentials. The host
 processes can connect only on the mock server's port and, for OpenCode 2, the
-local daemon's port. The authority cases that use the HTTP relay also allow its
-loopback port. Round tests keep Pi open in RPC mode between prompts; joined
-reply tests that check restart still start a fresh Pi process. The cases named
+local daemon's port. The cases that check whether a retry is still allowed
+(quota floors, killswitch, sign-out, credential replacement) over the HTTP relay
+also allow the relay's loopback port. Round tests keep Pi open in RPC mode
+between prompts. The joined-reply tests (a refused reply and its fallback retry
+streamed to the host as one reply) start a fresh Pi process when they check a
+restart. The cases named
 `callback-boundary` drive a second request through the real host's registered
 provider callback because its CLI waits for the current prompt to finish.
 
