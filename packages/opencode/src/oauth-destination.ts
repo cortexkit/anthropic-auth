@@ -141,6 +141,11 @@ export function oauthDestinationRefusal(
  */
 export const fetchOAuth: typeof fetch = createAnthropicOAuthFetch(originOptions)
 
+/** Send to a previously resolved endpoint without rewriting headers or replaying the body. */
+export function fetchOAuthPhysical(gateway?: ClaudeGateway): typeof fetch {
+  return createAnthropicOAuthFetch(() => originOptions(gateway))
+}
+
 /**
  * Fetch for OAuth model requests: like fetchOAuth, but a model request goes
  * to the user's gateway with its headers when one is set. See

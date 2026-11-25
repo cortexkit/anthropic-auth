@@ -1,6 +1,7 @@
 import { describe, expect, mock, spyOn } from 'bun:test'
 import {
   type AccountStorage,
+  hasValidRequestBodySignature,
   logger,
   SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
@@ -425,4 +426,208 @@ describe('auth.loader', () => {
       )
     },
   )
+
+  test('client retry 429 ends the host stream with the original refusal after two sends', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ accounts: [], quota: { enabled: false } }),
+    )
+    await setUserRefusalFallbackMode(testContext, 'client')
+    const credit = 'credit_only_for_this_retry_987'
+    const sends: Array<{ body: string; headers: Headers }> = []
+    const refusal = [
+      {
+        type: 'message_start',
+        message: {
+          id: 'msg_source',
+          model: 'claude-fable-5-2',
+          usage: { input_tokens: 12 },
+        },
+      },
+      {
+        type: 'message_delta',
+        delta: {
+          stop_reason: 'refusal',
+          stop_details: {
+            type: 'refusal',
+            category: 'cyber',
+            fallback_credit_token: credit,
+          },
+        },
+        usage: { output_tokens: 1 },
+      },
+      { type: 'message_stop' },
+    ]
+      .map(
+        (event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+      )
+      .join('')
+    globalThis.fetch = mock(
+      withNativeAdmission(
+        (input: string | URL | Request, init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url.includes('/api/oauth/usage'))
+            return Response.json({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            })
+          if (!url.includes('/v1/messages')) return Response.json({})
+          const body = String(init?.body)
+          if (JSON.parse(body).max_tokens === 0) return Response.json({})
+          sends.push({ body, headers: new Headers(init?.headers) })
+          return sends.length === 1
+            ? new Response(refusal, {
+                headers: {
+                  'content-type': 'text/event-stream',
+                  'anthropic-ratelimit-unified-5h-utilization': '0',
+                  'anthropic-ratelimit-unified-7d-utilization': '0',
+                },
+              })
+            : Response.json(
+                {
+                  type: 'error',
+                  error: {
+                    type: 'rate_limit_error',
+                    message: `Rejected ${credit}`,
+                  },
+                },
+                { status: 429 },
+              )
+        },
+      ),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const host = await plugin.auth.loader(
+      () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
+      { models: {} },
+    )
+    const response: Response = await host.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_client_retry_429' },
+      body: JSON.stringify({
+        model: 'claude-fable-5-2',
+        max_tokens: 128_000,
+        stream: true,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+    expect(response.status).toBe(200)
+    const text = await response.text()
+    expect(text.match(/"stop_reason":"refusal"/g)).toHaveLength(1)
+    expect(text.match(/"type":"message_stop"/g)).toHaveLength(1)
+    expect(text).not.toContain('event: error')
+    expect(text).not.toContain(credit)
+    expect(sends).toHaveLength(2)
+    const [source, retry] = sends
+    expect(JSON.parse(source!.body)).not.toHaveProperty('fallback_credit_token')
+    expect(JSON.parse(retry!.body)).toMatchObject({
+      model: 'claude-opus-4-8',
+      fallback_credit_token: credit,
+    })
+    expect(await hasValidRequestBodySignature(retry!.body)).toBe(true)
+    const sourceHeaders = new Headers(source!.headers)
+    sourceHeaders.delete('authorization')
+    const retryHeaders = new Headers(retry!.headers)
+    retryHeaders.delete('authorization')
+    expect([...retryHeaders]).toEqual([...sourceHeaders])
+  })
+
+  test('a newer primary makes the older refusal stand without a retry', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    await setUserRefusalFallbackMode(testContext, 'client')
+    const older =
+      Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>()
+    const encoder = new TextEncoder()
+    const frame = (type: string, fields = {}) =>
+      encoder.encode(`data: ${JSON.stringify({ type, ...fields })}\n\n`)
+    const sends: string[] = []
+    const headers = {
+      'content-type': 'text/event-stream',
+      'anthropic-ratelimit-unified-5h-utilization': '0',
+      'anthropic-ratelimit-unified-7d-utilization': '0',
+    }
+    globalThis.fetch = mock(
+      withNativeAdmission(
+        (input: string | URL | Request, init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url.includes('/api/oauth/usage'))
+            return Response.json({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            })
+          if (!url.includes('/v1/messages')) return Response.json({})
+          const { model, max_tokens } = JSON.parse(String(init?.body))
+          if (max_tokens === 0) return Response.json({})
+          sends.push(model)
+          const deferred = sends.length === 1
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  frame('message_start', {
+                    message: {
+                      id: deferred ? 'msg_older' : 'msg_newer',
+                      model,
+                      usage: { input_tokens: 3 },
+                    },
+                  }),
+                )
+                if (deferred) older.resolve(controller)
+                else {
+                  controller.enqueue(
+                    frame('message_delta', {
+                      delta: { stop_reason: 'end_turn' },
+                    }),
+                  )
+                  controller.enqueue(frame('message_stop'))
+                  controller.close()
+                }
+              },
+            }),
+            { headers },
+          )
+        },
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const host = await plugin.auth.loader(
+      () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
+      { models: {} },
+    )
+    const send = (text: string): Promise<Response> =>
+      host.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses_client_stale' },
+        body: JSON.stringify({
+          model: 'claude-fable-5-2',
+          max_tokens: 100,
+          stream: true,
+          messages: [{ role: 'user', content: text }],
+        }),
+      })
+    const previous = await send('older')
+    const controller = await older.promise
+    let newer: string
+    try {
+      newer = await (await send('newer')).text()
+    } finally {
+      controller.enqueue(
+        frame('message_delta', {
+          delta: {
+            stop_reason: 'refusal',
+            stop_details: {
+              type: 'refusal',
+              category: 'cyber',
+              fallback_credit_token: 'older_refusal_credit_951',
+            },
+          },
+        }),
+      )
+      controller.enqueue(frame('message_stop'))
+      controller.close()
+    }
+    expect(newer).toContain('"stop_reason":"end_turn"')
+    expect(await previous.text()).toContain('"stop_reason":"refusal"')
+    expect(sends).toEqual(['claude-fable-5-2', 'claude-fable-5-2'])
+  })
 })

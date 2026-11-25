@@ -90,7 +90,9 @@ export type RefusalFallbackDispatchOptions = {
     report: AnthropicBillingReport,
     attempt: RefusalFallbackPhysicalAttempt,
   ) => void
-  /** Wrap guarded responses for quota, thread or dump observation without reading ahead. */
+  /** The relay already guarded and billed the origin; this takes the token that credits the retry for the refused work. */
+  protectedOrigin?: { takeRefusalCredit: () => string | undefined }
+  /** Observe guarded bytes without reading ahead, before billing the response. A relay has already billed its protected origin. */
   observePhysicalResponse?: (
     response: Response,
     attempt: RefusalFallbackPhysicalAttempt,
@@ -204,9 +206,11 @@ export function dispatchRefusalFallback(
       maxPendingBytes: options.maxPendingBytes,
       onRefusalCredit,
     })
-  const guardedSource = protect(response, originHeaders, bodyText, (value) => {
-    credit = value
-  })
+  const guardedSource = options.protectedOrigin
+    ? response
+    : protect(response, originHeaders, bodyText, (value) => {
+        credit = value
+      })
   const sourceAttempt: RefusalFallbackPhysicalAttempt = Object.freeze({
     model: sentModel,
     ordinal: options.billing.attempt ?? 1,
@@ -214,14 +218,17 @@ export function dispatchRefusalFallback(
     paysCacheWrite: false,
     folded: false,
   })
-  const source = observeAnthropicBillingResponse(
-    billingInput(sourceAttempt),
-    guardedSource,
-    eventStream(guardedSource),
-  )
   const observedSource =
-    options.observePhysicalResponse?.(source, sourceAttempt) ?? source
-  if (!eventStream(guardedSource)) return observedSource
+    options.observePhysicalResponse?.(guardedSource, sourceAttempt) ??
+    guardedSource
+  const source = options.protectedOrigin
+    ? observedSource
+    : observeAnthropicBillingResponse(
+        billingInput(sourceAttempt),
+        observedSource,
+        eventStream(guardedSource),
+      )
+  if (!eventStream(guardedSource)) return source
 
   async function retry(
     refusal: RefusalFallbackStreamRefusal,
@@ -336,26 +343,28 @@ export function dispatchRefusalFallback(
         return { kind: 'none', reason: 'protection-failed' }
       }
       const sse = eventStream(guarded)
-      const billed = observeAnthropicBillingResponse(billing, guarded, sse)
       const observed =
-        options.observePhysicalResponse?.(billed, attempt, reusableBodyText) ??
-        billed
-      if (observed.ok && sse && observed.body)
-        return { kind: 'retry', response: observed }
+        options.observePhysicalResponse?.(guarded, attempt, reusableBodyText) ??
+        guarded
+      const billed = observeAnthropicBillingResponse(billing, observed, sse)
+      if (billed.ok && sse && billed.body)
+        return { kind: 'retry', response: billed }
       try {
-        if (!folded && (await wrongModel(observed, headers))) continue
+        if (!folded && (await wrongModel(billed, headers))) continue
         return { kind: 'none', reason: 'retry-rejected' }
       } finally {
-        void observed.body?.cancel().catch(() => {})
+        void billed.body?.cancel().catch(() => {})
       }
     }
     return { kind: 'none', reason: 'stale' }
   }
 
-  return joinRefusalFallbackStream(observedSource, {
+  return joinRefusalFallbackStream(source, {
     sourceModel: options.sourceModel,
     isFresh: options.isFresh,
     takeSourceRefusalCredit() {
+      if (options.protectedOrigin)
+        return options.protectedOrigin.takeRefusalCredit()
       const token = credit
       credit = undefined
       return token

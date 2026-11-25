@@ -394,16 +394,12 @@ export class FableFallbackManager {
     return reset
   }
 
-  completeSource(plan: FableFallbackPlan, servedBySource = true): boolean {
+  completeSource(plan: FableFallbackPlan): boolean {
     if (plan.downgraded || plan.cycle == null || plan.completed) return false
     plan.completed = true
     const state = this.recoveries.get(plan.recoveryKey)
     if (!state || state.cycle !== plan.cycle || state.remaining > 0)
       return false
-    if (!servedBySource) {
-      state.sourceSuccesses = 0
-      return false
-    }
     state.sourceSuccesses = Math.min(
       state.sourceSuccesses + 1,
       FABLE_FALLBACK_TURNS,

@@ -23,10 +23,12 @@ import {
   ClaudeCodeFirstUserTextTracker,
   type ClaudeCodeIdentity,
   type ClaudeCodeRequestClass,
+  copyStreamResponseTiming,
   countUserPrompts,
   createAnthropicStreamCompletion,
   createServerSideFallbackStreamRewriter,
   createSseFramer,
+  decodeSseFrame,
   FAST_MODE_BETA,
   type IncompleteStreamDiagnostics,
   isClaudeFableOrMythos5Model,
@@ -2493,6 +2495,110 @@ function sseDiagnosticStats(state: SseDiagnosticState) {
     sseRedactedThinkingBytes: state.redactedThinkingBytes,
     sseLastEvent: state.last ? { ...state.last } : undefined,
   }
+}
+
+/** Observe one guarded physical reply, not the host stream that may splice two replies. */
+export function observeCompletedCacheReply(
+  response: Response,
+  streaming: boolean,
+  onComplete: (usage: Record<string, unknown>) => void,
+): Response {
+  if (!response.ok || !response.body) return response
+  const reader = response.body.getReader()
+  const framer = streaming ? createSseFramer() : undefined
+  const decoder = !streaming ? new TextDecoder() : undefined
+  let json = ''
+  let jsonBytes = 0
+  let streamStart = true
+  let valid = true
+  let stopReason: unknown
+  const usage: Record<string, unknown> = {}
+  const observe = (message: Record<string, unknown> | undefined) => {
+    const content = message?.content
+    if (
+      Array.isArray(content) &&
+      content.some((block) => asDiagnosticRecord(block)?.type === 'refusal')
+    )
+      valid = false
+    stopReason = message?.stop_reason ?? stopReason
+    Object.assign(usage, asDiagnosticRecord(message?.usage))
+  }
+  const complete = () => {
+    if (
+      valid &&
+      (stopReason === 'end_turn' ||
+        stopReason === 'tool_use' ||
+        stopReason === 'max_tokens')
+    )
+      onComplete(usage)
+    valid = false
+  }
+  const body = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        try {
+          const next = await reader.read()
+          if (valid) {
+            try {
+              if (next.done) {
+                if (decoder) {
+                  observe(
+                    asDiagnosticRecord(JSON.parse(json + decoder.decode())),
+                  )
+                  complete()
+                }
+              } else if (framer) {
+                for (const frame of framer.push(next.value)) {
+                  const { data, event } = parseSseFrame(
+                    decodeSseFrame(frame, { streamStart }),
+                  )
+                  streamStart = false
+                  if (event === 'error') valid = false
+                  if (!data || data === '[DONE]') continue
+                  const payload = asDiagnosticRecord(JSON.parse(data))
+                  if (
+                    payload?.type === 'error' ||
+                    asDiagnosticRecord(payload?.content_block)?.type ===
+                      'refusal'
+                  )
+                    valid = false
+                  observe(asDiagnosticRecord(payload?.message))
+                  observe(asDiagnosticRecord(payload?.delta))
+                  Object.assign(usage, asDiagnosticRecord(payload?.usage))
+                  if (payload?.type === 'message_stop') complete()
+                }
+              } else if (decoder) {
+                jsonBytes += next.value.byteLength
+                valid = jsonBytes <= NON_STREAMING_DIAGNOSTICS_MAX_BYTES
+                json = valid
+                  ? json + decoder.decode(next.value, { stream: true })
+                  : ''
+              }
+            } catch {
+              // Diagnostics must not reject a response when observation fails.
+              valid = false
+            }
+          }
+          if (next.done) {
+            reader.releaseLock()
+            controller.close()
+          } else controller.enqueue(next.value)
+        } catch (error) {
+          reader.releaseLock()
+          controller.error(error)
+        }
+      },
+      async cancel(reason) {
+        try {
+          await reader.cancel(reason)
+        } finally {
+          reader.releaseLock()
+        }
+      },
+    },
+    { highWaterMark: 0 },
+  )
+  return copyStreamResponseTiming(response, new Response(body, response))
 }
 
 /**

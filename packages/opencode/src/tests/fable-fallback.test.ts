@@ -649,25 +649,6 @@ test('counts only terminal completed responses, including tool_use, on either mo
   ).toBe(10)
 })
 
-test('a provider fallback response does not count as a clean source response', () => {
-  const manager = new FableFallbackManager()
-  manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!)
-  for (let index = 0; index < 10; index++)
-    manager.complete(manager.plan('session-a', body('claude-opus-5-5'))!)
-  for (let index = 0; index < 9; index++)
-    manager.completeSource(manager.plan('session-a', body('claude-opus-5-5'))!)
-  expect(
-    manager.completeSource(
-      manager.plan('session-a', body('claude-opus-5-5'))!,
-      false,
-    ),
-  ).toBe(false)
-  manager.completeSource(manager.plan('session-a', body('claude-opus-5-5'))!)
-  expect(
-    manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!),
-  ).toBe(20)
-})
-
 test('only a changed primary selection clears recovery, not another family using the session', () => {
   const manager = new FableFallbackManager()
   expect(manager.resetForModelChange('session-a', 'claude-opus-5-5')).toBe(

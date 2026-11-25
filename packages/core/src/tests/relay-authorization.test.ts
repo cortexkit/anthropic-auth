@@ -1,6 +1,8 @@
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
+import { dispatchRefusalFallback } from '../refusal-fallback-dispatch.ts'
 import { type RelayConfig, sendViaRelay } from '../relay.ts'
+import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback-usage.ts'
 
 const routingKey = Symbol.for('cortexkit.routing')
 const globals = globalThis as Record<symbol, unknown>
@@ -493,6 +495,151 @@ test('WebSocket billing observes real upstream usage and response identity', asy
     server.stop(true)
   }
 })
+
+test.each(['http', 'websocket'] as const)(
+  '%s relay bills the origin once and hands the private credit to a direct retry',
+  async (transport) => {
+    const reports = captureBilling()
+    const source = 'claude-fable-5-2'
+    const credit = 'one_use_relay_fixture_credit_336'
+    const headers = new Headers({ 'anthropic-beta': SERVER_SIDE_FALLBACK_BETA })
+    const upstreamHeaders = {
+      'content-type': 'text/event-stream',
+      'request-id': 'req_origin',
+    }
+    const sse = (...events: object[]) =>
+      events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')
+    const refusal = sse(
+      {
+        type: 'message_start',
+        message: {
+          id: 'msg_origin',
+          model: source,
+          usage: { input_tokens: 3 },
+        },
+      },
+      {
+        type: 'message_delta',
+        delta: {
+          stop_reason: 'refusal',
+          stop_details: {
+            type: 'refusal',
+            category: 'cyber',
+            fallback_credit_token: credit,
+          },
+        },
+        usage: { output_tokens: 2 },
+      },
+      { type: 'message_stop' },
+    )
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch: (request, server) =>
+        server.upgrade(request)
+          ? undefined
+          : new Response(refusal, { headers: upstreamHeaders }),
+      websocket: {
+        open: (socket) => {
+          socket.send(
+            JSON.stringify({ type: 'ready', protocol: 2, state: null }),
+          )
+        },
+        message: (socket, data) => {
+          const { id } = JSON.parse(String(data))
+          socket.send(
+            JSON.stringify({
+              type: 'response_start',
+              id,
+              status: 200,
+              headers: upstreamHeaders,
+            }),
+          )
+          for (const fragment of [refusal.slice(0, -16), refusal.slice(-16)])
+            socket.send(
+              JSON.stringify({
+                type: 'chunk',
+                id,
+                base64: Buffer.from(fragment).toString('base64'),
+              }),
+            )
+          socket.send(JSON.stringify({ type: 'done', id }))
+        },
+      },
+    })
+    const binding = {
+      accountId: 'test-account',
+      credentialId: 'credential-1',
+      url: 'https://api.anthropic.com/v1/messages',
+    }
+    const bodyText = JSON.stringify({
+      model: source,
+      stream: true,
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    let capturedCredit: string | undefined
+    const retries: string[] = []
+    try {
+      const origin = await sendViaRelay({
+        config: config(server.url.href, transport),
+        input: binding.url,
+        init: { method: 'POST' },
+        headers,
+        body: bodyText,
+        affinity: randomUUID(),
+        optimisticResponse: true,
+        fallback: async () => {
+          throw new Error('Unexpected direct rescue')
+        },
+        authorizeAttempt: async () => ({
+          headers,
+          billing: { ...billing(1), model: source },
+          onRefusalCredit: (value) => {
+            capturedCredit = value
+          },
+        }),
+      })
+      const output = await dispatchRefusalFallback(origin, {
+        sourceModel: source,
+        origin: { ...binding, bodyText, headers },
+        isFresh: () => true,
+        protectedOrigin: {
+          takeRefusalCredit: () => {
+            const value = capturedCredit
+            capturedCredit = undefined
+            return value
+          },
+        },
+        authorize: () => ({
+          kind: 'authorized',
+          ...binding,
+          accessToken: 'same-binding-new-bearer',
+        }),
+        billing: billing(1),
+        send: async ({ bodyText }) => {
+          retries.push(bodyText)
+          return Response.json(
+            { error: { message: `quota exceeded: ${credit}` } },
+            { status: 429 },
+          )
+        },
+      }).text()
+      expect(retries).toHaveLength(1)
+      expect(JSON.parse(retries[0]!).fallback_credit_token).toBe(credit)
+      expect(output).toContain('"stop_reason":"refusal"')
+      expect(output).not.toContain(credit)
+      await Bun.sleep(10)
+      expect(reports.map((report) => report.status)).toEqual([200, 429])
+      expect(reports[0]).toMatchObject({
+        provider_response_id: 'msg_origin',
+        usage: { input: 3, output: 2 },
+      })
+    } finally {
+      server.stop(true)
+    }
+  },
+)
 
 test('a relay-only transport 401 without upstream provenance is not surfaced as an account 401', async () => {
   const server = Bun.serve({
