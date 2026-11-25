@@ -8686,8 +8686,9 @@ const anthropicAuthPlugin = async (
                   true,
                 )
                 if (options) {
-                  // Install the template callback before the terminal resend;
-                  // its completion belongs to Core, not to source dispatch.
+                  // Install the template callback before the terminal resend:
+                  // the resend's completion is reported by the round engine's
+                  // lifecycle (handleTarget400), not by source retry dispatch.
                   roundLifecycle(payer)
                   const resent = await rounds.handleTarget400(
                     handle,

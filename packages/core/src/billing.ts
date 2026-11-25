@@ -34,7 +34,12 @@ export type AnthropicBillingRequest = Omit<
    * produced. Must not wait or do I/O; `undefined` leaves `cache.warming` out.
    */
   cacheWarming?: () => AnthropicBillingWarming | undefined
-  /** A clean, completed origin can defer its billing report until the template is published. */
+  /**
+   * Set only for an origin request that finished without a refusal, and is
+   * still the session's current request: its report waits (at most one
+   * second) for the keep-warm template to be published, so the report's
+   * warming state includes it.
+   */
   cacheWarmingAfter?: () => Promise<void> | undefined
   /** In-process consumer of each billing report; nothing it adds is sent to shared routing. */
   onReport?: (report: AnthropicBillingReport) => void
