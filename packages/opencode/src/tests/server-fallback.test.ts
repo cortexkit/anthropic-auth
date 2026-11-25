@@ -749,9 +749,51 @@ describe('createServerSideFallbackStreamRewriter', () => {
     expect(withoutOptIn.push(stream) + withoutOptIn.flush()).toBe(stream)
   })
 
+  test('streams CR-only keep-alives and rewrites each handoff before EOF', () => {
+    const rewriter = createServerSideFallbackStreamRewriter({
+      requestedModel: 'claude-fable-5',
+      serverSideFallbackSent: true,
+    })
+    const heartbeat = ': keep-alive\r\r'
+    const handoff = sse('content_block_start', {
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'fallback',
+        from: { model: 'claude-fable-5' },
+        to: { model: 'claude-opus-4-8' },
+      },
+    }).replaceAll('\n', '\r')
+
+    expect(rewriter.push(heartbeat)).toBe(heartbeat)
+    const output = rewriter.push(handoff)
+    expect(output).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
+    expect(output).not.toContain(handoff)
+    expect(rewriter.flush()).toBe('')
+  })
+
+  test('keeps ordinary mixed SSE endings byte-for-byte across split CRLF', () => {
+    const rewriter = createServerSideFallbackStreamRewriter({
+      requestedModel: 'claude-fable-5',
+    })
+    const chunks = [
+      'event: ping\r',
+      '\ndata: {"type":"ping"}\r',
+      '\n',
+      '\n: keep-alive\r',
+      '\r',
+      '\n',
+    ]
+    let output = ''
+    for (const chunk of chunks) output += rewriter.push(chunk)
+    expect(output).toBe(chunks.join(''))
+    expect(rewriter.flush()).toBe('')
+  })
+
   test.each([
     ['LF', '\n\n', 1],
     ['CRLF', '\r\n\r\n', 2],
+    ['CR', '\r\r', 1],
   ])(
     'resyncs after an oversized frame ending in a split %s boundary',
     (_name, delimiter, splitAt) => {

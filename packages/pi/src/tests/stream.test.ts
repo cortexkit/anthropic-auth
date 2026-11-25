@@ -296,9 +296,13 @@ describe('Pi client refusal fallback', () => {
 const serverFallbackSource = { ...anthropicModel, id: 'claude-fable-5-2' }
 const serverFallbackTarget = 'claude-opus-5-5'
 
-function sseFixture(frames: Record<string, unknown>[]) {
+function sseFixture(frames: Record<string, unknown>[], lineEnding = '\n') {
   return new Response(
-    frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join(''),
+    frames
+      .map(
+        (frame) => `data: ${JSON.stringify(frame)}${lineEnding}${lineEnding}`,
+      )
+      .join(''),
     { headers: { 'content-type': 'text/event-stream' } },
   )
 }
@@ -560,6 +564,60 @@ test('Pi server fallback replays the boundary and signed thinking but never cont
       expect(text).not.toContain('cortexkit-server-fallback-')
       expect(await core.hasValidRequestBodySignature(text)).toBe(true)
     }
+  } finally {
+    f.close()
+  }
+})
+
+test('Pi server mode rewrites the handoff and preserves text on a CR-only stream', async () => {
+  const f = await piServerFallbackFixture('server')
+  f.respond(() =>
+    sseFixture(
+      [
+        {
+          type: 'message_start',
+          message: { id: 'msg_cr', model: serverFallbackSource.id },
+        },
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block: {
+            type: 'fallback',
+            from: { model: serverFallbackSource.id },
+            to: { model: serverFallbackTarget },
+          },
+        },
+        { type: 'content_block_stop', index: 0 },
+        {
+          type: 'content_block_start',
+          index: 1,
+          content_block: { type: 'text', text: '' },
+        },
+        {
+          type: 'content_block_delta',
+          index: 1,
+          delta: { type: 'text_delta', text: 'fallback answer' },
+        },
+        { type: 'content_block_stop', index: 1 },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+        { type: 'message_stop' },
+      ],
+      '\r',
+    ),
+  )
+  try {
+    const result = await f.send()
+    expect(result.stopReason).toBe('stop')
+    expect(result.content).toEqual([
+      {
+        type: 'thinking',
+        thinking: core.SERVER_FALLBACK_MARKER_TEXT,
+        thinkingSignature: `cortexkit-server-fallback-v1:${serverFallbackSource.id}|${serverFallbackTarget}`,
+      },
+      { type: 'text', text: 'fallback answer' },
+    ])
+    expect(f.sent).toHaveLength(1)
+    expect(f.sent[0]?.body.fallbacks).toBe('default')
   } finally {
     f.close()
   }

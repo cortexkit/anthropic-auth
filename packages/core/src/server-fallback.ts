@@ -302,7 +302,7 @@ export function sanitizeClaudeCodeRequestBody(
 function parseSseEvent(rawEvent: string): ParsedSseEvent {
   let event: string | undefined
   const dataLines: string[] = []
-  for (const line of rawEvent.split(/\r?\n/)) {
+  for (const line of rawEvent.split(/\r\n|\r|\n/)) {
     if (line.startsWith('event:')) {
       event = line.slice('event:'.length).trim()
     } else if (line.startsWith('data:')) {
@@ -319,12 +319,13 @@ function parseSseEvent(rawEvent: string): ParsedSseEvent {
   }
 }
 
-function findSseBoundary(value: string) {
-  const lf = value.indexOf('\n\n')
-  const crlf = value.indexOf('\r\n\r\n')
-  if (lf === -1) return crlf === -1 ? null : { index: crlf, length: 4 }
-  if (crlf === -1 || lf < crlf) return { index: lf, length: 2 }
-  return { index: crlf, length: 4 }
+function findSseBoundary(value: string, atFrameStart: boolean) {
+  // A blank first line needs only one terminator. Otherwise, CRLF must
+  // count as one line ending, never as a CR followed by a blank LF line.
+  const boundary =
+    (atFrameStart && /^\r\n?|^\n/.exec(value)) ||
+    /(?:\r\n|\r(?!\n)|\n)(?:\r\n?|\n)/.exec(value)
+  return boundary && { index: boundary.index, length: boundary[0].length }
 }
 
 function sseFrame(event: string, data: Record<string, unknown>) {
@@ -372,6 +373,9 @@ export function createServerSideFallbackStreamRewriter(options: {
   let pendingBytes = 0
   let resync = false
   let resyncCarry = ''
+  // A CR completes the line immediately. A leading LF in the next chunk
+  // belongs to that same terminator; keep it only if the CR was forwarded.
+  let splitCr: 'forward' | 'discard' | undefined
   let servedModel: string | undefined
   let handoff: ServerSideFallbackMarker | undefined
   let fallbackIterationModel: string | undefined
@@ -505,16 +509,17 @@ export function createServerSideFallbackStreamRewriter(options: {
   const drain = () => {
     let output = ''
     while (true) {
-      const boundary = findSseBoundary(pending)
+      const boundary = findSseBoundary(pending, true)
       if (!boundary) break
       const rawEvent = pending.slice(0, boundary.index)
-      const delimiter = pending.slice(
-        boundary.index,
-        boundary.index + boundary.length,
-      )
-      pending = pending.slice(boundary.index + boundary.length)
+      const end = boundary.index + boundary.length
+      const delimiter = pending.slice(boundary.index, end)
+      pending = pending.slice(end)
       pendingBytes = new TextEncoder().encode(pending).byteLength
-      output += rewriteEvent(rawEvent, delimiter)
+      const rewritten = rewriteEvent(rawEvent, delimiter)
+      if (!pending && delimiter.endsWith('\r'))
+        splitCr = rewritten.endsWith('\r') ? 'forward' : 'discard'
+      output += rewritten
     }
     return output
   }
@@ -525,15 +530,24 @@ export function createServerSideFallbackStreamRewriter(options: {
     },
     push(text: string) {
       let output = ''
+      if (!text) return output
+      if (splitCr) {
+        if (text.startsWith('\n')) {
+          if (splitCr === 'forward') output = '\n'
+          text = text.slice(1)
+        }
+        splitCr = undefined
+      }
       if (resync) {
         const window = resyncCarry + text
-        const boundary = findSseBoundary(window)
+        const boundary = findSseBoundary(window, false)
         if (!boundary) {
           resyncCarry = window.slice(-3)
-          return text
+          return output + text
         }
         const end = boundary.index + boundary.length
-        output = text.slice(0, Math.max(0, end - resyncCarry.length))
+        output += text.slice(0, Math.max(0, end - resyncCarry.length))
+        if (end === window.length && window.endsWith('\r')) splitCr = 'forward'
         text = window.slice(end)
         resync = false
         resyncCarry = ''

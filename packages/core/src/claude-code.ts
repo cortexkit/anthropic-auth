@@ -521,15 +521,24 @@ export function applyClaudeCodeHeaders(
     .split(',')
     .map((beta) => beta.trim())
     .filter(Boolean)
-  const extraBetas = [...incomingBetas, ...(options.extraBetas ?? [])].filter(
-    (beta) => beta.trim() !== SERVER_SIDE_FALLBACK_BETA,
-  )
+  let extraBetas = [...incomingBetas, ...(options.extraBetas ?? [])]
   const { body, refusalFallbackMode } = options
+  const eligible =
+    resolveClaudeModelCapabilities(body?.model)?.serverSideFallback === true
+  const serverFallback =
+    eligible &&
+    refusalFallbackMode === 'server' &&
+    body?.fallbacks === 'default'
+  // Server mode keeps a caller-supplied fallback beta in its original position.
+  // Appending the managed one below does not change that position after deduplication.
+  if (!serverFallback)
+    extraBetas = extraBetas.filter(
+      (beta) => beta.trim() !== SERVER_SIDE_FALLBACK_BETA,
+    )
   if (
-    resolveClaudeModelCapabilities(body?.model)?.serverSideFallback === true &&
-    (refusalFallbackMode === 'client' ||
-      refusalFallbackMode === 'off' ||
-      (refusalFallbackMode === 'server' && body?.fallbacks === 'default'))
+    serverFallback ||
+    (eligible &&
+      (refusalFallbackMode === 'client' || refusalFallbackMode === 'off'))
   )
     extraBetas.push(SERVER_SIDE_FALLBACK_BETA)
 

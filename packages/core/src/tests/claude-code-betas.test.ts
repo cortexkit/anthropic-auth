@@ -46,6 +46,24 @@ const TITLE =
 const QUOTA =
   'oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05'
 
+test('server fallback keeps the 2.17.1 anthropic-beta bytes for an incoming fallback beta followed by another beta', () => {
+  const headers = applyClaudeCodeHeaders(
+    new Headers({
+      'anthropic-beta': 'server-side-fallback-2026-07-01,context-1m-2025-08-07',
+    }),
+    'test-token',
+    {
+      body: { model: 'claude-fable-5-2', fallbacks: 'default' },
+      refusalFallbackMode: 'server',
+    },
+  )
+
+  // Captured with the published 2.17.1 header writer and OpenCode's appended beta.
+  expect(headers.get('anthropic-beta')).toBe(
+    `${MAIN},server-side-fallback-2026-07-01,context-1m-2025-08-07`,
+  )
+})
+
 for (const [model, expected] of [
   ['claude-sonnet-5-5', MAIN],
   ['claude-opus-5-5', MAIN],

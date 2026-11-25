@@ -39,6 +39,7 @@ import {
   createStickyNoRouteResponse,
   currentCacheKeepRealTurn,
   DEFAULT_REFUSAL_FALLBACK_MODE,
+  DEFAULT_SSE_MAX_FRAME_BYTES,
   type DumpHandle,
   decideStickyQuotaFailure,
   decodeSseFrame,
@@ -2740,6 +2741,7 @@ async function sendAnthropicRequestAttempt(
     const rewriter = createServerSideFallbackStreamRewriter({
       requestedModel: physicalModel,
       serverSideFallbackSent,
+      maxPendingBytes: DEFAULT_SSE_MAX_FRAME_BYTES,
       onOutcome: (outcome) => {
         // Sticky routing can change the serving model without a fallback block.
         if (outcome.fallback) threadRequest?.fail('response_fallback')
