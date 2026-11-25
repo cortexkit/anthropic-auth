@@ -1,0 +1,817 @@
+import { expect, test } from 'bun:test'
+import { hasValidRequestBodySignature, signRequestBody } from '../cch.ts'
+import { dispatchRefusalFallback } from '../refusal-fallback-dispatch.ts'
+import {
+  estimateRefusalFallbackInput,
+  refusalFallbackEstimateBase,
+} from '../refusal-fallback-prefix.ts'
+import {
+  RefusalFallbackRoundEngine,
+  type RefusalFallbackRoundEvent,
+  type RefusalFallbackRoundInput,
+  type RefusalFallbackRoundPlan,
+} from '../refusal-fallback-round.ts'
+import { joinRefusalFallbackStream } from '../refusal-fallback-stream.ts'
+import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback-usage.ts'
+import { TURN_END_NOTE_CONTENT } from '../turn-end-note.ts'
+
+const fable = 'claude-fable-5-2'
+const opus = 'claude-opus-4-8'
+const binding = {
+  accountId: 'A',
+  credentialId: 'key-A',
+  url: 'https://gateway.example/v1/messages',
+}
+const allowed = (): boolean => true
+const oauth = { accountId: binding.accountId, targetAllowed: allowed }
+const prompt = { role: 'user', content: 'Hello' }
+const marker = {
+  role: 'system',
+  content: [],
+  output_config: { effort: 'high' },
+}
+const body = {
+  model: fable,
+  stream: true,
+  max_tokens: 200_000,
+  messages: [prompt],
+  system: [
+    {
+      type: 'text',
+      text: 'x-anthropic-billing-header: cc_version=test; cc_entrypoint=test; cch=00000;',
+    },
+  ],
+}
+const usage = { input_tokens: 20, cache_read_input_tokens: 200 }
+const completion = { stopReason: 'end_turn', usage } as const
+const refusal = { category: 'cyber', releasedTool: false, usage }
+
+function fixture() {
+  const events: RefusalFallbackRoundEvent[] = []
+  const engine = new RefusalFallbackRoundEngine((event) => events.push(event))
+  const input: RefusalFallbackRoundInput = {
+    sessionId: 's',
+    requestedModel: fable,
+    kind: 'primary',
+    mode: 'client',
+    oauth,
+    bodyText: JSON.stringify(body),
+  }
+  const plan = (overrides?: Partial<RefusalFallbackRoundInput>) =>
+    engine.plan({ ...input, ...overrides })
+  const send = (plan: RefusalFallbackRoundPlan) => {
+    const handle = plan.request
+    if (!handle || !engine.markSent(handle))
+      throw new Error('Expected a sendable request')
+    const lifecycle = engine.lifecycle(handle, {
+      isFresh: allowed,
+      targetAllowed: allowed,
+    })
+    return { handle, lifecycle }
+  }
+  const begin = (
+    kind: 'retry' | 'tool' | 'no-retry' = 'retry',
+    start = plan(),
+  ) => {
+    expect(start.kind).toBe('source')
+    const { lifecycle } = send(start)
+    lifecycle?.onRefusal?.({ ...refusal, releasedTool: kind === 'tool' })
+    if (kind === 'retry')
+      lifecycle?.onRetryCompleted?.(completion, { model: opus, folded: false })
+  }
+  return { events, engine, input, plan, send, begin }
+}
+
+test.each([
+  ['first refusal after 3 clean responses', false, 3, 0, 'retry', 10],
+  ['10 clean then retry', true, 10, 0, 'retry', 10],
+  ['9 clean then retry', true, 9, 0, 'retry', 20],
+  ['10 clean then released tool', true, 10, 0, 'tool', 10],
+  ['7 clean, unretried refusal, then 5 clean', true, 7, 5, 'retry', 20],
+] as const)(
+  'backoff: %s',
+  (_name, hadRound, firstClean, moreClean, start, length) => {
+    const { begin, plan, send, events } = fixture()
+    if (hadRound) {
+      begin()
+      // Compaction ends the round without clearing the recent-round flag.
+      expect(plan({ compacted: true }).kind).toBe('source')
+    }
+    for (let i = 0; i < firstClean; i++)
+      send(plan()).lifecycle?.onCompleted?.(completion)
+    if (moreClean) begin('no-retry')
+    for (let i = 0; i < moreClean; i++)
+      send(plan()).lifecycle?.onCompleted?.(completion)
+    begin(start)
+    expect(
+      events.filter((event) => event.kind === 'round_started').at(-1)
+        ?.stepsLeft,
+    ).toBe(length - (start === 'retry' ? 1 : 0))
+  },
+)
+
+test('backoff saturates at 40 and resets on a requested model change even within the session', () => {
+  const { begin, plan, events } = fixture()
+  for (let i = 0; i < 4; i++) {
+    begin('tool')
+    if (i < 3) plan({ compacted: true })
+  }
+  expect(
+    events
+      .filter((event) => event.kind === 'round_started')
+      .map((e) => e.stepsLeft),
+  ).toEqual([10, 20, 40, 40])
+  expect(plan({ requestedModel: 'claude-haiku-5-5' }).kind).toBe('source')
+  expect(events.at(-1)).toMatchObject({
+    kind: 'round_ended',
+    reason: 'model',
+    stepsLeft: 40,
+  })
+  begin('tool')
+  expect(events.at(-1)).toMatchObject({ kind: 'round_started', stepsLeft: 10 })
+})
+
+test('events identify the round, decrement once per current primary, and reach zero at count end', () => {
+  const { plan, send, begin, events } = fixture()
+  begin()
+  const stale = send(plan())
+  const fresh = send(plan())
+  stale.lifecycle?.onCompleted?.(completion)
+  fresh.lifecycle?.onCompleted?.(completion)
+  fresh.lifecycle?.onCompleted?.(completion)
+  for (let i = 0; i < 8; i++) send(plan()).lifecycle?.onCompleted?.(completion)
+  expect(plan().kind).toBe('source')
+  expect(events.map(({ kind, stepsLeft }) => [kind, stepsLeft])).toEqual([
+    ['round_started', 9],
+    ...Array.from({ length: 10 }, (_, i) => ['step_served' as const, 9 - i]),
+    ['round_ended', 0],
+  ])
+  for (const event of events) {
+    const { kind: _kind, stepsLeft: _left, ...info } = event
+    expect(info).toEqual({
+      sessionId: 's',
+      requestedModel: fable,
+      servingModel: opus,
+      category: 'cyber',
+      ...(event.kind === 'round_ended' && { reason: 'count' }),
+    })
+  }
+})
+
+test.each([
+  ['compaction', { compacted: true }],
+  ['account', { oauth: { ...oauth, accountId: 'B' } }],
+  ['route', { oauth: undefined }],
+  ['quota', { oauth: { ...oauth, targetAllowed: (): boolean => false } }],
+  ['mode', { mode: 'off' }],
+  [
+    'budget',
+    {
+      bodyText: JSON.stringify({
+        ...body,
+        thinking: { type: 'enabled', budget_tokens: 128_000 },
+      }),
+    },
+  ],
+  [
+    'window',
+    {
+      bodyText: JSON.stringify({
+        ...body,
+        messages: [
+          ...body.messages,
+          { role: 'user', content: 'x'.repeat(4_000_000) },
+        ],
+      }),
+    },
+  ],
+] as const)(
+  '%s ends the round and selects the source before thread preparation',
+  (reason, overrides) => {
+    const { begin, plan, events } = fixture()
+    begin('tool')
+    const result = plan(overrides)
+    expect(result.kind).toBe('source')
+    expect(result.bodyText).toBe(
+      'bodyText' in overrides ? overrides.bodyText : JSON.stringify(body),
+    )
+    expect(events.at(-1)).toMatchObject({
+      kind: 'round_ended',
+      reason,
+      stepsLeft: 10,
+    })
+  },
+)
+
+test.each([
+  'title',
+  'summary',
+  'compaction',
+  'keep-warm',
+  'prime',
+  'fork',
+  'lane-start',
+  'auxiliary',
+])(
+  'ordinary %s is source byte-for-byte and cannot change round state',
+  (kind) => {
+    const { begin, input, plan, events } = fixture()
+    begin()
+    expect(
+      plan({
+        kind,
+        requestedModel: 'other-model',
+        mode: 'server',
+        oauth: undefined,
+      }),
+    ).toEqual({
+      kind: 'source',
+      bodyText: input.bodyText,
+    })
+    expect(plan().kind).toBe('round')
+    expect(events.map((event) => event.kind)).toEqual([
+      'round_started',
+      'step_served',
+    ])
+  },
+)
+
+test.each(['server', 'off'] as const)(
+  '%s primary remains untouched',
+  (mode) => {
+    const { input, plan, events } = fixture()
+    expect(plan({ mode })).toEqual({ kind: 'source', bodyText: input.bodyText })
+    expect(events).toEqual([])
+  },
+)
+
+test('the model swap comes after source shaping and headers but before thread and signing', async () => {
+  const { begin, plan, send } = fixture()
+  begin()
+  const stages: string[] = []
+  const route = () => {
+    stages.push('source route')
+    return oauth
+  }
+  const source = () => {
+    stages.push('source transform')
+    return JSON.stringify({ ...body, messages: [marker, prompt] })
+  }
+  const headers = () => {
+    stages.push('source headers')
+    return new Headers({
+      'anthropic-beta': `${SERVER_SIDE_FALLBACK_BETA},per-turn-control-test`,
+    })
+  }
+  const finalRoute = route()
+  const sourceBodyText = source()
+  const sourceHeaders = headers()
+  const originalHeaders = [...sourceHeaders]
+  const target = plan({
+    oauth: finalRoute,
+    bodyText: sourceBodyText,
+    filterBody(text, path) {
+      if (path.kind === 'target') {
+        expect(stages).toEqual([
+          'source route',
+          'source transform',
+          'source headers',
+        ])
+        expect(JSON.parse(text).model).toBe(fable)
+      }
+      return text
+    },
+  })
+  expect(target).toMatchObject({
+    kind: 'round',
+    folded: true,
+    servingModel: opus,
+  })
+  const preThread = JSON.parse(target.bodyText)
+  expect(preThread).toMatchObject({
+    model: opus,
+    max_tokens: 128_000,
+    messages: [prompt],
+    output_config: { effort: 'high' },
+  })
+  expect(preThread.thread).toBeUndefined()
+  const signed = await signRequestBody(
+    JSON.stringify({ ...preThread, thread: { type: 'create' } }),
+  )
+  expect(await hasValidRequestBodySignature(signed)).toBe(true)
+  expect([...sourceHeaders]).toEqual(originalHeaders)
+  send(target)
+  expect(plan()).toMatchObject({ kind: 'round', folded: true })
+})
+
+const start = (model: string, tokens = 20) => ({
+  type: 'message_start',
+  message: { model, usage: { input_tokens: tokens } },
+})
+const end = {
+  type: 'message_delta',
+  delta: { stop_reason: 'end_turn' },
+  usage: { output_tokens: 5 },
+}
+const stop = { type: 'message_stop' }
+const refused = {
+  type: 'message_delta',
+  delta: {
+    stop_reason: 'refusal',
+    stop_details: { type: 'refusal', category: 'cyber' },
+  },
+}
+const block = (content_block: Record<string, unknown>) => ({
+  type: 'content_block_start',
+  index: 0,
+  content_block,
+})
+const close = { type: 'content_block_stop', index: 0 }
+const encode = (...events: unknown[]) =>
+  events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')
+const sse = (...events: unknown[]) =>
+  new Response(encode(...events), {
+    headers: { 'content-type': 'text/event-stream' },
+  })
+const bad = () =>
+  Response.json({ error: { message: 'wrong request' } }, { status: 400 })
+const sendHeaders = new Headers({
+  authorization: 'Bearer initial',
+  'anthropic-beta': `${SERVER_SIDE_FALLBACK_BETA},per-turn-control-test`,
+  'x-source-header': 'preserved',
+})
+
+function resendOptions() {
+  const auth: string[] = []
+  const sends: string[] = []
+  const options = {
+    sourceModel: fable,
+    isCurrentPrimary: allowed,
+    origin: { ...binding, headers: sendHeaders },
+    authorize: (request: {
+      model: string
+      origin: typeof binding
+      wait: false
+    }) => {
+      expect(request).toMatchObject({ origin: binding, wait: false })
+      auth.push(request.model)
+      return { kind: 'authorized' as const, ...binding, accessToken: 'fresh' }
+    },
+    send: async ({
+      headers,
+      bodyText,
+    }: {
+      headers: Headers
+      bodyText: string
+    }) => {
+      expect(headers.get('authorization')).toBe('Bearer fresh')
+      expect(headers.get('anthropic-beta')).toBe(
+        sendHeaders.get('anthropic-beta'),
+      )
+      expect(headers.get('x-source-header')).toBe('preserved')
+      sends.push(bodyText)
+      return sse(start(fable), refused, stop)
+    },
+  }
+  return { options, auth, sends }
+}
+
+test('a fresh round target 400 resends one signed, unfolded and stateless source request, which is terminal', async () => {
+  const { begin, plan, send, engine, events } = fixture()
+  const { options, auth, sends } = resendOptions()
+  begin()
+  const original = {
+    ...body,
+    messages: [marker, prompt],
+    thread: { type: 'continue' },
+  }
+  const round = plan({
+    bodyText: JSON.stringify(original),
+    filterBody(text, route) {
+      return route.kind === 'source'
+        ? JSON.stringify({ ...JSON.parse(text), sourceBound: true })
+        : text
+    },
+  })
+  expect(round).toMatchObject({ kind: 'round', folded: true })
+  const { handle } = send(round)
+  const response = await engine.handleTarget400(handle, bad(), options)
+  expect(await response.text()).toBe(encode(start(fable), refused, stop))
+  expect(auth).toEqual([fable])
+  expect(sends).toHaveLength(1)
+  const resent = sends[0] ?? ''
+  expect(await hasValidRequestBodySignature(resent)).toBe(true)
+  const { thread: _thread, system: _system, ...initial } = original
+  const { system: _signed, ...wire } = JSON.parse(resent)
+  expect(wire).toEqual({ ...initial, sourceBound: true })
+  expect(events.at(-1)).toMatchObject({
+    kind: 'round_ended',
+    stepsLeft: 9,
+    reason: 'target-400',
+  })
+  expect(plan().kind).toBe('source')
+  const duplicate = bad()
+  expect(await engine.handleTarget400(handle, duplicate, options)).toBe(
+    duplicate,
+  )
+  expect(sends).toHaveLength(1)
+})
+
+test('a stale round 400 does not resend or retire the live round', async () => {
+  const { begin, plan, send, engine, events } = fixture()
+  const { options, auth, sends } = resendOptions()
+  begin()
+  const stale = send(plan())
+  send(plan())
+  const response = bad()
+  expect(await engine.handleTarget400(stale.handle, response, options)).toBe(
+    response,
+  )
+  expect(auth).toEqual([])
+  expect(sends).toEqual([])
+  expect(events.at(-1)).toMatchObject({ kind: 'step_served', stepsLeft: 9 })
+})
+
+test('a 400 delayed during admission cannot change a replacement round', async () => {
+  const { begin, plan, send, engine, events } = fixture()
+  const { options, sends } = resendOptions()
+  begin()
+  const { handle } = send(plan())
+  const pending = Promise.withResolvers<ReturnType<typeof options.authorize>>()
+  const entered = Promise.withResolvers<void>()
+  const original = bad()
+  const response = engine.handleTarget400(handle, original, {
+    ...options,
+    authorize() {
+      entered.resolve()
+      return pending.promise
+    },
+  })
+  await entered.promise
+  begin('tool', plan({ compacted: true }))
+  pending.resolve({ kind: 'authorized', ...binding, accessToken: 'fresh' })
+  expect(await response).toBe(original)
+  expect(sends).toEqual([])
+  expect(plan().kind).toBe('round')
+  expect(events.at(-1)).toMatchObject({ kind: 'round_started', stepsLeft: 20 })
+})
+
+test('fresh 400 with a changed credential ends the round but sends nothing', async () => {
+  const { begin, plan, send, engine, events } = fixture()
+  const { options, sends } = resendOptions()
+  begin()
+  const { handle } = send(plan())
+  const error = bad()
+  expect(
+    await engine.handleTarget400(handle, error, {
+      ...options,
+      authorize: () => ({
+        kind: 'authorized',
+        ...binding,
+        credentialId: 'replaced',
+        accessToken: 'new',
+      }),
+    }),
+  ).toBe(error)
+  expect(sends).toEqual([])
+  expect(events.at(-1)).toMatchObject({
+    kind: 'round_ended',
+    reason: 'target-400',
+  })
+})
+
+test('explicitly routed title fits only on a valid live target and its 400 ignores primary freshness', async () => {
+  const { begin, input, plan, send, engine, events } = fixture()
+  const { options, sends } = resendOptions()
+  const title = {
+    ...input,
+    kind: 'title',
+    bodyText: JSON.stringify({
+      ...body,
+      messages: [{ role: 'user', content: 'Title?' }],
+    }),
+  }
+  expect(engine.planRouted(title).kind).toBe('source')
+  begin()
+  expect(engine.planRouted({ ...title, mode: 'off' }).kind).toBe('source')
+  expect(
+    engine.planRouted({ ...title, oauth: { ...oauth, accountId: 'B' } }).kind,
+  ).toBe('source')
+  expect(engine.planRouted({ ...title, kind: 'prime' }).kind).toBe('source')
+  expect(engine.planRouted({ ...title, kind: 'keep-warm' }).kind).toBe('source')
+  expect(
+    engine.planRouted({
+      ...title,
+      bodyText: JSON.stringify({ ...body, messages: [marker, prompt] }),
+    }).kind,
+  ).toBe('source')
+  expect(
+    engine.planRouted({
+      ...title,
+      bodyText: JSON.stringify({
+        ...body,
+        thinking: { budget_tokens: 128_000 },
+      }),
+    }).kind,
+  ).toBe('source')
+  expect(
+    engine.planRouted({
+      ...title,
+      bodyText: JSON.stringify({
+        ...body,
+        messages: [{ ...prompt, content: 'x'.repeat(4_000_000) }],
+      }),
+    }).kind,
+  ).toBe('source')
+  const routed = engine.planRouted(title)
+  expect(routed).toMatchObject({ kind: 'routed', servingModel: opus })
+  const { handle, lifecycle } = send(routed)
+  expect(lifecycle).toBeUndefined()
+  send(plan())
+  expect(
+    (
+      await engine.handleTarget400(handle, bad(), {
+        ...options,
+        isCurrentPrimary: () => false,
+      })
+    ).ok,
+  ).toBe(true)
+  expect(JSON.parse(sends[0] ?? '').messages).toEqual([
+    { role: 'user', content: 'Title?' },
+  ])
+  expect(sends).toHaveLength(1)
+  expect(events.at(-1)).toMatchObject({ kind: 'step_served', stepsLeft: 9 })
+  expect(plan().kind).toBe('round')
+})
+
+test('folded routed request has its effort folded before validity is checked', () => {
+  const { begin, input, plan, send, engine, events } = fixture()
+  begin()
+  const bodyText = JSON.stringify({ ...body, messages: [marker, prompt] })
+  send(plan({ bodyText }))
+  const routed = engine.planRouted({ ...input, kind: 'title', bodyText })
+  expect(routed).toMatchObject({ kind: 'routed', folded: true })
+  expect(JSON.parse(routed.bodyText).messages).toEqual([prompt])
+  expect(events.at(-1)).toMatchObject({ kind: 'step_served', stepsLeft: 9 })
+})
+
+test.each([[true], [false]])(
+  'completed retry seeds the estimate from its own full-prefix usage (credited: %s)',
+  async (credited) => {
+    const { input, plan, send, engine, events } = fixture()
+    const initial = plan()
+    const { lifecycle } = send(initial)
+    const { options } = resendOptions()
+    const sent: string[] = []
+    const payload = credited
+      ? {
+          ...refused,
+          delta: {
+            ...refused.delta,
+            stop_details: {
+              ...refused.delta.stop_details,
+              fallback_credit_token: 'secret-sentinel',
+              fallback_has_prefill_claim: true,
+            },
+          },
+        }
+      : refused
+    const reply = dispatchRefusalFallback(
+      sse(
+        start(fable),
+        block({ type: 'text', text: 'prefix' }),
+        close,
+        payload,
+        stop,
+      ),
+      {
+        ...options,
+        origin: {
+          ...options.origin,
+          bodyText: JSON.stringify({
+            ...body,
+            thread: { type: 'continue' },
+            messages: [],
+          }),
+          fullBodyText: initial.bodyText,
+        },
+        billing: { sessionId: 's', requestKind: 'primary' },
+        isFresh: allowed,
+        lifecycle,
+        async send({ bodyText }) {
+          sent.push(bodyText)
+          return sse(
+            start(opus, 872_000),
+            block({ type: 'text', text: 'answer' }),
+            close,
+            end,
+            stop,
+          )
+        },
+      },
+    )
+    expect(await reply.text()).not.toContain('secret-sentinel')
+    const wire = JSON.parse(sent[0] ?? '')
+    expect(wire.thread).toEqual({ type: 'create' })
+    expect(wire.messages).toHaveLength(credited ? 2 : 1)
+    expect(events.map(({ kind, stepsLeft }) => [kind, stepsLeft])).toEqual([
+      ['round_started', 9],
+      ['step_served', 9],
+    ])
+    // A title's small standalone body fits by byte estimate and cannot overwrite the base.
+    const title = engine.planRouted({
+      ...input,
+      kind: 'title',
+      bodyText: JSON.stringify({
+        ...body,
+        messages: [{ ...prompt, content: 'Title?' }],
+      }),
+    })
+    expect(title.kind).toBe('routed')
+    await joinRefusalFallbackStream(sse(start(opus), end, stop), {
+      isFresh: allowed,
+      sourceModel: fable,
+      lifecycle: send(title).lifecycle,
+    }).text()
+    const messages = [
+      prompt,
+      { role: 'assistant', content: 'prefixanswer' },
+      { role: 'user', content: 'Follow up?' },
+    ]
+    expect(plan({ bodyText: JSON.stringify({ ...body, messages }) }).kind).toBe(
+      'source',
+    )
+    expect(events.at(-1)).toMatchObject({
+      kind: 'round_ended',
+      reason: 'window',
+      stepsLeft: 9,
+    })
+  },
+)
+
+test('prefix estimate adds only normalized appended message bytes and compares content', () => {
+  const original = { ...body, messages: [marker, prompt] }
+  const prefix = refusalFallbackEstimateBase(original, 91)
+  const tail = [{ content: [{ text: 'a☃b', type: 'text' }], role: 'assistant' }]
+  const expected = 91 + Buffer.byteLength(JSON.stringify(tail)) / 4
+  const extended = {
+    ...original,
+    messages: [
+      prompt,
+      {
+        role: 'system',
+        content: TURN_END_NOTE_CONTENT,
+        clear_at: 'next_user_message',
+      },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'a☃', cache_control: { type: 'ephemeral' } },
+          { type: 'thinking', thinking: 'unsigned' },
+          { type: 'text', text: '' },
+          { type: 'text', text: 'b' },
+        ],
+      },
+    ],
+  }
+  expect(
+    estimateRefusalFallbackInput(extended, JSON.stringify(extended), prefix),
+  ).toBe(expected)
+  const changed = {
+    ...extended,
+    messages: [
+      { ...prompt, content: 'Changed' },
+      ...extended.messages.slice(1),
+    ],
+  }
+  const text = JSON.stringify(changed)
+  expect(estimateRefusalFallbackInput(changed, text, prefix)).toBe(
+    Buffer.byteLength(text) / 4,
+  )
+  expect(
+    estimateRefusalFallbackInput(extended, JSON.stringify(extended), undefined),
+  ).toBe(Buffer.byteLength(JSON.stringify(extended)) / 4)
+})
+
+test('join counts only complete fresh target responses without a refusal block', async () => {
+  const { begin, plan, send, events } = fixture()
+  begin('tool')
+  const attempt = (response: Response, isFresh = allowed) => {
+    const { lifecycle } = send(plan())
+    return joinRefusalFallbackStream(response, {
+      sourceModel: fable,
+      isFresh,
+      lifecycle,
+    }).text()
+  }
+  await attempt(sse(start(opus), end))
+  await attempt(sse(start(opus), end, { type: 'error' }, stop))
+  await attempt(sse(start(opus), block({ type: 'refusal' }), close, end, stop))
+  await attempt(sse(start(opus), refused, stop))
+  await attempt(sse(start(opus), end, stop), () => false)
+  expect(events).toHaveLength(1)
+  expect(await attempt(sse(start(opus), end, stop))).toBe(
+    encode(start(fable), end, stop),
+  )
+  expect(events.at(-1)).toMatchObject({ kind: 'step_served', stepsLeft: 9 })
+})
+
+test('dispatch forwards a released tool and starts a folded round without an extra physical send', async () => {
+  const { plan, send, events } = fixture()
+  const initial = plan({
+    bodyText: JSON.stringify({
+      ...body,
+      model: 'claude-opus-5',
+      messages: [marker, prompt],
+    }),
+    requestedModel: 'claude-opus-5',
+  })
+  const { lifecycle } = send(initial)
+  const { options, sends } = resendOptions()
+  const tool = block({
+    type: 'tool_use',
+    id: 'toolu_1',
+    name: 'lookup',
+    input: {},
+  })
+  const source = 'claude-opus-5'
+  const reply = dispatchRefusalFallback(
+    sse(start(source), tool, close, refused, stop),
+    {
+      ...options,
+      sourceModel: source,
+      origin: { ...options.origin, bodyText: initial.bodyText },
+      isFresh: allowed,
+      billing: { sessionId: 's', requestKind: 'primary' },
+      lifecycle,
+    },
+  )
+  const result = await reply.text()
+  expect(result).toContain('"stop_reason":"tool_use"')
+  expect(result).not.toContain('stop_details')
+  expect(sends).toEqual([])
+  expect(events).toEqual([
+    {
+      kind: 'round_started',
+      sessionId: 's',
+      requestedModel: source,
+      servingModel: opus,
+      category: 'cyber',
+      stepsLeft: 10,
+    },
+  ])
+  expect(
+    plan({ requestedModel: source, bodyText: initial.bodyText }),
+  ).toMatchObject({ kind: 'round', folded: true })
+})
+
+test('dispatch with no round lifecycle preserves the joined wire bytes and physical retry', async () => {
+  const { options } = resendOptions()
+  const sent: string[] = []
+  const scope = {
+    ...options,
+    isFresh: allowed,
+    billing: { sessionId: 's', requestKind: 'primary' as const },
+    origin: { ...options.origin, bodyText: JSON.stringify(body) },
+    send: async ({ bodyText }: { bodyText: string }) => {
+      sent.push(bodyText)
+      return sse(
+        start(opus),
+        block({ type: 'text', text: 'answer' }),
+        close,
+        end,
+        stop,
+      )
+    },
+  }
+  const source = () => sse(start(fable), refused, stop)
+  const result = await dispatchRefusalFallback(source(), scope).text()
+  const withObservers = await dispatchRefusalFallback(source(), {
+    ...scope,
+    lifecycle: { onRefusal() {}, onRetryCompleted() {} },
+  }).text()
+  expect(withObservers).toBe(result)
+  expect(result).toBe(
+    encode(
+      start(fable),
+      block({ type: 'text', text: 'answer' }),
+      close,
+      {
+        ...end,
+        usage: {
+          input_tokens: 20,
+          output_tokens: 5,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation: {
+            ephemeral_5m_input_tokens: 0,
+            ephemeral_1h_input_tokens: 0,
+          },
+        },
+      },
+      stop,
+    ),
+  )
+  expect(sent).toHaveLength(2)
+  expect(sent[0]).toBe(sent[1])
+})

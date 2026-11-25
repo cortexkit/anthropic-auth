@@ -36,8 +36,29 @@ export type RefusalFallbackStreamRefusal = {
 }
 
 export type RefusalFallbackStreamRetry =
-  | { kind: 'retry'; response: Response; onCommitted?: () => void }
+  | {
+      kind: 'retry'
+      response: Response
+      onCommitted?: () => void
+      onCompleted?: (completion: RefusalFallbackCompletion) => void
+    }
   | { kind: 'none'; reason: string }
+
+export type RefusalFallbackCompletion = {
+  stopReason: 'end_turn' | 'tool_use' | 'max_tokens'
+  usage?: Readonly<Payload>
+}
+
+export type RefusalFallbackCompletedRefusal = {
+  category?: string
+  usage?: Readonly<Payload>
+  releasedTool: boolean
+}
+
+export type RefusalFallbackLifecycle = {
+  onCompleted?: (completion: RefusalFallbackCompletion) => void
+  onRefusal?: (refusal: RefusalFallbackCompletedRefusal) => void
+}
 
 type HeartbeatClock = {
   now: () => number
@@ -52,6 +73,7 @@ export type RefusalFallbackStreamOptions = {
     refusal: RefusalFallbackStreamRefusal,
     signal: AbortSignal,
   ) => RefusalFallbackStreamRetry | Promise<RefusalFallbackStreamRetry>
+  lifecycle?: RefusalFallbackLifecycle
   signal?: AbortSignal
   maxPendingBytes?: number
   /** Test clock for the fixed 30-second keep-alive. */
@@ -191,6 +213,10 @@ function createAttempt(maxBytes: number, holdChanged: () => void) {
   const blocks = new Map<number, Block>()
   let startUsage: Payload | undefined
   let releasedTool = false
+  let started = false
+  let refusalBlock = false
+  let completed = false
+  let completion: RefusalFallbackCompletion | undefined
   return {
     hold,
     blocks,
@@ -198,7 +224,35 @@ function createAttempt(maxBytes: number, holdChanged: () => void) {
       return startUsage
     },
     rememberStart(frame: Frame) {
+      started = true
       startUsage = record(record(frame.payload?.message)?.usage)
+    },
+    rememberRefusalBlock() {
+      refusalBlock = true
+    },
+    rememberDelta(frame: Frame) {
+      const reason = record(frame.payload?.delta)?.stop_reason
+      if (reason == null) return
+      completion =
+        reason === 'end_turn' ||
+        reason === 'tool_use' ||
+        reason === 'max_tokens'
+          ? {
+              stopReason: reason,
+              usage: mergedUsage(startUsage, record(frame.payload?.usage)),
+            }
+          : undefined
+    },
+    takeCompletion() {
+      if (!started || refusalBlock || completed) return undefined
+      completed = true
+      return completion
+    },
+    invalidateCompletion() {
+      completed = true
+    },
+    get canReportRefusal() {
+      return started && !completed
     },
     get releasedTool() {
       return releasedTool
@@ -374,6 +428,23 @@ export function joinRefusalFallbackStream(
       ? createPrefillCapture(maxBytes)
       : undefined
 
+  function notify<T>(callback: ((event: T) => void) | undefined, event: T) {
+    try {
+      callback?.(event)
+    } catch {
+      // A lifecycle observer cannot interrupt the answer.
+    }
+  }
+
+  function complete(
+    attempt: Attempt,
+    callback: RefusalFallbackLifecycle['onCompleted'],
+  ) {
+    if (!callback || abort.signal.aborted || !isFresh()) return
+    const completion = attempt.takeCompletion()
+    if (completion) notify(callback, completion)
+  }
+
   function updateHeartbeat() {
     stopTimer?.()
     stopTimer = undefined
@@ -489,6 +560,7 @@ export function joinRefusalFallbackStream(
       if (block) return
       const type = record(frame.payload?.content_block)?.type
       if (type === 'tool_use' || type === 'refusal') {
+        if (type === 'refusal') attempt.rememberRefusalBlock()
         attempt.blocks.set(upstreamIndex, { kind: type })
         attempt.withhold(upstreamIndex, frame)
         return
@@ -572,6 +644,7 @@ export function joinRefusalFallbackStream(
           if (committed) emit([frame.bytes])
           break
         } else if (frame.type === 'message_delta') {
+          if (result.onCompleted) attempt.rememberDelta(frame)
           const refuses =
             record(frame.payload?.delta)?.stop_reason === 'refusal'
           if (refuses && !committed) return false
@@ -582,7 +655,10 @@ export function joinRefusalFallbackStream(
           })
           emit(output)
         } else if (frame.type === 'message_stop') {
-          if (committed) emit([frame.bytes])
+          if (committed) {
+            emit([frame.bytes])
+            complete(attempt, result.onCompleted)
+          }
           break
         } else if (
           frame.type === 'content_block_start' ||
@@ -622,6 +698,7 @@ export function joinRefusalFallbackStream(
             : frame.bytes,
         ])
       } else if (frame.type === 'message_delta') {
+        if (options.lifecycle?.onCompleted) source.rememberDelta(frame)
         const delta = record(frame.payload?.delta)
         if (delta?.stop_reason !== 'refusal') {
           const output = beforeSourceContent()
@@ -640,6 +717,8 @@ export function joinRefusalFallbackStream(
           if (next.done) break
           await waitForDemand()
           if (next.value.type === 'ping') emit([next.value.bytes])
+          else if (next.value.type === 'error' || next.value.event === 'error')
+            source.invalidateCompletion()
           else if (next.value.type === 'message_stop') {
             source.withhold(terminalKey, next.value)
             sawStop = true
@@ -650,6 +729,18 @@ export function joinRefusalFallbackStream(
         await waitForDemand()
         const fresh = freshAtRefusal && isFresh()
         const details = record(delta.stop_details)
+        const refusal = {
+          category:
+            details?.type === 'refusal' && typeof details.category === 'string'
+              ? details.category
+              : undefined,
+          usage: mergedUsage(source.startUsage, record(frame.payload?.usage)),
+        }
+        if (fresh && sawStop && source.canReportRefusal)
+          notify(options.lifecycle?.onRefusal, {
+            ...refusal,
+            releasedTool: source.releasedTool,
+          })
         const creditToken = options.takeSourceRefusalCredit?.()
         const hasPrefillClaim = details?.fallback_has_prefill_claim === true
         const prefillBlocks =
@@ -663,13 +754,8 @@ export function joinRefusalFallbackStream(
           !source.releasedTool &&
           retry &&
           (await runRetry({
-            category:
-              details?.type === 'refusal' &&
-              typeof details.category === 'string'
-                ? details.category
-                : undefined,
+            ...refusal,
             creditToken,
-            usage: mergedUsage(source.startUsage, record(frame.payload?.usage)),
             hasHostContent: sourceHasContent,
             hasPrefillClaim,
             ...(prefillBlocks !== undefined && { prefillBlocks }),
@@ -692,8 +778,13 @@ export function joinRefusalFallbackStream(
       )
         forwardBlock(source, frame, beforeSourceContent)
       else {
-        if (frame.type === 'message_stop') source.clear()
+        if (frame.type === 'error' || frame.event === 'error')
+          source.invalidateCompletion()
         emit([frame.bytes])
+        if (frame.type === 'message_stop') {
+          complete(source, options.lifecycle?.onCompleted)
+          source.clear()
+        }
       }
     }
   }

@@ -11,6 +11,8 @@ import { signRequestBody } from './cch.ts'
 import { protectFallbackCreditResponse } from './fallback-credit.ts'
 import {
   joinRefusalFallbackStream,
+  type RefusalFallbackCompletion,
+  type RefusalFallbackLifecycle,
   type RefusalFallbackStreamRefusal,
   type RefusalFallbackStreamRetry,
 } from './refusal-fallback-stream.ts'
@@ -48,6 +50,13 @@ export type RefusalFallbackPhysicalAttempt = Readonly<{
   paysCacheWrite: boolean
   folded: boolean
 }>
+
+export type RefusalFallbackDispatchLifecycle = RefusalFallbackLifecycle & {
+  onRetryCompleted?: (
+    completion: RefusalFallbackCompletion,
+    target: Readonly<{ model: string; folded: boolean }>,
+  ) => void
+}
 
 export type RefusalFallbackDispatchOptions = {
   /** The host-requested model, even if its wire spelling differs. */
@@ -95,6 +104,7 @@ export type RefusalFallbackDispatchOptions = {
     model: string
     attempt: RefusalFallbackPhysicalAttempt
   }) => void
+  lifecycle?: RefusalFallbackDispatchLifecycle
   /** The relay already guarded and billed the origin; this takes the token that credits the retry for the refused work. */
   protectedOrigin?: { takeRefusalCredit: () => string | undefined }
   /** Observe guarded bytes without reading ahead, before billing the response. A relay has already billed its protected origin. */
@@ -360,6 +370,13 @@ export function dispatchRefusalFallback(
           response: billed,
           onCommitted: () =>
             options.onRetryCommitted?.({ model: attempt.model, attempt }),
+          ...(options.lifecycle?.onRetryCompleted && {
+            onCompleted: (completion: RefusalFallbackCompletion) =>
+              options.lifecycle?.onRetryCompleted?.(completion, {
+                model: attempt.model,
+                folded,
+              }),
+          }),
         }
       try {
         if (!folded && (await wrongModel(billed, headers))) continue
@@ -382,7 +399,94 @@ export function dispatchRefusalFallback(
       return token
     },
     retry,
+    lifecycle: options.lifecycle,
     signal: options.signal,
     maxPendingBytes: options.maxPendingBytes,
   })
+}
+
+export type RefusalFallbackResendOptions = Pick<
+  RefusalFallbackDispatchOptions,
+  'sourceModel' | 'authorize' | 'send' | 'signal' | 'maxPendingBytes'
+> & {
+  origin: RefusalFallbackBinding & { headers: Headers }
+  /** Attach billing and diagnostics to guarded source bytes, without a thread anchor. */
+  observeResendResponse?: (response: Response, model: string) => Response
+}
+
+/** Send the original source shape, not the target's folded or threaded body. */
+export async function resendRefusalFallbackSource(
+  response: Response,
+  sourceBodyText: string,
+  options: RefusalFallbackResendOptions,
+  isCurrent: () => boolean,
+  settle400: () => void,
+  isNewest: () => boolean,
+): Promise<Response> {
+  const signal = options.signal ?? new AbortController().signal
+  const fresh = () => !signal.aborted && isCurrent()
+  if (!fresh()) return response
+  const { accountId, credentialId, url } = options.origin
+  const origin = { accountId, credentialId, url }
+  const model = parseBody(sourceBodyText)?.model
+  const headers = new Headers(options.origin.headers)
+  let prepared: { body: Uint8Array | string; bodyText: string } | undefined
+  try {
+    if (typeof model === 'string') {
+      let bodyText = replace(sourceBodyText, ['thread'], undefined)
+      bodyText = replace(bodyText, ['fallback_credit_token'], undefined)
+      bodyText = replace(bodyText, ['fallbacks'], undefined)
+      bodyText = await signRequestBody(bodyText)
+      const body =
+        headers.get('content-encoding')?.toLowerCase() === 'gzip'
+          ? await gzipAsync(bodyText)
+          : bodyText
+      if (!fresh()) return response
+      const decision = await options.authorize({
+        model,
+        origin,
+        wait: false,
+        signal,
+      })
+      if (
+        decision.kind === 'authorized' &&
+        decision.accessToken &&
+        decision.accountId === accountId &&
+        decision.credentialId === credentialId &&
+        decision.url === url
+      ) {
+        headers.set('authorization', `Bearer ${decision.accessToken}`)
+        prepared = { bodyText, body }
+      }
+    }
+  } catch {
+    // A failed preparation or authorization leaves the original 400 available.
+  }
+  if (!fresh()) return response
+  // No await between the final check, retiring the exact round, and the send.
+  settle400()
+  if (!prepared || typeof model !== 'string' || signal.aborted || !isNewest())
+    return response
+  let resent: Response
+  try {
+    resent = await options.send({ url, headers, ...prepared, signal })
+  } catch {
+    return response
+  }
+  void response.body?.cancel().catch(() => {})
+  const guarded = protectFallbackCreditResponse(resent, {
+    requestHeaders: headers,
+    requestBodyText: prepared.bodyText,
+    framing: 'event-stream',
+    maxPendingBytes: options.maxPendingBytes,
+  })
+  const observed = options.observeResendResponse?.(guarded, model) ?? guarded
+  return eventStream(guarded)
+    ? joinRefusalFallbackStream(observed, {
+        sourceModel: options.sourceModel,
+        isFresh: () => !signal.aborted && isNewest(),
+        signal,
+        maxPendingBytes: options.maxPendingBytes,
+      })
+    : observed
 }

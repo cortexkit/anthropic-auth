@@ -156,7 +156,7 @@ export function foldRefusalFallbackEffort(
   }
 }
 
-function measuredInputTokens(
+export function measuredInputTokens(
   usage: Readonly<Record<string, unknown>> | null | undefined,
 ) {
   let total: number | undefined
