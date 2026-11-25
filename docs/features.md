@@ -29,7 +29,7 @@ CortexKit adds account and request controls beyond OpenCode's or Pi's single bui
 - **Fallback accounts and quota-aware routing:** ordered OAuth accounts and API-key routes, minimum remaining-quota thresholds, and `sticky-balanced` session affinity. See [accounts](accounts-and-routing.md) and the [routing reference](configuration.md#fallback-accounts-and-session-affinity).
 - **Cache controls:** explicit, automatic or hybrid prompt-cache placement, optional keepalive, and opt-in quota-window priming. [Cache controls](cache.md) explain the schedules and billed synthetic requests.
 - **Quota visibility and limits:** per-account status, quota refresh and killswitch thresholds in OpenCode and Pi, plus the OpenCode quota sidebar.
-- **Model controls:** adaptive reasoning summaries, effort levels, fast mode and OpenCode 1 safety fallback. See [models](models.md) and [safety fallback](request-rewriting.md#safety-fallback-opencode-1).
+- **Model controls:** adaptive reasoning summaries, effort levels, fast mode and refusal fallback. See [models](models.md) and [refusal fallback](refusal-fallback.md).
 - **Optional custody and transport:** Claustrum is a local credential-vault service that can supply accounts instead of the local pool; a user-owned Cloudflare Worker can relay request bodies. See [vault custody](vault.md) and [transports](transports.md).
 - **Claude-compatible request shaping:** identity and billing headers, final-body signing, tool replay and prompt-cache placement. See [request rewriting](request-rewriting.md#request-rewriting).
 

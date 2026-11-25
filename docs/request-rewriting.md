@@ -10,7 +10,7 @@ For Claude Pro/Max OAuth requests, the plugin changes outgoing HTTP headers and 
 4. Prepend Claude Code identity and billing-header blocks.
 5. Rewrite cache controls according to the configured cache mode.
 6. Rename MCP tools into Claude-compatible PascalCase form, with response names mapped back to the host.
-7. Apply eligible server-side safety fallback, restore stored fallback boundaries and, in OpenCode 1, use replay-safe client recovery if a response still refuses.
+7. Apply the [configured refusal fallback mode](refusal-fallback.md) on eligible OAuth requests, restoring stored fallback boundaries in `server` mode.
 8. Compute final-body `cch`, the billing signature, from the fully shaped request using the signer's canonicalization: reset the billing placeholder and normalize the model/token-limit fields before hashing.
 
 The sanitizer is anchor-based: it removes paragraphs containing known OpenCode documentation/source anchors, applies a small set of inline replacements and preserves the remaining prompt, including user/project instructions, tool policy, environment context and file paths.
@@ -21,31 +21,13 @@ Pi replaces the Anthropic provider implementation and converts its transcript, t
 
 OpenCode 1, OpenCode 2 and Pi send paid API-key requests without adding a Claude Code identity, changing tool names, or signing the body. The plugin still checks the message history, removes internal markers and OAuth-only fallback fields and persona betas, and applies the API route's endpoint, header and model overrides. See [environment overrides](environment.md#api-endpoint-and-proxy-routes).
 
-## Safety fallback (OpenCode 1)
+## Refusal fallback
 
-By default, Fable 5, Fable 5.1, Opus 5 and Opus 5.5 requests authenticated with OAuth opt into Anthropic's server-side safety fallback. The plugin sends `fallbacks: "default"` with `server-side-fallback-2026-07-01`, preserves fallback conversation boundaries in OpenCode history and reports handoffs/restoration in the sidebar or Desktop. Follow-up requests may remain on Anthropic's selected model for about one hour.
+OpenCode 1, OpenCode 2 and Pi default to `client`: Core can join a retry into the current response and reports only the serving model's usage to the host. Refused attempts are reported separately for billing. See [refusal fallback](refusal-fallback.md) for the shared setting, mode choices and how temporary fallback rounds work.
 
-If a response from one of those models still ends in refusal, OpenCode 1 starts a deterministic recovery through `claude-opus-4-8`. The first round lasts **10 completed Opus 4.8 responses**, the next lasts **20** if the source refuses again, and every further round lasts **40**. The source model is always tried again after each round; recovery never pins the session to Opus. Completed `tool_use` turns count, but failed or incomplete responses and duplicate or stale completion callbacks do not.
+### Server-mode per-attempt usage
 
-After returning to the source model, **10 consecutive successful source-model responses** (including `tool_use`) clear the backoff, so a later refusal starts a new 10-response Opus recovery round. A refusal before that point is a re-refusal, even after two successful source tool responses. A refused response that already completed a tool call keeps the call/result rather than replaying the tool. Recovery state is separate per session and requested model family. Activity refreshes its lifetime even while trying the source, so the 24-hour inactivity cleanup does not reset an active session's backoff. Picking a different model or ending the session clears the state. It is in memory: an OpenCode restart resets it, so a restarted session may try the original model once more. Mythos and Sonnet are outside this refusal-recovery gate.
-
-Recovery does **not** prewarm the source model after Opus responses or wait for a source warm before returning. Retargeting an already-converted Opus request loses the source's fallback boundaries and cannot reproduce the next source request's cache prefix. Ordinary CacheKeep still warms the active model; the account-bound Opus standby anchor remains available for later recovery rounds.
-
-To bypass the server policy and use client recovery from the first refusal, start OpenCode 1 with:
-
-```sh
-OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy opencode
-```
-
-Unset `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` and restart to return to server-first policy with client recovery as its backstop. In either mode, repeated refusals lengthen the Opus recovery rounds from 10 to 20 to 40 completed responses, repeating at 40; ten consecutive successful source responses reset the next round to 10 Opus responses. Recovery keeps the session's assigned OAuth account through the temporary model switch, migrating it only when routing requires another eligible account. Custom API-key routes receive neither the OAuth fallback beta nor the body field.
-
-### OpenCode 2 boundary
-
-OpenCode 2 applies server-side fallback and response-boundary rewriting in its Anthropic provider integration. It does not run OpenCode 1's client recovery backoff. `OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK` controls the server opt-in: `legacy` disables it without adding client recovery. The OpenCode 1 variable `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` is not an OpenCode 2 recovery switch.
-
-### Per-iteration usage (OpenCode 1 and 2)
-
-On a server-fallback step, Anthropic's top-level `usage` is the **billed sum of both attempts**. The plugin leaves that usage unchanged, so OpenCode's step tokens and cost retain the billed total. Do not use that total as the final model's context size.
+On a server-fallback step, Anthropic's top-level `usage` is the **billed sum of both attempts**. The plugin leaves that usage unchanged. Do not use that total as the final model's context size.
 
 The supported per-iteration breakdown is a separate hidden reasoning part, emitted after the answer's content blocks and before the terminal `message_delta`. Its thinking text is two word joiners (`"\u2060\u2060"`), and its Anthropic signature has this format:
 
@@ -57,16 +39,16 @@ Read the signature from the stored reasoning part: `metadata.anthropic.signature
 
 The usage marker is present only on fallback steps, including turns that continue on server fallback without a new boundary block. It accepts at most eight iterations, model IDs of at most 128 ASCII characters, nonnegative safe-integer token counts, and a JSON payload of at most 4096 bytes. Unknown fields are omitted; invalid or oversized breakdowns produce no usage marker rather than a partial or misleading breakdown. Top-level usage is still forwarded unchanged in those cases.
 
-This usage-only marker is distinct from the existing `cortexkit-server-fallback-v1:` conversation boundary. Before every subsequent send, the plugin removes usage markers entirely, even with server fallback disabled or on an API-key route. They are never restored to Anthropic thinking or fallback blocks and do not alter the outgoing request. The original conversation-boundary marker still restores the same Anthropic `fallback` block.
+This usage-only marker is distinct from the `cortexkit-server-fallback-v1:` conversation boundary. Before every subsequent send, the plugin removes usage markers entirely, even with server fallback disabled or on an API-key route. It restores the original conversation-boundary marker to the same Anthropic `fallback` block only on requests that still use server fallback.
 
-The tested hosts are OpenCode 1.19.5 (AI SDK Anthropic provider 3.0.111) and OpenCode 2.0.22 (its native Anthropic protocol). Both AI SDK 3.0.111 and the newer 4.0.94 used by this repository's direct provider tests expose raw-shaped `providerMetadata.anthropic.usage` and mapped `providerMetadata.anthropic.iterations`, including `fallback_message` entries. OpenCode 1 does not persist that finish metadata on step records. OpenCode 2's parser retains raw usage in its usage metadata, but step settlement projects it to numeric tokens and discards the breakdown. The hidden usage part provides a durable shared path instead. Pi does not opt into server-side fallback by default and is unchanged.
+OpenCode 1 does not persist the provider's finish metadata on step records. OpenCode 2's parser retains raw usage in its usage metadata, but step settlement projects it to numeric tokens and discards the breakdown. Both OpenCode versions keep the breakdown in the hidden per-attempt usage marker described above. Pi also supports `server` mode and restores the fallback boundary on replay; the usage marker is never sent back to Anthropic.
 
 ## Implementation
 
 - [OpenCode wire shaping and sanitizer](../packages/opencode/src/transform.ts)
-- [OpenCode 1 dispatch, lineage and recovery](../packages/opencode/src/index.ts)
-- [Server fallback boundaries](../packages/opencode/src/server-fallback.ts)
-- [Deterministic recovery state](../packages/opencode/src/fable-fallback.ts)
+- [OpenCode 1 dispatch and lineage](../packages/opencode/src/index.ts)
+- [Server fallback boundaries](../packages/core/src/server-fallback.ts)
+- [Client fallback rounds](../packages/core/src/refusal-fallback-round.ts) and [stream joining](../packages/core/src/refusal-fallback-stream.ts)
 - [OpenCode 2 wire options](../packages/opencode/src/v2/wire.ts) and [adapter](../packages/opencode/src/v2/adapter.ts)
 - [Pi conversion](../packages/pi/src/convert.ts) and [transcript replay](../packages/pi/src/transcript.ts)
 - [Final-body signing](../packages/core/src/cch.ts)

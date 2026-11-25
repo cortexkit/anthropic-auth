@@ -47,6 +47,7 @@ file are flat, lower-case snake_case, not the legacy nested camelCase names.
 | Killswitch | `killswitch_enabled`, `killswitch_default_five_hour`, `killswitch_default_seven_day`, `killswitch_default_scoped`, `killswitch_account_floors` |
 | Cache | `claude_cache_enabled`, `claude_cache_mode`, `cache_keep_enabled`, `cache_keep_always`, `cache_keep_window`, `cache_keep_subagents` |
 | Request features | `dump_enabled`, `prime_enabled`, `claude_fast_enabled`, `cost_zeroing_enabled` |
+| Refusal fallback | `refusal_fallback`: `client` (default), `server` or `off` (see [refusal fallback](refusal-fallback.md)) |
 | Logging | `log_level` |
 | Thinking binding | `thinking_binding_prefix_mismatch_behavior` |
 | Turn-end notes | `turn_end_note_tools` |
@@ -120,8 +121,8 @@ drop the `[1m]` qualifier and use the table's longest matching model id/suffix.
 Unknown models use the no-model values. Unrecognized model override keys are
 ignored, logged and named in Status.
 
-`killswitch_account_floors`, `gateway_url` and `gateway_headers` are the
-exceptions: they take **no overrides**. The floors setting is a list of
+`killswitch_account_floors`, `refusal_fallback`, `gateway_url` and `gateway_headers`
+are exceptions: they take **no overrides**. The floors setting is a list of
 complete `{account, host, five_hour, seven_day, scoped}` entries. `host` is
 `opencode`, `pi` or `both`; each host applies its own and `both` entries. `account` is the local row id or vault roster route id, never an email
 or account identity. Entries may not overlap for the same account and host.

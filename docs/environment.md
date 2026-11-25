@@ -58,8 +58,6 @@ A completed import records its routing destination in the journal; serving uses 
 
 | Variable | Effect |
 | --- | --- |
-| `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` | OpenCode 1: `legacy` skips Anthropic's server fallback and uses client safety recovery; default tries the server first, then client recovery |
-| `OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK` | OpenCode 2 wire policy: `legacy` disables its server-side fallback opt-in; it does not enable OC1's client recovery |
 | `OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR` | OpenCode 1 and 2 [CacheKeep session registry](cachekeep-registry.md#location-and-permissions) directory override |
 | `PI_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR` | Pi [CacheKeep session registry](cachekeep-registry.md#location-and-permissions) directory override |
 | `OPENCODE_ANTHROPIC_AUTH_RPC_DIR` | OpenCode TUI menu bridge's port/token directory; default is per-project under OpenCode state |
@@ -68,7 +66,7 @@ A completed import records its routing destination in the journal; serving uses 
 | `HTTPS_PROXY`, `HTTP_PROXY` (and lower-case), `NO_PROXY` | A proxy that applies to `api.anthropic.com` turns request-body gzip off, as in Claude Code. `HTTP_PROXY`/`http_proxy` also makes a loopback `http:` [custom gateway](settings-file.md#custom-gateway) refuse its requests unless `NO_PROXY`, and `no_proxy` when set, list the gateway host |
 | `NODE_EXTRA_CA_CERTS`, `CLAUDE_CODE_CLIENT_CERT`, `CLAUDE_CODE_CLIENT_KEY` | A custom CA or a client certificate turns request-body gzip off, as in Claude Code |
 
-The [sidebar guide](sidebar.md#tui-preferences), [safety fallback](request-rewriting.md#safety-fallback-opencode-1) and [dump guide](transports.md#diagnostics-and-dumps) explain scope and sensitive artifacts. The OpenCode TUI menu bridge accepts connections only from the local machine (`127.0.0.1`) and requires its bearer token.
+Refusal fallback now uses the [shared `refusal_fallback` setting](refusal-fallback.md#choose-a-mode), not environment variables. The [sidebar guide](sidebar.md#tui-preferences) and [dump guide](transports.md#diagnostics-and-dumps) explain scope and sensitive artifacts. The OpenCode TUI menu bridge accepts connections only from the local machine (`127.0.0.1`) and requires its bearer token.
 
 ## CLI inputs
 
