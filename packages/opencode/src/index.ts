@@ -212,8 +212,13 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  RecoveryThinkingStore,
+  type RefusalFallbackCacheRoute,
   type RefusalFallbackDispatchOptions,
   type RefusalFallbackMode,
+  RefusalFallbackRoundEngine,
+  type RefusalFallbackRoundInput,
+  type RefusalFallbackRoundPlan,
   readClaustrumEnrollmentStatus,
   readNativeAccountsForRequest,
   readNativeEnrollmentMode,
@@ -306,7 +311,6 @@ import {
   markOpenCodeEffortTransitions,
   OpenCodeEffortPlanTracker,
 } from './effort-history.ts'
-import { FableFallbackManager } from './fable-fallback.ts'
 import {
   fireLaneStart,
   LANE_START_REQUEST_HEADER,
@@ -325,6 +329,10 @@ import { pluginTestHandles } from './plugin-test-handles.ts'
 import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import { logFallbackQuotaPreflightWarning } from './quota-preflight.ts'
+import {
+  createRefusalRoundNotices,
+  refusalRoundNoticeText,
+} from './refusal-round-notices.ts'
 import {
   BILLING_REQUEST_KIND_HEADER,
   isAuxiliaryAgent,
@@ -2117,6 +2125,8 @@ const anthropicAuthPlugin = async (
   const billingLineageTracker = new BillingLineageTracker()
   const stickyQuotaRetries = new StickyQuotaRetryCounter()
   const desktopNoticeMessageIds = new Map<string, Set<string>>()
+  const pendingRoundDesktopNotices = new Map<string, string>()
+  const desktopNoticeIdle = new Map<string, object>()
   // Session-to-account assignments live in separate files for local and vault
   // accounts. A local host uses the committed migration destination; an enrolled
   // host uses only the vault routing file the native runtime names, so vault
@@ -3734,6 +3744,9 @@ const anthropicAuthPlugin = async (
     CacheKeepManager['trackedSessions']
   > = []
   const cacheKeepScopedAttempts = new Map<number, NativeOAuthAuthorization>()
+  const warmRoutes = new Map<string, RefusalFallbackCacheRoute>()
+  const recoveryThinking = new RecoveryThinkingStore()
+  const roundNotices = createRefusalRoundNotices()
   const currentWarmGateway = () => nativeAccounts.getClaudeGateway?.()
   const sourceWarmFetch = fetchOAuthModel(currentWarmGateway)
   const cacheWarmFetch = fetchOAuthModel(currentWarmGateway, requestGzipLatch)
@@ -3743,7 +3756,8 @@ const anthropicAuthPlugin = async (
     resolveSettings: (storage, model) =>
       nativeAccounts.resolveSettings?.(storage, model) ?? storage,
     now: runtimeNow,
-    peekRoutingAccount: (_target, { sessionId, modelId }) => {
+    peekRoutingAccount: (target, { sessionId, modelId }) => {
+      if (target.sourceWarm) modelId = parseRequestModel(target.bodyText)
       const snapshot = nativeAccounts.peek?.()
       return peekRoutingAccount({
         snapshot,
@@ -3766,7 +3780,12 @@ const anthropicAuthPlugin = async (
             cacheKeepManager.untrack(target.id, 'policy-refused')
             throw new CacheKeepWarmRefusal('stopped')
           }
-          return sourceWarmFetch(...args)
+          const gateway = currentWarmGateway()
+          return gateway &&
+            target.hostMetadata?.sourceBaseUrl &&
+            target.url !== target.hostMetadata.sourceBaseUrl
+            ? fetchOAuthPhysical(gateway)(...args)
+            : sourceWarmFetch(...args)
         },
         { preconnect: sourceWarmFetch.preconnect },
       )
@@ -3872,9 +3891,23 @@ const anthropicAuthPlugin = async (
       await cacheKeepRestart.stagger(target, attempt.signal)
       if (!cacheKeepRestart.active() || !isTargetCurrent())
         throw new CacheKeepWarmRefusal('stopped')
+      if (target.sourceWarm) {
+        const host = await latestHostGetAuth?.()
+        if (
+          !isCustodyTombstoneOAuth(host, 'anthropic') &&
+          !isRealHostLogin(host)
+        ) {
+          forgetRoundAccount(target.oauthAccountId ?? 'main')
+          throw new CacheKeepWarmRefusal('stopped')
+        }
+      }
       // A remembered URL gets the same destination rule as a live request;
       // refuse it before any credential is authorized for the prewarm.
-      if (!isAllowedOAuthDestination(target.url, modelGateway(target.url)))
+      const baseUrl =
+        typeof target.hostMetadata?.sourceBaseUrl === 'string'
+          ? target.hostMetadata.sourceBaseUrl
+          : target.url
+      if (!isAllowedOAuthDestination(target.url, modelGateway(baseUrl)))
         return undefined
       const accountId = target.oauthAccountId ?? 'main'
       let modelId: string | undefined
@@ -3891,7 +3924,9 @@ const anthropicAuthPlugin = async (
       )
       if (
         (target.oauthAccountIdentity &&
-          credential.accountIdentity !== target.oauthAccountIdentity) ||
+          (target.sourceWarm
+            ? credential.credentialId
+            : credential.accountIdentity) !== target.oauthAccountIdentity) ||
         (target.hostMetadata?.restartCredential !== undefined &&
           cacheKeepCredential(credential) !==
             target.hostMetadata.restartCredential)
@@ -3899,28 +3934,34 @@ const anthropicAuthPlugin = async (
         throw new NativeAccountRefusal('credential-changed')
       const accessToken = credential.accessToken
       cacheKeepScopedAttempts.set(attempt.id, credential)
-      try {
-        const parsedBody = JSON.parse(target.bodyText) as Record<
-          string,
-          unknown
-        >
-        const identity = nativeWireIdentity(credential.accountIdentity)
-        headers.delete('anthropic-beta')
-        setOAuthHeaders(headers, accessToken, {
-          body: parsedBody,
-          identity,
-          refusalFallbackMode: attempt.refusalFallbackMode,
-        })
-        headers.set(
-          'anthropic-beta',
-          mergeAnthropicBetas(headers.get('anthropic-beta'), [
-            CACHE_KEEP_EXTENDED_TTL_BETA,
-          ]),
-        )
-        if (parsedBody.speed === 'fast') addFastModeBetaHeader(headers)
-      } catch {
-        setOAuthHeaders(headers, accessToken)
-      }
+      if (target.sourceWarm || target.hostMetadata?.preserveSourceHeaders) {
+        if (target.sourceWarm) {
+          const gateway = modelGateway(baseUrl)
+          if (gateway) applyClaudeGatewayHeaders(headers, gateway)
+        }
+      } else
+        try {
+          const parsedBody = JSON.parse(target.bodyText) as Record<
+            string,
+            unknown
+          >
+          const identity = nativeWireIdentity(credential.accountIdentity)
+          headers.delete('anthropic-beta')
+          setOAuthHeaders(headers, accessToken, {
+            body: parsedBody,
+            identity,
+            refusalFallbackMode: attempt.refusalFallbackMode,
+          })
+          headers.set(
+            'anthropic-beta',
+            mergeAnthropicBetas(headers.get('anthropic-beta'), [
+              CACHE_KEEP_EXTENDED_TTL_BETA,
+            ]),
+          )
+          if (parsedBody.speed === 'fast') addFastModeBetaHeader(headers)
+        } catch {
+          setOAuthHeaders(headers, accessToken)
+        }
       const betas = headers.get('anthropic-beta')?.split(',') ?? []
       headers.set(
         'anthropic-beta',
@@ -3964,6 +4005,30 @@ const anthropicAuthPlugin = async (
     allowUrl: (url) => isAllowedOAuthDestination(url, modelGateway(url)),
     now: runtimeNow,
   })
+  // The same instance plans every request for its sessions and owns their warms.
+  const rounds = new RefusalFallbackRoundEngine(
+    (event) => {
+      roundNotices.observe(event)
+      if (event.kind === 'round_ended')
+        messageThreads.forget(event.sessionId, 'response_fallback')
+      publishRoundNotice(
+        event.sessionId,
+        event.kind === 'step_served'
+          ? undefined
+          : refusalRoundNoticeText(event),
+      )
+    },
+    {
+      thinkingStore: recoveryThinking,
+      cacheKeep: cacheKeepManager,
+      now: runtimeNow,
+    },
+  )
+  function forgetRoundAccount(accountId: string) {
+    rounds.forgetAccount(accountId)
+    for (const [sessionId, route] of warmRoutes)
+      if (route.accountId === accountId) warmRoutes.delete(sessionId)
+  }
 
   // Prime sends a minimal Haiku request after the account's quota reset to
   // start its next five-hour usage window. One shared manager and an atomic
@@ -4423,6 +4488,7 @@ const anthropicAuthPlugin = async (
     // Bounded: waits at most about a second for the recovery record's
     // pending write, so a restart right after a round keeps the record.
     try {
+      await recoveryThinking.close()
     } catch {}
     try {
       primeManagerAdoption.release()
@@ -4616,6 +4682,7 @@ const anthropicAuthPlugin = async (
           }
         : undefined,
       lastUpdated: Date.now(),
+      fableRecoveries: roundNotices.snapshot(),
     }
   }
 
@@ -4882,6 +4949,68 @@ const anthropicAuthPlugin = async (
       if (typeof oldestSession !== 'string') break
       desktopNoticeMessageIds.delete(oldestSession)
     }
+  }
+
+  function publishRoundNotice(sessionId: string, desktopText?: string) {
+    void loadAccounts(accountStoragePath)
+      .then((storage) =>
+        writeSidebarState(storage, {
+          activeId: lastSidebarRouting.activeId,
+          route: lastSidebarRouting.route,
+          routingAuthoritative: false,
+        }),
+      )
+      .catch(() => {})
+    if (!desktopText || isTuiConnected(sessionId)) return
+    pendingRoundDesktopNotices.delete(sessionId)
+    pendingRoundDesktopNotices.set(sessionId, desktopText)
+    if (pendingRoundDesktopNotices.size > 128) {
+      const oldest = pendingRoundDesktopNotices.keys().next()
+      if (!oldest.done) pendingRoundDesktopNotices.delete(oldest.value)
+    }
+  }
+
+  function flushRoundDesktopNotice(sessionId: string) {
+    const text = pendingRoundDesktopNotices.get(sessionId)
+    if (!text) return
+    const idle = {}
+    desktopNoticeIdle.set(sessionId, idle)
+    const canSend = () =>
+      desktopNoticeIdle.get(sessionId) === idle &&
+      pendingRoundDesktopNotices.get(sessionId) === text &&
+      !isTuiConnected(sessionId)
+    // Leave the host's idle event before calling its prompt API. Any newer
+    // activity invalidates this lease before we insert an ignored message.
+    setImmediate(() => {
+      void (async () => {
+        const session = ctx.client.session as PluginSessionClient | undefined
+        if (session?.status) {
+          const response = (await session.status()) as
+            | Record<string, unknown>
+            | undefined
+          const data = response?.data ?? response
+          if (!data || typeof data !== 'object' || Array.isArray(data)) return
+          const status = (data as Record<string, { type?: string }>)[sessionId]
+          if (status && status.type !== 'idle') return
+        }
+        if (!canSend()) return
+        const sent = await sendIgnoredMessage(ctx, sessionId, text, {
+          beforeActiveAssistant: true,
+          canSend,
+          onPreparedMessageId: (id) =>
+            trackDesktopNoticeMessageId(sessionId, id),
+          latestPreparedMessageId: () =>
+            [...(desktopNoticeMessageIds.get(sessionId) ?? [])].at(-1),
+        })
+        if (sent && pendingRoundDesktopNotices.get(sessionId) === text)
+          pendingRoundDesktopNotices.delete(sessionId)
+      })()
+        .catch(() => {})
+        .finally(() => {
+          if (desktopNoticeIdle.get(sessionId) === idle)
+            desktopNoticeIdle.delete(sessionId)
+        })
+    })
   }
 
   function isDesktopNoticeMessage(sessionId: string, messageId?: string) {
@@ -5397,6 +5526,7 @@ const anthropicAuthPlugin = async (
         )
       } else if (result.updated.action === 'remove') {
         await removeAccountPersistent(result.updated.id, accountStoragePath)
+        forgetRoundAccount(result.updated.id)
       } else if (result.updated.action === 'reorder') {
         await reorderAccountsPersistent(
           result.updated.newOrder ?? result.updated.previousOrder ?? [],
@@ -6186,7 +6316,17 @@ const anthropicAuthPlugin = async (
         value.properties?.sessionID ?? info?.sessionID ?? info?.id
       if (!sessionId) return
 
-      if (value.type === 'session.idle') stickyQuotaRetries.clear(sessionId)
+      if (value.type === 'session.idle') {
+        stickyQuotaRetries.clear(sessionId)
+        flushRoundDesktopNotice(sessionId)
+      } else if (
+        (value.type === 'session.status' &&
+          value.properties?.status?.type !== 'idle') ||
+        (value.type === 'message.updated' &&
+          info?.role === 'user' &&
+          !isDesktopNoticeMessage(sessionId, info.id))
+      )
+        desktopNoticeIdle.delete(sessionId)
 
       if (
         value.type === 'session.deleted' ||
@@ -6196,6 +6336,11 @@ const anthropicAuthPlugin = async (
       }
 
       if (value.type === 'session.deleted') {
+        rounds.forgetSession(sessionId)
+        warmRoutes.delete(sessionId)
+        roundNotices.forget(sessionId)
+        pendingRoundDesktopNotices.delete(sessionId)
+        desktopNoticeIdle.delete(sessionId)
         latestPrimaryRequest.delete(sessionId)
         stickyQuotaRetries.clear(sessionId)
         sessionCacheActivity.forget(sessionId)
@@ -6324,6 +6469,10 @@ const anthropicAuthPlugin = async (
         }
         latestHostGetAuth = hostGetAuth
         const activation = await hostGetAuth()
+        if (activation.type !== 'oauth') {
+          for (const { accountId } of warmRoutes.values())
+            forgetRoundAccount(accountId)
+        }
         // Stock API-key authentication is not owned by the OAuth vault path.
         if (activation.type !== 'oauth') return {}
         // Enrollment and account availability can change while OpenCode is
@@ -7071,6 +7220,18 @@ const anthropicAuthPlugin = async (
             )
             account = { ...account, ...apiCredential }
             configureApiRouteHeaders(requestHeaders, account)
+            const primary = trace && primaryRequestByTrace.get(trace)
+            if (primary?.model && typeof body === 'string') {
+              await rounds.loadThinking(primary.sessionId)
+              warmRoutes.delete(primary.sessionId)
+              body = rounds.plan({
+                sessionId: primary.sessionId,
+                requestedModel: remapModelId(primary.model),
+                kind: 'primary',
+                mode: readRefusalFallbackMode(),
+                bodyText: body,
+              }).bodyText
+            }
             const rewritten = rewriteUrl(input, { baseURL: account.baseURL })
             const sendStart = nowMs()
             // Keep the sent API key only to redact provider errors. Clear that
@@ -7486,7 +7647,9 @@ const anthropicAuthPlugin = async (
             const betaInfo = getCacheDiagnosticsBetas(requestHeaders).catch(
               () => null,
             )
-            const fullBodyText = typeof body === 'string' ? body : undefined
+            const sourceBodyText = typeof body === 'string' ? body : undefined
+            let fullBodyText = sourceBodyText
+            let ordinaryTemplate: string | undefined
             const clientStreamSource =
               refusalFallbackMode === 'client' &&
               streaming &&
@@ -7506,10 +7669,10 @@ const anthropicAuthPlugin = async (
                     (!subagentRequest ||
                       isCacheKeepSubagentsEnabled(cacheStorage)))),
             )
-            const reusableTemplate =
-              keepCompletedReply && fullBodyText
-                ? await withoutFallbackCredit(fullBodyText)
-                : undefined
+            let roundPlan: RefusalFallbackRoundPlan | undefined
+            let lifecycleForPlan: ReturnType<typeof rounds.lifecycle>
+            let roundMarked = false
+            const replan = new Error('Refusal round changed before dispatch')
             const acceptedCacheAttempts = new WeakSet<object>()
             const trackAcceptedRequest = (attempt: object, sentBody = body) => {
               if (init?.signal?.aborted) return
@@ -7557,7 +7720,9 @@ const anthropicAuthPlugin = async (
                 oauthAccountId,
                 init?.signal ?? undefined,
                 rejectedAccessToken,
-                modelForIdentity,
+                roundPlan?.kind === 'round' || roundPlan?.kind === 'routed'
+                  ? roundPlan.servingModel
+                  : modelForIdentity,
                 oauthAccountId === 'main' ? 'last-main' : 'serve',
                 undefined,
                 relayAffinity ?? undefined,
@@ -7566,6 +7731,7 @@ const anthropicAuthPlugin = async (
               init?.signal?.throwIfAborted()
               if (
                 current.accountIdentity !== requestAuthority.accountIdentity ||
+                current.credentialId !== requestAuthority.credentialId ||
                 Boolean(current.scopedAttempt) !==
                   Boolean(requestAuthority.scopedAttempt)
               ) {
@@ -7605,12 +7771,21 @@ const anthropicAuthPlugin = async (
                 billingRequestKind,
                 'subscription_included',
               )
-              if (billing)
+              if (billing) {
+                const publication =
+                  roundLifecycle(payer)?.cacheKeepTemplateSettled
                 return {
                   ...billing,
                   cacheWarming: () =>
-                    cacheKeepManager.warming(billing.sessionId),
+                    !publication || isFresh(payer)
+                      ? cacheKeepManager.warming(billing.sessionId)
+                      : undefined,
+                  ...(publication && {
+                    cacheWarmingAfter: () =>
+                      isFresh(payer) ? publication : undefined,
+                  }),
                 }
+              }
             }
 
             const dispatchResponses = new WeakSet<Response>()
@@ -7623,13 +7798,12 @@ const anthropicAuthPlugin = async (
               method?.toUpperCase() === 'POST'
                 ? modelGateway(requestUrl)
                 : undefined
-            const isFresh = (payer: NativeOAuthAuthorization) => {
+            const isCurrentPrimary = (payer: NativeOAuthAuthorization) => {
               if (
                 !primary ||
                 init?.signal?.aborted ||
                 latestPrimaryRequest.get(primary.sessionId) !==
                   primary.sequence ||
-                readRefusalFallbackMode() !== refusalFallbackMode ||
                 finalUrl(currentGateway()) !== finalUrl(gateway)
               )
                 return false
@@ -7647,54 +7821,140 @@ const anthropicAuthPlugin = async (
                     : account.credentialId) === payer.credentialId,
               )
             }
+            const isFresh = (payer: NativeOAuthAuthorization) =>
+              isCurrentPrimary(payer) &&
+              readRefusalFallbackMode() === refusalFallbackMode
+            const targetAllowed = (model: string) => {
+              const snapshot = nativeAccounts.peek?.()
+              if (!snapshot) return true // The physical authorization still checks quota.
+              const account = snapshot.accounts.find(
+                (row) => row.id === oauthAccountId,
+              )
+              if (!account || !nativeAccountCanServe(account)) return false
+              const storage = snapshot.policyStorage
+              const quota = routingAccountQuota(
+                account,
+                storage,
+                nativeAuthorization.scopedAttempt,
+              )
+              return (
+                quotaSnapshotPassesModelScope(quota, model) &&
+                (!isKillswitchEnabled(storage) ||
+                  killswitchPassesPolicy(
+                    quota,
+                    storage,
+                    oauthAccountId === 'main' ? undefined : oauthAccountId,
+                    model,
+                  ))
+              )
+            }
             const observeCompletedReply = (
               response: Response,
               payer: NativeOAuthAuthorization,
-              template = reusableTemplate,
+              template = ordinaryTemplate,
             ) => {
-              if (!keepCompletedReply || !template || !primary) return response
-              return observeCompletedCacheReply(
-                response,
-                streaming,
-                (usage) => {
-                  if (!isFresh(payer) || !cacheKeepRestart.active()) return
-                  const acceptedAt = runtimeNow()
-                  const tracked = cacheKeepManager.track({
-                    sessionId: primary.sessionId,
-                    url: requestUrl,
-                    headers: requestHeaders,
-                    bodyText: template,
-                    storage: cacheStorage,
-                    cacheMode: 'hybrid',
-                    ttlMs: acceptedCacheTtlMs,
-                    oauthAccountId,
-                    oauthAccountIdentity: payer.accountIdentity,
-                    hostMetadata: {
-                      restartCredential: cacheKeepCredential(payer),
-                    },
-                    isSubagent: subagentRequest,
-                    acceptedAt,
-                  })
-                  if (tracked.tracked)
+              if (
+                !keepCompletedReply ||
+                !template ||
+                !primary ||
+                roundPlan?.request
+              )
+                return response
+              return observeCompletedCacheReply(response, streaming, (usage) =>
+                trackRoundTemplate(
+                  payer,
+                  template,
+                  usage,
+                  () => isFresh(payer),
+                  true,
+                ),
+              )
+            }
+            const trackRoundTemplate = (
+              payer: NativeOAuthAuthorization,
+              bodyText: string | null,
+              usage:
+                | Parameters<CacheKeepManager['recordAcceptedUsage']>[2]
+                | undefined,
+              isCurrent: () => boolean,
+              preparedTemplate = false,
+            ) => {
+              if (
+                !primary ||
+                !keepCompletedReply ||
+                !isCurrent() ||
+                !cacheKeepRestart.active()
+              )
+                return
+              if (bodyText === null) {
+                cacheKeepRestart.forget(primary.sessionId)
+                return
+              }
+              const storeTemplate = (template: string) => {
+                if (!isCurrent() || !cacheKeepRestart.active()) return
+                const acceptedAt = runtimeNow()
+                const tracked = cacheKeepManager.track({
+                  sessionId: primary.sessionId,
+                  url: requestUrl,
+                  headers: requestHeaders,
+                  bodyText: template,
+                  storage: cacheStorage,
+                  cacheMode: 'hybrid',
+                  ttlMs: acceptedCacheTtlMs,
+                  oauthAccountId,
+                  oauthAccountIdentity: payer.accountIdentity,
+                  hostMetadata: {
+                    restartCredential: cacheKeepCredential(payer),
+                    ...(parseRequestModel(template) !== modelForIdentity && {
+                      preserveSourceHeaders: true,
+                    }),
+                  },
+                  isSubagent: subagentRequest,
+                  acceptedAt,
+                })
+                if (tracked.tracked) {
+                  if (usage)
                     cacheKeepManager.recordAcceptedUsage(
                       primary.sessionId,
                       template,
                       usage,
                     )
-                  else
-                    cacheKeepRestart.forget(
-                      primary.sessionId,
-                      false,
-                      acceptedAt,
-                    )
-                  trace?.mark('cachekeep_track', {
-                    session: primary.sessionId,
-                    tracked: tracked.tracked,
-                    reason: tracked.tracked ? undefined : tracked.reason,
-                    bodyBytes: template.length,
-                  })
-                },
-              )
+                } else
+                  cacheKeepRestart.forget(primary.sessionId, false, acceptedAt)
+                trace?.mark('cachekeep_track', {
+                  session: primary.sessionId,
+                  tracked: tracked.tracked,
+                  reason: tracked.tracked ? undefined : tracked.reason,
+                  bodyBytes: template.length,
+                })
+              }
+              if (preparedTemplate) return storeTemplate(bodyText)
+              return trackDispatch(async () => {
+                storeTemplate(
+                  await signRequestBody(await withoutFallbackCredit(bodyText)),
+                )
+              }).catch(() => {})
+            }
+            const roundLifecycle = (payer: NativeOAuthAuthorization) => {
+              const handle = roundPlan?.request
+              lifecycleForPlan ??=
+                handle &&
+                rounds.lifecycle(handle, {
+                  isFresh: () => isFresh(payer),
+                  targetAllowed,
+                  onCacheKeepTemplate: keepCompletedReply
+                    ? (template, isCurrent) =>
+                        trackRoundTemplate(
+                          payer,
+                          template?.bodyText ?? null,
+                          template?.usage,
+                          isCurrent,
+                          roundPlan?.kind === 'source' &&
+                            template?.servingModel !== modelForIdentity,
+                        )
+                    : undefined,
+                })
+              return lifecycleForPlan
             }
 
             const refusalDispatchOptions = (
@@ -7703,18 +7963,22 @@ const anthropicAuthPlugin = async (
               physicalBody: string,
               billing: AnthropicBillingRequest | undefined,
               protectedOrigin?: RefusalFallbackDispatchOptions['protectedOrigin'],
+              resend = false,
             ): RefusalFallbackDispatchOptions | undefined => {
-              const model = primary?.model
+              const model = modelForIdentity
               if (
-                !clientStreamSource ||
-                !primary ||
+                (!resend &&
+                  (!clientStreamSource ||
+                    !primary ||
+                    roundPlan?.kind === 'round')) ||
                 !payer.accountIdentity ||
                 !model
               )
                 return undefined
-              const accountId = payer.accountIdentity
+              const accountId = resend ? oauthAccountId : payer.accountIdentity
               const url = finalUrl(gateway)
-              const fresh = () => isFresh(payer)
+              const fresh = () =>
+                resend ? !primary || isCurrentPrimary(payer) : isFresh(payer)
               let retryAuthorization: NativeOAuthAuthorization | undefined
               return {
                 sourceModel: model,
@@ -7729,8 +7993,10 @@ const anthropicAuthPlugin = async (
                 isFresh: fresh,
                 signal: init?.signal ?? undefined,
                 protectedOrigin,
+                lifecycle: resend ? undefined : roundLifecycle(payer),
                 billing: billing ?? {
-                  sessionId: primary.sessionId,
+                  sessionId:
+                    primary?.sessionId ?? relayAffinity ?? 'session-unknown',
                   requestKind: billingRequestKind,
                   chargeBasis: 'subscription_included',
                 },
@@ -7766,7 +8032,9 @@ const anthropicAuthPlugin = async (
                   retryAuthorization = candidate
                   return {
                     kind: 'authorized',
-                    accountId: candidate.accountIdentity,
+                    accountId: resend
+                      ? oauthAccountId
+                      : candidate.accountIdentity,
                     credentialId: candidate.credentialId,
                     url: finalUrl(currentGateway()),
                     accessToken: candidate.accessToken,
@@ -7814,11 +8082,7 @@ const anthropicAuthPlugin = async (
                     throw safe
                   }
                 },
-                observePhysicalResponse: (
-                  response,
-                  attempt,
-                  reusableBodyText,
-                ) => {
+                observePhysicalResponse: (response, attempt) => {
                   if (!attempt.refusalRetry)
                     return protectedOrigin
                       ? (threadRequest?.observe(response) ?? response)
@@ -7838,13 +8102,7 @@ const anthropicAuthPlugin = async (
                     },
                     attempt.model,
                   )
-                  return reusableBodyText
-                    ? observeCompletedReply(
-                        response,
-                        candidate,
-                        reusableBodyText,
-                      )
-                    : response
+                  return response
                 },
               }
             }
@@ -7886,6 +8144,7 @@ const anthropicAuthPlugin = async (
                   )
                   let response: Response
                   try {
+                    markRoundSent()
                     notePrimarySent(trace)
                     response = scope.redactResponse(
                       await fetchOAuthPhysical(gateway)(finalUrl(gateway), {
@@ -7896,6 +8155,7 @@ const anthropicAuthPlugin = async (
                       }),
                     )
                   } catch (error) {
+                    if (error === replan) throw error
                     const safe = scope.redactError(error)
                     scope.dispose()
                     if (billing) reportAnthropicBillingFailure(billing)
@@ -7956,6 +8216,7 @@ const anthropicAuthPlugin = async (
                 }
                 return response
               } catch (error) {
+                if (error === replan) throw error
                 if (typeof body === 'string') {
                   await dumpDirectRequest({
                     affinity: relayAffinity,
@@ -7994,37 +8255,162 @@ const anthropicAuthPlugin = async (
               relayConfig = null
             }
             let threadRequest: MessageThreadRequest | undefined
-            if (
-              typeof body === 'string' &&
-              requestClass === 'main' &&
-              !subagentRequest &&
-              !laneStartRequest &&
-              // Gateways may refuse the thread route: send full requests.
-              !gateway &&
-              (!relayConfig ||
-                effectiveRelayTransport(
-                  relayConfig.transport,
-                  relayConfig.url,
-                ) !== 'websocket')
-            ) {
-              threadRequest = await prepareMessageThreadRequest(
-                messageThreads,
-                {
-                  session: relayAffinity ?? undefined,
-                  account:
-                    nativeAuthorization.accountIdentity ?? oauthAccountId,
-                  credential: nativeAuthorization.credentialId,
+            const prepareRoundAndThread = async () => {
+              lifecycleForPlan = undefined
+              threadRequest = undefined
+              body = sourceBodyText
+              const model = parseRequestModel(body)
+              if (
+                relayAffinity &&
+                model &&
+                body &&
+                !laneStartRequest &&
+                (primary || requestClass === 'auxiliary')
+              ) {
+                await rounds.loadThinking(relayAffinity)
+                const credentialId = requestAuthority.credentialId
+                const url = finalUrl(gateway)
+                const input: RefusalFallbackRoundInput = {
+                  sessionId: relayAffinity,
+                  requestedModel: model,
+                  kind: primary ? 'primary' : 'auxiliary',
+                  mode: readRefusalFallbackMode(),
                   bodyText: body,
-                  replyToolNames: toolNameMap,
-                  cacheSlot: threadCacheSlot,
-                  headers: requestHeaders,
-                  signal: init?.signal ?? undefined,
-                },
-              )
-              body = threadRequest.bodyText
-            } else if (typeof body === 'string') {
-              body = await signRequestBody(body)
+                  oauth:
+                    (streaming || !primary) && requestAuthority.accountIdentity
+                      ? {
+                          accountId: oauthAccountId,
+                          credentialId,
+                          targetAllowed,
+                          ...(primary &&
+                            wireSettings.cacheEnabled && {
+                              sourceWarm: {
+                                url,
+                                headers: new Headers(requestHeaders),
+                                cacheMode: wireSettings.cacheMode,
+                                loadStorage: () =>
+                                  loadAccounts(accountStoragePath, model),
+                                currentRoute: () => {
+                                  const route = warmRoutes.get(relayAffinity)
+                                  const snapshot = nativeAccounts.peek?.()
+                                  const account = snapshot?.accounts.find(
+                                    (row) => row.id === oauthAccountId,
+                                  )
+                                  if (
+                                    !route ||
+                                    account?.type !== 'oauth' ||
+                                    !nativeAccountCanServe(account) ||
+                                    account.accountIdentity !==
+                                      requestAuthority.accountIdentity ||
+                                    (account.binding
+                                      ? localMessageThreadCredential(
+                                          account.binding,
+                                        )
+                                      : account.credentialId) !==
+                                      credentialId ||
+                                    requestWireSettings(
+                                      snapshot?.policyStorage,
+                                      model,
+                                    ).cacheMode !== wireSettings.cacheMode ||
+                                    !requestWireSettings(
+                                      snapshot?.policyStorage,
+                                      model,
+                                    ).cacheEnabled
+                                  )
+                                    return
+                                  return {
+                                    ...route,
+                                    mode: readRefusalFallbackMode(),
+                                    url: finalUrl(currentGateway()),
+                                  }
+                                },
+                                hostMetadata: {
+                                  restartCredential:
+                                    cacheKeepCredential(requestAuthority),
+                                  sourceBaseUrl: requestUrl,
+                                },
+                                isSubagent: subagentRequest,
+                              },
+                            }),
+                        }
+                      : undefined,
+                }
+                roundPlan = primary
+                  ? rounds.plan(input)
+                  : rounds.planRouted(input)
+                body = roundPlan.bodyText
+              }
+              fullBodyText = body
+              // Outside the round engine, warm replays sign their templates as usual.
+              ordinaryTemplate =
+                keepCompletedReply && !roundPlan?.request && fullBodyText
+                  ? await withoutFallbackCredit(fullBodyText)
+                  : undefined
+              if (
+                typeof body === 'string' &&
+                requestClass === 'main' &&
+                !subagentRequest &&
+                !laneStartRequest &&
+                // Gateways may refuse the thread route: send full requests.
+                !gateway &&
+                (!relayConfig ||
+                  effectiveRelayTransport(
+                    relayConfig.transport,
+                    relayConfig.url,
+                  ) !== 'websocket')
+              ) {
+                threadRequest = await prepareMessageThreadRequest(
+                  messageThreads,
+                  {
+                    session: relayAffinity ?? undefined,
+                    account:
+                      nativeAuthorization.accountIdentity ?? oauthAccountId,
+                    credential: nativeAuthorization.credentialId,
+                    bodyText: body,
+                    replyToolNames: toolNameMap,
+                    cacheSlot:
+                      roundPlan?.kind === 'source' &&
+                      roundPlan.sourceCacheMarkerRestored
+                        ? undefined
+                        : threadCacheSlot,
+                    headers: requestHeaders,
+                    signal: init?.signal ?? undefined,
+                  },
+                )
+                body = threadRequest.bodyText
+              } else if (typeof body === 'string') {
+                body = await signRequestBody(body)
+              }
             }
+            const markRoundSent = () => {
+              if (roundMarked) return
+              if (roundPlan?.request && !rounds.markSent(roundPlan.request))
+                throw replan
+              if (
+                primary &&
+                modelForIdentity &&
+                requestAuthority.credentialId
+              ) {
+                const newest = latestPrimaryRequest.get(primary.sessionId)
+                if (newest === undefined || newest <= primary.sequence) {
+                  warmRoutes.delete(primary.sessionId)
+                  warmRoutes.set(primary.sessionId, {
+                    accountId: oauthAccountId,
+                    credentialId: requestAuthority.credentialId,
+                    requestedModel:
+                      parseRequestModel(sourceBodyText) ?? modelForIdentity,
+                    mode: refusalFallbackMode,
+                    url: finalUrl(gateway),
+                  })
+                  if (warmRoutes.size > 128) {
+                    const oldest = warmRoutes.keys().next()
+                    if (!oldest.done) warmRoutes.delete(oldest.value)
+                  }
+                }
+              }
+              roundMarked = true
+            }
+            await prepareRoundAndThread()
             const persistedFallbackAccount =
               oauthAccountId === 'main'
                 ? undefined
@@ -8084,7 +8470,11 @@ const anthropicAuthPlugin = async (
                 body,
                 fallback: directFetch,
                 affinity: relayAffinity,
-                optimisticResponse: relayConfig?.transport === 'websocket',
+                // A target 400 needs the real status for the source resend.
+                optimisticResponse:
+                  relayConfig?.transport === 'websocket' &&
+                  roundPlan?.kind !== 'round' &&
+                  roundPlan?.kind !== 'routed',
                 authorizeAttempt: async () => {
                   const nextAuthorization = await authorizePhysical()
                   const nextAttempt = nextAuthorization.scopedAttempt
@@ -8121,6 +8511,7 @@ const anthropicAuthPlugin = async (
                       },
                     }
                   }
+                  markRoundSent()
                   notePrimarySent(trace)
                   return {
                     headers: relayHeaders,
@@ -8168,7 +8559,16 @@ const anthropicAuthPlugin = async (
                 dumpTag: laneStartRequest ? 'start' : undefined,
               })
             return trackDispatch(async () => {
-              let response = await sendOnce()
+              let response: Response
+              for (;;) {
+                try {
+                  response = await sendOnce()
+                  break
+                } catch (error) {
+                  if (error !== replan) throw error
+                  await prepareRoundAndThread()
+                }
+              }
               if (
                 !usedDirectFetch &&
                 relay401Attempt &&
@@ -8272,7 +8672,56 @@ const anthropicAuthPlugin = async (
                   },
                 )
               }
-              if (response.ok && !usedDirectFetch && relayOrigin) {
+              const handle = roundPlan?.request
+              const targetPlan =
+                roundPlan?.kind === 'round' || roundPlan?.kind === 'routed'
+              if (targetPlan && handle && response.status === 400) {
+                const payer = nativeAuthorization
+                const options = refusalDispatchOptions(
+                  payer,
+                  relayOrigin?.headers ?? requestHeaders,
+                  fullBodyText ?? '',
+                  undefined,
+                  undefined,
+                  true,
+                )
+                if (options) {
+                  // Install the template callback before the terminal resend;
+                  // its completion belongs to Core, not to source dispatch.
+                  roundLifecycle(payer)
+                  const resent = await rounds.handleTarget400(
+                    handle,
+                    response,
+                    {
+                      ...options,
+                      isCurrentPrimary: () => isCurrentPrimary(payer),
+                      observeResendResponse: (response, model) => {
+                        const billing = modelBillingRequest(
+                          relayAffinity,
+                          JSON.stringify({ model }),
+                          {
+                            accountId: payer.accountIdentity,
+                            credentialId: payer.credentialId,
+                          },
+                          billingRequestKind,
+                          'subscription_included',
+                        )
+                        return billing
+                          ? observeAnthropicBillingResponse(billing, response)
+                          : response
+                      },
+                    },
+                  )
+                  if (resent !== response) dispatchResponses.add(resent)
+                  response = resent
+                }
+              }
+              if (
+                response.ok &&
+                !usedDirectFetch &&
+                relayOrigin &&
+                !dispatchResponses.has(response)
+              ) {
                 const dispatch = refusalDispatchOptions(
                   relayOrigin.payer,
                   relayOrigin.headers,
@@ -8287,12 +8736,19 @@ const anthropicAuthPlugin = async (
               }
               if (!dispatchResponses.has(response)) {
                 response = threadRequest?.observe(response) ?? response
-                if (response.ok && clientStreamSource && modelForIdentity) {
+                if (
+                  response.ok &&
+                  (clientStreamSource || (streaming && targetPlan)) &&
+                  modelForIdentity
+                ) {
                   // Client responses that cannot initiate a retry still hold
                   // unfinished tools and release completed tools as one step.
                   response = joinRefusalFallbackStream(response, {
                     sourceModel: primary?.model ?? modelForIdentity,
                     signal: init?.signal ?? undefined,
+                    lifecycle: targetPlan
+                      ? roundLifecycle(nativeAuthorization)
+                      : undefined,
                     isFresh: () =>
                       readRefusalFallbackMode() === 'client' &&
                       (!primary || isFresh(nativeAuthorization)),
@@ -11535,6 +11991,7 @@ const anthropicAuthPlugin = async (
                       expires: exchanged.expires,
                     },
                   })
+                  forgetRoundAccount('main')
                   const activation = custodyTombstoneOAuth('anthropic')
                   return {
                     type: 'success' as const,
@@ -11601,7 +12058,6 @@ const anthropicAuthPlugin = async (
     cacheKeepManager,
     messageThreads,
     nativeAccounts,
-    fableFallbackManager: new FableFallbackManager(runtimeNow),
     resolveMainQuotaIdentity: resolveMainQuotaAccountIdentity,
     resolveSidebarQuotaAccess,
     refreshSidebarQuota,

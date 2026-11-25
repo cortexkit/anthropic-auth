@@ -281,6 +281,8 @@ function stickyHold(
 export type NativeCacheRequestPrepared = Parameters<
   NonNullable<NativeSource['onRequestPrepared']>
 >[0] & {
+  readonly isCurrent?: () => boolean
+  readonly sourceHeaders?: Headers
   readonly admission?: {
     readonly snapshot: NativeAccountSnapshot
     readonly account: NativeAccountView
@@ -1081,7 +1083,10 @@ export function createNativeAnthropicSource(
       const currentGateway = gateway()
       const url =
         currentGateway && claudeGatewayModelUrl(input.baseUrl, currentGateway)
-      if (mode !== 'client' || (url?.toString() || input.baseUrl) !== input.url)
+      if (
+        (!input.ignoreMode && mode !== 'client') ||
+        (url?.toString() || input.baseUrl) !== input.url
+      )
         return false
       if (!snapshot) return true
       const account = snapshot.accounts.find(

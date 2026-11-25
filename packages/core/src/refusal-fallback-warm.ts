@@ -6,8 +6,10 @@ import type { RefusalFallbackBinding } from './refusal-fallback-dispatch.ts'
 import {
   extendsRefusalFallbackPrefix,
   type RefusalFallbackPrefix,
+  refusalBodyRecord,
   refusalFallbackPrefix,
 } from './refusal-fallback-prefix.ts'
+import { restoreRefusalFallbackReturnMarker } from './refusal-fallback-return-marker.ts'
 import { requestCacheLifetimeMs } from './session-cache-policy.ts'
 import type { RefusalFallbackMode } from './settings-definition.ts'
 
@@ -110,6 +112,13 @@ export class RefusalFallbackSourceWarm {
     if (kept && (!body || !extendsRefusalFallbackPrefix(body, kept.prefix))) {
       this.forgetSession(sessionId)
     }
+  }
+
+  restoreReturnMarker(sessionId: string, body: Record<string, unknown>) {
+    const kept = this.#kept.get(sessionId)
+    if (!kept) return false
+    const source = refusalBodyRecord(JSON.parse(kept.bodyText))
+    return Boolean(source && restoreRefusalFallbackReturnMarker(body, source))
   }
 
   completeSource(

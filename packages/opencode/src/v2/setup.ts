@@ -2,10 +2,12 @@ import {
   acquireNativeAccountRuntime,
   assertUnmanagedInjectedPaths,
   authorize,
+  claudeGatewayModelUrl,
   connectVaultHost,
   createEmptyStorage,
   createNativeAccountRuntime,
   createNativeUi,
+  DEFAULT_REFUSAL_FALLBACK_MODE,
   decideOpenCodeStateLayoutOnce,
   disconnectNativeVaultForHost,
   exchange,
@@ -14,6 +16,7 @@ import {
   isDumpPersistentlyEnabled,
   isVaultHosted,
   legacySettingsProtection,
+  localMessageThreadCredential,
   logger,
   type NativeAccountRuntime,
   type NativeAccountRuntimeOptions,
@@ -21,10 +24,14 @@ import {
   type NativeHolderRegistration,
   type NativePoolPaths,
   type NativeUiOptions,
+  nativeAccountCanServe,
+  nativeAccountPolicy,
   nativeVaultRuntimeKey,
   openCodeHolderKind,
   readNativeEnrollmentMode,
   readPeerLegacySettingsProtection,
+  readSessionCachePolicy,
+  readThreeWayBoolean,
   registerNativePoolHolder,
   resolveNativePoolPaths,
   resolveSettingsPaths,
@@ -100,6 +107,7 @@ export const ENROLLMENT_UNREADABLE =
   'The Claude vault enrollment could not be read; repair it and retry. Nothing was changed.'
 
 export interface ClaudeLoginMethodsInput {
+  readonly onMainReplaced?: () => void
   readonly verifyVault?: () => Promise<unknown>
   /** False once setup is disposed; every step refuses after that. */
   readonly isActive: () => boolean
@@ -221,6 +229,7 @@ export function claudeLoginMethods(
         credential,
         replace: true,
       })
+      input.onMainReplaced?.()
       ensureActive()
     },
     label: 'Claude native account pool',
@@ -599,6 +608,8 @@ export async function setupAnthropicAuth(
     runtime,
     source,
     cacheKeepRegistry: cacheKeep.registry,
+    roundNotices: cacheKeep.roundNotices.snapshot,
+    onAccountRemoved: cacheKeep.forgetRoundAccount,
     start: async (sessionID, text) => {
       await ctx.session.synthetic({
         sessionID,
@@ -613,6 +624,135 @@ export async function setupAnthropicAuth(
     ctx,
     {
       source,
+      rounds: cacheKeep.rounds,
+      takeRoundThreadReset: cacheKeep.roundNotices.takeThreadReset,
+      roundPolicy: (input) => {
+        const { sessionID, modelID, accountId, credentialId } = input
+        const initial = runtime.peek?.()
+        const cache = initial?.policyStorage.claudeCache
+        const cacheMode = cache?.mode ?? 'explicit'
+        const cacheEnabled = (view: NativeAccountRuntime) =>
+          readSessionCachePolicy(sessionID, true)?.keep_warm !== undefined ||
+          readThreeWayBoolean(
+            view.peek?.()?.policyStorage.claudeCache?.enabled,
+            false,
+          )
+        const currentAccount = (view: NativeAccountRuntime) => {
+          const snapshot = view.peek?.()
+          const account = snapshot?.accounts.find((row) => row.id === accountId)
+          return { snapshot, account }
+        }
+        return {
+          targetAllowed(model) {
+            const { snapshot, account } = currentAccount(runtime)
+            return Boolean(
+              snapshot &&
+                account &&
+                nativeAccountPolicy(account, snapshot, model).status ===
+                  'allowed',
+            )
+          },
+          onPrimarySent() {
+            const routes = cacheKeep?.roundRoutes
+            if (!routes) return
+            routes.delete(sessionID)
+            if (input.route !== 'oauth' || !credentialId) return
+            routes.set(sessionID, {
+              accountId,
+              credentialId,
+              requestedModel: modelID,
+              mode: input.mode,
+              url: input.url,
+            })
+            if (routes.size > 128) {
+              const oldest = routes.keys().next()
+              if (!oldest.done) routes.delete(oldest.value)
+            }
+          },
+          ...(credentialId &&
+            cacheEnabled(runtime) && {
+              sourceWarm: {
+                url: input.url,
+                headers: input.headers,
+                cacheMode,
+                hostMetadata: { sourceBaseUrl: input.baseUrl },
+                isSubagent: subagent(sessionID),
+                loadStorage: async () => {
+                  const current = cacheKeep?.roundRuntime()
+                  return current
+                    ? (await current.read(modelID)).policyStorage
+                    : null
+                },
+                currentRoute: () => {
+                  const route = cacheKeep?.roundRoutes.get(sessionID)
+                  const current = cacheKeep?.roundRuntime()
+                  if (!current) return
+                  const { snapshot, account } = currentAccount(current)
+                  if (
+                    !route ||
+                    account?.type !== 'oauth' ||
+                    !nativeAccountCanServe(account) ||
+                    (account.binding
+                      ? localMessageThreadCredential(account.binding)
+                      : account.credentialId) !== credentialId ||
+                    !cacheEnabled(current) ||
+                    (snapshot?.policyStorage.claudeCache?.mode ??
+                      'explicit') !== cacheMode
+                  )
+                    return
+                  const gateway = current.getClaudeGateway?.()
+                  return {
+                    ...route,
+                    url:
+                      (gateway &&
+                        claudeGatewayModelUrl(
+                          input.baseUrl,
+                          gateway,
+                        )?.toString()) ||
+                      input.baseUrl,
+                    mode:
+                      current.getRefusalFallbackMode?.() ??
+                      snapshot?.refusalFallbackMode ??
+                      DEFAULT_REFUSAL_FALLBACK_MODE,
+                  }
+                },
+              },
+            }),
+        }
+      },
+      onRoundCacheTemplate(input) {
+        const { template, isCurrent, headers, alreadySigned, ...scope } = input
+        if (!isCurrent() || !cacheKeep) return
+        if (!template) {
+          cacheKeep.retireRoundTemplate(scope.sessionID)
+          return
+        }
+        const keeper = cacheKeep
+        const acceptedAt = options.cacheKeep?.now?.() ?? Date.now()
+        return (async () => {
+          const bodyText = alreadySigned
+            ? template.bodyText
+            : await signRequestBody(template.bodyText)
+          if (!isCurrent()) return
+          try {
+            await keeper.track({
+              ...scope,
+              bodyText,
+              sourceHeaders: headers,
+              isCurrent,
+            })
+            if (isCurrent())
+              keeper.onResponseHeaders({
+                attemptId: scope.attemptId,
+                status: 200,
+                acceptedAt,
+                acceptedUsage: template.usage,
+              })
+          } finally {
+            keeper.discardAttempt(scope.attemptId)
+          }
+        })().catch(() => {})
+      },
       onSessionDeleted: (sessionID) => cacheKeep?.sessionDeleted(sessionID),
       now: options.cacheKeep?.now,
       log: { warn: (message, data) => logger.warn('opencode2', message, data) },
@@ -663,6 +803,7 @@ export async function setupAnthropicAuth(
       await registerOpenCode2AuthMethods(
         ctx,
         claudeLoginMethods({
+          onMainReplaced: () => cacheKeep?.forgetRoundAccount('main'),
           isActive: () => active,
           readMode: enrollment.readMode,
           verifyVault: () => runtime.vault.refresh(),

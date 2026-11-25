@@ -68,6 +68,7 @@ export interface FableRecoverySidebarState {
   requestedModelId?: string
   /** Anthropic-selected target while server-side safety fallback is active. */
   targetModelId?: string
+  category?: string
 }
 
 export interface PrimeSidebarAccountState {
@@ -446,6 +447,9 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
               }),
               ...(typeof recovery.targetModelId === 'string' && {
                 targetModelId: recovery.targetModelId,
+              }),
+              ...(typeof recovery.category === 'string' && {
+                category: recovery.category,
               }),
             },
           ]
@@ -947,6 +951,9 @@ export function getFableRecoverySummary(
   }
   if (recovery.mode === 'server') {
     return `${formatFallbackModelLabel(recovery.requestedModelId)}→${formatFallbackModelLabel(recovery.targetModelId)} · safety`
+  }
+  if (recovery.category && recovery.targetModelId) {
+    return `${formatFallbackModelLabel(recovery.requestedModelId)}→${formatFallbackModelLabel(recovery.targetModelId)} · ${recovery.category} · ${recovery.remaining} left`
   }
   return `Opus 4.8 · ${recovery.remaining} left`
 }

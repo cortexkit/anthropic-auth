@@ -924,8 +924,9 @@ test('two rounds keep the retry prefix identical and a second refusal does not r
   const thinkingStore = new RecoveryThinkingStore({ persist: false })
   const { plan, send, events } = fixture({ thinkingStore })
   const templates: Array<string | null> = []
-  const track = (template: { bodyText: string } | null) =>
+  const track = (template: { bodyText: string } | null) => {
     templates.push(template?.bodyText ?? null)
+  }
   const sends: string[] = []
   const initial = plan()
   const first = send(initial, { onCacheKeepTemplate: track }).lifecycle!
@@ -1045,7 +1046,9 @@ test.each(['refused', 'stale', 'broken', 'aborted'] as const)(
       const initial = plan()
       const templates: unknown[] = []
       const lifecycle = send(initial, {
-        onCacheKeepTemplate: (value) => templates.push(value),
+        onCacheKeepTemplate: (value) => {
+          templates.push(value)
+        },
       }).lifecycle!
       const abort = new AbortController()
       const response = retryWithThinking(

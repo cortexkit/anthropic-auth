@@ -1,4 +1,6 @@
 import { describe, expect, mock, spyOn } from 'bun:test'
+import { readdir, readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import {
   type AccountStorage,
   hasValidRequestBodySignature,
@@ -6,6 +8,7 @@ import {
   SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
 } from '@cortexkit/anthropic-auth-core'
+import { getPluginTestHandles } from './plugin-test-handles'
 import { createMockClient } from './support/opencode1-client.ts'
 import {
   installLoaderSetup,
@@ -629,5 +632,196 @@ describe('auth.loader', () => {
     expect(newer).toContain('"stop_reason":"end_turn"')
     expect(await previous.text()).toContain('"stop_reason":"refusal"')
     expect(sends).toEqual(['claude-fable-5-2', 'claude-fable-5-2'])
+  })
+
+  test('OpenCode 1 warms the last clean source and serves a signed round only in its own plugin instance', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: false },
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: true, always: true },
+        dump: { enabled: true },
+      }),
+    )
+    const dumpDir = join(testContext.tempConfigDir!, 'round-dumps')
+    const previousDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+    getBodyLifetime(testContext).deferCleanup(() => {
+      if (previousDumpDir === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      else process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = previousDumpDir
+    })
+    const source = 'claude-fable-5-2'
+    const target = 'claude-opus-5'
+    const credit = 'round-test-credit-never-replayed'
+    const sends: Array<{
+      text: string
+      body: Record<string, unknown>
+      headers: Headers
+    }> = []
+    let now = Date.now()
+    let refuse = false
+    let rejectTarget = false
+    globalThis.fetch = mock(
+      withNativeAdmission(
+        (input: string | URL | Request, init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (!url.includes('/v1/messages')) return Response.json({})
+          const text = String(init?.body)
+          const body = JSON.parse(text)
+          sends.push({ text, body, headers: new Headers(init?.headers) })
+          const usage = { input_tokens: 12, cache_read_input_tokens: 300 }
+          if (body.max_tokens === 0)
+            return Response.json({
+              id: 'msg_warm',
+              model: body.model,
+              usage,
+              content: [],
+              stop_reason: 'end_turn',
+            })
+          if (body.model === target && rejectTarget)
+            return Response.json(
+              { error: { message: 'rejected target' } },
+              { status: 400 },
+            )
+          const refused = body.model === source && refuse
+          if (refused) refuse = false
+          const events = [
+            {
+              type: 'message_start',
+              message: { id: `msg_${sends.length}`, model: body.model, usage },
+            },
+            ...(!refused
+              ? [
+                  {
+                    type: 'content_block_start',
+                    index: 0,
+                    content_block: { type: 'text', text: 'answer' },
+                  },
+                  { type: 'content_block_stop', index: 0 },
+                ]
+              : []),
+            {
+              type: 'message_delta',
+              delta: refused
+                ? {
+                    stop_reason: 'refusal',
+                    stop_details: {
+                      type: 'refusal',
+                      category: 'bio',
+                      fallback_credit_token: credit,
+                    },
+                  }
+                : { stop_reason: 'end_turn' },
+              usage: { output_tokens: 2 },
+            },
+            { type: 'message_stop' },
+          ]
+          return new Response(
+            events
+              .map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`)
+              .join(''),
+            {
+              headers: {
+                'content-type': 'text/event-stream',
+                'anthropic-ratelimit-unified-5h-utilization': '0',
+                'anthropic-ratelimit-unified-7d-utilization': '0',
+              },
+            },
+          )
+        },
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(undefined, undefined, { now: () => now })
+    const independent = await getPlugin()
+    const auth = () =>
+      Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() })
+    const host = await plugin.auth.loader(auth, { models: {} })
+    const other = await independent.auth.loader(auth, { models: {} })
+    const sessionId = 'ses_round_source_warm'
+    const first = [{ role: 'user', content: 'the clean cached prefix' }]
+    const append = (history: typeof first, content: string) => [
+      ...history,
+      { role: 'assistant', content: 'answer' },
+      { role: 'user', content },
+    ]
+    const request = async (which: typeof host, messages: typeof first) =>
+      (
+        await which.fetch(MESSAGES_URL, {
+          method: 'POST',
+          headers: { 'x-session-affinity': sessionId },
+          body: JSON.stringify({
+            model: source,
+            stream: true,
+            max_tokens: 256,
+            messages,
+          }),
+        })
+      ).text() as Promise<string>
+    await request(host, first)
+    const second = append(first, 'the refused turn, not kept')
+    refuse = true
+    expect(await request(host, second)).not.toContain('"stop_reason":"refusal"')
+    expect(sends.slice(0, 3).map(({ body }) => body.model)).toEqual([
+      source,
+      source,
+      target,
+    ])
+    const third = append(second, 'the next primary')
+    await request(other, third)
+    expect(sends.at(-1)?.body.model).toBe(source)
+    await request(host, third)
+    const round = sends.at(-1)!
+    expect(round.body.model).toBe(target)
+    expect(round.body.thread).toEqual({ type: 'create' })
+    const stableHeaders = (headers: Headers) =>
+      [...headers].filter(([name]) => name !== 'x-client-request-id')
+    expect(stableHeaders(round.headers)).toEqual(
+      stableHeaders(sends[1]!.headers),
+    )
+    expect(round.text).not.toContain(credit)
+
+    const keeper = getPluginTestHandles(plugin).cacheKeepManager
+    await Promise.resolve()
+    const warmId = `source-warm:${sessionId}:fable-5-2`
+    const kept = keeper.trackedRequest(warmId)
+    expect(kept?.bodyText).toContain('the clean cached prefix')
+    expect(kept?.bodyText).not.toContain('the refused turn')
+    now += 55 * 60_000
+    await keeper.tick()
+    const warm = sends.find(
+      ({ body }) => body.max_tokens === 0 && body.model === source,
+    )
+    expect(warm?.body).toMatchObject({ max_tokens: 0 })
+    expect(warm?.body).not.toHaveProperty('thread')
+    expect(warm?.body).not.toHaveProperty('fallbacks')
+    expect(warm?.text).not.toContain(credit)
+
+    rejectTarget = true
+    const before400 = sends.length
+    expect(
+      await request(host, append(third, 'upstream rejects the round target')),
+    ).toContain('answer')
+    expect(sends.slice(before400).map(({ body }) => body.model)).toEqual([
+      target,
+      source,
+    ])
+    expect(sends.at(-1)?.body).not.toHaveProperty('thread')
+    expect(keeper.trackedRequest(warmId)).toBeUndefined()
+    await request(host, append(third, 'source after the round'))
+    expect(sends.at(-1)?.body).toMatchObject({
+      model: source,
+      thread: { type: 'create' },
+    })
+    const dumpBodies = await Promise.all(
+      (await readdir(dumpDir))
+        .filter((name) => name.endsWith('.body.json'))
+        .map((name) => readFile(join(dumpDir, name), 'utf8')),
+    )
+    expect(dumpBodies).toContain(round.text)
+    expect(dumpBodies.join('\n')).not.toContain(credit)
+    for (const { text } of sends)
+      expect(await hasValidRequestBodySignature(text)).toBe(true)
   })
 })

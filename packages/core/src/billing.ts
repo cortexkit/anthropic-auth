@@ -4,6 +4,7 @@ import {
   type ReportRoutingInput,
   reportRouting,
 } from '@cortexkit/common-auth/routing-accessor'
+import { logger } from './logger.ts'
 import { copyStreamResponseTiming } from './stream-completion.ts'
 
 export type AnthropicBillingReport = Extract<
@@ -33,6 +34,8 @@ export type AnthropicBillingRequest = Omit<
    * produced. Must not wait or do I/O; `undefined` leaves `cache.warming` out.
    */
   cacheWarming?: () => AnthropicBillingWarming | undefined
+  /** A clean, completed origin can defer its billing report until the template is published. */
+  cacheWarmingAfter?: () => Promise<void> | undefined
   /** In-process consumer of each billing report; nothing it adds is sent to shared routing. */
   onReport?: (report: AnthropicBillingReport) => void
 }
@@ -148,6 +151,7 @@ function detachReport(
 
 function identity({
   cacheWarming: _,
+  cacheWarmingAfter: _after,
   onReport: _observer,
   ...input
 }: AnthropicBillingRequest) {
@@ -181,6 +185,9 @@ export function createAnthropicBillingObserver(
   let sent = false
   let finalUsage = false
   let failed = status >= 400
+  let stopReason: unknown
+  let stopped = false
+  let refusalContent = false
   let providerResponseId: string | undefined
   let rawUsage: Record<string, unknown> = {}
   const finish = () => {
@@ -190,24 +197,54 @@ export function createAnthropicBillingObserver(
     // message_start's zero output is not a measurement of a cut-off answer.
     if (!finalUsage) delete measured.usage.output
     const outcome = failed ? 'failed' : !finalUsage ? 'cut' : 'completed'
-    let cache = failed ? undefined : base.cache
-    if (outcome === 'completed' && !cache?.warming && input.cacheWarming) {
-      let warming: AnthropicBillingWarming | undefined
-      try {
-        warming = input.cacheWarming()
-      } catch {}
-      if (warming) cache = { ...cache, warming }
+    const publish = (readWarming: boolean) => {
+      let cache = failed ? undefined : base.cache
+      if (readWarming && !cache?.warming && input.cacheWarming) {
+        let warming: AnthropicBillingWarming | undefined
+        try {
+          warming = input.cacheWarming()
+        } catch {}
+        if (warming) cache = { ...cache, warming }
+      }
+      detachReport(
+        { ...base, cache, providerResponseId, outcome, ...measured },
+        input.onReport,
+      )
     }
-    detachReport(
-      {
-        ...base,
-        cache,
-        providerResponseId,
-        outcome,
-        ...measured,
-      },
-      input.onReport,
-    )
+    if (outcome !== 'completed' || !input.cacheWarmingAfter) {
+      publish(outcome === 'completed')
+      return
+    }
+    let publication: Promise<void> | undefined
+    if (
+      stopped &&
+      !refusalContent &&
+      (stopReason === 'end_turn' ||
+        stopReason === 'tool_use' ||
+        stopReason === 'max_tokens')
+    ) {
+      try {
+        publication = input.cacheWarmingAfter()
+      } catch {}
+    }
+    if (!publication) {
+      publish(false)
+      return
+    }
+    // Billing may wait for signing and tracking, but must never hold the stream.
+    let reported = false
+    const report = () => {
+      if (reported) return
+      reported = true
+      clearTimeout(timeout)
+      publish(true)
+    }
+    const timeout = setTimeout(() => {
+      logger.warn('billing', 'timed out waiting for the CacheKeep template')
+      report()
+    }, 1000)
+    timeout.unref?.()
+    void publication.then(report, report)
   }
   const observe = (value: unknown) => {
     const event = record(value)
@@ -227,9 +264,20 @@ export function createAnthropicBillingObserver(
       }
     }
     if (event.type === 'error') failed = true
-    if (event.type === 'message_delta' && usage) finalUsage = true
+    if (
+      event.type === 'content_block_start' &&
+      record(event.content_block)?.type === 'refusal'
+    )
+      refusalContent = true
+    if (event.type === 'message_delta') {
+      if (usage) finalUsage = true
+      stopReason = record(event.delta)?.stop_reason
+    }
     if (event.type === 'message' && usage) finalUsage = true
-    if (event.type === 'message_stop') finish()
+    if (event.type === 'message_stop') {
+      stopped = true
+      finish()
+    }
   }
   const decoder = new TextDecoder()
   const maxPending = 1_048_576

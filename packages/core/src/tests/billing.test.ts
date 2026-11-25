@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import {
+  type AnthropicBillingReport,
   type AnthropicBillingRequest,
   observeAnthropicBillingResponse,
   withAnthropicBilling,
@@ -559,6 +560,81 @@ test.each(['count-cap', 'deadline-missed'] as const)(
       ['cut', { ttl_ms: 300_000 }],
       ['failed', undefined],
     ])
+  },
+)
+
+test('a stalled CacheKeep template delays only the accepted origin billing row, for at most one second', async () => {
+  const report = Promise.withResolvers<AnthropicBillingReport>()
+  let warmingReads = 0
+  let waits = 0
+  const stalled = new Promise<void>(() => {})
+  const upstream = response([
+    start,
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: { output_tokens: 4 },
+    },
+    { type: 'message_stop' },
+  ])
+  const stream = observeAnthropicBillingResponse(
+    {
+      ...request,
+      onReport: report.resolve,
+      cacheWarmingAfter: () => {
+        waits++
+        return stalled
+      },
+      cacheWarming: () => {
+        warmingReads++
+        return { on: true }
+      },
+    },
+    upstream,
+  )
+  expect(await stream.text()).toContain('message_stop')
+  expect(waits).toBe(1)
+  expect(warmingReads).toBe(0)
+  const result = await Promise.race([
+    report.promise,
+    Bun.sleep(1800).then(() => null),
+  ])
+  expect(result).toMatchObject({
+    outcome: 'completed',
+    cache: { warming: { on: true } },
+  })
+  expect(warmingReads).toBe(1)
+})
+
+test.each(['refused', 'incomplete', 'stale'] as const)(
+  'a %s origin neither waits nor reports warming',
+  async (scenario) => {
+    const reported = Promise.withResolvers<AnthropicBillingReport>()
+    const upstream = response([
+      start,
+      {
+        type: 'message_delta',
+        delta: { stop_reason: scenario === 'refused' ? 'refusal' : 'end_turn' },
+        usage: { output_tokens: 1 },
+      },
+      ...(scenario !== 'incomplete' ? [{ type: 'message_stop' }] : []),
+    ])
+    let waits = 0
+    await observeAnthropicBillingResponse(
+      {
+        ...request,
+        onReport: reported.resolve,
+        cacheWarming: () => ({ on: true }),
+        cacheWarmingAfter: () => {
+          waits++
+          if (scenario !== 'stale') throw new Error('unexpected wait')
+          return undefined
+        },
+      },
+      upstream,
+    ).text()
+    expect((await reported.promise).cache?.warming).toBeUndefined()
+    expect(waits).toBe(scenario === 'stale' ? 1 : 0)
   },
 )
 

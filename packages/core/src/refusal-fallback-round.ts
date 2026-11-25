@@ -100,6 +100,8 @@ export type RefusalFallbackRoundPlan =
       kind: 'source'
       bodyText: string
       request?: RefusalFallbackRoundRequest
+      /** This marker takes precedence over a thread-tail cache marker. */
+      sourceCacheMarkerRestored?: true
     }>
   | Readonly<{
       kind: 'round' | 'routed'
@@ -133,6 +135,7 @@ type Session = {
   lifetime: object
   latest?: symbol
   accountId?: string
+  returning?: boolean
   families: Map<ClaudeRefusalRecoveryFamily, FamilyState>
 }
 
@@ -153,6 +156,7 @@ type Request = {
   identity: symbol
   folded: boolean
   phase: 'planned' | 'sent' | 'refusal' | 'finished'
+  returning?: boolean
   category?: string
   handling400?: boolean
   publishTemplate?: (
@@ -248,7 +252,7 @@ export type RefusalFallbackRoundLifecycleOptions = {
   onCacheKeepTemplate?: (
     template: RefusalFallbackCacheKeepTemplate | null,
     isCurrent: () => boolean,
-  ) => void
+  ) => void | Promise<void>
 }
 
 /** Process-local client round state. The host owns routing, headers, threads and transport. */
@@ -336,6 +340,8 @@ export class RefusalFallbackRoundEngine {
     if (family.round !== round) return
     family.round = undefined
     round.releaseThinking()
+    const session = this.#sessions.get(round.sessionId)
+    if (session) session.returning = true
     if (reason === 'compaction') this.#warm?.forgetSession(round.sessionId)
     this.#emit(round, 'round_ended', reason)
   }
@@ -397,9 +403,15 @@ export class RefusalFallbackRoundEngine {
         if (target !== 'source') this.#end(existing, round, target)
       }
     }
-    const bodyText = this.#filter(input, familyId)
+    let bodyText = this.#filter(input, familyId)
     if (input.mode !== 'client' || !oauth) return { kind: 'source', bodyText }
-    this.#warm?.checkSourceHistory(sessionId, parse(bodyText))
+    const parsed = parse(bodyText)
+    const returning = session?.returning
+    const sourceCacheMarkerRestored = Boolean(
+      returning && parsed && this.#warm?.restoreReturnMarker(sessionId, parsed),
+    )
+    if (sourceCacheMarkerRestored) bodyText = JSON.stringify(parsed)
+    this.#warm?.checkSourceHistory(sessionId, parsed)
     if (!session) {
       const lifetime = this.#sessionLifetimes.get(sessionId) ?? {}
       this.#sessionLifetimes.set(sessionId, lifetime)
@@ -411,6 +423,7 @@ export class RefusalFallbackRoundEngine {
     return {
       kind: 'source',
       bodyText,
+      ...(sourceCacheMarkerRestored && { sourceCacheMarkerRestored: true }),
       request: this.#handle({
         kind: 'source',
         sessionId,
@@ -421,6 +434,7 @@ export class RefusalFallbackRoundEngine {
         credentialId: oauth.credentialId,
         cacheRoute: route,
         sourceWarm: oauth.sourceWarm,
+        returning,
         sourceBodyText: bodyText,
         baseBodyText: bodyText,
         templateBodyText: bodyText,
@@ -545,6 +559,7 @@ export class RefusalFallbackRoundEngine {
       request?.phase !== 'planned' ||
       this.#sessions.get(request.sessionId) !== request.session ||
       request.family.round !== request.round ||
+      (request.returning && !request.session.returning) ||
       (request.round?.folded && !request.folded)
     )
       return false
@@ -553,6 +568,7 @@ export class RefusalFallbackRoundEngine {
       request.session.latest = request.identity
       request.session.accountId = request.accountId
       if (request.round && request.folded) request.round.folded = true
+      if (request.returning) request.session.returning = false
     }
     return true
   }
@@ -683,29 +699,43 @@ export class RefusalFallbackRoundEngine {
     if (!request || request.kind === 'routed') return undefined
     const fresh = () => this.#isCurrentPrimary(request) && isFresh()
     const templateIsCurrent = () => this.#isNewestPrimary(request) && isFresh()
+    const publication = onCacheKeepTemplate && Promise.withResolvers<void>()
     const publish = (
       bodyText: string | null,
       servingModel: string,
       usage?: RefusalFallbackCompletion['usage'],
     ) => {
-      if (!onCacheKeepTemplate || !templateIsCurrent()) return
+      if (!onCacheKeepTemplate || !publication) return
+      if (!templateIsCurrent()) {
+        publication.resolve()
+        return
+      }
       try {
-        if (bodyText === null) onCacheKeepTemplate(null, templateIsCurrent)
+        let pending: void | Promise<void>
+        if (bodyText === null)
+          pending = onCacheKeepTemplate(null, templateIsCurrent)
         else {
           const body = parse(bodyText)
-          if (!body || refusalBodyRecord(body.thread)?.type === 'continue')
+          if (!body || refusalBodyRecord(body.thread)?.type === 'continue') {
+            publication.resolve()
             return
+          }
           if (body.thread !== undefined)
             bodyText = update(bodyText, 'thread', undefined)
           if (body.fallback_credit_token !== undefined)
             bodyText = update(bodyText, 'fallback_credit_token', undefined)
-          onCacheKeepTemplate(
+          pending = onCacheKeepTemplate(
             { bodyText, servingModel, usage },
             templateIsCurrent,
           )
         }
+        void Promise.resolve(pending).then(
+          publication.resolve,
+          publication.resolve,
+        )
       } catch {
         // Transport-side CacheKeep bookkeeping cannot interrupt the response.
+        publication.resolve()
       }
     }
     const sessionStillExists = () =>
@@ -720,12 +750,16 @@ export class RefusalFallbackRoundEngine {
     if (onCacheKeepTemplate) request.publishTemplate = publish
     return {
       captureReply: true,
+      cacheKeepTemplateSettled: publication?.promise,
       ...(request.round && {
         onThinkingDigest: (digest) =>
           record(digest, request.round?.identity ?? request.identity),
       }),
       onCompleted: (completion) => {
-        if (request.phase !== 'sent' || !fresh()) return
+        if (request.phase !== 'sent' || !fresh()) {
+          publication?.resolve()
+          return
+        }
         request.phase = 'finished'
         if (request.round) {
           const round = request.round

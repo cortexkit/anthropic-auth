@@ -52,6 +52,7 @@ export type RefusalFallbackPhysicalAttempt = Readonly<{
 }>
 
 export type RefusalFallbackDispatchLifecycle = RefusalFallbackLifecycle & {
+  cacheKeepTemplateSettled?: Promise<void>
   onRetryCompleted?: (
     completion: RefusalFallbackCompletion,
     target: Readonly<{ model: string; folded: boolean; bodyText?: string }>,
@@ -198,6 +199,7 @@ export function dispatchRefusalFallback(
     ...(attempt.refusalRetry && {
       attemptId: undefined,
       cacheWarming: undefined,
+      cacheWarmingAfter: undefined,
       ...(options.billing.cache && {
         cache: { ...options.billing.cache, warming: undefined },
       }),

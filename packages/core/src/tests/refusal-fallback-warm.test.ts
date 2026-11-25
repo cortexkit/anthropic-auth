@@ -71,6 +71,7 @@ function harness(
   let current: RefusalFallbackCacheRoute | undefined = route
   let storage = stored
   const sent: RequestInit[] = []
+  const registered = Promise.withResolvers<void>()
   const cacheKeep = new CacheKeepManager({
     loadStorage: async () => storage,
     now: () => now,
@@ -79,6 +80,10 @@ function harness(
       return Response.json({ usage })
     }) as typeof fetch,
     ...overrides,
+    onTargetChanged(target) {
+      if (target.sourceWarm) registered.resolve()
+      overrides.onTargetChanged?.(target)
+    },
   })
   const engine = new RefusalFallbackRoundEngine(undefined, {
     cacheKeep,
@@ -136,6 +141,7 @@ function harness(
     start,
     input,
     sent,
+    registered: registered.promise,
     advance(ms: number) {
       now += ms
     },
@@ -175,7 +181,7 @@ test('warm uses only the last full accepted source prefix, waits until near expi
     })
     expect(title.request).toBeUndefined()
     h.start()
-    await settle()
+    await h.registered
     const kept = h.cacheKeep.trackedRequest(warmId())!
     expect(JSON.parse(kept.bodyText).messages).toEqual(body.messages)
     expect(kept.oauthAccountIdentity).toBe(route.credentialId)
@@ -226,6 +232,86 @@ test('warm uses only the last full accepted source prefix, waits until near expi
     h.cacheKeep.stop()
   }
 })
+
+test.each(['matching prefix', 'edited prefix', 'changed lifetime'] as const)(
+  'source return after more than 20 round blocks: %s',
+  (scenario) => {
+    const h = harness()
+    const marker = { type: 'ephemeral', ttl: '1h' }
+    try {
+      h.send().lifecycle.onCompleted?.(completion)
+      h.start()
+      const messages: Array<{ role: string; content: unknown }> = [
+        ...refusedBody.messages,
+      ]
+      for (let step = 0; step < 10; step++) {
+        const reply = Array.from({ length: 3 }, (_, block) => ({
+          type: 'text',
+          text: `round step ${step} block ${block}`,
+        }))
+        const { plan, lifecycle } = h.send({
+          bodyText: JSON.stringify({ ...body, messages }),
+        })
+        expect(plan.kind).toBe('round')
+        expect(JSON.parse(plan.bodyText).messages).toEqual(messages)
+        lifecycle.onCompleted?.({ ...completion, reply })
+        messages.push(
+          { role: 'assistant', content: reply },
+          { role: 'user', content: `next ${step}` },
+        )
+      }
+      const current = {
+        ...body,
+        system: [{ ...body.system[0], cache_control: marker }],
+        messages: messages.map((message, index) => {
+          if (index === 0)
+            return {
+              role: 'user',
+              content:
+                scenario === 'edited prefix'
+                  ? 'edited prefix'
+                  : 'accepted prefix',
+            }
+          if ([3, 9, messages.length - 1].includes(index))
+            return {
+              role: message.role,
+              content: [
+                {
+                  type: 'text',
+                  text: message.content,
+                  cache_control:
+                    scenario === 'changed lifetime'
+                      ? { type: 'ephemeral' }
+                      : marker,
+                },
+              ],
+            }
+          return message
+        }),
+      }
+      const outbound = { ...h.input(), bodyText: JSON.stringify(current) }
+      expect(
+        h.engine.planRouted({ ...outbound, kind: 'summary' }).bodyText,
+      ).toBe(outbound.bodyText)
+      const { plan } = h.send(outbound)
+      expect(plan.kind).toBe('source')
+      if (scenario !== 'matching prefix') {
+        expect(plan.bodyText).toBe(outbound.bodyText)
+        return
+      }
+      expect(plan).toHaveProperty('sourceCacheMarkerRestored', true)
+      const returned = JSON.parse(plan.bodyText)
+      expect(returned.messages[0].content[0].cache_control).toEqual(marker)
+      expect(returned.messages.at(-1).content[0].cache_control).toEqual(marker)
+      expect(JSON.stringify(returned).match(/"cache_control":/g)).toHaveLength(
+        4,
+      )
+      expect(h.send(outbound).plan.bodyText).toBe(outbound.bodyText)
+    } finally {
+      h.cacheKeep.stop()
+    }
+  },
+)
 
 test.each(['mode', 'credential', 'destination', 'sign-out', 'delete'] as const)(
   '%s while registration waits leaves no warm target',
@@ -416,8 +502,9 @@ test('released-tool start clears only the earlier template until the first round
   const h = harness()
   try {
     const seen: Array<string | null> = []
-    const onCacheKeepTemplate = (template: { bodyText: string } | null) =>
+    const onCacheKeepTemplate = (template: { bodyText: string } | null) => {
       seen.push(template?.bodyText ?? null)
+    }
     h.send(undefined, { onCacheKeepTemplate }).lifecycle.onCompleted?.(
       completion,
     )

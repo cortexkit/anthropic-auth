@@ -294,6 +294,7 @@ describe('auth.loader', () => {
     await Promise.all(managers.map((manager) => manager.tick()))
     expect(warmBodies).toHaveLength(1)
     expect(warmBodies[0]).toContain('a restartable prefix')
+    expect(await core.hasValidRequestBodySignature(warmBodies[0]!)).toBe(true)
     expect(reservations).toEqual([
       expect.objectContaining({
         warmsSinceLastRealRequest: 1,

@@ -106,9 +106,11 @@ export function createNativeMenuCapabilities(options: {
   readonly runtime: NativeAccountRuntime
   readonly source: NativeSource
   readonly cacheKeepRegistry?: CacheKeepSessionRegistry
+  readonly roundNotices?: () => SidebarState['fableRecoveries']
+  readonly onAccountRemoved?: (accountId: string) => void
   readonly start: (sessionID: string, text: string) => Promise<void>
 }): NativeMenuCapabilities {
-  const { runtime, source } = options
+  const { runtime, source, onAccountRemoved } = options
   let lastSidebar: SidebarState | undefined
   let sidebarReadContended = false
   const pending = new Map<
@@ -189,6 +191,7 @@ export function createNativeMenuCapabilities(options: {
         return done()
       case 'remove':
         await runtime.remove(request.values.id)
+        onAccountRemoved?.(request.values.id)
         return done()
       case 'move-up':
       case 'move-down': {
@@ -552,6 +555,7 @@ export function createNativeMenuCapabilities(options: {
       return normalizeSidebarState({
         ...lastSidebar,
         activeId: source.servedAccount(sessionID),
+        fableRecoveries: options.roundNotices?.(),
       })
     },
     forgetSession(sessionID) {
