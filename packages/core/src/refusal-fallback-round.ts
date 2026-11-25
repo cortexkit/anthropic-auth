@@ -67,7 +67,11 @@ export type RefusalFallbackRoundInput = {
   }
   /** Result of comparing the host's normalized history with the round checkpoint. */
   compacted?: boolean
-  /** Apply thinking policy before swapping. Source filtering is confined to the latest mixed turn. */
+  /**
+   * Apply thinking policy before swapping models. On the source route, filtering
+   * may only touch the latest assistant turn that holds thinking from both the
+   * requested model and the round's fallback model; older turns stay as sent.
+   */
   filterBody?: (
     bodyText: string,
     route: { kind: 'source' } | { kind: 'target'; round: symbol },
@@ -534,7 +538,11 @@ export class RefusalFallbackRoundEngine {
     handle: RefusalFallbackRoundRequest,
     response: Response,
     options: RefusalFallbackResendOptions & {
-      /** Check that this is still the newest primary and its model and account match; ignore mode. */
+      /**
+       * Whether this is still the session's newest primary request, with the
+       * same requested model and account. It must not compare the
+       * refusal_fallback mode: a mode change doesn't cancel this resend.
+       */
       isCurrentPrimary: () => boolean
     },
   ): Promise<Response> {
