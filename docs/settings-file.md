@@ -352,14 +352,19 @@ and `applied.json`. It writes them under `<state root>/settings/<key>/` and also
 beside the settings file as `<target>.moved`, `<target>.moved.opencode`,
 `<target>.moved.pi` and `<target>.applied.json`. The state root is
 `$XDG_STATE_HOME/cortexkit/anthropic-auth` if `XDG_STATE_HOME` is absolute;
-otherwise it is `~/.local/state/cortexkit/anthropic-auth` on every OS. The key is
+otherwise it is `~/.local/state/cortexkit/anthropic-auth` on every OS. The mirror
+is disabled if the resolved root is not fully qualified. The key is
 specific to the configured filename in its canonical parent folder; a symlink
 at the filename does not change the key.
 
-A marker in either location counts; an unreadable record is not treated as
-missing. For `applied.json`, each host's newest recorded reading wins. If the
-state folder cannot be used, the plugin warns and keeps using the records beside
-the settings file. `/claude` Status, and the setup command (run with OpenCode and Pi stopped), show where the records are kept.
+The record beside the settings file is authoritative while it exists, even if
+it cannot be read or its `applied.json` has no entry for the acting host. Only
+when the beside record is missing does the plugin check the state copy. An
+unreadable or invalid state copy is unknown, not missing. The plugin finishes
+writing beside records before attempting their state copies in the background.
+If the state folder cannot be used, the plugin warns and a usable settings file
+continues with the beside records. `/claude` Status, and the setup command (run
+with OpenCode and Pi stopped), show the record locations.
 
 The copies beside the settings file keep 2.17.x working during mixed-version use
 and after rollback. This release removes neither copy. A later release will stop
@@ -389,7 +394,10 @@ same-account wait) are recovered as a complete set, never by skipping a bad
 account entry. An unusable file keeps last-good protection values. At startup
 the recovery order is this host's last-applied copy, then its readable legacy
 store, then the restrictive fallback: killswitch on at the default floors,
-unknown quota refused and same-account wait off.
+unknown quota refused and same-account wait off. If there is no beside-file
+copy and the state copy cannot be read or is invalid, recovery goes straight to
+the restrictive fallback; menu writes and setup cannot use that fallback to
+recreate the file.
 
 The owner-only `applied.json` records hold a complete last-applied protection
 set per host and no credentials. They are updated from usable user-file values

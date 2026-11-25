@@ -98,11 +98,13 @@ export async function createWindowsOwnerOnly(
 
 /**
  * Create only missing Windows directories; never tighten an existing shared directory.
+ * With createMissing disabled, only verify a directory that already exists.
  * Returns false off Windows so callers retain their POSIX directory policy.
  */
 export async function ensureWindowsOwnerOnlyDirectory(
   path: string,
   options: OwnerOnlyOptions = {},
+  createMissing = true,
 ): Promise<boolean> {
   const backend = await windowsBackend(options)
   if (!backend) return false
@@ -173,12 +175,20 @@ export async function ensureWindowsOwnerOnlyDirectory(
   }
   async function ancestors(directory: string): Promise<void> {
     if (await exists(directory)) return safe(directory)
+    if (!createMissing) throw refused('safe-parent', 'io-error')
     const parent = dirname(directory)
     if (parent === directory) throw refused('safe-parent', 'io-error')
     await ancestors(parent)
     await create(directory)
   }
   // Existing ancestors need entry integrity; the requested leaf needs confidentiality.
+  if (!createMissing) {
+    if (await exists(path)) {
+      await ancestors(dirname(path))
+      await privateDirectory(path)
+    }
+    return true
+  }
   await ancestors(dirname(path))
   if (await exists(path)) await privateDirectory(path)
   else await create(path)

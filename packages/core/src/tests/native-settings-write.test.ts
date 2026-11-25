@@ -37,6 +37,7 @@ import {
   type SettingsMode,
   setSettingsAdoptionCheck,
 } from '../settings-mode.ts'
+import { __waitForSettingsRecordMirrorsForTest } from '../settings-paths.ts'
 import {
   readSettingsProtectionCopy,
   writeSettingsProtectionCopy,
@@ -86,7 +87,10 @@ async function fixture(
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'native-settings-write-'))
-  cleanup.push(() => rm(root, { recursive: true, force: true }))
+  cleanup.push(async () => {
+    await __waitForSettingsRecordMirrorsForTest()
+    await rm(root, { recursive: true, force: true })
+  })
   const file = join(root, 'settings.jsonc')
   if (source !== null) await writeFile(file, source)
   const paths = await resolveNativePoolPaths(join(root, 'accounts.json'))
@@ -301,6 +305,7 @@ for (const missing of [false, true]) {
     expect(result.outcome).toBe('saved')
     await f.runtime.close()
     await f.service.dispose()
+    await __waitForSettingsRecordMirrorsForTest()
     const { beside, state } = f.service.records
     const applied = await readFile(beside.applied, 'utf8')
     expect(await readFile(state!.applied, 'utf8')).toBe(applied)

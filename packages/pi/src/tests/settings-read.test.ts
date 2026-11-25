@@ -235,9 +235,19 @@ test('service awaits the move and first resolve; requests make no settings files
   expect(JSON.parse(await fs.readFile(`${file}.moved`, 'utf8')).target).toBe(
     file,
   )
-  expect(await fs.readFile(state.moved, 'utf8')).toBe(
-    await fs.readFile(`${file}.moved`, 'utf8'),
-  )
+  const besideBytes = await fs.readFile(`${file}.moved`, 'utf8')
+  const readMirror = () =>
+    fs.readFile(state.moved, 'utf8').catch((error) => {
+      if (error.code === 'ENOENT') return undefined
+      throw error
+    })
+  const deadline = Date.now() + 2000
+  let mirrored = await readMirror()
+  while (mirrored !== besideBytes && Date.now() < deadline) {
+    await Bun.sleep(5)
+    mirrored = await readMirror()
+  }
+  expect(mirrored).toBe(besideBytes)
   expect((await native.requestView()).policyStorage.quota?.enabled).toBe(
     'default',
   )

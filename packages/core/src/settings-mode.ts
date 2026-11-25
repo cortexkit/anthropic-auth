@@ -10,7 +10,12 @@ import {
   resolvePathOptions,
 } from './path-options.ts'
 import { canonicalPath } from './pool-paths.ts'
-import type { SettingsHost, SettingsPaths } from './settings-paths.ts'
+import {
+  mirrorSettingsRecord,
+  type SettingsHost,
+  type SettingsPaths,
+  type SettingsRecordPaths,
+} from './settings-paths.ts'
 import type { SettingsService } from './settings-service.ts'
 import { writeOwnerOnlyExclusive } from './state-layout-io.ts'
 
@@ -28,6 +33,8 @@ export interface SettingsModeOptions extends PathResolutionOptions {
   ownership?: OwnerOnlyOptions
   now?: () => number
   moveCompleted?: boolean
+  /** A usable settings file still uses beside records if the mirror folder is unusable. */
+  useBesideIfStateFolderUnavailable?: boolean
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -45,28 +52,25 @@ export function hasSettingsMoveMarker(
   { records }: Pick<SettingsPaths, 'records'>,
   options: SettingsModeOptions = {},
 ): Promise<boolean> {
-  return hasSettingsRecord(records.beside.moved, records.state?.moved, options)
+  return hasSettingsRecord(
+    records,
+    records.beside.moved,
+    records.state?.moved,
+    options,
+  )
 }
 
 async function hasSettingsRecord(
+  records: SettingsRecordPaths,
   beside: string,
   state: string | undefined,
   options: SettingsModeOptions,
 ): Promise<boolean> {
   const check = options.fs?.exists ?? exists
-  if (!state) return check(beside)
-  // A marker proves a one-time fact. Either copy can prove it even if the
-  // other can't be read. Don't backfill on reads; keep old-only markers until
-  // a later release copies them before removing the old layout.
-  let failure: { error: unknown } | undefined
-  try {
-    if (await check(beside)) return true
-  } catch (error) {
-    failure = { error }
-  }
-  if (await check(state)) return true
-  if (failure) throw failure.error
-  return false
+  if (await check(beside)) return true
+  if (records.stateUnavailable && !options.useBesideIfStateFolderUnavailable)
+    throw records.stateUnavailable
+  return state ? check(state) : false
 }
 
 /** Publish once after a completed move or a usable hand-made file is found. */
@@ -75,6 +79,7 @@ export async function writeSettingsMoveMarker(
   options: SettingsModeOptions = {},
 ): Promise<void> {
   await writeSettingsRecordCopies(
+    records,
     records.beside.moved,
     records.state?.moved,
     async () => ({
@@ -97,6 +102,7 @@ export function hasSettingsImportRecord(
   options: SettingsModeOptions = {},
 ): Promise<boolean> {
   return hasSettingsRecord(
+    records,
     records.beside.imports[host],
     records.state?.imports[host],
     options,
@@ -114,6 +120,7 @@ export async function writeSettingsImportRecord(
   options: SettingsModeOptions = {},
 ): Promise<void> {
   await writeSettingsRecordCopies(
+    records,
     records.beside.imports[host],
     records.state?.imports[host],
     async () => ({
@@ -126,8 +133,8 @@ export async function writeSettingsImportRecord(
   )
 }
 
-/** Check each destination independently; a marker in one doesn't publish the other. */
 async function writeSettingsRecordCopies(
+  records: SettingsRecordPaths,
   beside: string,
   state: string | undefined,
   record: () => Promise<Record<string, unknown>>,
@@ -135,11 +142,16 @@ async function writeSettingsRecordCopies(
 ): Promise<void> {
   const check = options.fs?.exists ?? exists
   let bytes: Uint8Array | undefined
-  for (const path of [beside, state]) {
-    if (!path || (await check(path))) continue
-    bytes ??= Buffer.from(`${JSON.stringify(await record())}\n`)
-    await writeSettingsRecord(path, bytes, options)
+  const encode = async () => Buffer.from(`${JSON.stringify(await record())}\n`)
+  if (!(await check(beside))) {
+    bytes = await encode()
+    await writeSettingsRecord(beside, bytes, options)
   }
+  if (state)
+    mirrorSettingsRecord(records, state, async () => {
+      if (!(await check(state)))
+        await writeSettingsRecord(state, bytes ?? (await encode()), options)
+    })
 }
 
 /** Write a small owner-only record, exactly once. */

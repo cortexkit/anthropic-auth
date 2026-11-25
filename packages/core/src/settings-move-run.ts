@@ -49,6 +49,7 @@ import {
   resolveSettingsPaths,
   type SettingsPaths,
   settingsRecordLocations,
+  withSettingsRecordMirrors,
 } from './settings-paths.ts'
 import {
   openSettingsService,
@@ -162,7 +163,14 @@ export async function importSettingsHostStore(
   const generation = service.snapshot()
   // An imported host's protection is in the file, or in its applied copy
   // while the file is unusable.
-  if (await hasSettingsImportRecord(paths, host, authority)) return 'adopt'
+  if (
+    await hasSettingsImportRecord(paths, host, {
+      ...authority,
+      useBesideIfStateFolderUnavailable:
+        generation.status === 'ready' && generation.protection[host].usable,
+    })
+  )
+    return 'adopt'
   if (generation.status === 'missing') return 'pending'
   // A file this check can't compare against must not be adopted: its values
   // would replace the legacy set, without an import, once it becomes usable.
@@ -261,10 +269,23 @@ export async function runSettingsMoveAtStartup(
   options: SettingsMoveStartupOptions,
 ): Promise<SettingsMoveStartupResult> {
   const authority = { ...options, ...options.authority }
+  const warn = options.log?.warn ?? options.warn
   const paths = await prepareSettingsRecordPaths(
-    options.paths ?? (await resolveSettingsPaths(options.host, options)),
-    { ...authority, warn: options.log?.warn ?? options.warn },
+    options.paths ??
+      (await resolveSettingsPaths(options.host, { ...options, warn })),
+    { ...authority, warn },
   )
+  const result = await withSettingsRecordMirrors(paths.records, (records) =>
+    runSettingsMove(options, { ...paths, records }, authority),
+  )
+  return { ...result, paths }
+}
+
+async function runSettingsMove(
+  options: SettingsMoveStartupOptions,
+  paths: SettingsPaths,
+  authority: SettingsModeOptions,
+): Promise<SettingsMoveStartupResult> {
   let blockers: SettingsMoveBlockerIdentity[] = []
   const noteClosedFence = () => {
     if (loggedClosedFence) return
@@ -306,7 +327,6 @@ export async function runSettingsMoveAtStartup(
     outcome: SettingsMoveStartupResult['outcome'] | undefined,
     move?: MoveResult,
   ): Promise<SettingsMoveStartupResult> => {
-    const marked = await hasSettingsMoveMarker(paths, authority)
     // This lease only runs the import check, before any host adopts the
     // file through it, and has no acting host whose protection it records.
     const service = await openSettingsService({
@@ -315,17 +335,21 @@ export async function runSettingsMoveAtStartup(
       adopted: () => false,
     })
     if (!service) throw new Error('Settings service did not open')
+    let marked: boolean
     let importPending = false
     try {
       const generation = service.snapshot()
+      const usable =
+        generation.status === 'ready' &&
+        generation.protection[options.host].usable
+      marked = await hasSettingsMoveMarker(paths, {
+        ...authority,
+        useBesideIfStateFolderUnavailable: usable,
+      })
       // Only a usable file is marked: an empty, unparseable or invalid one may
       // be a save in progress, and a marker would keep a later deletion of it
       // in charge.
-      if (
-        !marked &&
-        generation.status === 'ready' &&
-        generation.protection[options.host].usable
-      ) {
+      if (!marked && usable) {
         try {
           await writeSettingsMoveMarker(paths, authority)
         } catch {

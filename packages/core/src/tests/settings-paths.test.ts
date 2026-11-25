@@ -29,6 +29,7 @@ import {
   writeSettingsMoveMarker,
 } from '../settings-mode.ts'
 import {
+  __waitForSettingsRecordMirrorsForTest,
   getDefaultSettingsStorePaths,
   getPiAgentDir,
   getSettingsFilePath,
@@ -44,6 +45,7 @@ import { writeOwnerOnlyExclusive } from '../state-layout-io.ts'
 const roots: string[] = []
 
 afterEach(async () => {
+  await __waitForSettingsRecordMirrorsForTest()
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   )
@@ -480,6 +482,35 @@ for (const xdg of ['unset', 'relative', 'home-config', 'private'] as const) {
   })
 }
 
+test('an ambiguous Windows state root or relative fallback home disables only the mirror', async () => {
+  for (const options of [
+    {
+      platform: 'win32' as const,
+      home: 'C:\\home',
+      env: {
+        ANTHROPIC_AUTH_SETTINGS_FILE: 'C:\\settings.jsonc',
+        XDG_STATE_HOME: '\\state',
+      },
+    },
+    {
+      platform: 'linux' as const,
+      home: 'relative-home',
+      env: { ANTHROPIC_AUTH_SETTINGS_FILE: '/settings.jsonc' },
+    },
+  ]) {
+    const warnings: string[] = []
+    const resolved = await resolveSettingsPaths('pi', {
+      ...options,
+      warn: (message) => warnings.push(message),
+      realpath: async (path) => path,
+    })
+    expect(resolved.target).toBe(options.env.ANTHROPIC_AUTH_SETTINGS_FILE)
+    expect(resolved.records.beside.moved).toBe(`${resolved.target}.moved`)
+    expect(resolved.records.state).toBeUndefined()
+    expect(warnings).toHaveLength(1)
+  }
+})
+
 test('marker publication is owner-only, target-specific and canonical before missing folders exist', async () => {
   const { root, options, fs, touched } = await sandbox()
   const alias = join(root, 'alias')
@@ -503,6 +534,7 @@ test('marker publication is owner-only, target-specific and canonical before mis
   })
   expect((await lstat(`${target}.moved`)).mode & 0o777).toBe(0o600)
   const bytes = await readFile(`${target}.moved`, 'utf8')
+  await __waitForSettingsRecordMirrorsForTest()
   expect(await readFile(paths.records.state!.moved, 'utf8')).toBe(bytes)
   expect((await lstat(paths.records.state!.moved)).mode & 0o777).toBe(0o600)
   expect((await lstat(paths.records.state!.directory)).mode & 0o777).toBe(0o700)
@@ -539,7 +571,7 @@ test('concurrent marker publishers keep the first marker', async () => {
   expect(marker.version).toBe(1)
 })
 
-test('move and import markers prove presence from either location without backfill', async () => {
+test('move and import markers consult state only when beside is absent, without backfill', async () => {
   const { options } = await sandbox()
   const paths = await resolveSettingsPaths('pi', options)
   const { beside, state } = paths.records
@@ -563,12 +595,14 @@ test('move and import markers prove presence from either location without backfi
       [true, false, true],
       [false, true, true],
       [true, true, true],
-      ['unreadable', true, true],
+      ['unreadable', true, 'unknown'],
       [true, 'unreadable', true],
       ['unreadable', false, 'unknown'],
       [false, 'unreadable', 'unknown'],
     ] as const) {
+      const calls: string[] = []
       const result = check(async (path) => {
+        calls.push(path)
         expect([oldPath, newPath]).toContain(path)
         const value = path === oldPath ? old : next
         if (value === 'unreadable') throw new Error('unreadable')
@@ -577,6 +611,7 @@ test('move and import markers prove presence from either location without backfi
       if (expected === 'unknown')
         await expect(result).rejects.toThrow('unreadable')
       else expect(await result).toBe(expected)
+      expect(calls).toEqual(old === false ? [oldPath, newPath] : [oldPath])
     }
   }
   await expect(lstat(state.directory)).rejects.toMatchObject({ code: 'ENOENT' })

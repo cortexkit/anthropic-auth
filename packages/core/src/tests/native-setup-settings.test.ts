@@ -24,6 +24,7 @@ import {
 } from '../settings-definition.ts'
 import { readPeerLegacySettingsProtection } from '../settings-move-sources.ts'
 import {
+  __waitForSettingsRecordMirrorsForTest,
   prepareSettingsRecordPaths,
   resolveSettingsPaths,
   type SettingsHost,
@@ -35,6 +36,7 @@ import { openSettingsService } from '../settings-service.ts'
 
 const folders: string[] = []
 afterEach(async () => {
+  await __waitForSettingsRecordMirrorsForTest()
   for (const folder of folders.splice(0))
     await rm(folder, { recursive: true, force: true })
 })
@@ -893,6 +895,39 @@ test('a refused setup saves no applied copy from the file it never imported', as
   await absent(`${f.paths.target}.applied.json`)
 })
 
+test('release A: a failed state marker write does not prevent setup from saving protection', async () => {
+  const f = await fixture('opencode', {
+    killswitch: { enabled: true, main: { five_hour: 61, seven_day: 61 } },
+  })
+  const { beside, state } = f.paths.records
+  await writeFile(f.paths.target, '{}')
+  await writeFile(beside.moved, 'already moved')
+  const attempted = Promise.withResolvers<void>()
+  const result = await writeNativeSetupSettings({
+    ...f.options,
+    authority: {
+      fs: {
+        writeMarker: async (path) => {
+          expect(path).toBe(state!.moved)
+          attempted.resolve()
+          throw Object.assign(new Error('read-only state'), { code: 'EROFS' })
+        },
+      },
+    },
+  })
+  expect(result.outcome).toBe('saved')
+  const applied = JSON.parse(await readFile(beside.applied, 'utf8'))
+  expect(applied.opencode.values).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 61,
+  })
+  await attempted.promise
+  await __waitForSettingsRecordMirrorsForTest()
+  expect(
+    f.messages.filter((message) => message.includes(state!.moved)),
+  ).toHaveLength(1)
+})
+
 test('a committed setup saves the applied copy of the generation it wrote', async () => {
   const f = await fixture('opencode', {
     killswitch: { enabled: true, main: { five_hour: 61, seven_day: 61 } },
@@ -912,6 +947,7 @@ test('a committed setup saves the applied copy of the generation it wrote', asyn
   } = await resolveSettingsPaths('opencode', options)
   if (!state) throw new Error('Missing state layout')
   expect((await writeNativeSetupSettings(options)).outcome).toBe('saved')
+  await __waitForSettingsRecordMirrorsForTest()
   const bytes = await readFile(beside.applied, 'utf8')
   const copy = JSON.parse(bytes)
   expect(await readFile(state.applied, 'utf8')).toBe(bytes)

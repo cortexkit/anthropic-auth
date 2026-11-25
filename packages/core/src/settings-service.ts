@@ -36,6 +36,7 @@ import {
 } from './settings-paths.ts'
 import {
   readSettingsProtectionCopy,
+  UnknownSettingsStateCopyError,
   writeSettingsProtectionCopy,
 } from './settings-protection-copy.ts'
 
@@ -1422,8 +1423,9 @@ class SharedSettingsService {
 /**
  * Rungs 1-3 of the protection ladder, which need no open settings handle:
  * the applied copy (by default read from disk only for the acting host),
- * then the host's legacy store, then the strictest set. A source that can't
- * be read is skipped whole; keys are never mixed across sources.
+ * then the host's legacy store, then the strictest set. An unknown state
+ * fallback stops at the strictest set; a beside read error still skips rung 1.
+ * Keys are never mixed across sources.
  */
 export async function recoverSettingsProtection(
   records: SettingsRecordPaths | undefined,
@@ -1444,8 +1446,9 @@ export async function recoverSettingsProtection(
     try {
       const values = await read?.(host)
       if (values) return { values, rung }
-    } catch {
-      // Skip this source whole.
+    } catch (error) {
+      if (rung === 1 && error instanceof UnknownSettingsStateCopyError) break
+      // Skip this source whole, as before.
     }
   }
   return { values: mostRestrictiveSettingsProtection(), rung: 3 }

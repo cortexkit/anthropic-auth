@@ -7,7 +7,10 @@ import { openSettings } from '@cortexkit/common-auth/settings'
 import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
 import { createNativePoolStore } from '../pool-store.ts'
 import { settingsDefinition } from '../settings-definition.ts'
-import type { SettingsHost } from '../settings-paths.ts'
+import {
+  __waitForSettingsRecordMirrorsForTest,
+  type SettingsHost,
+} from '../settings-paths.ts'
 import {
   readSettingsProtectionCopy,
   writeSettingsProtectionCopy,
@@ -59,7 +62,10 @@ const complete: SettingsProtectionValues = {
 
 async function fixture(source: unknown = complete, name = 'settings.jsonc') {
   const root = await mkdtemp(join(tmpdir(), 'protection-copy-'))
-  cleanup.push(() => rm(root, { recursive: true, force: true }))
+  cleanup.push(async () => {
+    await __waitForSettingsRecordMirrorsForTest()
+    await rm(root, { recursive: true, force: true })
+  })
   const file = join(root, name)
   await writeFile(
     file,
@@ -107,7 +113,7 @@ test('a copy from before refusal fallback was configurable recovers the client d
   expect(service.resolve('pi').killswitch_default_five_hour).toBe(21)
 })
 
-test('applied records merge per host by readAt, keep old ties, and reject unreadable copies', async () => {
+test('applied records use state only when the whole beside copy is missing', async () => {
   const f = await fixture()
   const { beside, state } = f.records
   if (!state) throw new Error('Missing state layout')
@@ -127,7 +133,7 @@ test('applied records merge per host by readAt, keep old ties, and reject unread
   )
   expect(await floor('opencode')).toBe(80)
   await writeFile(beside.applied, JSON.stringify({ pi: entry(2, 70) }))
-  expect(await floor('opencode')).toBe(80)
+  expect(await floor('opencode')).toBeUndefined()
   expect(await floor('pi')).toBe(70)
   await writeFile(
     beside.applied,
@@ -137,12 +143,66 @@ test('applied records merge per host by readAt, keep old ties, and reject unread
   await rm(state.applied)
   expect(await floor('pi')).toBe(70)
   await mkdir(state.applied)
-  await expect(floor('pi')).rejects.toThrow()
+  expect(await floor('pi')).toBe(70)
+  await rm(beside.applied)
+  await expect(floor('pi')).rejects.toThrow('state protection copy')
   await rm(state.applied, { recursive: true })
   await writeFile(state.applied, JSON.stringify({ pi: entry(3, 90) }))
-  await rm(beside.applied)
   await mkdir(beside.applied)
   await expect(floor('pi')).rejects.toThrow()
+})
+
+test('release A: unknown state fallback stops at rung 3 and refuses recreation', async () => {
+  const f = await fixture()
+  const { refusal_fallback, ...values } = complete
+  await writeFile(
+    f.records.state!.applied,
+    JSON.stringify({
+      pi: { readAt: 1, values: { invalid: true } },
+      opencode: { readAt: 1, values, refusal_fallback },
+    }),
+  )
+  await rm(f.file)
+  const service = await f.open('pi', {
+    protection: { readLegacyProtection: async () => complete },
+  })
+  await expect(
+    service.update([{ setting: 'dump_enabled', value: true }], 'pi', {
+      createMissing: true,
+    }),
+  ).rejects.toThrow('recreate')
+  expect(service.snapshot().protection.pi.rung).toBe(3)
+  expect(await Bun.file(f.file).exists()).toBe(false)
+})
+
+test('release A: newer state from a different target cannot replace a beside copy', async () => {
+  const f = await fixture()
+  const { beside, state } = f.records
+  await writeSettingsProtectionCopy({ beside }, 'pi', {
+    readAt: 1,
+    values: complete,
+  })
+  const { refusal_fallback, ...values } = complete
+  await writeFile(
+    state!.applied,
+    JSON.stringify({
+      pi: { readAt: 2, values: { ...values, killswitch_enabled: false } },
+      opencode: { readAt: 2, values, refusal_fallback },
+    }),
+  )
+  const reads = spyOn(fs, 'readFile')
+  try {
+    expect(await readSettingsProtectionCopy(f.records, 'pi')).toEqual(complete)
+    expect(
+      await readSettingsProtectionCopy(f.records, 'opencode'),
+    ).toBeUndefined()
+    expect(reads.mock.calls.map(([path]) => path)).toEqual([
+      beside.applied,
+      beside.applied,
+    ])
+  } finally {
+    reads.mockRestore()
+  }
 })
 
 test('a missing settings file is not recreated from two conflicting applied fallback modes', async () => {
@@ -762,6 +822,7 @@ test('copy publication retries a transient Windows sharing violation before repl
       },
     },
   )
+  await __waitForSettingsRecordMirrorsForTest()
   expect(attempts).toBe(3)
   expect(sleeps).toEqual([10])
   expect(await readSettingsProtectionCopy(f.records, 'pi')).toEqual(next)

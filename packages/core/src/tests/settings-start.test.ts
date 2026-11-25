@@ -21,6 +21,7 @@ import { beginNativeEmptyInit } from '../pool-authority.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { settingsDefinition } from '../settings-definition.ts'
 import {
+  __waitForSettingsRecordMirrorsForTest,
   getSettingsFilePath,
   getSettingsStorePaths,
   prepareSettingsRecordPaths,
@@ -57,7 +58,10 @@ const stricter: SettingsProtectionValues = {
 
 async function fixture(file: 'present' | 'absent' = 'present') {
   const root = await mkdtemp(join(tmpdir(), 'settings-start-'))
-  cleanup.push(() => rm(root, { recursive: true, force: true }))
+  cleanup.push(async () => {
+    await __waitForSettingsRecordMirrorsForTest()
+    await rm(root, { recursive: true, force: true })
+  })
   const target = join(root, 'settings.jsonc')
   const ownPoolPaths = await resolveNativePoolPaths(
     join(root, 'anthropic-auth.json'),
@@ -284,6 +288,44 @@ test('a service open that throws after a move applies the stricter applied copy,
     (reader.resolve(stored) as { killswitch: { enabled: boolean } }).killswitch
       .enabled,
   ).toBe(false)
+})
+
+test('release A: unreadable state copy leaves startup recovery on beside rung 1', async () => {
+  const f = await fixture()
+  const { beside, state } = f.paths.records
+  await writeSettingsProtectionCopy({ beside }, 'opencode', {
+    readAt: 1,
+    values: stricter,
+  })
+  await mkdir(state!.applied, { recursive: true, mode: 0o700 })
+  const started = await startSettings(f.options)
+  expect(started.fallback).toMatchObject({ rung: 1, values: stricter })
+})
+
+test('release A: a mirror-key realpath failure keeps the custom file in service', async () => {
+  const f = await fixture()
+  await writeFile(f.target, '{"killswitch_enabled":true}')
+  const warnings: string[] = []
+  const started = await startSettings({
+    ...f.options,
+    env: { ...f.options.env, ANTHROPIC_AUTH_SETTINGS_FILE: f.target },
+    paths: undefined,
+    start: undefined,
+    log: { warn: (message) => warnings.push(message) },
+    realpath: async (path) => {
+      if (path === f.root)
+        throw Object.assign(new Error('unreadable mirror key'), { code: 'EIO' })
+      return realpath(path)
+    },
+  })
+  if (started.service) cleanup.push(() => started.service?.dispose())
+  expect(started.mode).toBe('user-file')
+  expect(started.service?.resolve('opencode').killswitch_enabled).toBe(true)
+  expect(started.fallback).toBeUndefined()
+  expect(started.service?.records.state).toBeUndefined()
+  expect(warnings.filter((message) => message.includes('record'))).toHaveLength(
+    1,
+  )
 })
 
 test('unresolvable source paths do not hide a readable beside-file protection copy', async () => {

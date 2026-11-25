@@ -18,7 +18,11 @@ import {
   type SettingsMoveStartupOptions,
 } from '../settings-move-run.ts'
 import { prepareSettingsMoveSources } from '../settings-move-sources.ts'
-import { resolveSettingsPaths, type SettingsHost } from '../settings-paths.ts'
+import {
+  __waitForSettingsRecordMirrorsForTest,
+  resolveSettingsPaths,
+  type SettingsHost,
+} from '../settings-paths.ts'
 import { openSettingsService } from '../settings-service.ts'
 import { LEGACY_STATE_LAYOUT } from '../state-layout-paths.ts'
 
@@ -34,6 +38,7 @@ const cleanup: (() => Promise<unknown> | undefined)[] = []
 let teardown = Promise.resolve()
 
 async function restoreFixture() {
+  await __waitForSettingsRecordMirrorsForTest()
   setSettingsFsForTest()
   setSettingsMoveStepHookForTest()
   for (const close of cleanup.splice(0).reverse()) await close()
@@ -215,6 +220,7 @@ test('startup publishes before the first resolve, preserves every source, and no
   expect((await fs.stat(f.paths.records.beside.moved)).mode & 0o777).toBe(0o600)
   const { beside, state } = started.paths.records
   if (!state) throw new Error('Missing state layout')
+  await __waitForSettingsRecordMirrorsForTest()
   for (const [oldPath, newPath] of [
     [beside.moved, state.moved],
     [beside.imports.opencode, state.imports.opencode],
@@ -229,6 +235,77 @@ test('startup publishes before the first resolve, preserves every source, and no
   f.reads.length = 0
   expect((await f.start()).outcome).toBe('marker-present')
   expect(f.reads).toEqual([])
+})
+
+test('release A: all beside markers are written before a stalled mirror, which does not delay the move', async () => {
+  const f = await fixture()
+  await put(f.stores.opencode.config, { dump: { enabled: true } })
+  await put(f.stores.pi.config, { dump: { enabled: true } })
+  const { beside, state } = f.paths.records
+  const writes: string[] = []
+  const blocked = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const mirrored = Promise.withResolvers<void>()
+  const start = runSettingsMoveAtStartup({
+    ...f.options,
+    authority: {
+      fs: {
+        writeMarker: async (path, bytes) => {
+          writes.push(path)
+          if (path === state!.moved) {
+            blocked.resolve()
+            await release.promise
+          }
+          await io.writeFile(path, bytes, { flag: 'wx', mode: 0o600 })
+          if (path === state!.imports.pi) mirrored.resolve()
+        },
+      },
+    },
+  })
+  try {
+    await blocked.promise
+    expect(writes.slice(0, 4)).toEqual([
+      beside.moved,
+      beside.imports.opencode,
+      beside.imports.pi,
+      state!.moved,
+    ])
+    expect(
+      await Promise.race([
+        start.then((result) => result.outcome),
+        Bun.sleep(250).then(() => 'still waiting for the mirror'),
+      ]),
+    ).toBe('moved')
+  } finally {
+    release.resolve()
+    await start
+    await mirrored.promise
+  }
+})
+
+test('release A: EACCES on an existing state folder with no beside marker remains unknown', async () => {
+  const f = await fixture()
+  const state = f.paths.records.state!
+  await fs.mkdir(state.directory, { recursive: true, mode: 0o700 })
+  await fs.writeFile(state.moved, 'move completed')
+  const denied = Object.assign(new Error('state folder unreadable'), {
+    code: 'EACCES',
+  })
+  const stat = spyOn(fs, 'lstat').mockImplementation((async (path: string) => {
+    if (path === state.directory || path === state.moved) throw denied
+    return io.lstat(path)
+  }) as typeof fs.lstat)
+  try {
+    await expect(
+      runSettingsMoveAtStartup({ ...f.options, paths: f.paths }),
+    ).rejects.toMatchObject({ cause: denied })
+    expect(
+      f.messages.filter((message) => message.includes(state.directory)),
+    ).toHaveLength(1)
+    expect(await absent(f.paths.target)).toBe(true)
+  } finally {
+    stat.mockRestore()
+  }
 })
 
 test('a refused state folder warns once and publishes only beside the settings file', async () => {
@@ -287,6 +364,7 @@ test('the 2.17.1 reader sees all four records and keeps both hosts protected aft
       await service.dispose()
     }
   }
+  await __waitForSettingsRecordMirrorsForTest()
   expect(await fs.readFile(records.state!.applied, 'utf8')).toBe(
     await fs.readFile(records.beside.applied, 'utf8'),
   )
@@ -1116,6 +1194,7 @@ test('later-host import writes stricter protection at its host level before reco
     outcome: 'marker-present',
   })
   expect(await absent(record('pi'))).toBe(false)
+  await __waitForSettingsRecordMirrorsForTest()
   expect(await fs.readFile(moved.paths.records.state!.imports.pi, 'utf8')).toBe(
     await fs.readFile(record('pi'), 'utf8'),
   )

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { readFile, rm } from 'node:fs/promises'
+import { lstat, readFile, rm } from 'node:fs/promises'
 import { withLock } from '@cortexkit/common-auth/fs'
 import {
   capturePublicationOptions,
@@ -11,7 +11,11 @@ import {
   isRefusalFallbackMode,
   type RefusalFallbackMode,
 } from './settings-definition.ts'
-import type { SettingsHost, SettingsRecordPaths } from './settings-paths.ts'
+import {
+  mirrorSettingsRecord,
+  type SettingsHost,
+  type SettingsRecordPaths,
+} from './settings-paths.ts'
 import {
   SETTINGS_PROTECTION_KEYS,
   type SettingsProtectionValues,
@@ -112,6 +116,14 @@ async function readCopy(path: string): Promise<Record<string, unknown>> {
   return record(copy) ? copy : {}
 }
 
+const missingCopy = Symbol('missing protection copy')
+
+export class UnknownSettingsStateCopyError extends Error {
+  constructor(cause: unknown) {
+    super('Could not read the state protection copy', { cause })
+  }
+}
+
 /**
  * This host's complete set from the applied copy. A copy file that doesn't
  * exist, or one without an entry for this host, returns undefined: there is
@@ -123,31 +135,44 @@ export async function readSettingsProtectionCopy(
   records: SettingsRecordPaths,
   host: SettingsHost,
 ): Promise<SettingsProtectionValues | undefined> {
-  const beside = await readProtectionEntry(records.beside.applied, host)
-  const state =
-    records.state && (await readProtectionEntry(records.state.applied, host))
-  // Unlike an existence marker, either unreadable copy could hide a newer
-  // set, so read errors propagate even if the other copy has a valid entry.
-  // On a tie keep the beside-file entry, the only one 2.17.x plugins can read.
-  const entry =
-    state && (!beside || state.readAt > beside.readAt) ? state : beside
-  return (
-    entry && {
-      ...entry.values,
-      refusal_fallback: entry.refusal_fallback ?? DEFAULT_REFUSAL_FALLBACK_MODE,
+  let entry = await readProtectionEntry(records.beside.applied, host)
+  // A beside file with no entry for this host still outranks the mirror.
+  if (entry === missingCopy) {
+    try {
+      if (records.stateUnavailable) throw records.stateUnavailable
+      if (records.state)
+        entry = await readProtectionEntry(records.state.applied, host)
+    } catch (cause) {
+      throw new UnknownSettingsStateCopyError(cause)
     }
-  )
+  }
+  return entry !== missingCopy && entry
+    ? {
+        ...entry.values,
+        refusal_fallback:
+          entry.refusal_fallback ?? DEFAULT_REFUSAL_FALLBACK_MODE,
+      }
+    : undefined
 }
 
 async function readProtectionEntry(
   path: string,
   host: SettingsHost,
-): Promise<StoredProtectionCopyEntry | undefined> {
+): Promise<StoredProtectionCopyEntry | typeof missingCopy | undefined> {
   let text: string
   try {
     text = await readFile(path, 'utf8')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      // A dangling symlink still occupies the name and is not an absent copy.
+      try {
+        await lstat(path)
+      } catch (statError) {
+        if ((statError as NodeJS.ErrnoException).code === 'ENOENT')
+          return missingCopy
+        throw statError
+      }
+    }
     throw error
   }
   const copy: unknown = JSON.parse(text)
@@ -180,13 +205,10 @@ export async function writeSettingsProtectionCopy(
     lockTimeoutMs,
     publication,
   )
-  if (records.state)
-    await writeProtectionEntry(
-      records.state.applied,
-      host,
-      stored,
-      lockTimeoutMs,
-      publication,
+  const state = records.state?.applied
+  if (state)
+    mirrorSettingsRecord(records, state, () =>
+      writeProtectionEntry(state, host, stored, lockTimeoutMs, publication),
     )
 }
 

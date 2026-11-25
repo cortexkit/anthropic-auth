@@ -45,6 +45,8 @@ interface SettingsRecordFiles {
 export interface SettingsRecordPaths {
   beside: SettingsRecordFiles
   state?: SettingsRecordFiles
+  /** No usable mirror, but its absence was not proved. */
+  stateUnavailable?: Error
 }
 
 export interface SettingsPaths {
@@ -59,7 +61,7 @@ export interface SettingsPaths {
   defaults: Record<SettingsHost, SettingsStorePaths>
 }
 
-/** The configured target is known, but its install or canonical identity is not. */
+/** The configured target is known, but its install is not. */
 export class SettingsPathResolutionError extends Error {
   readonly records: SettingsRecordPaths
 
@@ -86,49 +88,155 @@ function recordFiles(directory: string, prefix: string): SettingsRecordFiles {
 }
 
 const preparedRecords = new WeakMap<SettingsPaths, Promise<SettingsPaths>>()
-const warnedStateFolders = new Set<string>()
+const warnedMirrors = new Set<string>()
+type MirrorOptions = SettingsPathOptions & { ownership?: OwnerOnlyOptions }
+const mirrorOptions = new WeakMap<SettingsRecordPaths, MirrorOptions>()
 
-/** Check the private state directory before reading or publishing records there. */
+function warnMirrorOnce(key: string, message: string, options?: MirrorOptions) {
+  if (warnedMirrors.has(key)) return
+  warnedMirrors.add(key)
+  if (options?.warn) options.warn(message)
+  else logger.warn('settings', message)
+}
+
+function warnRefusedFolder(directory: string, options?: MirrorOptions) {
+  warnMirrorOnce(
+    directory,
+    `Cannot use settings record folder "${directory}"; keeping records beside the settings file.`,
+    options,
+  )
+}
+
+async function checkStateFolder(
+  directory: string,
+  options: MirrorOptions,
+  create: boolean,
+) {
+  const { platform } = resolvePathOptions(options)
+  if (
+    await ensureWindowsOwnerOnlyDirectory(
+      directory,
+      { ...options.ownership, platform },
+      create,
+    )
+  )
+    return
+  if (create) await mkdir(directory, { recursive: true, mode: 0o700 })
+  const stat = await lstat(directory).catch((error: NodeJS.ErrnoException) => {
+    if (!create && error.code === 'ENOENT') return undefined
+    throw error
+  })
+  if (
+    stat &&
+    (!stat.isDirectory() ||
+      (stat.mode & 0o777) !== 0o700 ||
+      (process.getuid && stat.uid !== process.getuid()))
+  )
+    throw new Error('Settings record directory is not owner-only')
+}
+
+/** Check an existing state directory without writing to the optional layout. */
 export function prepareSettingsRecordPaths(
   resolved: SettingsPaths,
-  options: SettingsPathOptions & { ownership?: OwnerOnlyOptions },
+  options: MirrorOptions,
 ): Promise<SettingsPaths> {
   const directory = resolved.records.state?.directory
   if (!directory) return Promise.resolve(resolved)
   let prepared = preparedRecords.get(resolved)
   if (!prepared) {
-    const { platform } = resolvePathOptions(options)
+    mirrorOptions.set(resolved.records, options)
     prepared = (async () => {
       try {
-        if (
-          !(await ensureWindowsOwnerOnlyDirectory(directory, {
-            ...options.ownership,
-            platform,
-          }))
-        ) {
-          await mkdir(directory, { recursive: true, mode: 0o700 })
-          const stat = await lstat(directory)
-          if (
-            !stat.isDirectory() ||
-            (stat.mode & 0o777) !== 0o700 ||
-            (process.getuid && stat.uid !== process.getuid())
-          )
-            throw new Error('Settings record directory is not owner-only')
-        }
+        await checkStateFolder(directory, options, false)
         return resolved
-      } catch {
-        if (!warnedStateFolders.has(directory)) {
-          warnedStateFolders.add(directory)
-          const message = `Cannot use settings record folder "${directory}"; keeping records beside the settings file.`
-          if (options.warn) options.warn(message)
-          else logger.warn('settings', message)
+      } catch (cause) {
+        warnRefusedFolder(directory, options)
+        return {
+          ...resolved,
+          records: {
+            beside: resolved.records.beside,
+            stateUnavailable: new Error(
+              'Settings record folder is unavailable',
+              { cause },
+            ),
+          },
         }
-        return { ...resolved, records: { beside: resolved.records.beside } }
       }
     })()
     preparedRecords.set(resolved, prepared)
   }
   return prepared
+}
+
+type MirrorWrite = { path: string; write: () => Promise<void> }
+const mirrorBatches = new WeakMap<SettingsRecordPaths, MirrorWrite[]>()
+const pendingMirrors = new Set<Promise<void>>()
+
+/** Hold mirror writes until the operation has finished its beside writes. */
+export async function withSettingsRecordMirrors<T>(
+  records: SettingsRecordPaths,
+  operation: (scoped: SettingsRecordPaths) => Promise<T>,
+): Promise<T> {
+  if (!records.state) return operation(records)
+  const scoped = { ...records }
+  const options = mirrorOptions.get(records)
+  if (options) mirrorOptions.set(scoped, options)
+  const writes: MirrorWrite[] = []
+  mirrorBatches.set(scoped, writes)
+  try {
+    return await operation(scoped)
+  } finally {
+    mirrorBatches.delete(scoped)
+    if (writes.length) startSettingsRecordMirrors(scoped, writes)
+  }
+}
+
+export function mirrorSettingsRecord(
+  records: SettingsRecordPaths,
+  path: string,
+  write: () => Promise<void>,
+) {
+  const batch = mirrorBatches.get(records)
+  if (batch) batch.push({ path, write })
+  else startSettingsRecordMirrors(records, [{ path, write }])
+}
+
+function startSettingsRecordMirrors(
+  records: SettingsRecordPaths,
+  writes: MirrorWrite[],
+) {
+  const directory = records.state?.directory
+  if (!directory) return
+  const options = mirrorOptions.get(records)
+  const task = Promise.resolve()
+    .then(async () => {
+      try {
+        await checkStateFolder(directory, options ?? {}, true)
+      } catch {
+        warnRefusedFolder(directory, options)
+        return
+      }
+      for (const { path, write } of writes) {
+        try {
+          await write()
+        } catch {
+          warnMirrorOnce(
+            path,
+            `Could not mirror settings record "${path}".`,
+            options,
+          )
+        }
+      }
+    })
+    .catch(() => {
+      // An optional warning hook must not surface a detached rejection.
+    })
+    .finally(() => pendingMirrors.delete(task))
+  pendingMirrors.add(task)
+}
+
+export async function __waitForSettingsRecordMirrorsForTest() {
+  while (pendingMirrors.size) await Promise.all(pendingMirrors)
 }
 
 export function settingsRecordLocations(records: SettingsRecordPaths): string {
@@ -291,32 +399,45 @@ export async function resolveSettingsPaths(
 ): Promise<SettingsPaths> {
   const target = getSettingsFilePath(options)
   const context = resolvePathOptions(options)
-  const { paths, env, home } = context
+  const { paths, env, home, platform } = context
   const parent = paths.dirname(target)
   const beside = recordFiles(parent, `${target}.`)
   try {
     const separate = await isSeparateSettingsInstall(host, options)
     const records: SettingsRecordPaths = { beside }
     if (!separate) {
-      // Resolve parent aliases but keep the configured filename, even if it is a
-      // symlink. Removing the file or symlink must not change the record key.
-      const identity = paths.join(
-        await canonicalSettingsParent(parent, context),
-        paths.basename(target),
-      )
-      const key = createHash('sha256')
-        .update(identity)
-        .digest('hex')
-        .slice(0, 16)
-      const directory = paths.join(
-        anthropicAuthStateRoot(
+      try {
+        // Resolve parent aliases but keep the configured filename, even if it is a
+        // symlink. Removing the file or symlink must not change the record key.
+        const identity = paths.join(
+          await canonicalSettingsParent(parent, context),
+          paths.basename(target),
+        )
+        const key = createHash('sha256')
+          .update(identity)
+          .digest('hex')
+          .slice(0, 16)
+        const root = anthropicAuthStateRoot(
           { xdgStateHome: env.XDG_STATE_HOME, home },
           paths,
-        ),
-        'settings',
-        key,
-      )
-      records.state = recordFiles(directory, `${directory}${paths.sep}`)
+        )
+        // A drive-rooted Windows path without a drive depends on the caller's cwd.
+        if (
+          !paths.isAbsolute(root) ||
+          (platform === 'win32' &&
+            !/^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\)/.test(root))
+        )
+          throw new Error('Settings state root is not fully qualified')
+        const directory = paths.join(root, 'settings', key)
+        records.state = recordFiles(directory, `${directory}${paths.sep}`)
+        mirrorOptions.set(records, options)
+      } catch {
+        warnMirrorOnce(
+          `key:${target}`,
+          `Cannot resolve the settings record mirror for "${target}"; keeping records beside the settings file.`,
+          options,
+        )
+      }
     }
     return {
       target,

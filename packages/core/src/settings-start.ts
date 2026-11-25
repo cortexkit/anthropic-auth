@@ -208,7 +208,11 @@ export async function startSettings(
       let resolved: SettingsPaths
       try {
         resolved =
-          options.paths ?? (await resolveSettingsPaths(options.host, options))
+          options.paths ??
+          (await resolveSettingsPaths(options.host, {
+            ...options,
+            warn: warnOnce,
+          }))
       } catch (error) {
         if (error instanceof SettingsPathResolutionError) {
           unresolvedPaths = error

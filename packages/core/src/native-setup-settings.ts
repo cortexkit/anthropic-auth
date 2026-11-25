@@ -32,6 +32,7 @@ import {
   type SettingsPathOptions,
   type SettingsPaths,
   settingsRecordLocations,
+  withSettingsRecordMirrors,
 } from './settings-paths.ts'
 import { legacySettingsProtection } from './settings-protection-legacy.ts'
 import {
@@ -325,9 +326,21 @@ export async function writeNativeSetupSettings(
   }
   const authority = { ...options, ...options.authority }
   const paths = await prepareSettingsRecordPaths(
-    options.paths ?? (await resolveSettingsPaths(options.host, options)),
+    options.paths ??
+      (await resolveSettingsPaths(options.host, { ...options, warn })),
     { ...authority, warn },
   )
+  return withSettingsRecordMirrors(paths.records, (records) =>
+    saveNativeSetupSettings(options, { ...paths, records }, authority, warn),
+  )
+}
+
+async function saveNativeSetupSettings(
+  options: NativeSetupSettingsOptions,
+  paths: SettingsPaths,
+  authority: SettingsModeOptions,
+  warn: (message: string) => void,
+): Promise<NativeSetupSettingsResult> {
   const mode = await resolveSettingsMode(paths, authority)
   const result: NativeSetupSettingsResult = {
     target: mode === 'user-file' ? 'user-file' : 'legacy-store',

@@ -1,3 +1,4 @@
+import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 import {
@@ -16,8 +17,11 @@ export async function settingsTestPaths(
     ...input,
     env: { ...input.env, ANTHROPIC_AUTH_SETTINGS_FILE: file },
   }
-  return prepareSettingsRecordPaths(
+  const paths = await prepareSettingsRecordPaths(
     await resolveSettingsPaths('opencode', options),
     options,
   )
+  if (paths.records.state)
+    await mkdir(paths.records.state.directory, { recursive: true, mode: 0o700 })
+  return paths
 }
