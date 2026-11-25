@@ -228,7 +228,7 @@ export type SpawnOptions = {
   /** Stand-in child used by preparation tests; ordinary runs use the locked host binary. */
   executable?: string
   hybridCache?: boolean
-  refusalFallbackMode?: 'server'
+  refusalFallbackMode?: 'client' | 'server'
   relay?: {
     url: string
     token: string
@@ -237,6 +237,9 @@ export type SpawnOptions = {
   port?: number
   beforeSpawn?: (env: IsolatedEnv) => void | Promise<void>
   childEnv?: Record<string, string | undefined>
+  /** Replace the inherited environment for hosts launched with disposable state. */
+  childBaseEnv?: Record<string, string>
+  configDependencies?: string
   childTmpDir?: string
   /** Defaults to `{ kind: 'local' }`. */
   nativeAccounts?: NativeAccountFixture
@@ -992,7 +995,9 @@ export async function spawnOpencode(
     await options.beforeSpawn?.(env)
 
     const childEnv: Record<string, string> = {}
-    for (const [key, value] of Object.entries(process.env)) {
+    for (const [key, value] of Object.entries(
+      options.childBaseEnv ?? process.env,
+    )) {
       if (value == null) continue
       if (key === 'OPENCODE_SERVER_PASSWORD') continue
       if (key === 'OPENCODE_SERVER_USERNAME') continue
@@ -1120,7 +1125,8 @@ export async function spawnOpencode(
       })
     }
 
-    const configDependencies = process.env[OPENCODE_CONFIG_DEPS_ENV]
+    const configDependencies =
+      options.configDependencies ?? process.env[OPENCODE_CONFIG_DEPS_ENV]
     if (configDependencies)
       await seedOpencodeConfigDependencies(env, childEnv, configDependencies)
 

@@ -1,3 +1,6 @@
+import { gunzipSync } from 'node:zlib'
+import type { RefusalMock } from './mock-refusal'
+
 export type MockUsage = {
   input_tokens: number
   output_tokens: number
@@ -77,10 +80,14 @@ export class MockAnthropicServer {
   private captured: CapturedAnthropicRequest[] = []
   private tokenRequestCount = 0
 
+  constructor(private readonly refusal?: RefusalMock) {}
+
   async start() {
     this.server = Bun.serve({
       hostname: '127.0.0.1',
       port: 0,
+      // Longer than the host-side idle timeout in the refusal fixtures.
+      idleTimeout: this.refusal ? 60 : undefined,
       fetch: (request) => this.handle(request),
     })
     const port = this.server.port
@@ -127,10 +134,13 @@ export class MockAnthropicServer {
       })
     }
 
-    const body = (await request.json().catch(() => ({}))) as Record<
-      string,
-      unknown
-    >
+    const body = (await (async () => {
+      if (request.headers.get('content-encoding') === 'gzip')
+        return JSON.parse(
+          gunzipSync(new Uint8Array(await request.arrayBuffer())).toString(),
+        )
+      return request.json()
+    })().catch(() => ({}))) as Record<string, unknown>
     const headers: Record<string, string> = {}
     request.headers.forEach((value, key) => {
       headers[key] = value
@@ -176,6 +186,9 @@ export class MockAnthropicServer {
         },
       )
     }
+
+    const refusal = this.refusal?.respond(body)
+    if (refusal) return refusal
 
     const response = this.queue.shift() ?? {
       type: 'text' as const,
