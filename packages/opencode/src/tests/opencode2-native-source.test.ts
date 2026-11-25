@@ -730,7 +730,9 @@ describe('OC2 shared routing relay', () => {
       expect(await native.authorizeAccount(target, accountId)).toBeUndefined()
       expect(await native.authorizeAccount(requested, accountId)).toBeDefined()
       if (scenario === 'relay target floor') {
-        // The ordinary target request still has its session routing grant.
+        // Without extraSend, the same target request is an ordinary send that
+        // shared routing admitted for this session, so it still authorizes;
+        // only the fallback retry loses that admission.
         expect(
           await native.authorizeAccount(
             { ...target, extraSend: undefined },
