@@ -12,7 +12,7 @@
         "@earendil-works/pi-coding-agent": "1.5.2",
         "@earendil-works/pi-tui": "1.5.2",
         "@opencode-ai/plugin": "1.19.5",
-        "@tsconfig/bun": "1.0.11",
+        "@tsconfig/bun": "1.0.12",
         "@types/bun": "1.4.4",
         "dedent": "^1.7.2",
         "jsonc-parser": "^3.3.1",
@@ -605,7 +605,7 @@
 
     "@standard-schema/spec": ["@standard-schema/spec@1.1.0", "", {}, "sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w=="],
 
-    "@tsconfig/bun": ["@tsconfig/bun@1.0.11", "", {}, "sha512-DQA3HOKFQ+/yPTUa73k5QGcuEM1ExtL6uWQMR0QrfOTitm0oLHqHd1tI74WtEtMqlIu+tvSMELJ6p5uNxVE7lw=="],
+    "@tsconfig/bun": ["@tsconfig/bun@1.0.12", "", {}, "sha512-/7sosWfGyWpPtJGwQtTcq8piOWZF8Xjy57lx//8MGBdn5a03Q6qcDTcZ9Zo3Qv3Ui764mp1HZiMlL+RYU6WarA=="],
 
     "@tufjs/canonical-json": ["@tufjs/canonical-json@2.0.0", "", {}, "sha512-yVtV8zsdo8qFHe+/3kw81dSLyF7D576A5cCFCi4X7B39tWT7SekaEFUnvnWJHz+9qO7qJTah1JbrDjWKqFtdWA=="],
 
