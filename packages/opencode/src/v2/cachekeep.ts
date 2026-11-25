@@ -30,6 +30,7 @@ import {
   RefusalFallbackRoundEngine,
   readSessionCachePolicy,
   requestCacheLifetimeMs,
+  resolveClaudeModelCapabilities,
   sessionCacheActivity,
 } from '@cortexkit/anthropic-auth-core'
 import type { Attempt, RequestScope } from '@cortexkit/common-auth/opencode2'
@@ -495,6 +496,13 @@ function createSharedCacheKeep(
               )
             if (account.type !== 'oauth' || !nativeAccountCanServe(account))
               return 'account-gone'
+            const { refusalSourceModel } = entry
+            if (
+              refusalSourceModel !== undefined &&
+              !resolveClaudeModelCapabilities(refusalSourceModel)
+                ?.refusalRecoveryFamily
+            )
+              return 'invalid'
             if (
               entry.isSubagent &&
               !entry.policyState?.planned &&
@@ -521,6 +529,9 @@ function createSharedCacheKeep(
               cacheMode: 'hybrid',
               oauthAccountId: account.id,
               oauthAccountIdentity: entry.oauthAccountIdentity,
+              ...(refusalSourceModel !== undefined && {
+                hostMetadata: { refusalSourceModel },
+              }),
               isSubagent: entry.isSubagent,
               acceptedAt,
               retained: {
@@ -704,10 +715,14 @@ export function createNativeCacheKeep(
       throw new NativeAccountRefusal(reason)
     }
     let actualWarmTtl = requestCacheLifetimeMs(warmBodyText)
+    const refusalSourceModel = target.hostMetadata?.refusalSourceModel
     const native = createNativeAnthropicAdapter({
       cacheKeepHeaders: target.headers['anthropic-beta']
         ? new Headers(target.headers)
         : undefined,
+      ...(typeof refusalSourceModel === 'string' && {
+        cacheKeepRefusalSourceModel: refusalSourceModel,
+      }),
       source: {
         ...source,
         quotaFromHeaders(headers, input) {
@@ -1026,7 +1041,9 @@ export function createNativeCacheKeep(
     },
     retireRoundTemplate: (sessionID: string) => manager.untrack(sessionID),
     beginRealTurn,
-    async track(input: NativeCacheRequestPrepared) {
+    async track(
+      input: NativeCacheRequestPrepared & { refusalSourceModel?: string },
+    ) {
       let turn =
         input.kind === 'primary' &&
         input.agent !== 'cachekeep' &&
@@ -1132,6 +1149,11 @@ export function createNativeCacheKeep(
         cacheMode: 'hybrid',
         oauthAccountId: input.accountId,
         oauthAccountIdentity: accountKey(account),
+        ...(input.refusalSourceModel !== undefined && {
+          hostMetadata: {
+            refusalSourceModel: input.refusalSourceModel,
+          },
+        }),
         isSubagent,
         ttlMs:
           requestCacheLifetimeMs(input.bodyText) ||

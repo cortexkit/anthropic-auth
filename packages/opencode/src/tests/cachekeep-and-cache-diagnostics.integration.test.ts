@@ -273,6 +273,7 @@ describe('auth.loader', () => {
     expect(saved).toMatchObject({ v: 1, id: sessionId })
     expect(saved.bodyText).toContain('a restartable prefix')
     expect(saved.headers).toBeUndefined()
+    expect(saved).not.toHaveProperty('refusalSourceModel')
     expect(saved.policyState.prefixTokens).toBe(1500)
 
     const plugins = await Promise.all([

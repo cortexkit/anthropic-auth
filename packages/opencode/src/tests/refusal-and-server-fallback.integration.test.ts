@@ -1,10 +1,14 @@
 import { describe, expect, mock, spyOn } from 'bun:test'
-import { readdir, readFile } from 'node:fs/promises'
+import { readdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { gunzipSync, gzipSync } from 'node:zlib'
 import {
   type AccountStorage,
+  CACHE_DIAGNOSTICS_BETA,
+  cacheKeepStoreDirectory,
   hasValidRequestBodySignature,
   logger,
+  MESSAGE_THREADS_BETA,
   SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
 } from '@cortexkit/anthropic-auth-core'
@@ -634,7 +638,9 @@ describe('auth.loader', () => {
     expect(sends).toEqual(['claude-fable-5-2', 'claude-fable-5-2'])
   })
 
-  test('OpenCode 1 warms the last clean source and serves a signed round only in its own plugin instance', async () => {
+  const exerciseRoundWarm = async (
+    restart: 'valid' | 'unsupported' | false,
+  ) => {
     await useTempAccountFile(
       createFallbackStorage({
         accounts: [],
@@ -798,6 +804,85 @@ describe('auth.loader', () => {
     expect(warm?.body).not.toHaveProperty('fallbacks')
     expect(warm?.text).not.toContain(credit)
 
+    if (restart) {
+      const modelBetas = (headers: Headers) =>
+        headers
+          .get('anthropic-beta')!
+          .split(',')
+          .filter((beta) => beta !== MESSAGE_THREADS_BETA)
+      const liveWarm = sends.find(
+        ({ body }) => body.max_tokens === 0 && body.model === target,
+      )
+      expect(modelBetas(liveWarm!.headers)).toEqual(
+        modelBetas(round.headers).filter(
+          (beta) => beta !== CACHE_DIAGNOSTICS_BETA,
+        ),
+      )
+      await plugin.dispose()
+      testContext.livePlugins.delete(plugin)
+      await independent.dispose()
+      testContext.livePlugins.delete(independent)
+      const disk = cacheKeepStoreDirectory(
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
+        undefined,
+        'opencode1',
+      )
+      const entries = (await readdir(disk)).filter((name) =>
+        name.endsWith('.json.gz'),
+      )
+      expect(entries).toHaveLength(1)
+      const path = join(disk, entries[0]!)
+      const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+      if (restart === 'unsupported') {
+        await writeFile(
+          path,
+          gzipSync(
+            JSON.stringify({
+              ...saved,
+              refusalSourceModel: 'claude-sonnet-4-6',
+            }),
+          ),
+        )
+      }
+      const debug = spyOn(logger, 'debug')
+      getBodyLifetime(testContext).deferCleanup(() => debug.mockRestore())
+      const restarted = await getPlugin(undefined, undefined, {
+        now: () => now,
+      })
+      await restarted.auth.loader(auth, { models: {} })
+      const handles = getPluginTestHandles(restarted)
+      await handles.drainDispatchWork()
+      now = saved.nextPrewarmAt + 1
+      const before = sends.length
+      await handles.cacheKeepManager.tick()
+      const restored = sends.slice(before)
+      if (restart === 'unsupported') {
+        expect(restored).toBeEmpty()
+        expect(await readdir(disk)).not.toContain(entries[0]!)
+        expect(
+          debug.mock.calls.filter(
+            ([, message]) => message === 'restart record dropped',
+          ),
+        ).toEqual([
+          [
+            'cachekeep',
+            'restart record dropped',
+            { file: entries[0], reason: 'invalid' },
+          ],
+        ])
+        return
+      }
+      expect(restored).toHaveLength(1)
+      expect(restored[0]!.body).toMatchObject({ model: target, max_tokens: 0 })
+      expect(modelBetas(restored[0]!.headers)).toEqual(
+        modelBetas(liveWarm!.headers),
+      )
+      expect(await hasValidRequestBodySignature(restored[0]!.text)).toBe(true)
+      expect(saved.refusalSourceModel).toBe(source)
+      expect(saved).not.toHaveProperty('headers')
+      return
+    }
+
     rejectTarget = true
     const before400 = sends.length
     expect(
@@ -823,5 +908,12 @@ describe('auth.loader', () => {
     expect(dumpBodies.join('\n')).not.toContain(credit)
     for (const { text } of sends)
       expect(await hasValidRequestBodySignature(text)).toBe(true)
-  })
+  }
+
+  test('OpenCode 1 warms the last clean source and serves a signed round only in its own plugin instance', () =>
+    exerciseRoundWarm(false))
+  test('OpenCode 1 restart replays the live refusal-round warm headers', () =>
+    exerciseRoundWarm('valid'))
+  test('OpenCode 1 restart drops an unsupported refusal source without sending it', () =>
+    exerciseRoundWarm('unsupported'))
 })

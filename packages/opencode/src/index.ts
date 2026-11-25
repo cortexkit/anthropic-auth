@@ -3946,19 +3946,28 @@ const anthropicAuthPlugin = async (
             unknown
           >
           const identity = nativeWireIdentity(credential.accountIdentity)
+          const refusalSourceModel = target.hostMetadata?.refusalSourceModel
           headers.delete('anthropic-beta')
           setOAuthHeaders(headers, accessToken, {
-            body: parsedBody,
+            body:
+              typeof refusalSourceModel === 'string'
+                ? { ...parsedBody, model: refusalSourceModel }
+                : parsedBody,
             identity,
-            refusalFallbackMode: attempt.refusalFallbackMode,
+            refusalFallbackMode:
+              typeof refusalSourceModel === 'string'
+                ? 'client'
+                : attempt.refusalFallbackMode,
           })
-          headers.set(
-            'anthropic-beta',
-            mergeAnthropicBetas(headers.get('anthropic-beta'), [
-              CACHE_KEEP_EXTENDED_TTL_BETA,
-            ]),
-          )
-          if (parsedBody.speed === 'fast') addFastModeBetaHeader(headers)
+          if (typeof refusalSourceModel !== 'string') {
+            headers.set(
+              'anthropic-beta',
+              mergeAnthropicBetas(headers.get('anthropic-beta'), [
+                CACHE_KEEP_EXTENDED_TTL_BETA,
+              ]),
+            )
+            if (parsedBody.speed === 'fast') addFastModeBetaHeader(headers)
+          }
         } catch {
           setOAuthHeaders(headers, accessToken)
         }
@@ -7893,6 +7902,8 @@ const anthropicAuthPlugin = async (
               const storeTemplate = (template: string) => {
                 if (!isCurrent() || !cacheKeepRestart.active()) return
                 const acceptedAt = runtimeNow()
+                const sourceModel = parseRequestModel(sourceBodyText)
+                const servingModel = parseRequestModel(template)
                 const tracked = cacheKeepManager.track({
                   sessionId: primary.sessionId,
                   url: requestUrl,
@@ -7905,9 +7916,14 @@ const anthropicAuthPlugin = async (
                   oauthAccountIdentity: payer.accountIdentity,
                   hostMetadata: {
                     restartCredential: cacheKeepCredential(payer),
-                    ...(parseRequestModel(template) !== modelForIdentity && {
+                    ...(servingModel !== modelForIdentity && {
                       preserveSourceHeaders: true,
                     }),
+                    ...(sourceModel &&
+                      servingModel &&
+                      servingModel !== sourceModel && {
+                        refusalSourceModel: sourceModel,
+                      }),
                   },
                   isSubagent: subagentRequest,
                   acceptedAt,

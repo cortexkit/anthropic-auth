@@ -33,6 +33,7 @@ import {
   getLogLevel,
   hasValidRequestBodySignature,
   logger,
+  MESSAGE_THREADS_BETA,
   NativeCustodyError,
   type NativeLockEvent,
   RequestGzipLatch,
@@ -1968,6 +1969,8 @@ test('OpenCode 2 restores a gzipped session after a server restart with the same
   expect(saved).not.toMatch(
     /authorization|x-api-key|sk-ant-oat01|refresh-first|placeholder/,
   )
+  const record = JSON.parse(saved)
+  expect(record).not.toHaveProperty('refusalSourceModel')
   // A fresh server has no process-wide registry, even though its files survive.
   forgetCacheKeepProcess(f.paths.storageId)
   const next = await f.start()
@@ -1986,7 +1989,7 @@ test('OpenCode 2 restores a gzipped session after a server restart with the same
   )
 })
 
-test('OpenCode 2 keeps the source prefix and the signed round template in separate warm targets', async () => {
+test('OpenCode 2 keeps separate warm targets and replays the live refusal-round warm headers on restart', async () => {
   const f = await fixture()
   await f.setQuota('first')
   await f.store.updateSettings((settings) => ({
@@ -2148,6 +2151,29 @@ test('OpenCode 2 keeps the source prefix and the signed round template in separa
   )
   expect(dumpBodies).toContain(roundBody)
   expect(dumpBodies.join('\n')).not.toContain(credit)
+
+  const record = JSON.parse(
+    gunzipSync(await readFile(join(f.disk, saved[0]!))).toString(),
+  )
+  forgetCacheKeepProcess(f.paths.storageId)
+  const next = await f.start()
+  next.setSend(send)
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(1)
+  const wire = await next.sent[0]!.text()
+  expect(JSON.parse(wire)).toMatchObject({ model: target, max_tokens: 0 })
+  const modelBetas = (headers: Headers) =>
+    headers
+      .get('anthropic-beta')!
+      .split(',')
+      .filter((beta) => beta !== MESSAGE_THREADS_BETA)
+  expect(modelBetas(next.sent[0]!.headers)).toEqual(
+    modelBetas(warmByModel.get(target)!.headers),
+  )
+  expect(await hasValidRequestBodySignature(wire)).toBe(true)
+  expect(record.refusalSourceModel).toBe(source)
+  expect(record).not.toHaveProperty('headers')
 })
 
 const CACHE_KEEP_SLOT = Symbol.for(
@@ -2781,6 +2807,8 @@ test.each([
   'unreadable',
   'unfinished-write',
   'invalid',
+  'unknown-refusal-source',
+  'unsupported-refusal-source',
   ...(process.platform === 'win32' ? [] : ['unsafe-file']),
 ])(
   'OpenCode 2 deletes a %s restart record without sending it',
@@ -2797,6 +2825,10 @@ test.each([
       saved.oauthAccountIdentity = 'someone-else'
     if (change === 'format') saved.v = 99
     if (change === 'invalid') saved.bodyText = '{not JSON'
+    if (change === 'unknown-refusal-source')
+      saved.refusalSourceModel = 'unknown-claude-model'
+    if (change === 'unsupported-refusal-source')
+      saved.refusalSourceModel = 'claude-sonnet-4-6'
     await writeFile(
       path,
       change === 'unreadable' ? 'not gzip' : gzipSync(JSON.stringify(saved)),
@@ -2816,7 +2848,9 @@ test.each([
     )
     expect(drops).toHaveLength(1)
     expect(drops[0]).toContain('DEBUG [cachekeep]')
-    expect(drops[0]).toContain(`"reason":"${change}"`)
+    expect(drops[0]).toContain(
+      `"reason":"${change.includes('refusal-') ? 'invalid' : change}"`,
+    )
     expect(drops[0]).toContain(`"file":"${droppedName}"`)
     expect(drops[0]).not.toContain(saved.id)
     expect(drops[0]).not.toContain(saved.bodyText)

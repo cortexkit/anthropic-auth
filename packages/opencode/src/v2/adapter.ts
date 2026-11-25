@@ -566,12 +566,15 @@ export interface NativeAnthropicAdapterDeps<Q, P> {
       headers: Headers
       signal: AbortSignal
       template: RefusalFallbackCacheKeepTemplate | null
+      refusalSourceModel?: string
       alreadySigned: boolean
       isCurrent: () => boolean
     },
   ) => void | Promise<void>
   /** A warm replays the source-shaped headers that its live request used. */
   readonly cacheKeepHeaders?: Headers
+  /** Requested model for rebuilding OAuth betas when a saved keep-warm body names a fallback model. */
+  readonly cacheKeepRefusalSourceModel?: string
   readonly log?: NativeAnthropicAdapterLogger
   /** Maximum number of authorized sends waiting for their request rewrite. */
   readonly maxPendingSends?: number
@@ -1506,16 +1509,27 @@ export function createNativeAnthropicAdapter<Q, P>(
           headers = new Headers(deps.cacheKeepHeaders)
           headers.delete('content-encoding')
           headers.set('authorization', `Bearer ${accessToken}`)
-        } else
+        } else {
+          const refusalSourceModel =
+            attempt.agent === 'cachekeep'
+              ? deps.cacheKeepRefusalSourceModel
+              : undefined
           setOAuthHeaders(headers, accessToken, {
-            body: finalBody,
-            refusalFallbackMode,
+            body:
+              refusalSourceModel && finalBody
+                ? { ...finalBody, model: refusalSourceModel }
+                : finalBody,
+            refusalFallbackMode: refusalSourceModel
+              ? 'client'
+              : refusalFallbackMode,
             ...(identity ? { identity } : {}),
             requestClass:
-              attempt.kind !== 'primary' || isAuxiliaryAgent(attempt.agent)
+              !refusalSourceModel &&
+              (attempt.kind !== 'primary' || isAuxiliaryAgent(attempt.agent))
                 ? 'auxiliary'
                 : 'main',
           })
+        }
       } else {
         if (body !== undefined && messages)
           body = rewriteApiKeyRequestBody(body, {
@@ -2194,6 +2208,10 @@ export function createNativeAnthropicAdapter<Q, P>(
                 headers: templateHeaders,
                 signal,
                 template,
+                ...(template &&
+                  template.servingModel !== requestedModel && {
+                    refusalSourceModel: requestedModel,
+                  }),
                 alreadySigned:
                   roundPlan.kind === 'source' &&
                   template?.servingModel !== requestedModel,

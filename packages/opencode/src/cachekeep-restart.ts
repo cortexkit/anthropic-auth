@@ -12,6 +12,7 @@ import {
   type NativeAccountSnapshot,
   nativeAccountCanServe,
   readSessionCachePolicy,
+  resolveClaudeModelCapabilities,
 } from '@cortexkit/anthropic-auth-core'
 import { version as pluginVersion } from '../package.json'
 
@@ -106,6 +107,13 @@ function restore(shared: Shared): Promise<void> {
         if (!lease.allowUrl(entry.url)) return 'invalid'
         const account = accounts.get(entry.oauthAccountIdentity)
         if (!account) return 'account-gone'
+        const { refusalSourceModel } = entry
+        if (
+          refusalSourceModel !== undefined &&
+          !resolveClaudeModelCapabilities(refusalSourceModel)
+            ?.refusalRecoveryFamily
+        )
+          return 'invalid'
         if (
           entry.isSubagent &&
           !entry.policyState?.planned &&
@@ -126,7 +134,12 @@ function restore(shared: Shared): Promise<void> {
           cacheMode: 'hybrid',
           oauthAccountId: account.id,
           oauthAccountIdentity: account.accountIdentity,
-          hostMetadata: { restartCredential: entry.oauthAccountIdentity },
+          hostMetadata: {
+            restartCredential: entry.oauthAccountIdentity,
+            ...(refusalSourceModel !== undefined && {
+              refusalSourceModel,
+            }),
+          },
           isSubagent: entry.isSubagent,
           acceptedAt,
           retained: {
