@@ -1807,7 +1807,11 @@ async function sendAnthropicRequestAttempt(
     }
     return account?.type === 'oauth' && nativeAccountCanServe(account)
   }
-  const targetAllowed = (model: string, view = native.peek?.() ?? snapshot) => {
+  const targetAllowed = (
+    model: string,
+    view = native.peek?.() ?? snapshot,
+    inheritRouting = false,
+  ) => {
     const account = view.accounts.find((row) => row.id === routeId)
     const policyStorage =
       servingRuntime.resolveSettings?.(view.policyStorage, model) ??
@@ -1821,7 +1825,10 @@ async function sendAnthropicRequestAttempt(
         routeId === STICKY_ROUTING_MAIN_ACCOUNT_ID ? undefined : routeId,
         model,
       ) &&
-      quotaSnapshotPassesPolicy(account.quota, policyStorage) &&
+      ((inheritRouting &&
+        options.routingChoice &&
+        routingChoiceMatches(options.routingChoice, account)) ||
+        quotaSnapshotPassesPolicy(account.quota, policyStorage)) &&
       quotaSnapshotPassesModelScope(account.quota, model)
     )
   }
@@ -2066,7 +2073,7 @@ async function sendAnthropicRequestAttempt(
         )
       },
     })
-  const extraSender = () => {
+  const extraSender = (refusalRetry = false, relayedOrigin = false) => {
     let candidate: PiNativeAttempt | undefined
     let dump: DumpHandle | null = null
     let scope: ProviderErrorResponseScope | undefined
@@ -2076,13 +2083,30 @@ async function sendAnthropicRequestAttempt(
     }) => {
       candidate = undefined
       try {
-        // No routing override or quota wait is allowed for an extra send.
-        const attempt = await native.authorize(routeId, signal, model, 'serve')
+        if (relayedOrigin && !relayConfig?.fallbackToDirect)
+          return { kind: 'denied' }
+        // This is the same routed step. Reuse its account choice, but check
+        // the retry model's protections separately on the final account view.
+        const routingChoice = refusalRetry ? options.routingChoice : undefined
+        const attempt = routingChoice
+          ? await native.authorize(
+              routeId,
+              signal,
+              model,
+              'serve',
+              routingChoice,
+            )
+          : await native.authorize(routeId, signal, model, 'serve')
+        if (
+          relayedOrigin &&
+          !(await (await native.service()).getRelayConfig())?.fallbackToDirect
+        )
+          return { kind: 'denied' }
         const view = await native.view(signal, model)
         const account = view.accounts.find((row) => row.id === routeId)
         const payer = piBillingPayer(attempt)
         if (
-          !targetAllowed(model, view) ||
+          !targetAllowed(model, view, refusalRetry) ||
           account?.accountIdentity !== payer.accountId ||
           piCredentialId(account) !== payer.credentialId
         )
@@ -2172,7 +2196,7 @@ async function sendAnthropicRequestAttempt(
       bodyText: sentBody,
       fullBodyText: bodyText,
     }
-    const extra = extraSender()
+    const extra = extraSender(true, protectedOrigin !== undefined)
     const fresh = () => isFresh(origin)
     const originalThread = threadRequest
     return dispatchRefusalFallback(response, {
@@ -2681,6 +2705,9 @@ async function sendAnthropicRequestAttempt(
       isCurrentPrimary: () => currentPrimary(payer),
       authorize: extra.authorize,
       send: extra.send,
+      onResendFailure: () => {
+        if (sourceBilling) reportAnthropicBillingFailure(sourceBilling)
+      },
       observeResendResponse: (guarded, model) => {
         const observed = extra.observe(guarded, model)
         return sourceBilling

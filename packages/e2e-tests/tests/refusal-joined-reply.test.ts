@@ -52,6 +52,7 @@ const scenarios = [
   [11, 'keep-alive through a slow held tool'],
   [12, 'closed text with no prefill claim'],
   [13, 'shortened host timeout fires with no held frames'],
+  [14, 'cold refusal after visible text does not restart the answer'],
 ] as const
 
 const text = (value: string) => ({ type: 'text', text: value })
@@ -113,6 +114,7 @@ for (const host of Object.keys(launch) as Host[]) {
               directory,
               env: offlineEnv(await hostEnv(directory)),
               shortTimeout: point === 11 || point === 13,
+              persistent: point === 14,
             })
             const prompt = `${refusalMarker(point)} Reply in one short sentence.`
             const started = performance.now()
@@ -159,7 +161,8 @@ for (const host of Object.keys(launch) as Host[]) {
               .filter(generation)
             const nextTurn = captures.slice(firstRequests).filter(generation)
             const complete = point === 4 || point === 10 || point === 11
-            const refusal = point === 8 || point === 9
+            const noContinuation = [6, 12, 14].includes(point)
+            const refusal = point === 8 || point === 9 || noContinuation
             const sourceParts =
               point === 2
                 ? [reason(fixtureSource)]
@@ -167,11 +170,13 @@ for (const host of Object.keys(launch) as Host[]) {
                   ? [reason(fixtureSource), text(sourceText)]
                   : point === 6
                     ? [{ type: 'thinking', text: openThinking, signature: '' }]
-                    : [3, 5, 7, 8, 9, 12].includes(point)
+                     : [3, 5, 7, 8, 9, 12, 14].includes(point)
                       ? [text(sourceText)]
                       : []
             const retryParts =
-              point === 8 ? [] : [reason(fixtureFallback), text(targetText)]
+               point === 8 || noContinuation
+                 ? []
+                 : [reason(fixtureFallback), text(targetText)]
             const finish = stops[host]
             expect(
               steps,
@@ -189,7 +194,8 @@ for (const host of Object.keys(launch) as Host[]) {
                 : [
                     {
                       parts: [...sourceParts, ...retryParts],
-                      usage: point === 8 ? usage.source : usage.retry,
+                       usage:
+                         point === 8 || noContinuation ? usage.source : usage.retry,
                       finish: refusal ? finish.refusal : finish.success,
                     },
                   ],
@@ -197,29 +203,34 @@ for (const host of Object.keys(launch) as Host[]) {
             expect(runs).toEqual(complete ? ['executed'] : [])
             if (point === 11)
               expect(elapsed).toBeGreaterThan(toolChunkTimeoutMs)
-            expect(firstTurn.map(({ body }) => body.model)).toEqual([
-              fixtureSource,
-              fixtureFallback,
+             expect(firstTurn.map(({ body }) => body.model)).toEqual([
+               fixtureSource,
+               ...(!noContinuation ? [fixtureFallback] : []),
             ])
             expect(nextTurn).toHaveLength(1)
-            expect(fixture.events.map(({ kind }) => kind)).toEqual([
-              'refusal',
-              complete ? 'uncredited' : 'credited',
+             expect(fixture.events.map(({ kind }) => kind)).toEqual([
+               'refusal',
+               ...(!noContinuation ? [complete ? 'uncredited' : 'credited'] : []),
             ])
             const [refused, next, after] = [
               firstTurn[0]?.body,
               firstTurn[1]?.body,
               nextTurn[0]?.body,
             ]
-            if (!refused || !next || !after)
-              throw new Error('Missing source, retry or follow-up request')
-            if (refusal || host === 'pi') expect(after.model).toBe(fixtureSource)
+             if (!refused || (!noContinuation && !next) || !after)
+               throw new Error('Missing source, retry or follow-up request')
+             const restartedPi = host === 'pi' && point !== 14
+             if ((refusal && !noContinuation) || restartedPi)
+               expect(after.model).toBe(fixtureSource)
+             if (noContinuation && !restartedPi)
+               expect(after.model).toBe(fixtureFallback)
             expect(firstTurn[0]?.headers.authorization).toMatch(
               /^Bearer sk-ant-oat01-/,
             )
-            expect(firstTurn[1]?.headers.authorization).toBe(
-              firstTurn[0]?.headers.authorization,
-            )
+             if (!noContinuation)
+               expect(firstTurn[1]?.headers.authorization).toBe(
+                 firstTurn[0]?.headers.authorization,
+               )
             expect(partsOnWire(refused).at(-1)).toMatchObject({
               role: 'user',
               part: text(prompt),
@@ -228,14 +239,14 @@ for (const host of Object.keys(launch) as Host[]) {
               role: 'user',
               part: text(followPrompt),
             })
-            if (complete) {
+             if (next && complete) {
               expect(wireHistory(next)).toEqual([tool, toolResult])
               expect(
                 partsOnWire(next).some(
                   ({ role, part }) => role === 'user' && part.text === prompt,
                 ),
               ).toBe(true)
-            } else {
+             } else if (next) {
               const prefill =
                 point === 2
                   ? [thinking(fixtureSource)]
@@ -277,9 +288,9 @@ for (const host of Object.keys(launch) as Host[]) {
             expect(hostData).not.toContain(retryRefusalCredit)
             expect(hostData).not.toContain(openToolId)
             if (!complete) {
-              // OpenCode omits failed assistant turns. Pi restarts before the
-              // follow-up, so even after a successful retry its request returns
-              // to the source and drops target thinking after source thinking.
+               // OpenCode omits failed assistant turns. When Pi restarts before
+               // the follow-up, it returns to the source and drops target
+               // thinking after source thinking.
               const dropsRetryThinking =
                 point === 9 || (host === 'pi' && point === 2)
               const kept = [

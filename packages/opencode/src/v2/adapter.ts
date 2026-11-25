@@ -269,9 +269,9 @@ export interface NativeAnthropicAttemptData<P> {
  * the host's request scope, the attempt, and what the source authorized.
  */
 export interface NativeAnthropicSendScope extends RequestScope {
-  /** An extra send reuses the binding, not the original admission or wait budget. */
+  /** An extra send reuses the account's credential binding without waiting for quota. */
   readonly extraSend?: {
-    readonly kind: 'refusal' | 'thread'
+    readonly kind: 'refusal' | 'thread' | 'source-resend'
     readonly credentialId: string
   }
 }
@@ -446,6 +446,10 @@ export interface NativeAnthropicSource<Q, P> {
       readonly ignoreMode?: boolean
     },
   ) => boolean
+  /** A relayed origin can only spend its one-use credit on an allowed direct send. */
+  readonly allowsDirectRefusalRetry?: (
+    input: NativeAnthropicAttemptContext<P>,
+  ) => boolean | Promise<boolean>
   readonly onCompletedFallbackRequest?: (
     input: Parameters<
       NonNullable<NativeAnthropicSource<Q, P>['onRequestPrepared']>
@@ -1337,6 +1341,14 @@ export function createNativeAnthropicAdapter<Q, P>(
     }
   >()
   const resendProvenance = new WeakMap<Data, P>()
+  const recoveredSource = new WeakMap<
+    Response,
+    Pick<RefusalFallbackDispatchOptions, 'protectedOrigin'> & {
+      headers: Headers
+      bodyText: string
+      billing?: AnthropicBillingRequest
+    }
+  >()
   const classifiedForRetry = new WeakSet<Data>()
   const rewriteRequest = (
     input: AccountRequest & {
@@ -1791,10 +1803,17 @@ export function createNativeAnthropicAdapter<Q, P>(
                 void received.body?.cancel().catch(() => {})
                 request.signal.throwIfAborted()
               }
+              let credit: string | undefined
               received = protectFallbackCreditResponse(received, {
                 requestHeaders: retryHeaders,
                 requestBodyText: createBody,
                 framing: responseMode,
+                ...(clientSource &&
+                  received.ok && {
+                    onRefusalCredit: (value: string) => {
+                      credit = value
+                    },
+                  }),
               })
               if (billingSend) {
                 billingSend.received = true
@@ -1805,6 +1824,23 @@ export function createNativeAnthropicAdapter<Q, P>(
                   )
               }
               if (received.ok && fromUpstream(received.headers, data)) {
+                if (clientSource) {
+                  recoveredSource.set(received, {
+                    headers:
+                      dispatch?.kind === 'http-relay'
+                        ? retryHeaders
+                        : new Headers(init.headers),
+                    bodyText: createBody,
+                    billing: billingSend?.input,
+                    protectedOrigin: {
+                      takeRefusalCredit() {
+                        const token = credit
+                        credit = undefined
+                        return token
+                      },
+                    },
+                  })
+                }
                 physicalAcceptances.set(data, {
                   at: deps.now?.() ?? Date.now(),
                 })
@@ -2070,7 +2106,7 @@ export function createNativeAnthropicAdapter<Q, P>(
 
     async function authorizeResend(
       modelID: string,
-      kind: 'refusal' | 'thread',
+      kind: NonNullable<NativeAnthropicSendScope['extraSend']>['kind'],
       signal: AbortSignal,
     ) {
       if (!data || !send?.oauth) return undefined
@@ -2274,14 +2310,25 @@ export function createNativeAnthropicAdapter<Q, P>(
               roundPlan?.kind === 'round' || roundPlan?.kind === 'routed',
             )
           if (!fresh()) return { kind: 'denied' }
-          candidate = await authorizeResend(model, 'refusal', signal)
+          const relayedOrigin = clientSource && dispatch?.kind === 'http-relay'
+          candidate = await authorizeResend(
+            model,
+            clientSource ? 'refusal' : 'source-resend',
+            signal,
+          )
           if (!candidate || !fresh()) return { kind: 'denied' }
+          if (
+            relayedOrigin &&
+            (!(await source.allowsDirectRefusalRetry?.(context)) || !fresh())
+          )
+            return { kind: 'denied' }
           const gateway = candidate.gateway
           const nextUrl = gateway && claudeGatewayModelUrl(url, gateway)
           if (
             !nextUrl &&
             candidate.dispatch &&
-            candidate.dispatch.kind !== 'direct'
+            candidate.dispatch.kind !== 'direct' &&
+            !(relayedOrigin && candidate.dispatch.kind === 'http-relay')
           )
             return { kind: 'denied' }
           const resolved = nextUrl?.toString() ?? url
@@ -2390,10 +2437,21 @@ export function createNativeAnthropicAdapter<Q, P>(
         rounds &&
         (roundPlan.kind === 'round' || roundPlan.kind === 'routed')
       ) {
+        const resendBilling = (model: string) =>
+          billing && {
+            ...billing.input,
+            attemptId: randomUUID(),
+            model,
+            cacheWarmingAfter: undefined,
+          }
         physical.target400 = (response) =>
           rounds.handleTarget400(handle, response, {
             ...fallback,
             isCurrentPrimary: () => isCurrent(true),
+            onResendFailure: (model) => {
+              const input = resendBilling(model)
+              if (input) reportAnthropicBillingFailure(input)
+            },
             observeResendResponse: (response, model) => {
               let safe =
                 fallback.observePhysicalResponse?.(response, {
@@ -2403,16 +2461,8 @@ export function createNativeAnthropicAdapter<Q, P>(
                   paysCacheWrite: false,
                   folded: false,
                 }) ?? response
-              if (billing)
-                safe = observeAnthropicBillingResponse(
-                  {
-                    ...billing.input,
-                    attemptId: randomUUID(),
-                    model,
-                    cacheWarmingAfter: undefined,
-                  },
-                  safe,
-                )
+              const input = resendBilling(model)
+              if (input) safe = observeAnthropicBillingResponse(input, safe)
               return safe
             },
           })
@@ -2526,15 +2576,15 @@ export function createNativeAnthropicAdapter<Q, P>(
       const threaded = data ? threadRequests.get(data) : undefined
       const failThread = threaded?.thread.fail
       if (data) threadRequests.delete(data)
-      const fallback = upstream && response.ok && physical?.fallback
+      let fallback = upstream && response.ok && physical?.fallback
       let terminalResend = false
       let targetStatus: number | undefined
       // A send whose failure was already reported (the fetch threw) must not
       // be billed a second time from the response it was replaced with.
       const firstReceipt = !!billingSend && !billingSend.received
       if (billingSend) billingSend.received = true
-      if (fallback) {
-        response = dispatchRefusalFallback(response, {
+      const dispatchFallback = (fallback: RefusalFallbackDispatchOptions) =>
+        dispatchRefusalFallback(response, {
           ...fallback,
           observePhysicalResponse: (guarded, attempt, template) => {
             if (attempt.refusalRetry)
@@ -2547,9 +2597,11 @@ export function createNativeAnthropicAdapter<Q, P>(
               )
             let observed = scrubResponse(data, guarded)
             if (threaded) observed = threaded.thread.observe(observed)
-            return physical.observeCompletion?.(observed) ?? observed
+            return physical?.observeCompletion?.(observed) ?? observed
           },
         })
+      if (fallback) {
+        response = dispatchFallback(fallback)
       } else {
         if (physical)
           response = protectFallbackCreditResponse(response, {
@@ -2568,7 +2620,28 @@ export function createNativeAnthropicAdapter<Q, P>(
             threaded.resend,
             threaded.beforeResend,
           )
-          response = threaded.thread.observe(response)
+          const recovered = recoveredSource.get(response)
+          if (recovered && physical?.fallback) {
+            recoveredSource.delete(response)
+            const original = physical.fallback
+            fallback = {
+              ...original,
+              origin: {
+                ...original.origin,
+                headers: recovered.headers,
+                bodyText: recovered.bodyText,
+              },
+              protectedOrigin: recovered.protectedOrigin,
+              billing: recovered.billing
+                ? {
+                    ...recovered.billing,
+                    cacheWarming: original.billing.cacheWarming,
+                    cacheWarmingAfter: original.billing.cacheWarmingAfter,
+                  }
+                : original.billing,
+            }
+            response = dispatchFallback(fallback)
+          } else response = threaded.thread.observe(response)
         } else threaded?.thread.fail()
         if (upstream && response.status === 400 && physical?.target400) {
           targetStatus = response.status

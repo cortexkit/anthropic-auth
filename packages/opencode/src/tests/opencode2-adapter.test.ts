@@ -704,121 +704,311 @@ function fallbackReply(model: string, refuses = false) {
   )
 }
 
-test('OpenCode 2 sends round and routed title bodies with source headers and resends a target 400 once', async () => {
-  const events: core.RefusalFallbackRoundEvent[] = []
-  const rounds = new core.RefusalFallbackRoundEngine((event) =>
-    events.push(event),
-  )
-  const physicalExtras: Array<{ body: string; headers: Headers }> = []
-  const templates: string[] = []
-  const admitted: string[] = []
+test.each([false, true])(
+  'OpenCode 2 sends round and routed title bodies with source headers and resends a target 400 once (source socket loss: %s)',
+  async (loseResend) => {
+    const events: core.RefusalFallbackRoundEvent[] = []
+    const rounds = new core.RefusalFallbackRoundEngine((event) =>
+      events.push(event),
+    )
+    const physicalExtras: Array<{ body: string; headers: Headers }> = []
+    const templates: string[] = []
+    const admitted: string[] = []
+    const reports: core.AnthropicBillingReport[] = []
+    const { source } = makeSource({
+      admitRequest(input) {
+        admitted.push(input.modelID)
+      },
+      billingRequest: (input) => ({
+        sessionId: input.sessionID,
+        credentialId: 'synthetic-credential-row',
+        requestKind: input.kind,
+        model: input.modelID,
+        onReport: (report) => reports.push(report),
+      }),
+    })
+    const native = createNativeAnthropicAdapter({
+      source,
+      rounds,
+      onRoundCacheTemplate(input) {
+        if (input.template) templates.push(input.template.bodyText)
+      },
+      fetch: (async (_url, init) => {
+        const body = String(init?.body)
+        physicalExtras.push({ body, headers: new Headers(init?.headers) })
+        const model = JSON.parse(body).model
+        if (loseResend && physicalExtras.length === 3)
+          throw new Error('source socket closed before headers')
+        return fallbackReply(model, model === FALLBACK_SOURCE)
+      }) as typeof fetch,
+    })
+    const host = new Host(native.adapter)
+    const primary = scopeOf({ modelID: FALLBACK_SOURCE })
+    const payload = { ...sonnetPayload(), model: FALLBACK_SOURCE, stream: true }
+    const messages = [{ role: 'user', content: 'source turn' }]
+    const next = [
+      ...messages,
+      { role: 'assistant', content: 'the retry answered' },
+      { role: 'user', content: 'next turn' },
+    ]
+    const prepare = (history: typeof messages, scope = primary) =>
+      host.run(scope, hostRequest({ ...payload, messages: history }))
+    const expose = (
+      send: Awaited<ReturnType<typeof prepare>>,
+      response: Response,
+    ) =>
+      native.adapter.rewriteResponse?.({
+        ...send.attempt,
+        attempt: send.attempt,
+        request: send.final,
+        response,
+      })
+    try {
+      const original = await prepare(messages)
+      const stableHeaders = (headers: Headers) =>
+        [...headers].filter(([name]) => name !== 'x-client-request-id')
+      const originalHeaders = stableHeaders(original.final.headers)
+      expect(
+        await (
+          await expose(original, fallbackReply(FALLBACK_SOURCE, true))
+        )?.text(),
+      ).toContain('the retry answered')
+      expect(events[0]).toMatchObject({
+        kind: 'round_started',
+        requestedModel: FALLBACK_SOURCE,
+        servingModel: FALLBACK_TARGET,
+        category: 'cyber',
+        stepsLeft: 9,
+      })
+      expect(templates).toHaveLength(1)
+      expect(templates[0]).not.toContain(PRIVATE_CREDIT)
+      expect(await core.hasValidRequestBodySignature(templates[0]!)).toBe(true)
+
+      const title = await prepare([{ role: 'user', content: 'make a title' }], {
+        ...primary,
+        agent: 'title',
+        kind: 'title',
+      })
+      const titleText = await title.final.clone().text()
+      expect(JSON.parse(titleText).model).toBe(FALLBACK_TARGET)
+      expect(JSON.parse(titleText)).not.toHaveProperty('thread')
+      expect(await core.hasValidRequestBodySignature(titleText)).toBe(true)
+      const round = await prepare(next)
+      const roundText = await round.final.clone().text()
+      expect(JSON.parse(roundText).model).toBe(FALLBACK_TARGET)
+      expect(stableHeaders(round.final.headers)).toEqual(originalHeaders)
+      expect(await core.hasValidRequestBodySignature(roundText)).toBe(true)
+      expect(roundText).not.toContain(PRIVATE_CREDIT)
+      expect(admitted.slice(-2)).toEqual([FALLBACK_TARGET, FALLBACK_TARGET])
+
+      const bad = () =>
+        Response.json(
+          { error: { message: 'invalid target request' } },
+          { status: 400 },
+        )
+      await (await expose(title, bad()))?.text()
+      expect(events.map(({ kind }) => kind)).toEqual([
+        'round_started',
+        'step_served',
+      ])
+      const result = await expose(round, bad())
+      expect(await result?.text()).toContain(
+        loseResend ? 'invalid target request' : '"stop_reason":"refusal"',
+      )
+      expect(events.at(-1)).toMatchObject({
+        kind: 'round_ended',
+        reason: 'target-400',
+      })
+      expect(physicalExtras.map(({ body }) => JSON.parse(body).model)).toEqual([
+        FALLBACK_TARGET,
+        FALLBACK_SOURCE,
+        FALLBACK_SOURCE,
+      ])
+      for (const { body } of physicalExtras.slice(1)) {
+        expect(JSON.parse(body)).not.toHaveProperty('thread')
+        expect(body).not.toContain(PRIVATE_CREDIT)
+        expect(await core.hasValidRequestBodySignature(body)).toBe(true)
+      }
+      if (loseResend) {
+        await Bun.sleep(10)
+        expect(
+          reports.filter(
+            ({ outcome, status, model }) =>
+              outcome === 'failed' &&
+              status === undefined &&
+              model === FALLBACK_SOURCE,
+          ),
+        ).toHaveLength(1)
+      }
+    } finally {
+      native.dispose()
+    }
+  },
+)
+
+test('OpenCode 2 joins a credited retry after a rejected continue recovers to a refusal', async () => {
+  const sent: Record<string, unknown>[] = []
+  const reports: core.AnthropicBillingReport[] = []
   const { source } = makeSource({
-    admitRequest(input) {
-      admitted.push(input.modelID)
-    },
+    billingRequest: (input) => ({
+      sessionId: input.sessionID,
+      credentialId: 'synthetic-credential-row',
+      requestKind: input.kind,
+      model: input.modelID,
+      onReport: (report) => reports.push(report),
+    }),
   })
   const native = createNativeAnthropicAdapter({
     source,
-    rounds,
-    onRoundCacheTemplate(input) {
-      if (input.template) templates.push(input.template.bodyText)
-    },
     fetch: (async (_url, init) => {
-      const body = String(init?.body)
-      physicalExtras.push({ body, headers: new Headers(init?.headers) })
-      const model = JSON.parse(body).model
-      return fallbackReply(model, model === FALLBACK_SOURCE)
+      const body = JSON.parse(String(init?.body))
+      sent.push(body)
+      return fallbackReply(body.model, body.model === FALLBACK_SOURCE)
     }) as typeof fetch,
   })
   const host = new Host(native.adapter)
-  const primary = scopeOf({ modelID: FALLBACK_SOURCE })
-  const payload = { ...sonnetPayload(), model: FALLBACK_SOURCE, stream: true }
-  const messages = [{ role: 'user', content: 'source turn' }]
-  const next = [
-    ...messages,
-    { role: 'assistant', content: 'the retry answered' },
-    { role: 'user', content: 'next turn' },
-  ]
-  const prepare = (history: typeof messages, scope = primary) =>
+  const scope = scopeOf({ modelID: FALLBACK_SOURCE })
+  const messages = [{ role: 'user', content: 'first' }]
+  const payload = { model: FALLBACK_SOURCE, stream: true, max_tokens: 100 }
+  const prepare = (history: typeof messages) =>
     host.run(scope, hostRequest({ ...payload, messages: history }))
   const expose = (
-    send: Awaited<ReturnType<typeof prepare>>,
+    { attempt, final }: Awaited<ReturnType<typeof prepare>>,
     response: Response,
   ) =>
     native.adapter.rewriteResponse?.({
-      ...send.attempt,
-      attempt: send.attempt,
-      request: send.final,
+      ...attempt,
+      attempt,
+      request: final,
       response,
     })
   try {
-    const original = await prepare(messages)
-    const stableHeaders = (headers: Headers) =>
-      [...headers].filter(([name]) => name !== 'x-client-request-id')
-    const originalHeaders = stableHeaders(original.final.headers)
+    await (
+      await expose(await prepare(messages), fallbackReply(FALLBACK_SOURCE))
+    )?.text()
+    const next = [
+      ...messages,
+      { role: 'assistant', content: 'the retry answered' },
+      { role: 'user', content: 'second' },
+    ]
+    const continued = await prepare(next)
     expect(
-      await (
-        await expose(original, fallbackReply(FALLBACK_SOURCE, true))
-      )?.text(),
-    ).toContain('the retry answered')
-    expect(events[0]).toMatchObject({
-      kind: 'round_started',
-      requestedModel: FALLBACK_SOURCE,
-      servingModel: FALLBACK_TARGET,
-      category: 'cyber',
-      stepsLeft: 9,
-    })
-    expect(templates).toHaveLength(1)
-    expect(templates[0]).not.toContain(PRIVATE_CREDIT)
-    expect(await core.hasValidRequestBodySignature(templates[0]!)).toBe(true)
-
-    const title = await prepare([{ role: 'user', content: 'make a title' }], {
-      ...primary,
-      agent: 'title',
-      kind: 'title',
-    })
-    const titleText = await title.final.clone().text()
-    expect(JSON.parse(titleText).model).toBe(FALLBACK_TARGET)
-    expect(JSON.parse(titleText)).not.toHaveProperty('thread')
-    expect(await core.hasValidRequestBodySignature(titleText)).toBe(true)
-    const round = await prepare(next)
-    const roundText = await round.final.clone().text()
-    expect(JSON.parse(roundText).model).toBe(FALLBACK_TARGET)
-    expect(stableHeaders(round.final.headers)).toEqual(originalHeaders)
-    expect(await core.hasValidRequestBodySignature(roundText)).toBe(true)
-    expect(roundText).not.toContain(PRIVATE_CREDIT)
-    expect(admitted.slice(-2)).toEqual([FALLBACK_TARGET, FALLBACK_TARGET])
-
-    const bad = () =>
+      JSON.parse(await continued.final.clone().text()).thread,
+    ).toMatchObject({ type: 'continue' })
+    const response = await expose(
+      continued,
       Response.json(
-        { error: { message: 'invalid target request' } },
-        { status: 400 },
-      )
-    await (await expose(title, bad()))?.text()
-    expect(events.map(({ kind }) => kind)).toEqual([
-      'round_started',
-      'step_served',
-    ])
-    const result = await expose(round, bad())
-    expect(await result?.text()).toContain('"stop_reason":"refusal"')
-    expect(events.at(-1)).toMatchObject({
-      kind: 'round_ended',
-      reason: 'target-400',
+        {
+          type: 'error',
+          error: {
+            type: 'not_found_error',
+            details: { error_code: 'thread_not_found' },
+          },
+        },
+        { status: 404 },
+      ),
+    )
+    const text = await response?.text()
+    expect(sent[0]).toMatchObject({
+      model: FALLBACK_SOURCE,
+      thread: { type: 'create' },
+      messages: next,
     })
-    expect(physicalExtras.map(({ body }) => JSON.parse(body).model)).toEqual([
-      FALLBACK_TARGET,
-      FALLBACK_SOURCE,
-      FALLBACK_SOURCE,
+    expect(text).toContain('the retry answered')
+    expect(text).not.toContain(PRIVATE_CREDIT)
+    expect(text).not.toContain('"stop_reason":"refusal"')
+    expect(sent).toHaveLength(2)
+    expect(sent[1]).toMatchObject({
+      model: FALLBACK_TARGET,
+      thread: { type: 'create' },
+      messages: next,
+      fallback_credit_token: PRIVATE_CREDIT,
+    })
+    await until(() => reports.length >= 4)
+    expect(reports.map(({ model, status }) => [model, status])).toEqual([
+      [FALLBACK_SOURCE, 200],
+      [FALLBACK_SOURCE, 404],
+      [FALLBACK_SOURCE, 200],
+      [FALLBACK_TARGET, 200],
     ])
-    for (const { body } of physicalExtras.slice(1)) {
-      expect(JSON.parse(body)).not.toHaveProperty('thread')
-      expect(body).not.toContain(PRIVATE_CREDIT)
-      expect(await core.hasValidRequestBodySignature(body)).toBe(true)
-    }
   } finally {
     native.dispose()
   }
 })
+
+test.each([
+  [false, 'http-relay'],
+  [true, 'http-relay'],
+  [false, 'direct'],
+  [true, 'direct'],
+] as const)(
+  'OpenCode 2 relay-origin refusal follows fallbackToDirect=%s with %s authorization',
+  async (fallbackToDirect, retryDispatch) => {
+    const dispatch = {
+      kind: 'http-relay' as const,
+      url: 'https://relay.example.test',
+      token: 'relay-token',
+    }
+    const sent: Array<{ url: string; body: Record<string, unknown> }> = []
+    const { source } = makeSource({
+      allowsDirectRefusalRetry: () => fallbackToDirect,
+      authorizeAccount: (input) =>
+        oauth(
+          'stable-relay-oauth',
+          { custody: 'local', receipt: 'relay-row' },
+          {
+            dispatch:
+              input.extraSend && retryDispatch === 'direct'
+                ? { kind: 'direct' }
+                : dispatch,
+          },
+        ),
+    })
+    const native = createNativeAnthropicAdapter({
+      source,
+      fetch: (async (url, init) => {
+        sent.push({ url: String(url), body: JSON.parse(String(init?.body)) })
+        return fallbackReply(FALLBACK_TARGET)
+      }) as typeof fetch,
+    })
+    try {
+      const { attempt, final } = await new Host(native.adapter).run(
+        scopeOf({ modelID: FALLBACK_SOURCE }),
+        hostRequest({
+          model: FALLBACK_SOURCE,
+          stream: true,
+          max_tokens: 100,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      )
+      expect(final.url).toBe(`${dispatch.url}/`)
+      const response = await native.adapter.rewriteResponse?.({
+        ...attempt,
+        attempt,
+        request: final,
+        response: fallbackReply(FALLBACK_SOURCE, true),
+      })
+      expect(await response?.text()).toContain(
+        fallbackToDirect ? 'the retry answered' : '"stop_reason":"refusal"',
+      )
+      expect(sent).toEqual(
+        fallbackToDirect
+          ? [
+              {
+                url: `${UPSTREAM}?beta=true`,
+                body: expect.objectContaining({
+                  model: FALLBACK_TARGET,
+                  fallback_credit_token: PRIVATE_CREDIT,
+                }),
+              },
+            ]
+          : [],
+      )
+    } finally {
+      native.dispose()
+    }
+  },
+)
 
 test.each(['answer', 'reject', 'gateway moved', 'new primary'] as const)(
   'OpenCode 2 client fallback: %s',

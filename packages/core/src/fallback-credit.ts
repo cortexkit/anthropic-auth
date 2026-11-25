@@ -243,7 +243,7 @@ export function protectFallbackCreditResponse(
     !betas?.some((beta) => beta.trim() === SERVER_SIDE_FALLBACK_BETA)
   )
     return response
-  if (!response.body) return response
+  if (!response.body && !genuineCredit(sentCredit)) return response
 
   const maxBytes = Math.min(
     checkedLimit(options.maxPendingBytes ?? DEFAULT_SSE_MAX_FRAME_BYTES),
@@ -263,8 +263,13 @@ export function protectFallbackCreditResponse(
   const headers = new Headers(response.headers)
   for (const [name, value] of headers)
     headers.set(name, redactText(value, credits))
-  headers.delete('content-length')
   const statusText = redactText(response.statusText, credits)
+  if (!response.body)
+    return copyStreamResponseTiming(
+      response,
+      new Response(null, { status: response.status, statusText, headers }),
+    )
+  headers.delete('content-length')
   const contentType = headers.get('content-type') ?? ''
   const sse =
     /text\/event-stream/i.test(contentType) ||

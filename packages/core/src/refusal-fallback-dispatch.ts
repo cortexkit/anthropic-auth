@@ -198,11 +198,6 @@ export function dispatchRefusalFallback(
     ...options.billing,
     ...(attempt.refusalRetry && {
       attemptId: undefined,
-      cacheWarming: undefined,
-      cacheWarmingAfter: undefined,
-      ...(options.billing.cache && {
-        cache: { ...options.billing.cache, warming: undefined },
-      }),
     }),
     accountId: origin.accountId,
     credentialId: origin.credentialId,
@@ -284,6 +279,10 @@ export function dispatchRefusalFallback(
 
       const folded = phase === 'folded'
       const token = folded ? undefined : refusal.creditToken
+      const prefill =
+        token && refusal.hasPrefillClaim ? refusal.prefillBlocks : undefined
+      // Once content has reached the host, only a continuation can finish it.
+      if (refusal.hasHostContent && !prefill?.length) return { kind: 'defer' }
       if (token && refusal.hasPrefillClaim && refusal.prefillBlocks === null)
         return { kind: 'none', reason: 'prefill-too-large' }
       let retryBody = folded
@@ -301,10 +300,10 @@ export function dispatchRefusalFallback(
         retryBody = replace(retryBody, ['thread'], { type: 'create' })
       if (token) {
         retryBody = replace(retryBody, ['fallback_credit_token'], token)
-        if (refusal.hasPrefillClaim && refusal.prefillBlocks?.length) {
+        if (prefill?.length) {
           retryBody = replace(retryBody, ['messages', -1], {
             role: 'assistant',
-            content: refusal.prefillBlocks,
+            content: prefill,
           })
         }
       }
@@ -420,6 +419,7 @@ export type RefusalFallbackResendOptions = Pick<
   origin: RefusalFallbackBinding & { headers: Headers }
   /** Attach billing and diagnostics to guarded source bytes, without a thread anchor. */
   observeResendResponse?: (response: Response, model: string) => Response
+  onResendFailure?: (model: string) => void
 }
 
 /** Send the original source shape, not the target's folded or threaded body. */
@@ -437,6 +437,8 @@ export async function resendRefusalFallbackSource(
   onSourceAccepted?: () => void,
 ): Promise<Response> {
   const signal = options.signal ?? new AbortController().signal
+  // The requested model replaces a failed physical send; it is not a fallback
+  // send, so a change to the fallback mode does not cancel this replacement.
   const fresh = () => !signal.aborted && isCurrent()
   if (!fresh()) return response
   const { accountId, credentialId, url } = options.origin
@@ -484,6 +486,7 @@ export async function resendRefusalFallbackSource(
   try {
     resent = await options.send({ url, headers, ...prepared, signal })
   } catch {
+    options.onResendFailure?.(model)
     return response
   }
   void response.body?.cancel().catch(() => {})

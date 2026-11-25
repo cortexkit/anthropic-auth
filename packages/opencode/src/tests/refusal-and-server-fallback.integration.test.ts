@@ -30,6 +30,7 @@ import {
   createFallbackStorage,
   getPlugin as getPluginWithCtx,
   syntheticMainHostAuth,
+  updatePoolRelay,
   useTempAccountFile as useTempAccountFileWithCtx,
   withNativeAdmission as withNativeAdmissionWithCtx,
 } from './support/opencode1-pool-fixture.ts'
@@ -686,8 +687,116 @@ describe('auth.loader', () => {
     expect(sends).toEqual(['claude-fable-5-2', 'claude-fable-5-2'])
   })
 
+  test.each(['relay denied', 'relay allowed', 'late killswitch'] as const)(
+    'OC1 refusal retry: %s',
+    async (scenario) => {
+      const relay = 'https://relay.example.test/'
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          quota: { enabled: false },
+        }),
+      )
+      const sent: Array<[string, string]> = []
+      globalThis.fetch = mock(
+        withNativeAdmission(
+          (input: string | URL | Request, init?: RequestInit) => {
+            const url = extractUrl(input)
+            if (url !== relay && !url.includes('/v1/messages'))
+              return Response.json({})
+            const wire = JSON.parse(String(init?.body))
+            const body = url === relay ? JSON.parse(wire.body) : wire
+            sent.push([url.split('?')[0]!, body.model])
+            return refusalThinkingReply(body.model)
+          },
+        ),
+      ) as unknown as typeof fetch
+      const plugin = await getPlugin()
+      const runtime = getPluginTestHandles(plugin).nativeAccounts
+      const read = runtime.read.bind(runtime)
+      let retryReads = 0
+      let armed = false
+      let killswitch = false
+      const readSpy = spyOn(runtime, 'read').mockImplementation(
+        async (...args) => {
+          const snapshot = await read(...args)
+          if (!killswitch) return snapshot
+          const checkedAt = Date.now()
+          return {
+            ...snapshot,
+            policyStorage: {
+              ...snapshot.policyStorage,
+              killswitch: { enabled: true, main: { five_hour: 20 } },
+            },
+            accounts: snapshot.accounts.map((account) =>
+              account.id === 'main'
+                ? {
+                    ...account,
+                    quota: {
+                      ...account.quota,
+                      checkedAt,
+                      five_hour: {
+                        checkedAt,
+                        usedPercent: 90,
+                        remainingPercent: 10,
+                      },
+                    },
+                  }
+                : account,
+            ),
+          }
+        },
+      )
+      getBodyLifetime(testContext).deferCleanup(() => readSpy.mockRestore())
+      const host = await plugin.auth.loader(
+        async () => {
+          if (scenario === 'late killswitch' && armed && ++retryReads === 2)
+            killswitch = true
+          return { type: 'oauth', ...syntheticMainHostAuth() }
+        },
+        { models: {} },
+      )
+      const relayed = scenario.startsWith('relay')
+      if (relayed)
+        await updatePoolRelay(testContext, {
+          enabled: true,
+          url: relay,
+          token: 'fixture-relay-token',
+          transport: 'http',
+          fallbackToDirect: scenario === 'relay allowed',
+        })
+      const response = await host.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: {
+          'x-session-affinity': `ses_refusal_admission_${scenario.replaceAll(' ', '_')}`,
+        },
+        body: JSON.stringify({
+          model: SOURCE_MODEL,
+          stream: true,
+          max_tokens: 256,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+      expect(sent[0]).toEqual([relayed ? relay : MESSAGES_URL, SOURCE_MODEL])
+      armed = true
+      const text = await response.text()
+      if (scenario === 'late killswitch') expect(killswitch).toBe(true)
+      const permitted = scenario === 'relay allowed'
+      expect(text).toContain(
+        permitted ? TARGET_SIGNATURE : '"stop_reason":"refusal"',
+      )
+      expect(sent).toEqual([
+        [relayed ? relay : MESSAGES_URL, SOURCE_MODEL],
+        ...(permitted
+          ? [[MESSAGES_URL, 'claude-opus-5'] as [string, string]]
+          : []),
+      ])
+    },
+  )
+
   const exerciseRoundWarm = async (
     restart: 'valid' | 'unsupported' | 'legacy' | false,
+    loseResend = false,
   ) => {
     await useTempAccountFile(
       createFallbackStorage({
@@ -719,6 +828,21 @@ describe('auth.loader', () => {
     let refuse = false
     let rejectTarget = false
     let rejectIndependent = false
+    const routingKey = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const previousRouting = globals[routingKey]
+    const reports: Record<string, unknown>[] = []
+    if (loseResend) {
+      globals[routingKey] = () => ({
+        report: (row: Record<string, unknown>) => {
+          if (row.kind === 'billing') reports.push(row)
+        },
+      })
+      getBodyLifetime(testContext).deferCleanup(() => {
+        if (previousRouting === undefined) delete globals[routingKey]
+        else globals[routingKey] = previousRouting
+      })
+    }
     globalThis.fetch = mock(
       withNativeAdmission(
         (input: string | URL | Request, init?: RequestInit) => {
@@ -746,6 +870,8 @@ describe('auth.loader', () => {
               { error: { message: 'unaccepted probe' } },
               { status: 400 },
             )
+          if (rejectTarget && loseResend && body.model === source)
+            throw new Error('source socket closed before headers')
           const refused = body.model === source && refuse
           if (refused) refuse = false
           const events = [
@@ -959,12 +1085,24 @@ describe('auth.loader', () => {
     const before400 = sends.length
     expect(
       await request(host, append(third, 'upstream rejects the round target')),
-    ).toContain('answer')
+    ).toContain(loseResend ? 'rejected target' : 'answer')
     expect(sends.slice(before400).map(({ body }) => body.model)).toEqual([
       target,
       source,
     ])
     expect(sends.at(-1)?.body).not.toHaveProperty('thread')
+    if (loseResend) {
+      await Bun.sleep(10)
+      expect(
+        reports.filter(
+          (row) =>
+            row.model === source &&
+            row.status === undefined &&
+            row.outcome === 'failed',
+        ),
+      ).toHaveLength(1)
+      return
+    }
     expect(keeper.trackedRequest(warmId)).toBeUndefined()
     await request(host, append(third, 'source after the round'))
     expect(sends.at(-1)?.body).toMatchObject({
@@ -984,6 +1122,8 @@ describe('auth.loader', () => {
 
   test('OpenCode 1 warms the last clean source and serves a signed round only in its own plugin instance', () =>
     exerciseRoundWarm(false))
+  test('OpenCode 1 bills a round source resend that loses its socket before headers', () =>
+    exerciseRoundWarm(false, true))
   test('OpenCode 1 restart warms the last accepted requested-model prefix', () =>
     exerciseRoundWarm('valid'))
   test('OpenCode 1 restart drops an unsupported refusal source without sending it', () =>

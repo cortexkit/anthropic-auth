@@ -654,8 +654,7 @@ test.each([[true], [false]])(
     const reply = dispatchRefusalFallback(
       sse(
         start(fable),
-        block({ type: 'text', text: 'prefix' }),
-        close,
+        ...(credited ? [block({ type: 'text', text: 'prefix' }), close] : []),
         payload,
         stop,
       ),
@@ -710,7 +709,7 @@ test.each([[true], [false]])(
     }).text()
     const messages = [
       prompt,
-      { role: 'assistant', content: 'prefixanswer' },
+      { role: 'assistant', content: credited ? 'prefixanswer' : 'answer' },
       { role: 'user', content: 'Follow up?' },
     ]
     expect(plan({ bodyText: JSON.stringify({ ...body, messages }) }).kind).toBe(
@@ -1066,6 +1065,7 @@ test.each(['refused', 'stale', 'broken', 'aborted'] as const)(
               : [end, stop]),
         ],
         {
+          credited: true,
           signal: abort.signal,
           onCommit:
             outcome === 'stale'
@@ -1166,12 +1166,12 @@ test.each([
       messages: [prompt, earlier, system, ask],
     }
     const request = plan({ bodyText: JSON.stringify(original) })
-    await retryWithThinking(request, send(request).lifecycle!, [
-      block(textBlock('latest answer')),
-      close,
-      end,
-      stop,
-    ]).text()
+    await retryWithThinking(
+      request,
+      send(request).lifecycle!,
+      [block(textBlock('latest answer')), close, end, stop],
+      { credited: true },
+    ).text()
     const latest = assistant(sourceThought, textBlock('latest answer'))
     const next = {
       ...original,
@@ -1193,6 +1193,56 @@ test.each([
       kind: 'round_ended',
       reason: 'compaction',
     })
+  },
+)
+
+test.each(['append', 'edit'] as const)(
+  'deferred refusal checks the leading blocks of a merged user turn: %s',
+  async (change) => {
+    const { plan, send, events } = fixture()
+    const earlier = [prompt, assistant(textBlock('earlier answer'))]
+    const leading = [textBlock('the refused request'), textBlock('keep this')]
+    const initial = plan({
+      bodyText: replay(...earlier, { role: 'user', content: leading }),
+    })
+    const { options, sends } = resendOptions()
+    const refusal = dispatchRefusalFallback(
+      sse(
+        start(fable),
+        block(textBlock('The result is ')),
+        close,
+        refused,
+        stop,
+      ),
+      {
+        ...options,
+        origin: { ...options.origin, bodyText: initial.bodyText },
+        billing: { sessionId: 's', requestKind: 'primary' },
+        isFresh: allowed,
+        lifecycle: send(initial).lifecycle,
+      },
+    )
+    expect(await refusal.text()).toContain('"stop_reason":"refusal"')
+    expect(sends).toEqual([])
+    expect(events).toEqual([
+      expect.objectContaining({ kind: 'round_started', stepsLeft: 10 }),
+    ])
+    const next = plan({
+      bodyText: replay(...earlier, {
+        role: 'user',
+        content: [
+          leading[0],
+          change === 'append' ? leading[1] : textBlock('edited'),
+          textBlock('next request'),
+        ],
+      }),
+    })
+    expect(next.kind).toBe(change === 'append' ? 'round' : 'source')
+    if (change === 'edit')
+      expect(events.at(-1)).toMatchObject({
+        kind: 'round_ended',
+        reason: 'compaction',
+      })
   },
 )
 

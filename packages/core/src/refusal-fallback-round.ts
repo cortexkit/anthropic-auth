@@ -17,9 +17,13 @@ import {
   type RefusalFallbackPrefix,
   refusalBodyRecord,
   refusalFallbackCheckpoint,
+  refusalFallbackDeferredPrefix,
   refusalFallbackPrefix,
 } from './refusal-fallback-prefix.ts'
-import type { RefusalFallbackCompletion } from './refusal-fallback-stream.ts'
+import type {
+  RefusalFallbackCompletedRefusal,
+  RefusalFallbackCompletion,
+} from './refusal-fallback-stream.ts'
 import {
   fitRefusalFallbackTarget,
   foldRefusalFallbackEffort,
@@ -634,10 +638,13 @@ export class RefusalFallbackRoundEngine {
     request: Request,
     { usage, reply }: Pick<RefusalFallbackCompletion, 'usage' | 'reply'>,
     projectReply: RefusalFallbackRoundLifecycleOptions['projectReply'],
+    deferred = false,
   ): Pick<Round, 'base' | 'checkpoint'> {
     const body = parse(request.baseBodyText)
     if (!body) return { checkpoint: null }
-    const prefix = refusalFallbackPrefix(body)
+    const prefix = deferred
+      ? refusalFallbackDeferredPrefix(body)
+      : refusalFallbackPrefix(body)
     const inputTokens = measuredInputTokens(usage)
     const base =
       inputTokens === undefined ? undefined : { ...prefix, inputTokens }
@@ -760,6 +767,34 @@ export class RefusalFallbackRoundEngine {
     }
     let releaseRetryThinking: (() => void) | undefined
     if (onCacheKeepTemplate) request.publishTemplate = publish
+    const startOnNextRequest = (refusal: RefusalFallbackCompletedRefusal) => {
+      if (request.phase !== 'refusal' || !refusal.category || !fresh()) return
+      request.phase = 'finished'
+      const body = parse(request.baseBodyText)
+      if (!body) return
+      const choice = {
+        sourceModel:
+          typeof body.model === 'string' ? body.model : request.session.model,
+        category: refusal.category,
+        body,
+        refusedUsage: refusal.usage,
+      }
+      let target = selectRefusalFallbackTarget(choice)
+      const folded =
+        target.kind === 'none' && target.reason === 'no-fitting-target'
+      if (folded)
+        target = selectRefusalFallbackTarget({ ...choice, phase: 'folded' })
+      if (target.kind === 'target' && targetAllowed(target.model) && fresh()) {
+        this.#start(
+          request,
+          refusal.category,
+          { model: target.model, folded },
+          this.#step(request, refusal, projectReply, !refusal.releasedTool),
+          false,
+        )
+        publish(null, target.model)
+      }
+    }
     return {
       captureReply: true,
       cacheKeepTemplateSettled: publication?.promise,
@@ -811,39 +846,10 @@ export class RefusalFallbackRoundEngine {
           request.phase = 'refusal'
           request.family.clean = 0
           request.category = refusal.category
-          if (!refusal.releasedTool || !refusal.category) return
-          request.phase = 'finished'
-          const body = parse(request.baseBodyText)
-          if (!body) return
-          const choice = {
-            sourceModel:
-              typeof body.model === 'string'
-                ? body.model
-                : request.session.model,
-            category: refusal.category,
-            body,
-            refusedUsage: refusal.usage,
-          }
-          let target = selectRefusalFallbackTarget(choice)
-          const folded =
-            target.kind === 'none' && target.reason === 'no-fitting-target'
-          if (folded)
-            target = selectRefusalFallbackTarget({ ...choice, phase: 'folded' })
-          if (
-            target.kind === 'target' &&
-            targetAllowed(target.model) &&
-            fresh()
-          ) {
-            this.#start(
-              request,
-              refusal.category,
-              { model: target.model, folded },
-              this.#step(request, refusal, projectReply),
-              false,
-            )
-            publish(null, target.model)
-          }
+          if (refusal.releasedTool) startOnNextRequest(refusal)
         },
+        // A host may omit a refused assistant turn from its next request.
+        onDeferredRefusal: startOnNextRequest,
         onRetryCompleted: (completion, target) => {
           if (request.phase !== 'refusal' || !request.category || !fresh())
             return

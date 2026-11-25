@@ -84,11 +84,17 @@ describe('Pi client refusal fallback', () => {
     'client payload replacement',
     'off',
     'target exhausted',
+    'relay denied',
+    'relay allowed',
+    'shared routing below quota floor',
   ] as const)(
     '%s preserves the beta and checks the target before retrying',
     async (scenario) => {
       const mode = scenario === 'off' ? 'off' : 'client'
-      const retries = scenario.startsWith('client')
+      const shared = scenario === 'shared routing below quota floor'
+      const relayed = scenario.startsWith('relay')
+      const retries =
+        scenario.startsWith('client') || scenario === 'relay allowed' || shared
       tempDir = await mkdtemp(join(tmpdir(), 'pi-refusal-fallback-'))
       const storagePath = join(tempDir, 'accounts.json')
       process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
@@ -98,9 +104,30 @@ describe('Pi client refusal fallback', () => {
       const read = runtime.read.bind(runtime)
       await runtime.updateSettings((settings) => ({
         ...settings,
-        quota: { enabled: false },
+        quota: shared
+          ? {
+              enabled: true,
+              minimumRemaining: { five_hour: 20, seven_day: 20 },
+            }
+          : { enabled: false },
         cacheKeep: { enabled: false },
       }))
+      const relay = 'https://relay.example.test/v1/messages'
+      if (relayed)
+        await runtime.updateRelay({
+          enabled: true,
+          url: relay,
+          token: 'fixture-relay-token',
+          transport: 'http',
+          fallbackToDirect: retries,
+        })
+      if (shared)
+        globals[routingKey] = () => ({
+          accountFor: async () => ({
+            account_id: fixtureAccountIdentity('main'),
+            credential_id: 'local',
+          }),
+        })
       const source = { ...anthropicModel, id: 'claude-fable-5-2' }
       const target = 'claude-opus-4-8'
       const readSpy = spyOn(runtime, 'read').mockImplementation(
@@ -133,6 +160,28 @@ describe('Pi client refusal fallback', () => {
                   : account,
               ),
             }),
+            ...(shared && {
+              accounts: snapshot.accounts.map((account) =>
+                account.id === 'main'
+                  ? {
+                      ...account,
+                      quota: {
+                        checkedAt,
+                        five_hour: {
+                          checkedAt,
+                          usedPercent: 90,
+                          remainingPercent: 10,
+                        },
+                        seven_day: {
+                          checkedAt,
+                          usedPercent: 0,
+                          remainingPercent: 100,
+                        },
+                      },
+                    }
+                  : account,
+              ),
+            }),
           }
         },
       )
@@ -143,6 +192,7 @@ describe('Pi client refusal fallback', () => {
         body: Record<string, unknown>
         headers: Headers
         text: string
+        url: string
       }[] = []
       const targetUsage = {
         input_tokens: 31,
@@ -157,12 +207,20 @@ describe('Pi client refusal fallback', () => {
         async (input: string | URL | Request, init?: RequestInit) => {
           if (!String(input).includes('/v1/messages'))
             throw new Error('unexpected request')
-          const text =
+          const url = String(input)
+          const requestText =
             init?.body instanceof Uint8Array
               ? gunzipSync(init.body).toString()
               : String(init?.body)
+          const envelope = url === relay ? JSON.parse(requestText) : undefined
+          const text = envelope?.body ?? requestText
           const body = JSON.parse(text)
-          sent.push({ text, body, headers: new Headers(init?.headers) })
+          sent.push({
+            text,
+            body,
+            url,
+            headers: new Headers(envelope?.upstream.headers ?? init?.headers),
+          })
           const retry = body.model === target
           return new Response(
             [
@@ -238,6 +296,12 @@ describe('Pi client refusal fallback', () => {
         expect(sent.map(({ body }) => body.model)).toEqual(
           retries ? [source.id, target] : [source.id],
         )
+        if (relayed)
+          expect(sent.map(({ url }) => url.split('?')[0])).toEqual(
+            retries
+              ? [relay, 'https://api.anthropic.com/v1/messages']
+              : [relay],
+          )
         for (const { body, headers, text } of sent) {
           expect(headers.get('anthropic-beta')?.split(',')).toContain(
             core.SERVER_SIDE_FALLBACK_BETA,
@@ -247,11 +311,28 @@ describe('Pi client refusal fallback', () => {
           expect(await core.hasValidRequestBodySignature(text)).toBe(true)
         }
         expect(JSON.stringify(result)).not.toContain(token)
-        expect(authSpy.mock.calls.filter((call) => call[2] === target)).toEqual(
-          mode === 'off'
-            ? []
-            : [['main', expect.any(AbortSignal), target, 'serve']],
+        const targetAuth = authSpy.mock.calls.filter(
+          (call) => call[2] === target,
         )
+        if (shared)
+          expect(targetAuth).toEqual([
+            [
+              'main',
+              expect.any(AbortSignal),
+              target,
+              'serve',
+              expect.objectContaining({
+                account_id: fixtureAccountIdentity('main'),
+                credential_id: 'local',
+              }),
+            ],
+          ])
+        else
+          expect(targetAuth).toEqual(
+            mode === 'off' || scenario === 'relay denied'
+              ? []
+              : [['main', expect.any(AbortSignal), target, 'serve']],
+          )
         if (!retries) {
           expect(result.stopReason).toBe('error')
           expect(result.errorMessage).toContain('stop_reason: refusal')
@@ -707,9 +788,10 @@ test.each([
   },
 )
 
-test.each(['stateless', 'threaded'] as const)(
+test.each(['stateless', 'threaded', 'threaded socket loss'] as const)(
   'Pi %s refusal round replays signed thinking, routes side requests and returns to source',
   async (transport) => {
+    const loseResend = transport === 'threaded socket loss'
     tempDir = await mkdtemp(join(tmpdir(), 'pi-refusal-round-'))
     const storagePath = join(tempDir, 'accounts.json')
     process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
@@ -726,6 +808,13 @@ test.each(['stateless', 'threaded'] as const)(
     const sessionId = `pi-round-${transport}`
     const token = 'unique-pi-round-credit'
     const notices: Array<string | undefined> = []
+    const reports: Record<string, unknown>[] = []
+    if (loseResend)
+      globals[routingKey] = () => ({
+        report: (row: Record<string, unknown>) => {
+          if (row.kind === 'billing') reports.push(row)
+        },
+      })
     let claude: ((...args: unknown[]) => Promise<void>) | undefined
     registerCommands(
       {
@@ -785,6 +874,8 @@ test.each(['stateless', 'threaded'] as const)(
           },
           { status: 400 },
         )
+      if (loseResend && answer === 'reject-target' && sent.length === 7)
+        throw new Error('source socket closed before headers')
       const refused = answer === 'refuse' && model === source.id
       const frames: Record<string, unknown>[] = [
         {
@@ -876,7 +967,7 @@ test.each(['stateless', 'threaded'] as const)(
         history,
         {
           sessionId,
-          ...(transport === 'threaded' && {
+          ...(transport !== 'stateless' && {
             onPayload: (payload: unknown) => payload,
             onResponse: () => {},
             onProviderStreamEvent: () => {},
@@ -958,7 +1049,7 @@ test.each(['stateless', 'threaded'] as const)(
       } else {
         answer = 'reject-target'
       }
-      expect((await send()).stopReason).toBe('stop')
+      expect((await send()).stopReason).toBe(loseResend ? 'error' : 'stop')
       expect(sent.at(-1)?.body.model).toBe(source.id)
       expect(sent.at(-1)?.text).toContain('source-signed-probe')
       expect(sent.at(-1)?.text).not.toContain('target-signed-probe')
@@ -966,7 +1057,21 @@ test.each(['stateless', 'threaded'] as const)(
       expect(notices.at(-1)).toBeUndefined()
       expect(await claudeStatus()).not.toContain('Claude safety fallback')
       answer = 'complete'
-      if (transport === 'threaded') {
+      if (loseResend) {
+        expect(sent.slice(-2).map(({ body }) => body.model)).toEqual([
+          target,
+          source.id,
+        ])
+        await Bun.sleep(10)
+        expect(
+          reports.filter(
+            (row) =>
+              row.model === source.id &&
+              row.outcome === 'failed' &&
+              row.status === undefined,
+          ),
+        ).toHaveLength(1)
+      } else if (transport === 'threaded') {
         expect(sent[4]?.body.thread).toEqual({ type: 'create' })
         expect(sent[5]?.body.model).toBe(target)
         expect(sent.at(-1)?.body.thread).toBeUndefined()

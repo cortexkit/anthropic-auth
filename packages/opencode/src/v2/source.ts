@@ -527,7 +527,8 @@ export function createNativeAnthropicSource(
     nativeAccountCanServe(account) &&
     (extraSend
       ? account.type === 'oauth' &&
-        extraSendPolicy(account, snapshot, modelID).status === 'allowed'
+        extraSendPolicy(account, snapshot, modelID, sessionID, extraSend.kind)
+          .status === 'allowed'
       : account.type === 'api' ||
         routingRelay.policy(sessionID, account, snapshot, remapModelId(modelID))
           .status === 'allowed')
@@ -536,8 +537,20 @@ export function createNativeAnthropicSource(
     account: NativeAccountView,
     snapshot: NativeAccountSnapshot,
     modelID: string,
+    sessionID: string,
+    kind: NonNullable<NativeAnthropicSendScope['extraSend']>['kind'],
   ): NativeAccountPolicy => {
     const policy = nativeAccountPolicy(account, snapshot, modelID)
+    if (kind === 'refusal' && routingRelay.admitted(sessionID, account)) {
+      // The shared router already admitted this payer for the step's general
+      // quota floor. The retry model's killswitch and scoped quota still apply.
+      if (
+        policy.quotaPolicyLimits?.length === 1 &&
+        policy.quotaPolicyLimits[0] === 'quota-floor'
+      )
+        return { status: 'allowed' }
+      return policy
+    }
     if (
       policy.status !== 'allowed' ||
       !isKillswitchEnabled(snapshot.policyStorage)
@@ -1074,6 +1087,12 @@ export function createNativeAnthropicSource(
   }
 
   const source: NativeSource = {
+    async allowsDirectRefusalRetry(input) {
+      return (
+        states.get(input.provenance)?.relayFallback === true &&
+        (await runtime.getRelayConfig())?.fallbackToDirect === true
+      )
+    },
     isRefusalFallbackCurrent(input) {
       if (closed || states.get(input.provenance)?.active.signal.aborted)
         return false
@@ -1651,7 +1670,9 @@ export function createNativeAnthropicSource(
         gateway: sendGateway,
       } = await dispatchFor(
         snapshot,
-        extraSend?.kind === 'refusal' || choice?.direct === true,
+        extraSend?.kind === 'source-resend' ||
+          extraSend?.kind === 'refusal' ||
+          choice?.direct === true,
         account.type,
       )
       const gatewayField = sendGateway ? { gateway: sendGateway } : {}
@@ -1779,7 +1800,13 @@ export function createNativeAnthropicSource(
         signal: active.signal,
         policy: (row, view) =>
           extraSend
-            ? extraSendPolicy(row, view, modelID)
+            ? extraSendPolicy(
+                row,
+                view,
+                modelID,
+                scope.sessionID,
+                extraSend.kind,
+              )
             : routingRelay.policy(scope.sessionID, row, view, modelID),
       })
       active.signal.throwIfAborted()

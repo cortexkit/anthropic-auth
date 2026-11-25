@@ -47,6 +47,7 @@ export type RefusalFallbackStreamRetry =
       onFinished?: () => void
     }
   | { kind: 'none'; reason: string }
+  | { kind: 'defer' }
 
 export type RefusalFallbackCompletion = {
   stopReason: 'end_turn' | 'tool_use' | 'max_tokens'
@@ -65,6 +66,7 @@ export type RefusalFallbackCompletedRefusal = {
 export type RefusalFallbackLifecycle = {
   onCompleted?: (completion: RefusalFallbackCompletion) => void
   onRefusal?: (refusal: RefusalFallbackCompletedRefusal) => void
+  onDeferredRefusal?: (refusal: RefusalFallbackCompletedRefusal) => void
   captureReply?: boolean
   onThinkingDigest?: (digest: string) => void
 }
@@ -632,7 +634,9 @@ export function joinRefusalFallbackStream(
     return []
   }
 
-  async function runRetry(refusal: RefusalFallbackStreamRefusal) {
+  async function runRetry(
+    refusal: RefusalFallbackStreamRefusal,
+  ): Promise<boolean | 'defer'> {
     if (!retry) return false
     const retryAbort = new AbortController()
     const retrySignal = AbortSignal.any([abort.signal, retryAbort.signal])
@@ -658,6 +662,7 @@ export function joinRefusalFallbackStream(
     try {
       const result = await retry(refusal, retrySignal)
       if (result.kind === 'none') return false
+      if (result.kind === 'defer') return 'defer'
       const { response: target } = result
       onCommitted = result.onCommitted
       onFinished = result.onFinished
@@ -790,20 +795,21 @@ export function joinRefusalFallbackStream(
             ? prefill?.complete()
             : undefined
         prefill?.clear()
-        if (
-          sawStop &&
-          fresh &&
-          !source.releasedTool &&
-          retry &&
-          (await runRetry({
+        if (sawStop && fresh && !source.releasedTool && retry) {
+          const result = await runRetry({
             ...refusal,
             creditToken,
             hasHostContent: sourceHasContent,
             hasPrefillClaim,
             ...(prefillBlocks !== undefined && { prefillBlocks }),
-          }))
-        )
-          return
+          })
+          if (result === true) return
+          if (result === 'defer' && source.canReportRefusal && isFresh())
+            notify(options.lifecycle?.onDeferredRefusal, {
+              ...refusal,
+              releasedTool: false,
+            })
+        }
         await waitForDemand()
         const output = beforeSourceContent()
         const [, ...stops] = source.hold.release(terminalKey)

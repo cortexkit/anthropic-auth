@@ -269,8 +269,8 @@ test('claimed prefill copies closed signed blocks and synthetically closed text,
 })
 
 test.each([
-  ['no claim', credit, false, { type: 'text', text: 'visible' }],
-  ['cold refusal', null, true, { type: 'text', text: 'visible' }],
+  ['no claim', credit, false, { type: 'text', text: 'The result is ' }],
+  ['cold refusal', null, true, { type: 'text', text: 'The result is ' }],
   [
     'no eligible block',
     credit,
@@ -278,7 +278,7 @@ test.each([
     { type: 'thinking', thinking: 'unsigned' },
   ],
 ] as const)(
-  '%s never appends an assistant prefill',
+  '%s leaves the refusal standing after visible content without a continuation',
   async (_label, token, claim, content) => {
     const { options, sends } = await setup()
     const response = stream(
@@ -288,11 +288,11 @@ test.each([
       refuse(token, claim),
       stop,
     )
-    await dispatchRefusalFallback(response, options).text()
-    expect(sends).toHaveLength(1)
-    const body = JSON.parse(at(sends).bodyText)
-    expect(body.messages).toEqual(input.messages)
-    expect(body.fallback_credit_token).toBe(token ?? undefined)
+    const output = await dispatchRefusalFallback(response, options).text()
+    expect(output).toContain(JSON.stringify(content))
+    expect(output).toContain('"stop_reason":"refusal"')
+    expect(output).not.toContain('answer')
+    expect(sends).toHaveLength(0)
   },
 )
 
@@ -410,10 +410,7 @@ test('exhausted unchanged targets get one folded retry on the first unused model
         stop,
       ),
   )
-  const output = await dispatchRefusalFallback(
-    origin(block(0, { type: 'text', text: 'source text' }), close(0)),
-    options,
-  ).text()
+  const output = await dispatchRefusalFallback(origin(), options).text()
   expect(output).not.toContain('refusal')
   expect(admissions).toEqual([opus5, opus48])
   expect(sends).toHaveLength(2)
@@ -438,6 +435,90 @@ test('exhausted unchanged targets get one folded retry on the first unused model
     },
     { refusalRetry: true, paysCacheWrite: true, folded: true },
   ])
+})
+
+test('a folded target cannot restart an already visible answer', async () => {
+  const marker = {
+    role: 'system',
+    content: [],
+    output_config: { effort: 'low' },
+  }
+  const { options, sends, replies } = await setup({
+    bodyText: JSON.stringify({
+      ...input,
+      messages: [marker, ...input.messages],
+    }),
+  })
+  replies.push(() => rejected(wrongModel))
+  const output = await dispatchRefusalFallback(
+    origin(block(0, { type: 'text', text: 'source text' }), close(0)),
+    options,
+  ).text()
+  assertStandingRefusal(output)
+  expect(output).toContain('source text')
+  expect(output).not.toContain('answer')
+  expect(sends.map(({ bodyText }) => JSON.parse(bodyText).model)).toEqual([
+    opus5,
+  ])
+  expect(JSON.parse(at(sends).bodyText).messages.at(-1)).toEqual({
+    role: 'assistant',
+    content: [{ type: 'text', text: 'source text' }],
+  })
+})
+
+test('only the serving row waits for the retry CacheKeep template', async () => {
+  const { options, reports } = await setup()
+  const publication = Promise.withResolvers<void>()
+  const sourceReported = Promise.withResolvers<void>()
+  const warming = { on: true as const }
+  let warmed = false
+  let completed = false
+  options.billing.cacheWarming = () => (warmed ? warming : undefined)
+  options.billing.cacheWarmingAfter = () => publication.promise
+  options.lifecycle = {
+    cacheKeepTemplateSettled: publication.promise,
+    onRetryCompleted() {
+      completed = true
+    },
+  }
+  const report = options.onBillingReport
+  options.onBillingReport = (...args) => {
+    report?.(...args)
+    if (!args[1].refusalRetry) sourceReported.resolve()
+  }
+  expect(await dispatchRefusalFallback(origin(), options).text()).toContain(
+    'answer',
+  )
+  expect(completed).toBe(true)
+  await sourceReported.promise
+  warmed = true
+  publication.resolve()
+  await Bun.sleep(10)
+  expect(reports.map(([row]) => [row.model, row.cache?.warming])).toEqual([
+    [fable, undefined],
+    [opus48, warming],
+  ])
+})
+
+test('the billing row for a bodyless credited 204 never sees the sent credit', async () => {
+  const { options, reports, replies, sends } = await setup()
+  replies.push(
+    () =>
+      new Response(null, {
+        status: 204,
+        headers: { 'request-id': `gateway-echo-${credit}` },
+      }),
+  )
+  assertStandingRefusal(await dispatchRefusalFallback(origin(), options).text())
+  expect(JSON.parse(at(sends).bodyText).fallback_credit_token).toBe(credit)
+  await Bun.sleep(10)
+  expect(reports).toHaveLength(2)
+  expect(at(reports, 1)[0]).toMatchObject({
+    model: opus48,
+    status: 204,
+    providerRequestId: `gateway-echo-${FALLBACK_CREDIT_PLACEHOLDER}`,
+  })
+  expect(JSON.stringify(reports)).not.toContain(credit)
 })
 
 test.each([

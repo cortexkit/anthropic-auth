@@ -1560,6 +1560,74 @@ describe('OC2 shared routing relay', () => {
     },
   )
 
+  test.each(['general floor', 'target scope', 'killswitch'] as const)(
+    'OC2 refusal target admission on a shared-routed account: %s',
+    async (policy) => {
+      const f = await vault()
+      const native = source(f.runtime, f.paths)
+      const input = { ...scope, modelID: 'claude-fable-5-2' }
+      const target = 'claude-opus-4-8'
+      await f.store.updateSettings((settings) => ({
+        ...settings,
+        quota: {
+          enabled: true,
+          minimumRemaining: { five_hour: 20, seven_day: 0 },
+        },
+        killswitch: {
+          enabled: policy === 'killswitch',
+          main: { five_hour: 20 },
+        },
+      }))
+      const receipt = await f.runtime.authorizeVault('main')
+      const checkedAt = Date.now()
+      await f.runtime.vault.publish(receipt, {
+        quota: {
+          accountIdentity: identity,
+          checkedAt,
+          five_hour: { usedPercent: 90, remainingPercent: 10, checkedAt },
+          seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt },
+          scoped:
+            policy === 'target scope'
+              ? [
+                  {
+                    id: 'opus',
+                    title: 'Opus weekly',
+                    modelId: target,
+                    modelName: target,
+                    usedPercent: 100,
+                    remainingPercent: 0,
+                    checkedAt,
+                  },
+                ]
+              : [],
+        },
+      })
+      bridge(() => ({
+        account_id: identity,
+        credential_id: receipt.credentialId,
+      }))
+      expect(await native.chooseAccount(input)).toBe('main')
+      const primary = await native.authorizeAccount(input, 'main')
+      if (primary?.route !== 'oauth')
+        throw new Error('Expected routed OAuth source')
+      const retry = await native.authorizeAccount(
+        {
+          ...input,
+          modelID: target,
+          extraSend: { kind: 'refusal', credentialId: primary.credentialId },
+        },
+        'main',
+      )
+      if (policy === 'general floor')
+        expect(retry).toMatchObject({
+          route: 'oauth',
+          credentialId: primary.credentialId,
+          identity: primary.identity,
+        })
+      else expect(retry).toBeUndefined()
+    },
+  )
+
   test('no accessor and undefined advice leave OC2 request bytes and choice unchanged', async () => {
     const f = await vaultWithFallback()
     const native = source(f.runtime, f.paths)

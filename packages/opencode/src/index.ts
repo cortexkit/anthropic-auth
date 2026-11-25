@@ -7860,6 +7860,19 @@ const anthropicAuthPlugin = async (
               isCurrentSessionRequest(cacheRequest, payer, 'cache') &&
               (laneStartRequest ||
                 readRefusalFallbackMode() === refusalFallbackMode)
+            const targetModelAllowed = (
+              quota: ReturnType<typeof routingAccountQuota>,
+              storage: AccountStorage,
+              model: string,
+            ) =>
+              quotaSnapshotPassesModelScope(quota, model) &&
+              (!isKillswitchEnabled(storage) ||
+                killswitchPassesPolicy(
+                  quota,
+                  storage,
+                  oauthAccountId === 'main' ? undefined : oauthAccountId,
+                  model,
+                ))
             const targetAllowed = (model: string) => {
               const snapshot = nativeAccounts.peek?.()
               if (!snapshot) return true // The physical authorization still checks quota.
@@ -7873,16 +7886,7 @@ const anthropicAuthPlugin = async (
                 storage,
                 nativeAuthorization.scopedAttempt,
               )
-              return (
-                quotaSnapshotPassesModelScope(quota, model) &&
-                (!isKillswitchEnabled(storage) ||
-                  killswitchPassesPolicy(
-                    quota,
-                    storage,
-                    oauthAccountId === 'main' ? undefined : oauthAccountId,
-                    model,
-                  ))
-              )
+              return targetModelAllowed(quota, storage, model)
             }
             const observeCompletedReply = (
               response: Response,
@@ -8048,6 +8052,8 @@ const anthropicAuthPlugin = async (
                   chargeBasis: 'subscription_included',
                 },
                 authorize: async ({ model, signal }) => {
+                  if (protectedOrigin && !relayConfig?.fallbackToDirect)
+                    return { kind: 'denied' }
                   await requireCurrentNativeActivation(separateLocalLogin)
                   const candidate = await authorizeOAuth(
                     oauthAccountId,
@@ -8057,23 +8063,36 @@ const anthropicAuthPlugin = async (
                     'serve',
                   )
                   await requireCurrentNativeActivation(separateLocalLogin)
-                  const snapshot = await nativeAccounts.read()
+                  if (
+                    protectedOrigin &&
+                    !(await nativeAccounts.getRelayConfig())?.fallbackToDirect
+                  )
+                    return { kind: 'denied' }
+                  const snapshot = await nativeAccounts.read(model)
                   const account = snapshot.accounts.find(
                     (row) => row.id === oauthAccountId,
                   )
                   const policy = snapshot.policyStorage
                   if (
                     !account ||
+                    !nativeAccountCanServe(account) ||
                     !candidate.accountIdentity ||
-                    !fresh() ||
-                    !quotaSnapshotPassesPolicy(
-                      routingAccountQuota(
-                        account,
-                        policy,
-                        candidate.scopedAttempt,
-                      ),
-                      policy,
-                    )
+                    !fresh()
+                  )
+                    return { kind: 'denied' }
+                  const quota = routingAccountQuota(
+                    account,
+                    policy,
+                    candidate.scopedAttempt,
+                  )
+                  const routed =
+                    !resend &&
+                    relayAffinity &&
+                    hasSharedRouting() &&
+                    routingRelay.admitted(relayAffinity, account)
+                  if (
+                    (!routed && !quotaSnapshotPassesPolicy(quota, policy)) ||
+                    (!resend && !targetModelAllowed(quota, policy, model))
                   )
                     return { kind: 'denied' }
                   retryAuthorization = candidate
@@ -8743,23 +8762,29 @@ const anthropicAuthPlugin = async (
                   // the resend's completion is reported by the round engine's
                   // lifecycle (handleTarget400), not by source retry dispatch.
                   roundLifecycle(payer)
+                  const resendBilling = (model: string) =>
+                    modelBillingRequest(
+                      relayAffinity,
+                      JSON.stringify({ model }),
+                      {
+                        accountId: payer.accountIdentity,
+                        credentialId: payer.credentialId,
+                      },
+                      billingRequestKind,
+                      'subscription_included',
+                    )
                   const resent = await rounds.handleTarget400(
                     handle,
                     response,
                     {
                       ...options,
                       isCurrentPrimary: () => isCurrentPrimary(payer),
+                      onResendFailure: (model) => {
+                        const billing = resendBilling(model)
+                        if (billing) reportAnthropicBillingFailure(billing)
+                      },
                       observeResendResponse: (response, model) => {
-                        const billing = modelBillingRequest(
-                          relayAffinity,
-                          JSON.stringify({ model }),
-                          {
-                            accountId: payer.accountIdentity,
-                            credentialId: payer.credentialId,
-                          },
-                          billingRequestKind,
-                          'subscription_included',
-                        )
+                        const billing = resendBilling(model)
                         return billing
                           ? observeAnthropicBillingResponse(billing, response)
                           : response

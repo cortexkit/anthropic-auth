@@ -5,6 +5,12 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { ROUTING_HOLD_LIMIT_MS } from '../routing-relay'
+import {
+  refusalThinkingReply,
+  SOURCE_MODEL,
+  TARGET_MODEL,
+  TARGET_SIGNATURE,
+} from './fixtures/refusal-thinking'
 import { getPluginTestHandles } from './plugin-test-handles'
 import { installLoaderSetup } from './support/opencode1-loader-setup'
 import {
@@ -107,7 +113,10 @@ describe('OC1 shared routing relay', () => {
           quota: {
             enabled: true,
             checkIntervalMinutes: 5,
-            minimumRemaining: { five_hour: 1, seven_day: 1 },
+            minimumRemaining: {
+              five_hour: mode === 'refusal floor' ? 20 : 1,
+              seven_day: 1,
+            },
             failClosedOnUnknownQuota: true,
             mainQuota: {
               ...quota(
@@ -150,7 +159,9 @@ describe('OC1 shared routing relay', () => {
                       mode === 'unknown quota'
                         ? undefined
                         : quota(
-                            mode === 'floor' || mode === 'blocked' ? 10 : 80,
+                            ['floor', 'blocked', 'refusal floor'].includes(mode)
+                              ? 10
+                              : 80,
                           ),
                     ...(mode === 'signed out'
                       ? {
@@ -1618,6 +1629,38 @@ describe('OC1 shared routing relay', () => {
       expect(f.sends).toEqual(['Bearer sk-ant-oat01-fallback-access'])
     },
   )
+
+  test('OC1 refusal retry uses the same routed account below its general quota floor', async () => {
+    let sends = 0
+    const f = await fixture('refusal floor', () => {
+      const response = refusalThinkingReply(
+        ++sends === 1 ? SOURCE_MODEL : TARGET_MODEL,
+      )
+      response.headers.delete('anthropic-ratelimit-unified-5h-utilization')
+      response.headers.delete('anthropic-ratelimit-unified-7d-utilization')
+      return response
+    })
+    globals[key] = () => ({
+      accountFor: async () => ({
+        account_id: syntheticFallbackAccountUuid(0),
+        credential_id: 'local',
+      }),
+    })
+    const response = await f.send({
+      model: SOURCE_MODEL,
+      stream: true,
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    expect(await response.text()).toContain(TARGET_SIGNATURE)
+    expect(f.sends).toEqual(
+      Array(2).fill('Bearer sk-ant-oat01-fallback-access'),
+    )
+    expect(f.bodies.map((body) => JSON.parse(body).model)).toEqual([
+      SOURCE_MODEL,
+      TARGET_MODEL,
+    ])
+  })
 
   test('a signed-out routing pick is replaced by our own OC1 subscription', async () => {
     const f = await fixture('signed out')

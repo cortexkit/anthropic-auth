@@ -104,7 +104,7 @@ export class RefusalMock {
 
   respond(body: Body): Response | undefined {
     const point = fixturePoint(body)
-    if (!point || point > 13) return undefined
+    if (!point || point > 14) return undefined
     const model = String(body.model)
     const original = this.originals.get(point)
     if (body.fallback_credit_token !== undefined) {
@@ -148,7 +148,11 @@ export class RefusalMock {
         content: [
           {
             block: text(
-              point === 13 ? recoveryText : 'Tool continuation completed.',
+              point === 13
+                ? recoveryText
+                : point === 14
+                  ? targetText
+                  : 'Tool continuation completed.',
             ),
           },
         ],
@@ -157,7 +161,7 @@ export class RefusalMock {
     }
     const content: FixtureBlock[] = []
     if (point === 2 || point === 9) content.push({ block: thinking(model) })
-    if ([3, 7, 8, 9, 12].includes(point))
+    if ([3, 7, 8, 9, 12, 14].includes(point))
       content.push({ block: text(sourceText), open: point === 7 })
     if (point === 6)
       content.push({
@@ -201,7 +205,7 @@ export class RefusalMock {
       model,
       content,
       stop: point === 13 ? 'end_turn' : 'refusal',
-      credit: fixtureCredit,
+      credit: point === 14 ? null : fixtureCredit,
       claim,
       onStop: () =>
         this.mark(point === 13 ? 'idle-text-completed' : 'refusal', body),
@@ -239,7 +243,7 @@ export function fixtureStream({
   content: FixtureBlock[]
   stop: 'refusal' | 'end_turn'
   credited?: boolean
-  credit?: string
+  credit?: string | null
   claim?: boolean
   onStop?: () => void
   beforeContent?: () => Promise<void>

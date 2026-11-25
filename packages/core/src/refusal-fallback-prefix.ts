@@ -42,7 +42,7 @@ function plainText(block: unknown): block is { type: 'text'; text: string } {
   )
 }
 
-function normalizeMessage(value: unknown): unknown {
+function normalizeMessage(value: unknown, mergeText = true): unknown {
   const message = refusalBodyRecord(withoutCacheControl(value))
   if (!message) return value
   if (isOwnNote(message)) return undefined
@@ -86,7 +86,7 @@ function normalizeMessage(value: unknown): unknown {
   const content: unknown[] = []
   for (const block of filtered) {
     const previous = content.at(-1)
-    if (plainText(block) && plainText(previous)) {
+    if (mergeText && plainText(block) && plainText(previous)) {
       content[content.length - 1] = {
         type: 'text',
         text: previous.text + block.text,
@@ -113,6 +113,14 @@ function digest(value: string): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
+function normalizedMessages(body: Body, mergeText: boolean) {
+  return Array.isArray(body.messages)
+    ? body.messages
+        .map((message: unknown) => normalizeMessage(message, mergeText))
+        .filter((message) => message !== undefined)
+    : []
+}
+
 function comparisonBody(body: Body) {
   const system = Array.isArray(body.system)
     ? body.system
@@ -129,18 +137,14 @@ function comparisonBody(body: Body) {
   const tools = Array.isArray(body.tools)
     ? body.tools.map(withoutCacheControl)
     : body.tools
-  const messages = Array.isArray(body.messages)
-    ? body.messages
-        .map(normalizeMessage)
-        .filter((message) => message !== undefined)
-        .map(canonical)
-    : []
+  const messages = normalizedMessages(body, true).map(canonical)
   return { fixed: digest(canonical({ system, tools })), messages }
 }
 
 export type RefusalFallbackPrefix = Readonly<{
   fixed: string
   messages: readonly string[]
+  deferredUser?: Readonly<{ header: string; blocks: readonly string[] }>
 }>
 
 export type RefusalFallbackEstimateBase = RefusalFallbackPrefix &
@@ -152,6 +156,29 @@ export type RefusalFallbackEstimateBase = RefusalFallbackPrefix &
 export function refusalFallbackPrefix(body: Body): RefusalFallbackPrefix {
   const { fixed, messages } = comparisonBody(body)
   return { fixed, messages: messages.map(digest) }
+}
+
+function finalUser(body: Body) {
+  const last = refusalBodyRecord(normalizedMessages(body, false).at(-1))
+  if (last?.role !== 'user' || !Array.isArray(last.content)) return
+  const { content, ...header } = last
+  return { content, header }
+}
+
+export function refusalFallbackDeferredPrefix(
+  body: Body,
+): RefusalFallbackPrefix {
+  const base = refusalFallbackPrefix(body)
+  const user = finalUser(body)
+  return user?.content.length
+    ? {
+        ...base,
+        deferredUser: {
+          header: digest(canonical(user.header)),
+          blocks: user.content.map((block) => digest(canonical(block))),
+        },
+      }
+    : base
 }
 
 export function refusalFallbackCheckpoint(
@@ -189,11 +216,51 @@ function extendsPrefix(
   )
 }
 
+function appendedMessages(
+  body: Body,
+  comparison: ReturnType<typeof comparisonBody>,
+  base: RefusalFallbackPrefix,
+) {
+  if (extendsPrefix(comparison, base))
+    return comparison.messages.slice(base.messages.length)
+  const { deferredUser } = base
+  if (
+    !deferredUser ||
+    comparison.fixed !== base.fixed ||
+    comparison.messages.length !== base.messages.length ||
+    !base.messages.slice(0, -1).every((hash, index) => {
+      const message = comparison.messages[index]
+      return message !== undefined && hash === digest(message)
+    })
+  )
+    return undefined
+
+  // OpenCode 1 merges consecutive user messages when it drops a refused turn
+  // (see effort-history.ts). The old blocks must still be the exact prefix.
+  const user = finalUser(body)
+  if (
+    !user ||
+    digest(canonical(user.header)) !== deferredUser.header ||
+    user.content.length <= deferredUser.blocks.length ||
+    !deferredUser.blocks.every(
+      (hash, index) => hash === digest(canonical(user.content[index])),
+    )
+  )
+    return undefined
+
+  return [
+    canonical({
+      ...user.header,
+      content: user.content.slice(deferredUser.blocks.length),
+    }),
+  ]
+}
+
 export function extendsRefusalFallbackPrefix(
   body: Body,
   base: RefusalFallbackPrefix,
 ): boolean {
-  return extendsPrefix(comparisonBody(body), base)
+  return appendedMessages(body, comparisonBody(body), base) !== undefined
 }
 
 export function estimateRefusalFallbackInput(
@@ -202,9 +269,8 @@ export function estimateRefusalFallbackInput(
   base: RefusalFallbackEstimateBase | undefined,
 ): number {
   if (base) {
-    const comparison = comparisonBody(body)
-    if (extendsPrefix(comparison, base)) {
-      const suffix = comparison.messages.slice(base.messages.length)
+    const suffix = appendedMessages(body, comparisonBody(body), base)
+    if (suffix !== undefined) {
       return base.inputTokens + Buffer.byteLength(`[${suffix.join(',')}]`) / 4
     }
   }

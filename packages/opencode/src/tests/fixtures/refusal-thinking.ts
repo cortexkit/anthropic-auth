@@ -35,6 +35,7 @@ export function refusalThinkingReply(model: string) {
               type: 'refusal',
               category: 'bio',
               fallback_credit_token: 'synthetic-fallback-credit',
+              fallback_has_prefill_claim: true,
             },
           }
         : { stop_reason: 'end_turn' },
