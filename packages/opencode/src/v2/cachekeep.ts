@@ -137,6 +137,7 @@ interface CacheKeepLease {
 interface SharedCacheKeep {
   readonly manager: CacheKeepManager
   readonly rounds: RefusalFallbackRoundEngine
+  readonly thinkingStore: RecoveryThinkingStore
   readonly roundNotices: ReturnType<typeof createRefusalRoundNotices>
   readonly roundRoutes: Map<string, RefusalFallbackCacheRoute>
   readonly roundRuntime: () => NativeAccountRuntime | undefined
@@ -384,7 +385,6 @@ function createSharedCacheKeep(
       if (copies?.get(cacheKeepModule) === shared) {
         copies.delete(cacheKeepModule)
         if (!copies.size) shareds.delete(storageId)
-        void thinkingStore.close()
       }
       return
     }
@@ -393,6 +393,7 @@ function createSharedCacheKeep(
   }
   const shared: SharedCacheKeep = {
     manager,
+    thinkingStore,
     // A reload keeps the round engine with the manager that warms its sessions.
     rounds: new RefusalFallbackRoundEngine(roundNotices.observe, {
       thinkingStore,
@@ -1307,9 +1308,15 @@ export function createNativeCacheKeep(
           await Promise.all(lease.inflight)
           await owner.persistence.drain()
         } finally {
-          // Retained sessions are not being warmed, so withdraw them from the
-          // shared session list unless another instance adopted them already.
-          if (last && owner.leases.size === 0) await registry.dispose()
+          try {
+            // Retained sessions are not being warmed, so withdraw them from the
+            // shared session list unless another instance adopted them already.
+            if (last && owner.leases.size === 0) await registry.dispose()
+          } finally {
+            // The keeper can outlive a lease. Flush the thinking record within
+            // the store's shutdown grace instead of waiting for eviction.
+            await owner.thinkingStore.close()
+          }
         }
       })()
       return cleanup

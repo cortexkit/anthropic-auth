@@ -9,9 +9,17 @@ import {
   hasValidRequestBodySignature,
   logger,
   MESSAGE_THREADS_BETA,
+  RecoveryThinkingStore,
   SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
 } from '@cortexkit/anthropic-auth-core'
+import {
+  RECOVERY_FAMILY,
+  refusalThinkingReply,
+  SOURCE_MODEL,
+  TARGET_DIGEST,
+  TARGET_SIGNATURE,
+} from './fixtures/refusal-thinking'
 import { getPluginTestHandles } from './plugin-test-handles'
 import { createMockClient } from './support/opencode1-client.ts'
 import {
@@ -433,6 +441,46 @@ describe('auth.loader', () => {
       )
     },
   )
+
+  test('OpenCode 1 saves pending recovery thinking before plugin disposal returns', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ accounts: [], quota: { enabled: false } }),
+    )
+    await setUserRefusalFallbackMode(testContext, 'client')
+    globalThis.fetch = mock(
+      withNativeAdmission(
+        (input: string | URL | Request, init?: RequestInit) =>
+          extractUrl(input).includes('/v1/messages')
+            ? refusalThinkingReply(JSON.parse(String(init?.body)).model)
+            : Response.json({}),
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const host = await plugin.auth.loader(
+      () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
+      { models: {} },
+    )
+    const sessionID = 'ses_oc1_thinking_shutdown'
+    const joined = await host.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': sessionID },
+      body: JSON.stringify({
+        model: SOURCE_MODEL,
+        max_tokens: 256,
+        stream: true,
+        messages: [{ role: 'user', content: 'Hello' }],
+      }),
+    })
+    expect(await joined.text()).toContain(TARGET_SIGNATURE)
+    await plugin.dispose()
+    testContext.livePlugins.delete(plugin)
+
+    const restarted = new RecoveryThinkingStore()
+    await restarted.loadSession(sessionID)
+    expect(restarted.peek(sessionID, RECOVERY_FAMILY)?.has(TARGET_DIGEST)).toBe(
+      true,
+    )
+  })
 
   test('client retry 429 ends the host stream with the original refusal after two sends', async () => {
     await useTempAccountFile(

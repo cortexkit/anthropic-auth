@@ -36,6 +36,7 @@ import {
   MESSAGE_THREADS_BETA,
   NativeCustodyError,
   type NativeLockEvent,
+  RecoveryThinkingStore,
   RequestGzipLatch,
   resolveNativePoolPaths,
   runNativeMigration,
@@ -75,6 +76,14 @@ import { createNativeMenuCapabilities } from '../v2/menu'
 import { setupAnthropicAuth } from '../v2/setup'
 import type { NativeSource } from '../v2/source'
 import * as sourceFactory from '../v2/source'
+import {
+  RECOVERY_FAMILY,
+  refusalThinkingReply,
+  SOURCE_MODEL,
+  TARGET_DIGEST,
+  TARGET_MODEL,
+  TARGET_SIGNATURE,
+} from './fixtures/refusal-thinking'
 
 const cleanups: Array<() => void | Promise<void>> = []
 let reportFailure: (() => void) | undefined
@@ -1986,6 +1995,52 @@ test('OpenCode 2 restores a gzipped session after a server restart with the same
   expect(warm.max_tokens).toBe(0)
   expect(next.sent[0]!.headers.get('authorization')).toBe(
     'Bearer sk-ant-oat01-first',
+  )
+})
+
+test('OpenCode 2 saves pending recovery thinking before server disposal returns', async () => {
+  const f = await fixture()
+  // Leave a session with a live cache so the shared keeper stays in memory
+  // after disposal. No eviction should be needed to save the thinking digest.
+  await f.live()
+  const owner = keeperFor(f.paths.storageId)
+  expect(owner.manager.trackedCount()).toBe(1)
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = Object.assign(
+    async (input: string | URL | Request, init?: RequestInit) => {
+      const request = new Request(input as Request, init)
+      if (new URL(request.url).pathname !== '/v1/messages')
+        return originalFetch(input, init)
+      const { model } = (await request.json()) as { model: string }
+      expect(model).toBe(TARGET_MODEL)
+      return refusalThinkingReply(model)
+    },
+    { preconnect: originalFetch.preconnect },
+  ) satisfies typeof fetch
+  cleanups.push(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  const sessionID = 'ses_oc2_thinking_shutdown'
+  const prepared = await f.prepare(
+    undefined,
+    { model: SOURCE_MODEL, max_tokens: 256, stream: true },
+    sessionID,
+  )
+  const joined = await f.respond(
+    prepared,
+    refusalThinkingReply(SOURCE_MODEL),
+    false,
+  )
+  expect(await joined.text()).toContain(TARGET_SIGNATURE)
+  await f.dispose()
+  expect(keeperFor(f.paths.storageId)).toBe(owner)
+
+  const restarted = new RecoveryThinkingStore()
+  await restarted.loadSession(sessionID)
+  expect(restarted.peek(sessionID, RECOVERY_FAMILY)?.has(TARGET_DIGEST)).toBe(
+    true,
   )
 })
 
