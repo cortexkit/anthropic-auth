@@ -58,7 +58,7 @@ test('server fallback keeps the 2.17.1 anthropic-beta bytes for an incoming fall
     },
   )
 
-  // Captured with the published 2.17.1 header writer and OpenCode's appended beta.
+  // Captured with anthropic-auth 2.17.1's published header writer and OpenCode's appended beta.
   expect(headers.get('anthropic-beta')).toBe(
     `${MAIN},server-side-fallback-2026-07-01,context-1m-2025-08-07`,
   )
