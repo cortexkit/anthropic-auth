@@ -4,12 +4,12 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
-- New default on OpenCode 1, OpenCode 2 and Pi: client refusal fallback. When Claude refuses a step for safety on Fable 5.x, Opus 5.5 or Opus 5, the plugin retries it on a supported fallback model (Opus 4.8 or Opus 5) inside the same reply. When Anthropic grants a fallback credit, the retry reuses the cached prompt. The session then stays on that model for a short round (10, then 20, then 40 responses while refusals recur) and returns to the requested model. If the retry can't answer, the original refusal is shown. OpenCode 1 and 2 previously used Anthropic's server-side fallback by default (#861).
+- New default on OpenCode 1, OpenCode 2 and Pi: client refusal fallback. When Claude refuses a step for safety on Fable 5.x, Opus 5.5 or Opus 5, the plugin retries it on a supported fallback model (Opus 4.8 or Opus 5) inside the same reply. When Anthropic attaches a fallback credit to the refusal (a one-time token that lets the retry bill the cached prompt as a cache read), the retry uses it. The session then stays on that model for a short round (10, then 20, then 40 responses while refusals recur) and returns to the requested model. If the retry can't answer, the original refusal is shown. OpenCode 1 and 2 previously used Anthropic's server-side fallback by default (#861).
 - New `refusal_fallback` setting in the shared settings file: `client` (default), `server` (Anthropic's server-side fallback, now on Pi too) or `off`. It replaces `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` and `OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK`, which no longer have any effect. In `server` mode a refusal the server doesn't absorb now stands; OpenCode 1 no longer adds its own recovery round on top.
 - During a round, the requested model's cache is kept warm, and the first request back reads it again instead of rewriting the conversation. A round's keep-warm survives a restart.
-- Requests to the requested model drop the fallback model's reasoning wherever Anthropic would refuse the mixed turn, including after a restart.
+- Requests back to the requested model drop the fallback model's reasoning wherever it follows the requested model's own reasoning in the same turn, which Anthropic would refuse. This holds after a restart too.
 - OpenCode and Pi show the requested model, the serving model and the steps left in a round. Pi prices fallback replies at the serving model's rates. Billing reports carry the refused attempt and its retry as separate rows.
-- Fallback credit tokens never appear in logs, request dumps or saved keep-warm templates.
+- Fallback credits never appear in logs, request dumps or saved keep-warm templates.
 
 ## 2.17.1
 
