@@ -8,6 +8,6 @@
   },
   "dependencies": {
     "@cortexkit/subc-client": "^0.24",
-    "@opencode-ai/sdk": "1.19.5"
+    "@opencode-ai/sdk": "1.19.6"
   }
 }

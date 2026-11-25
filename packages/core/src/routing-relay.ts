@@ -319,6 +319,7 @@ export function createRoutingRelay(
       status: number,
       modelId?: string,
       served = status < 400,
+      upstreamHttp429 = true,
     ) {
       if (silenced.has(sessionId)) return
       reportRoutingResponse(
@@ -329,6 +330,7 @@ export function createRoutingRelay(
         modelId,
         served,
         quotaFor ? () => quotaFor(subject) : undefined,
+        upstreamHttp429,
       )
     },
   }

@@ -21,6 +21,7 @@ import {
   classifyGzipRejection,
   claudeGatewayHeaderValues,
   claudeGatewayModelUrl,
+  createAnthropicBillingObserver,
   createDumpResponseObserver,
   createProviderErrorRedactor,
   createProviderErrorResponseScope,
@@ -2528,9 +2529,10 @@ export function createNativeAnthropicAdapter<Q, P>(
       const fallback = upstream && response.ok && physical?.fallback
       let terminalResend = false
       let targetStatus: number | undefined
-      if (billingSend) {
-        billingSend.received = true
-      }
+      // A send whose failure was already reported (the fetch threw) must not
+      // be billed a second time from the response it was replaced with.
+      const firstReceipt = !!billingSend && !billingSend.received
+      if (billingSend) billingSend.received = true
       if (fallback) {
         response = dispatchRefusalFallback(response, {
           ...fallback,
@@ -2555,7 +2557,7 @@ export function createNativeAnthropicAdapter<Q, P>(
             requestBodyText: physical.bodyText,
             framing: physical.framing,
           })
-        if (billingSend && upstream)
+        if (billingSend && firstReceipt && upstream)
           response = observeAnthropicBillingResponse(
             billingSend.input,
             response,
@@ -2899,6 +2901,17 @@ export function createNativeAnthropicAdapter<Q, P>(
     quotaFromHeaders(headers, status, attempt) {
       const data = attempt.data
       if (!data || !fromUpstream(headers, data)) return undefined
+      const billingSend = billingSends.get(data)
+      if (status >= 400 && billingSend && !billingSend.received) {
+        // common-auth ends HTTP errors before rewriteResponse. Capture the
+        // upstream status and request ID before attempt cleanup drops them.
+        billingSend.received = true
+        createAnthropicBillingObserver(
+          billingSend.input,
+          status,
+          headers,
+        ).finish()
+      }
       if (data.route === 'oauth' && status >= 200 && status < 300)
         physicalAcceptances.set(data, { at: deps.now?.() ?? Date.now() })
       return source.quotaFromHeaders?.(headers, {

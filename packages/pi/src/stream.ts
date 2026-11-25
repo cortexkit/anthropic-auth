@@ -144,6 +144,7 @@ import {
   shouldFallbackStatus,
   signRequestBody,
   startRoutingWait,
+  stickyQuotaBlockerInForce,
   stickyQuotaSnapshotIsFresh,
   stickyRetainRetryHeaders,
   stickyRetryAfterWithJitter,
@@ -3307,6 +3308,7 @@ async function executeWithFallback(options: {
     )
   }
 
+  const refusedOAuth = new Set<string>()
   async function tryFallbackAccounts(
     routeOptions: { includeApiRoutes?: boolean; apiOnly?: boolean } = {},
   ) {
@@ -3316,25 +3318,56 @@ async function executeWithFallback(options: {
     const usableOAuthById = new Map(
       usableOAuth.map((account) => [account.id, account]),
     )
+    const fallbackQuota = (account: OAuthAccount) =>
+      quotaManager.getFallback(account.id, account)?.quota ?? account.quota
+    const oauthRoute = (configured: OAuthAccount) => {
+      if (routeOptions.apiOnly || !nativeReady(configured.id)) return undefined
+      const account = usableOAuthById.get(configured.id) ?? configured
+      const quota = fallbackQuota(account)
+      if (
+        (!usableOAuthById.has(account.id) &&
+          quotaSnapshotHasStandardWindows(quota)) ||
+        (isKillswitchEnabled(storage) &&
+          !killswitchPassesPolicy(quota, storage, account.id, options.model.id))
+      )
+        return undefined
+      return account
+    }
+    // Reorder only eligible OAuth accounts, leaving paid API-key routes in place.
+    const oauth = storage.accounts.flatMap((account) => {
+      if (!nativeAccountCanServe(account) || !isOAuthAccount(account)) return []
+      const route = oauthRoute(account)
+      return route ? [[account.id, route] as const] : []
+    })
+    const oauthSlots = new Set(oauth.map(([id]) => id))
+    const remainingOAuth = oauth.map(([, route]) => route)
     let sawPaidLaneRoute = false
     for (const configured of storage.accounts) {
       if (!nativeAccountCanServe(configured)) continue
       let response: Response | undefined
+      let accountSent: string | undefined
       if (isOAuthAccount(configured)) {
-        if (routeOptions.apiOnly || !nativeReady(configured.id)) continue
-        const account = usableOAuthById.get(configured.id) ?? configured
-        const quota =
-          quotaManager.getFallback(account.id, account)?.quota ?? account.quota
-        if (
-          !usableOAuthById.has(account.id) &&
-          quotaSnapshotHasStandardWindows(quota)
+        if (!oauthSlots.has(configured.id)) continue
+        const warm = refusedOAuth.size
+          ? sessionCacheActivity.warmRetryAccount(
+              options.streamOptions?.sessionId,
+              remainingOAuth.filter(
+                (account) =>
+                  !refusedOAuth.has(account.id) &&
+                  !stickyQuotaBlockerInForce({
+                    quota: fallbackQuota(account),
+                    modelId: options.model.id,
+                  }),
+              ),
+              (account) => account.id,
+            )
+          : undefined
+        const [account] = remainingOAuth.splice(
+          warm ? remainingOAuth.indexOf(warm) : 0,
+          1,
         )
-          continue
-        if (
-          isKillswitchEnabled(storage) &&
-          !killswitchPassesPolicy(quota, storage, account.id, options.model.id)
-        )
-          continue
+        if (!account) continue
+        accountSent = account.id
         response = await sendAnthropicRequest({
           ...options,
           oauthAccountId: account.id,
@@ -3366,6 +3399,7 @@ async function executeWithFallback(options: {
         !shouldFallbackStatus(preflight.status, storage)
       )
         return preflight
+      if (accountSent) refusedOAuth.add(accountSent)
       await inspected.response.body?.cancel().catch(() => {})
     }
     return sawPaidLaneRoute ? skippedPaidLaneStart : null
@@ -3800,6 +3834,7 @@ async function executeWithFallback(options: {
             storage,
             inputBytes: initialInputBytes,
             excludeAccountIds: new Set([failedRouteId]),
+            preferWarmRetryAccount: true,
           })
           const migrated = routes.allRoutes.find(
             (candidate) => candidate.id === resolution?.accountId,
@@ -3966,6 +4001,7 @@ async function executeWithFallback(options: {
     if (!shouldFallbackStatus(primaryPreflight.status, storage))
       return primaryPreflight
   }
+  refusedOAuth.add(STICKY_ROUTING_MAIN_ACCOUNT_ID)
 
   const primaryAllowsQuotaFallback =
     primaryResponseAllowsApiFallback(primaryPreflight)

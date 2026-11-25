@@ -8471,6 +8471,7 @@ const anthropicAuthPlugin = async (
                   takeRefusalCredit: () => string | undefined
                 }
               | undefined
+            let routingStatus: number | undefined
             const reportScoped401 = reportVault401
             // The relay scrubs each physical relay attempt's responses and
             // errors with that attempt's own credentials and the relay token;
@@ -8544,6 +8545,7 @@ const anthropicAuthPlugin = async (
                       }),
                     errorSecrets: [nextAuthorization.accessToken],
                     onUpstreamStatus: (status: number) => {
+                      routingStatus = status
                       if (
                         status >= 200 &&
                         status < 300 &&
@@ -8807,6 +8809,7 @@ const anthropicAuthPlugin = async (
                   response.status,
                   modelForIdentity,
                   servedTurn,
+                  usedDirectFetch || routingStatus === 429,
                 )
                 if (response.status === 200) {
                   // Keep the upstream headers before sticky retries replace the
@@ -8818,6 +8821,7 @@ const anthropicAuthPlugin = async (
                       headers,
                       429,
                       modelForIdentity,
+                      false,
                       false,
                     ),
                   )
@@ -9467,6 +9471,9 @@ const anthropicAuthPlugin = async (
             refusalFallbackMode: RefusalFallbackMode
             refusal: ReturnType<typeof createRefusalOwner>
             attemptedPaid: Set<string>
+            refusedOAuth: Set<string>
+            sessionId: string | null
+            modelId: string | undefined
             shared?: {
               afterRefusal: (
                 id: string,
@@ -9495,10 +9502,36 @@ const anthropicAuthPlugin = async (
             if (!accounts.length) return currentResponse ?? null
 
             const returnLastOnExhausted = options?.returnLastOnExhausted ?? true
-            const { trace, refusal, shared, attemptedPaid } = routing
+            const { trace, refusal, shared, attemptedPaid, refusedOAuth } =
+              routing
             let attempted = false
 
-            for (const [index, account] of accounts.entries()) {
+            const ordered = [...accounts]
+            for (let index = 0; index < ordered.length; index++) {
+              const pending = ordered[index]
+              if (pending && refusedOAuth.size && isOAuthAccount(pending)) {
+                const warm = sessionCacheActivity.warmRetryAccount(
+                  routing.sessionId,
+                  ordered.slice(index).filter(
+                    (account) =>
+                      isOAuthAccount(account) &&
+                      nativeAccountCanServe(account) &&
+                      !refusedOAuth.has(account.id) &&
+                      !shared?.skipLocal(account.id) &&
+                      !stickyQuotaBlockerInForce({
+                        quota: getFallbackQuota(account),
+                        modelId: routing.modelId,
+                      }),
+                  ),
+                  (account) => account.id,
+                )
+                if (warm && warm !== pending) {
+                  ordered.splice(ordered.indexOf(warm, index), 1)
+                  ordered.splice(index, 0, warm)
+                }
+              }
+              const account = ordered[index]
+              if (!account) break
               if (shared?.skipLocal(account.id)) continue
               let response: Response
               if (isApiKeyAccount(account)) {
@@ -9588,6 +9621,7 @@ const anthropicAuthPlugin = async (
               }
               attempted = true
               refusal.keep(response)
+              if (isOAuthAccount(account)) refusedOAuth.add(account.id)
               if (shared && isOAuthAccount(account)) {
                 const replacement = await shared.afterRefusal(
                   account.id,
@@ -9670,6 +9704,7 @@ const anthropicAuthPlugin = async (
               return currentResponse
             }
             if (!mainAlreadyInspected) refusal.keep(currentResponse, true)
+            routing.refusedOAuth.add('main')
             if (shared) {
               const replacement = await shared.afterRefusal(
                 'main',
@@ -9785,6 +9820,11 @@ const anthropicAuthPlugin = async (
                 refusalFallbackMode,
                 refusal,
                 attemptedPaid: new Set(),
+                refusedOAuth: new Set(),
+                sessionId,
+                // The requested model: a refusal round's serving model is
+                // chosen later, per send, and checks its own quota there.
+                modelId: requestModel ?? undefined,
               }
               if (
                 sessionId &&
@@ -10366,6 +10406,7 @@ const anthropicAuthPlugin = async (
                     }
                     judged.add(response)
                     refused.set(account.id, response.headers)
+                    requestRouting.refusedOAuth.add(account.id)
                     lastRefuser = account.id
                     refusal.keep(response, account.id === 'main')
                   }
@@ -10645,6 +10686,7 @@ const anthropicAuthPlugin = async (
                           ? Buffer.byteLength(init.body)
                           : 1,
                       preferredAccountId,
+                      preferWarmRetryAccount: !!excludeAccountIds && !advised,
                       excludeAccountIds,
                       ...(advised && {
                         preserveOnNoCandidate: true,

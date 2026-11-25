@@ -55,6 +55,22 @@ export class SessionCacheActivity {
     )
   }
 
+  /** Prefer the last accepted account only while its cache can still be warm. */
+  warmRetryAccount<T>(
+    sessionId: string | null | undefined,
+    candidates: readonly T[],
+    accountId: (candidate: T) => string,
+    now = Date.now(),
+  ): T | undefined {
+    if (!sessionId) return undefined
+    const activity = this.entries.get(sessionId)
+    if (!activity || activity.lastAcceptedAt + activity.ttlMs <= now)
+      return undefined
+    return candidates.find(
+      (candidate) => accountId(candidate) === activity.accountId,
+    )
+  }
+
   /** A late keep-warm send must not replace a newer turn on a different account. */
   recordPrewarm(
     sessionId: string,

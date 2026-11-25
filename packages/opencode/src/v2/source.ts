@@ -1052,6 +1052,7 @@ export function createNativeAnthropicSource(
   function reportRateLimit(
     input: NativeAnthropicAttemptContext<NativeSourceProvenance>,
     state: State,
+    upstreamHttp429: boolean,
   ) {
     if (state.exhaustionReported) return
     state.exhaustionReported = true
@@ -1068,6 +1069,7 @@ export function createNativeAnthropicSource(
       429,
       state.scope.modelID,
       false,
+      upstreamHttp429,
     )
   }
 
@@ -1463,6 +1465,7 @@ export function createNativeAnthropicSource(
           storage: snapshot.policyStorage,
           inputBytes: 1,
           preferredAccountId: input.previousAccountId,
+          preferWarmRetryAccount: input.phase === 'retry',
           // A refusal leaves the host in charge; it must not clear its route.
           preserveOnNoCandidate: true,
         })
@@ -1488,7 +1491,15 @@ export function createNativeAnthropicSource(
                 ...routes.filter((account) => account.id === 'main'),
                 ...routes.filter((account) => account.id !== 'main'),
               ]
-        if (ordered[0]) return ordered[0].id
+        const warm =
+          input.phase === 'retry'
+            ? sessionCacheActivity.warmRetryAccount(
+                input.sessionID,
+                ordered,
+                (account) => account.id,
+              )
+            : undefined
+        if (warm || ordered[0]) return (warm ?? ordered[0])?.id
       }
       if (snapshot.mode === 'claustrum') {
         const holdForPool = poolHold()
@@ -2125,7 +2136,7 @@ export function createNativeAnthropicSource(
         if (input.reportRouting !== false) {
           const served = input.status < 400 && !servedTurns.has(input.sessionID)
           if (served) servedTurns.add(input.sessionID)
-          if (input.status === 429) reportRateLimit(input, state)
+          if (input.status === 429) reportRateLimit(input, state, true)
           else
             routingRelay.report(
               input.sessionID,
@@ -2311,7 +2322,7 @@ export function createNativeAnthropicSource(
     limitFromStreamError(input) {
       const state = states.get(input.provenance)
       if (state && input.errorType === 'rate_limit_error')
-        reportRateLimit(input, state)
+        reportRateLimit(input, state, false)
       return input.errorType === 'rate_limit_error'
         ? { reason: 'provider-rate-limit', status: 429 }
         : undefined
