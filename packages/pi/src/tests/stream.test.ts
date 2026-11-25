@@ -866,7 +866,24 @@ test.each(['stateless', 'threaded'] as const)(
         (31 * rates.input + 7 * rates.output) / 1_000_000,
         10,
       )
-      expect(sent[4]?.text).toContain('target-signed-probe')
+      expect(sent[4]?.body).toMatchObject({
+        model: target,
+        messages: expect.arrayContaining([
+          expect.objectContaining({
+            role: 'assistant',
+            content: expect.arrayContaining([
+              expect.objectContaining({
+                type: 'thinking',
+                signature: 'source-signed-probe',
+              }),
+              expect.objectContaining({
+                type: 'thinking',
+                signature: 'target-signed-probe',
+              }),
+            ]),
+          }),
+        ]),
+      })
       expect(sent[4]?.text).not.toContain('unsigned probe')
       expect(piRefusalRoundStatus(sessionId)).toContain('8 steps left')
       history = {

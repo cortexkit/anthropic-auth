@@ -855,6 +855,9 @@ export function startPiCacheKeepSession(
 export async function stopPiCacheKeep() {
   await piCacheKeep.stop()
   await getPiCacheKeepRegistry().dispose()
+  // Pi can exit before the store's delayed write runs. Save the digests before
+  // a resumed session can replay a turn containing both models' thinking.
+  await thinkingStore.close()
   // Pi may reload the extension in the same process. Discard its old rounds
   // without deleting the saved thinking of sessions the user can still resume.
   rounds = createPiRefusalRounds()

@@ -105,6 +105,13 @@ test('Pi signs both round warms and restores only the target with its source hea
   })
 }, 20_000)
 
+test('Pi drops only the refused retry thinking from source replay after restart', async () => {
+  await withProcesses(async (spawn) => {
+    expect(await spawn('thinking-seed').result).toEqual({ live: 2, warm: 0 })
+    expect(await spawn('thinking-resume').result).toEqual({ live: 1, warm: 0 })
+  })
+}, 20_000)
+
 test(
   'Pi startup, turn and accepted response proceed while the keep-warm lock is held',
   () => restart('locked'),

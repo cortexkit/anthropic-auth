@@ -1,6 +1,7 @@
+import { deepStrictEqual } from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { readdir, readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { readdir, readFile, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import {
   __setLogTestSink,
@@ -35,6 +36,8 @@ const roundSource = 'claude-fable-5-2'
 const roundTarget = 'claude-opus-4-8'
 const roundSeed = phase === 'round-seed'
 const roundFixture = roundSeed || phase === 'round-resume'
+const thinkingSeed = phase === 'thinking-seed'
+const thinkingFixture = thinkingSeed || phase === 'thinking-resume'
 const shouldSend =
   roundSeed || ['seed', 'locked', 'takeover'].includes(phase ?? '')
 const sessionId = 'pi-restart-session-S'
@@ -63,6 +66,7 @@ __setLogTestSink((record) => {
 })
 const storagePath = process.env.PI_ANTHROPIC_AUTH_FILE
 if (!storagePath) throw new Error('Missing isolated Pi storage path')
+const transcript = join(dirname(storagePath), 'thinking-transcript.json')
 let now = Number(process.env.PI_RESTART_CLOCK)
 Date.now = () => now
 const intervals = new Map<ReturnType<typeof setInterval>, () => unknown>()
@@ -79,6 +83,50 @@ globalThis.clearInterval = ((timer: ReturnType<typeof setInterval>) => {
 }) as typeof clearInterval
 
 const messages: Array<Record<string, unknown>> = []
+function partialReply(lane: 'source' | 'target') {
+  return [
+    {
+      type: 'thinking',
+      thinking: `${lane} thinking`,
+      signature: `${lane}-signature`,
+    },
+    { type: 'text', text: `${lane} text` },
+  ] as const
+}
+
+function partialReplyFrames(lane: 'source' | 'target') {
+  const [thinking, text] = partialReply(lane)
+  return [
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'thinking', thinking: '' },
+    },
+    {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'thinking_delta', thinking: thinking.thinking },
+    },
+    {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'signature_delta', signature: thinking.signature },
+    },
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'content_block_start',
+      index: 1,
+      content_block: { type: 'text', text: '' },
+    },
+    {
+      type: 'content_block_delta',
+      index: 1,
+      delta: { type: 'text_delta', text: text.text },
+    },
+    { type: 'content_block_stop', index: 1 },
+  ]
+}
+
 let refuseRoundSource = false
 const probeFailures: string[] = []
 const originalFetch = globalThis.fetch
@@ -133,33 +181,39 @@ globalThis.fetch = Object.assign(
             },
           },
         },
-        ...(!refused
-          ? [
-              {
-                type: 'content_block_start',
-                index: 0,
-                content_block: { type: 'text', text: '' },
-              },
-              {
-                type: 'content_block_delta',
-                index: 0,
-                delta: { type: 'text_delta', text: 'answer' },
-              },
-              { type: 'content_block_stop', index: 0 },
-            ]
-          : []),
+        ...(thinkingSeed
+          ? partialReplyFrames(body.model === roundSource ? 'source' : 'target')
+          : !refused
+            ? [
+                {
+                  type: 'content_block_start',
+                  index: 0,
+                  content_block: { type: 'text', text: '' },
+                },
+                {
+                  type: 'content_block_delta',
+                  index: 0,
+                  delta: { type: 'text_delta', text: 'answer' },
+                },
+                { type: 'content_block_stop', index: 0 },
+              ]
+            : []),
         {
           type: 'message_delta',
-          delta: refused
-            ? {
-                stop_reason: 'refusal',
-                stop_details: {
-                  type: 'refusal',
-                  category: 'cyber',
-                  fallback_credit_token: 'pi-restart-round-probe',
-                },
-              }
-            : { stop_reason: 'end_turn' },
+          delta:
+            refused || thinkingSeed
+              ? {
+                  stop_reason: 'refusal',
+                  stop_details: {
+                    type: 'refusal',
+                    category: 'cyber',
+                    ...((!thinkingSeed || body.model === roundSource) && {
+                      fallback_credit_token: 'pi-restart-round-probe',
+                      ...(thinkingSeed && { fallback_has_prefill_claim: true }),
+                    }),
+                  },
+                }
+              : { stop_reason: 'end_turn' },
           usage: { output_tokens: 1 },
         },
         { type: 'message_stop' },
@@ -172,7 +226,7 @@ globalThis.fetch = Object.assign(
   { preconnect: originalFetch.preconnect },
 ) as typeof fetch
 
-if (roundSeed || phase === 'seed' || phase === 'locked') {
+if (roundSeed || thinkingSeed || phase === 'seed' || phase === 'locked') {
   await saveNativePiFixture({ version: 1, accounts: [] }, storagePath)
   const runtime = await getPiNativeRuntime(storagePath).service()
   // The synthetic login outlives the clock advance; this test is about cache
@@ -191,7 +245,7 @@ if (roundSeed || phase === 'seed' || phase === 'locked') {
     ...settings,
     quota: { enabled: false },
     claudeCache: { enabled: true, mode: 'hybrid' },
-    cacheKeep: { enabled: true, always: true },
+    cacheKeep: { enabled: !thinkingSeed, always: !thinkingSeed },
   }))
 } else if (phase === 'round-resume') {
   const paths = await resolveNativePoolPaths(
@@ -236,7 +290,10 @@ const model = provider
   ?.getModels()
   .find(
     (row) =>
-      row.id === (roundFixture ? roundSource : CLAUDE_SONNET_5_5_MODEL_ID),
+      row.id ===
+      (roundFixture || thinkingFixture
+        ? roundSource
+        : CLAUDE_SONNET_5_5_MODEL_ID),
   )
 if (!provider || !model)
   throw new Error('Pi did not register the Anthropic model')
@@ -300,8 +357,62 @@ async function emit(name: string, event: unknown) {
   await result
 }
 
+async function replayThinking() {
+  if (!provider || !model) throw new Error('Pi did not register its stream')
+  const history: Context['messages'] = [
+    { role: 'user', content: 'hello', timestamp: now },
+  ]
+  if (!thinkingSeed) {
+    history.push(JSON.parse(await readFile(transcript, 'utf8')), {
+      role: 'user',
+      content: 'continue after restart',
+      timestamp: now + 1,
+    })
+  }
+  await emit('turn_start', { type: 'turn_start', turnIndex: 0 })
+  const result = await provider
+    .streamSimple(model, { messages: history }, { sessionId })
+    .result()
+  if (thinkingSeed) {
+    deepStrictEqual(
+      messages.map((body) => body.model),
+      [roundSource, roundTarget],
+    )
+    deepStrictEqual(result.stopReason, 'error')
+    deepStrictEqual(result.model, roundSource)
+    deepStrictEqual(
+      result.content,
+      [...partialReply('source'), ...partialReply('target')].map((block) =>
+        block.type === 'thinking'
+          ? {
+              type: 'thinking',
+              thinking: block.thinking,
+              thinkingSignature: block.signature,
+            }
+          : block,
+      ),
+    )
+    await writeFile(transcript, JSON.stringify(result))
+  } else {
+    deepStrictEqual(result.stopReason, 'stop')
+    const request = messages.at(-1)
+    deepStrictEqual(request?.model, roundSource)
+    if (!Array.isArray(request?.messages))
+      throw new Error('Pi did not send a replay')
+    deepStrictEqual(
+      request.messages.find((message) => message.role === 'assistant'),
+      {
+        role: 'assistant',
+        content: [...partialReply('source'), partialReply('target')[1]],
+      },
+    )
+  }
+  await emit('agent_settled', { type: 'agent_settled' })
+}
+
 try {
   await emit('session_start', { type: 'session_start', reason: 'startup' })
+  if (thinkingFixture) await replayThinking()
   if (shouldSend) {
     await emit('turn_start', { type: 'turn_start', turnIndex: 0 })
     const context: Context = {
@@ -369,7 +480,7 @@ try {
       await roundManager.tick()
     }
   }
-  if (!shouldSend || phase === 'takeover') {
+  if ((!shouldSend && !thinkingFixture) || phase === 'takeover') {
     // Observe the public registry, not a private restore API. Production starts
     // restoration detached. An implementation without restart restoration
     // still reaches the warm-count assertion instead of hanging at startup.
