@@ -3585,7 +3585,7 @@ describe('OC2 installed quota reroutes', () => {
             ],
           },
         })
-        // The vault persists a native quota map; the report reads the decoded
+        // The vault stores quota in its own format; the report reads the decoded
         // Anthropic snapshot under the credential ID, not the logical route ID.
         expect(
           (await fixture.runtime.read()).accounts.find(
@@ -3883,7 +3883,8 @@ describe('OC2 installed quota reroutes', () => {
     }
     const fable = { ...scope, modelID: 'claude-fable-5-2' }
     const host = await retryHost(source(fixture.runtime, fixture.paths))
-    // The previous turn reached the last account after two unconfirmed limits.
+    // The previous turn reached the last account after the first two answered
+    // 429 without headers confirming a spent quota window.
     for (const token of access.slice(0, 2)) {
       const request = await host.send(fable)
       expect(request.headers.get('authorization')).toBe(`Bearer ${token}`)
