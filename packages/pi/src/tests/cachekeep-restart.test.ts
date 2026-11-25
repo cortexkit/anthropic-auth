@@ -40,7 +40,10 @@ async function withProcesses(
         live: number
         warm: number
       }
-      if (['resume', 'takeover'].includes(phase) && value.warm !== 1)
+      if (
+        ['resume', 'round-resume', 'takeover'].includes(phase) &&
+        value.warm !== 1
+      )
         throw new Error(`Pi ${phase} sent ${value.warm} warms: ${stderr}`)
       return value
     })
@@ -94,6 +97,13 @@ test(
   () => restart('seed'),
   20_000,
 )
+
+test('Pi signs both round warms and restores only the target with its source headers', async () => {
+  await withProcesses(async (spawn) => {
+    expect(await spawn('round-seed').result).toEqual({ live: 4, warm: 2 })
+    expect(await spawn('round-resume').result).toEqual({ live: 0, warm: 1 })
+  })
+}, 20_000)
 
 test(
   'Pi startup, turn and accepted response proceed while the keep-warm lock is held',

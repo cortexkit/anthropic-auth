@@ -16,6 +16,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { isRetryableAssistantError } from '@earendil-works/pi-ai/compat'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
+import { registerCommands } from '../commands.ts'
 import {
   closePiNativeRuntime,
   getPiNativeRuntime,
@@ -31,6 +32,7 @@ import {
   endPiPrimaryTurn,
   forgetPiMessageThread,
   parseSse,
+  piRefusalRoundStatus,
   primaryResponseAllowsApiFallback,
   streamCortexKitAnthropic,
 } from '../stream.ts'
@@ -289,6 +291,272 @@ describe('Pi client refusal fallback', () => {
     },
   )
 })
+
+test.each(['stateless', 'threaded'] as const)(
+  'Pi %s refusal round replays signed thinking, routes side requests and returns to source',
+  async (transport) => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-refusal-round-'))
+    const storagePath = join(tempDir, 'accounts.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveNativePiFixture({ version: 1, accounts: [] }, storagePath)
+    const runtime = await getPiNativeRuntime(storagePath).service()
+    await runtime.updateSettings((settings) => ({
+      ...settings,
+      quota: { enabled: false },
+      cacheKeep: { enabled: false },
+    }))
+    const source = { ...anthropicModel, id: 'claude-fable-5-2' }
+    const target = 'claude-opus-4-8'
+    const rates = { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 }
+    const sessionId = `pi-round-${transport}`
+    const token = 'unique-pi-round-credit'
+    const notices: Array<string | undefined> = []
+    let claude: ((...args: unknown[]) => Promise<void>) | undefined
+    registerCommands(
+      {
+        registerCommand(_name: string, command: { handler: typeof claude }) {
+          claude = command.handler
+        },
+      } as unknown as Parameters<typeof registerCommands>[0],
+      {
+        async readMode() {
+          return 'local'
+        },
+        async readStatus() {
+          return 'available'
+        },
+        async dispatch() {
+          return { ok: false, text: 'not used' }
+        },
+      },
+    )
+    async function claudeStatus() {
+      let status = ''
+      if (!claude) throw new Error('Pi did not register /claude')
+      await claude('', {
+        hasUI: false,
+        sessionManager: { getSessionId: () => sessionId },
+        ui: {
+          notify: (text: string) => {
+            status = text
+          },
+        },
+      })
+      return status
+    }
+    const sent: Array<{
+      text: string
+      body: Record<string, unknown>
+      beta: string | null
+    }> = []
+    let answer: 'refuse' | 'complete' | 'reject-target' = 'refuse'
+    globalThis.fetch = mock(async (_url, init) => {
+      const text =
+        init?.body instanceof Uint8Array
+          ? gunzipSync(init.body).toString()
+          : String(init?.body)
+      const body = JSON.parse(text)
+      const model = body.model
+      sent.push({
+        text,
+        body,
+        beta: new Headers(init?.headers).get('anthropic-beta'),
+      })
+      if (answer === 'reject-target' && model === target)
+        return Response.json(
+          {
+            type: 'error',
+            error: { type: 'invalid_request_error', message: 'invalid target' },
+          },
+          { status: 400 },
+        )
+      const refused = answer === 'refuse' && model === source.id
+      const frames: Record<string, unknown>[] = [
+        {
+          type: 'message_start',
+          message: {
+            id: `msg_pi_round_${sent.length}`,
+            model,
+            usage: { input_tokens: 31 },
+          },
+        },
+      ]
+      const textBlock = (index: number, text: string) =>
+        frames.push(
+          {
+            type: 'content_block_start',
+            index,
+            content_block: { type: 'text', text: '' },
+          },
+          {
+            type: 'content_block_delta',
+            index,
+            delta: { type: 'text_delta', text },
+          },
+          { type: 'content_block_stop', index },
+        )
+      const thinking = (index: number, signature?: string) =>
+        frames.push(
+          {
+            type: 'content_block_start',
+            index,
+            content_block: { type: 'thinking', thinking: '' },
+          },
+          {
+            type: 'content_block_delta',
+            index,
+            delta: {
+              type: 'thinking_delta',
+              thinking: signature ?? 'unsigned probe',
+            },
+          },
+          ...(signature
+            ? [
+                {
+                  type: 'content_block_delta',
+                  index,
+                  delta: { type: 'signature_delta', signature },
+                },
+              ]
+            : []),
+          { type: 'content_block_stop', index },
+        )
+      if (refused) thinking(0, 'source-signed-probe')
+      if (!refused) {
+        if (model === target && body.fallback_credit_token)
+          thinking(0, 'target-signed-probe')
+        else textBlock(0, 'First part. ')
+        thinking(1)
+        textBlock(2, 'Second part.')
+      }
+      frames.push(
+        {
+          type: 'message_delta',
+          delta: refused
+            ? {
+                stop_reason: 'refusal',
+                stop_details: {
+                  type: 'refusal',
+                  category: 'cyber',
+                  fallback_credit_token: token,
+                  fallback_has_prefill_claim: true,
+                },
+              }
+            : { stop_reason: 'end_turn' },
+          usage: { output_tokens: 7 },
+        },
+        { type: 'message_stop' },
+      )
+      return new Response(
+        frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join(''),
+        {
+          headers: { 'content-type': 'text/event-stream' },
+        },
+      )
+    }) as unknown as typeof fetch
+    let history = anthropicContext
+    const send = (origin: 'agent-loop' | 'direct' = 'agent-loop') =>
+      streamCortexKitAnthropic(
+        source,
+        history,
+        {
+          sessionId,
+          ...(transport === 'threaded' && {
+            onPayload: (payload: unknown) => payload,
+            onResponse: () => {},
+            onProviderStreamEvent: () => {},
+          }),
+        },
+        undefined,
+        { setWorkingMessage: (message) => notices.push(message) },
+        origin,
+        (id) => (id === target ? rates : undefined),
+      ).result()
+    beginPiPrimaryTurn(storagePath, sessionId)
+    try {
+      const retry = await send()
+      expect(retry.stopReason).toBe('stop')
+      expect(retry.model).toBe(source.id)
+      expect(piRefusalRoundStatus(sessionId)).toContain(
+        `${source.id} → ${target} (cyber; 9 steps left)`,
+      )
+      expect(notices.at(-1)).toBe(piRefusalRoundStatus(sessionId))
+      expect(await claudeStatus()).toContain(
+        `Status\n${piRefusalRoundStatus(sessionId)}`,
+      )
+      history = {
+        ...history,
+        messages: [
+          ...history.messages,
+          retry,
+          { role: 'user', content: 'continue', timestamp: 1 },
+        ],
+      }
+      answer = 'reject-target'
+      expect((await send('direct')).stopReason).toBe('stop')
+      expect(
+        sent.slice(2).map(({ body }) => [body.model, body.thread]),
+      ).toEqual([
+        [target, undefined],
+        [source.id, undefined],
+      ])
+      expect(piRefusalRoundStatus(sessionId)).toContain('9 steps left')
+      answer = 'complete'
+      const round = await send()
+      expect(round.stopReason).toBe('stop')
+      expect(round.model).toBe(source.id)
+      expect(round.usage.cost.total).toBeCloseTo(
+        (31 * rates.input + 7 * rates.output) / 1_000_000,
+        10,
+      )
+      expect(sent[4]?.text).toContain('target-signed-probe')
+      expect(sent[4]?.text).not.toContain('unsigned probe')
+      expect(piRefusalRoundStatus(sessionId)).toContain('8 steps left')
+      history = {
+        ...history,
+        messages: [
+          ...history.messages,
+          round,
+          { role: 'user', content: 'again', timestamp: 2 },
+        ],
+      }
+      if (transport === 'stateless') {
+        // Editing the most recent reply ends the round, even before Pi has replayed it.
+        round.content[0] = { type: 'text', text: 'edited latest reply' }
+      } else {
+        answer = 'reject-target'
+      }
+      expect((await send()).stopReason).toBe('stop')
+      expect(sent.at(-1)?.body.model).toBe(source.id)
+      expect(sent.at(-1)?.text).toContain('source-signed-probe')
+      expect(sent.at(-1)?.text).not.toContain('target-signed-probe')
+      expect(piRefusalRoundStatus(sessionId)).toBeUndefined()
+      expect(notices.at(-1)).toBeUndefined()
+      expect(await claudeStatus()).not.toContain('Claude safety fallback')
+      answer = 'complete'
+      if (transport === 'threaded') {
+        expect(sent[4]?.body.thread).toEqual({ type: 'create' })
+        expect(sent[5]?.body.model).toBe(target)
+        expect(sent.at(-1)?.body.thread).toBeUndefined()
+        await send()
+        expect(sent.at(-1)?.body.thread).toEqual({ type: 'create' })
+      } else {
+        expect(sent.every(({ body }) => body.thread === undefined)).toBe(true)
+      }
+      expect(sent.filter(({ text }) => text.includes(token))).toEqual([
+        sent[1]!,
+      ])
+      for (const { text, beta, body } of sent) {
+        expect(await core.hasValidRequestBodySignature(text)).toBe(true)
+        if (body.model === target)
+          expect(beta?.split(',')).toContain(core.SERVER_SIDE_FALLBACK_BETA)
+      }
+    } finally {
+      endPiPrimaryTurn(storagePath, sessionId, true)
+      forgetPiMessageThread(sessionId)
+    }
+  },
+)
 
 describe('Pi shared routing relay', () => {
   async function fixture(mode = 'normal', retry401 = false) {

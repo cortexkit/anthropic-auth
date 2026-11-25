@@ -1,12 +1,16 @@
 import { createHash } from 'node:crypto'
+import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import {
   __setLogTestSink,
+  CacheKeepManager,
   CLAUDE_SONNET_5_5_MODEL_ID,
   cacheKeepStoreDirectory,
   ensureHolderDirectory,
+  hasValidRequestBodySignature,
   LEGACY_STATE_LAYOUT,
+  PER_TURN_CONTROL_BETA,
   resolveNativePoolPaths,
   withNativeLock,
 } from '@cortexkit/anthropic-auth-core'
@@ -27,8 +31,32 @@ import {
 // Each invocation is a real process boundary: no module manager, timer or
 // credential runtime can be inherited from the preceding Pi instance.
 const phase = process.argv[2]
-const shouldSend = ['seed', 'locked', 'takeover'].includes(phase ?? '')
+const roundSource = 'claude-fable-5-2'
+const roundTarget = 'claude-opus-4-8'
+const roundSeed = phase === 'round-seed'
+const roundFixture = roundSeed || phase === 'round-resume'
+const shouldSend =
+  roundSeed || ['seed', 'locked', 'takeover'].includes(phase ?? '')
 const sessionId = 'pi-restart-session-S'
+const roundTemplateReady = Promise.withResolvers<void>()
+const sourceWarmReady = Promise.withResolvers<void>()
+let roundManager: CacheKeepManager | undefined
+if (roundSeed) {
+  const track = CacheKeepManager.prototype.track
+  CacheKeepManager.prototype.track = function (input) {
+    const result = track.call(this, input)
+    if (result.tracked && input.sourceWarm) sourceWarmReady.resolve()
+    if (
+      result.tracked &&
+      input.sessionId === sessionId &&
+      input.bodyText.includes('later round step')
+    ) {
+      roundManager = this
+      roundTemplateReady.resolve()
+    }
+    return result
+  }
+}
 __setLogTestSink((record) => {
   if (JSON.stringify(record).includes('cachekeep'))
     console.error(JSON.stringify(record))
@@ -51,6 +79,8 @@ globalThis.clearInterval = ((timer: ReturnType<typeof setInterval>) => {
 }) as typeof clearInterval
 
 const messages: Array<Record<string, unknown>> = []
+let refuseRoundSource = false
+const probeFailures: string[] = []
 const originalFetch = globalThis.fetch
 globalThis.fetch = Object.assign(
   async (input: string | URL | Request, init?: RequestInit) => {
@@ -61,39 +91,75 @@ globalThis.fetch = Object.assign(
       })
     if (!url.includes('/v1/messages'))
       throw new Error(`Unexpected fixture request: ${new URL(url).pathname}`)
-    const body = JSON.parse(
+    const text =
       init?.body instanceof Uint8Array
         ? gunzipSync(init.body).toString()
-        : String(init?.body),
-    )
+        : String(init?.body)
+    const body = JSON.parse(text)
     messages.push(body)
-    if (body.max_tokens === 0)
+    if (roundFixture && !(await hasValidRequestBodySignature(text)))
+      probeFailures.push(`Pi sent unsigned ${body.model} shape`)
+    if (body.max_tokens === 0) {
+      if (roundFixture) {
+        const beta = new Headers(init?.headers)
+          .get('anthropic-beta')
+          ?.split(',')
+        if (!beta?.includes(PER_TURN_CONTROL_BETA))
+          probeFailures.push(
+            `Warm ${body.model} lost Fable source feature headers: ${beta}`,
+          )
+        if (body.thread || body.fallback_credit_token || body.fallbacks)
+          probeFailures.push(
+            'Round warm replayed a thread or credit-bearing body',
+          )
+        if (body.model === roundSource && text.includes('blocked next prompt'))
+          probeFailures.push('Source warm replayed the refused prefix')
+      }
       return Response.json({ usage: { cache_read_input_tokens: 100 } })
+    }
+    const refused = refuseRoundSource && body.model === roundSource
     return new Response(
       [
         {
           type: 'message_start',
           message: {
-            id: 'msg_restart',
-            model: CLAUDE_SONNET_5_5_MODEL_ID,
+            id: `msg_restart_${messages.length}`,
+            model: body.model,
             content: [],
-            usage: { input_tokens: 1, output_tokens: 0 },
+            usage: {
+              input_tokens: 17,
+              output_tokens: 0,
+              cache_read_input_tokens: 100,
+            },
           },
         },
-        {
-          type: 'content_block_start',
-          index: 0,
-          content_block: { type: 'text', text: '' },
-        },
-        {
-          type: 'content_block_delta',
-          index: 0,
-          delta: { type: 'text_delta', text: 'answer' },
-        },
-        { type: 'content_block_stop', index: 0 },
+        ...(!refused
+          ? [
+              {
+                type: 'content_block_start',
+                index: 0,
+                content_block: { type: 'text', text: '' },
+              },
+              {
+                type: 'content_block_delta',
+                index: 0,
+                delta: { type: 'text_delta', text: 'answer' },
+              },
+              { type: 'content_block_stop', index: 0 },
+            ]
+          : []),
         {
           type: 'message_delta',
-          delta: { stop_reason: 'end_turn' },
+          delta: refused
+            ? {
+                stop_reason: 'refusal',
+                stop_details: {
+                  type: 'refusal',
+                  category: 'cyber',
+                  fallback_credit_token: 'pi-restart-round-probe',
+                },
+              }
+            : { stop_reason: 'end_turn' },
           usage: { output_tokens: 1 },
         },
         { type: 'message_stop' },
@@ -106,7 +172,7 @@ globalThis.fetch = Object.assign(
   { preconnect: originalFetch.preconnect },
 ) as typeof fetch
 
-if (phase === 'seed' || phase === 'locked') {
+if (roundSeed || phase === 'seed' || phase === 'locked') {
   await saveNativePiFixture({ version: 1, accounts: [] }, storagePath)
   const runtime = await getPiNativeRuntime(storagePath).service()
   // The synthetic login outlives the clock advance; this test is about cache
@@ -127,6 +193,18 @@ if (phase === 'seed' || phase === 'locked') {
     claudeCache: { enabled: true, mode: 'hybrid' },
     cacheKeep: { enabled: true, always: true },
   }))
+} else if (phase === 'round-resume') {
+  const paths = await resolveNativePoolPaths(
+    storagePath,
+    undefined,
+    LEGACY_STATE_LAYOUT,
+  )
+  const directory = cacheKeepStoreDirectory(paths.storageId, undefined, 'pi')
+  const name = `${createHash('sha256').update(sessionId).digest('hex')}.json.gz`
+  const saved = JSON.parse(
+    gunzipSync(await readFile(join(directory, name))).toString(),
+  )
+  now = saved.nextPrewarmAt
 } else if (phase === 'resume') {
   now += 55 * 60_000
 }
@@ -156,7 +234,10 @@ await cortexKitPiAnthropicAuth(pi)
 const provider = providers.get('anthropic')
 const model = provider
   ?.getModels()
-  .find((row) => row.id === CLAUDE_SONNET_5_5_MODEL_ID)
+  .find(
+    (row) =>
+      row.id === (roundFixture ? roundSource : CLAUDE_SONNET_5_5_MODEL_ID),
+  )
 if (!provider || !model)
   throw new Error('Pi did not register the Anthropic model')
 const ctx = {
@@ -223,20 +304,17 @@ try {
   await emit('session_start', { type: 'session_start', reason: 'startup' })
   if (shouldSend) {
     await emit('turn_start', { type: 'turn_start', turnIndex: 0 })
-    const stream = provider?.streamSimple?.(
-      model,
-      {
-        systemPrompt: 'Keep the same prompt prefix across the Pi restart.',
-        messages: [
-          {
-            role: 'user',
-            content: phase === 'takeover' ? 'real turn elsewhere' : 'hello',
-            timestamp: now,
-          },
-        ],
-      },
-      { sessionId },
-    )
+    const context: Context = {
+      systemPrompt: 'Keep the same prompt prefix across the Pi restart.',
+      messages: [
+        {
+          role: 'user',
+          content: phase === 'takeover' ? 'real turn elsewhere' : 'hello',
+          timestamp: now,
+        },
+      ],
+    }
+    const stream = provider?.streamSimple?.(model, context, { sessionId })
     if (!stream) throw new Error('Pi did not register its stream')
     let timeout: ReturnType<typeof setTimeout> | undefined
     const result = await (phase === 'locked'
@@ -256,7 +334,40 @@ try {
         ]).finally(() => clearTimeout(timeout))
       : stream.result())
     if (result.stopReason === 'error') throw new Error(result.errorMessage)
+    if (roundSeed) {
+      refuseRoundSource = true
+      context.messages.push(result, {
+        role: 'user',
+        content: 'blocked next prompt',
+        timestamp: now + 1,
+      })
+      const retry = await provider
+        .streamSimple(model, context, { sessionId })
+        .result()
+      if (retry.stopReason !== 'stop') throw new Error(retry.errorMessage)
+      refuseRoundSource = false
+      context.messages.push(retry, {
+        role: 'user',
+        content: 'later round step',
+        timestamp: now + 2,
+      })
+      const round = await provider
+        .streamSimple(model, context, { sessionId })
+        .result()
+      if (round.stopReason !== 'stop' || messages.at(-1)?.model !== roundTarget)
+        throw new Error('Pi did not serve the round step on the target')
+      await Promise.all([roundTemplateReady.promise, sourceWarmReady.promise])
+    }
     await events.get('agent_settled')?.({ type: 'agent_settled' }, ctx)
+  }
+  if (roundSeed && roundManager) {
+    // The two prefixes can have different lifetimes. Tick when each one is
+    // due instead of moving both by the assumed one-hour cache lifetime.
+    const due = roundManager.trackedSessions().map((row) => row.nextPrewarmAt)
+    for (const next of [...new Set(due)].sort((a, b) => a - b)) {
+      now = next + 1000
+      await roundManager.tick()
+    }
   }
   if (!shouldSend || phase === 'takeover') {
     // Observe the public registry, not a private restore API. Production starts
@@ -279,7 +390,7 @@ try {
       process.send?.({ tracked })
       await Bun.stdin.text()
     }
-    if (phase !== 'resume') now += 55 * 60_000
+    if (phase !== 'resume' && phase !== 'round-resume') now += 55 * 60_000
     now += 60_000
     for (const callback of [...intervals.values()]) await callback()
   }
@@ -291,6 +402,27 @@ await events.get('session_shutdown')?.(
   { type: 'session_shutdown', reason: 'quit' },
   ctx,
 )
+if (roundSeed) {
+  const paths = await resolveNativePoolPaths(
+    storagePath,
+    undefined,
+    LEGACY_STATE_LAYOUT,
+  )
+  const files = await readdir(
+    cacheKeepStoreDirectory(paths.storageId, undefined, 'pi'),
+  )
+  const expected = `${createHash('sha256').update(sessionId).digest('hex')}.json.gz`
+  const saved = files.filter((file) => file.endsWith('.json.gz'))
+  if (JSON.stringify(saved) !== JSON.stringify([expected]))
+    throw new Error(`Source warm leaked into Pi restart persistence: ${saved}`)
+  if (
+    !messages.some(
+      (body) => body.model === roundSource && body.max_tokens === 0,
+    )
+  )
+    throw new Error('Pi did not warm the source during the round')
+}
+if (probeFailures.length) throw new Error(probeFailures.join('\n'))
 console.log(
   `PI_RESTART_RESULT ${JSON.stringify({ live: messages.filter((body) => body.max_tokens !== 0).length, warm: messages.filter((body) => body.max_tokens === 0).length })}`,
 )

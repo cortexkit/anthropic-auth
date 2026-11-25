@@ -17,6 +17,7 @@ import {
   peekRoutingAccount,
   readSessionCachePolicy,
   remapModelId,
+  resolveClaudeModelCapabilities,
   type StickySessionRouter,
 } from '@cortexkit/anthropic-auth-core'
 import { version as pluginVersion } from '../package.json'
@@ -50,6 +51,7 @@ export class PiCacheKeep {
     { turn: CacheKeepRealTurn; claimed: boolean }
   >()
   private readonly pendingTurns = new Set<CacheKeepRealTurn>()
+  private readonly preservedTurns = new WeakSet<CacheKeepRealTurn>()
   readonly manager: CacheKeepManager
   private readonly stores = new Map<string, Promise<CacheKeepStore>>()
   private readonly sessions = new Map<string, Session>()
@@ -82,12 +84,14 @@ export class PiCacheKeep {
     this.schedule = schedule
     this.cancel = managerOptions.clearIntervalImpl ?? clearInterval
     const persisted = (target: Readonly<CacheKeepTarget>) => {
+      if (target.sourceWarm) return undefined
       const identity = target.hostMetadata?.accountIdentity
       return typeof identity === 'string'
         ? { ...target, oauthAccountIdentity: identity }
         : undefined
     }
     const persistWarm = async (target: Readonly<CacheKeepTarget>) => {
+      if (target.sourceWarm) return true
       const session = this.sessions.get(target.id)
       const entry = persisted(target)
       if (this.stopping || !session || !entry) return 'not-owner' as const
@@ -96,6 +100,8 @@ export class PiCacheKeep {
     this.manager = new CacheKeepManager({
       ...managerOptions,
       peekRoutingAccount: (target, route) => {
+        // Core checks the source route, not the live template's target model.
+        if (target.sourceWarm) return undefined
         const session = this.sessions.get(route.sessionId)
         const routing = this.options.routing?.(
           session?.storagePath ?? target.accountStoragePath ?? '',
@@ -121,7 +127,8 @@ export class PiCacheKeep {
           : Promise.resolve(false),
       onTargetRemoved: (id, target) => {
         this.restored.delete(id)
-        this.sessions.get(id)?.store.removed(persisted(target) ?? target)
+        if (!target.sourceWarm)
+          this.sessions.get(id)?.store.removed(persisted(target) ?? target)
         managerOptions.onTargetRemoved?.(id, target)
       },
       prepareHeaders: async (headers, target, attempt, isTargetCurrent) => {
@@ -147,7 +154,8 @@ export class PiCacheKeep {
             (row) => accountKey(row) === identity,
           )
           if (!account || !nativeAccountCanServe(account)) return undefined
-        } else if (this.manager.trackedRequest(target.id)) return undefined
+        } else if (!target.sourceWarm && this.manager.trackedRequest(target.id))
+          return undefined
         return managerOptions.prepareHeaders
           ? managerOptions.prepareHeaders(
               headers,
@@ -365,6 +373,17 @@ export class PiCacheKeep {
           if (account.type !== 'oauth' || !nativeAccountCanServe(account))
             return 'account-gone'
           if (
+            entry.refusalSourceModel !== undefined &&
+            !resolveClaudeModelCapabilities(entry.refusalSourceModel)
+              ?.refusalRecoveryFamily
+          ) {
+            logger.warn(
+              'cachekeep',
+              'Ignoring restored warm for unsupported refusal source model',
+            )
+            return 'invalid'
+          }
+          if (
             entry.isSubagent &&
             !entry.policyState?.planned &&
             readSessionCachePolicy(
@@ -383,7 +402,12 @@ export class PiCacheKeep {
             cacheMode: 'hybrid',
             oauthAccountId: account.id,
             oauthAccountIdentity: account.accountIdentity,
-            hostMetadata: { accountIdentity: accountKey(account) },
+            hostMetadata: {
+              accountIdentity: accountKey(account),
+              ...(entry.refusalSourceModel !== undefined && {
+                refusalSourceModel: entry.refusalSourceModel,
+              }),
+            },
             accountStoragePath: storagePath,
             isSubagent: entry.isSubagent,
             retained: {
@@ -424,7 +448,7 @@ export class PiCacheKeep {
     }
     try {
       const previous = this.turnStarts.get(sessionId)
-      if (previous && !previous.claimed) previous.turn.finish()
+      if (previous && !previous.claimed) this.finishTurn(previous.turn)
       const turn = this.manager.beginRealTurn(sessionId)
       this.turnStarts.set(sessionId, { turn, claimed: false })
       return turn
@@ -449,14 +473,21 @@ export class PiCacheKeep {
     const pending = this.turnStarts.get(sessionId)
     this.turnStarts.delete(sessionId)
     try {
-      if (pending && !pending.claimed) pending.turn.finish()
+      if (pending && !pending.claimed) this.finishTurn(pending.turn)
     } catch {}
   }
 
   finishTurn(turn: CacheKeepRealTurn | undefined) {
     try {
-      if (turn && !this.pendingTurns.has(turn)) turn.finish()
+      if (turn && !this.pendingTurns.has(turn)) {
+        if (this.preservedTurns.has(turn)) turn.pause()
+        else turn.finish()
+      }
     } catch {}
+  }
+
+  preserveTurn(turn: CacheKeepRealTurn | undefined) {
+    if (turn) this.preservedTurns.add(turn)
   }
 
   trackAccepted(
@@ -464,6 +495,7 @@ export class PiCacheKeep {
     snapshot: NativeAccountSnapshot,
     requestTurn?: CacheKeepRealTurn,
     isFresh: () => boolean = () => true,
+    prepare?: (bodyText: string) => Promise<string>,
   ) {
     let turn = requestTurn ?? currentCacheKeepRealTurn()
     try {
@@ -480,6 +512,8 @@ export class PiCacheKeep {
     const acceptedAt = this.now()
     if (turn) this.pendingTurns.add(turn)
     const tracking = (async () => {
+      const bodyText = prepare ? await prepare(input.bodyText) : input.bodyText
+      if (!isFresh()) return
       const session = await this.claim(storagePath, sessionId, true)
       if (!session || !isFresh()) return
       const account =
@@ -498,6 +532,7 @@ export class PiCacheKeep {
       // that accepted body, but never grant the cache the time spent waiting.
       const result = turn?.track({
         ...input,
+        bodyText,
         acceptedAt,
         hostMetadata: {
           ...input.hostMetadata,
@@ -510,9 +545,7 @@ export class PiCacheKeep {
     })()
       .finally(() => {
         if (turn) this.pendingTurns.delete(turn)
-        try {
-          turn?.finish()
-        } catch {}
+        this.finishTurn(turn)
       })
       .catch(() =>
         logger.warn('cachekeep', 'accepted response tracking failed'),

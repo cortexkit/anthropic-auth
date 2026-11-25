@@ -93,7 +93,12 @@ export type SavedCacheKeepTarget = Pick<
   | 'lastTouchAt'
   | 'lastTouchKind'
   | 'policyState'
-> & { v: typeof RECORD_FORMAT_VERSION; pluginVersion: string }
+> & {
+  v: typeof RECORD_FORMAT_VERSION
+  pluginVersion: string
+  /** Model used to rebuild OAuth feature headers for a switched-model body. */
+  refusalSourceModel?: string
+}
 
 type DropReason =
   | 'format'
@@ -496,6 +501,9 @@ function record(
     ttlMs: target.ttlMs,
     lastTouchAt: target.lastTouchAt,
     lastTouchKind: target.lastTouchKind,
+    ...(typeof target.hostMetadata?.refusalSourceModel === 'string' && {
+      refusalSourceModel: target.hostMetadata.refusalSourceModel,
+    }),
     ...(target.policyState && {
       policyState: {
         ownerSessionId: target.policyState.ownerSessionId,

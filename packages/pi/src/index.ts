@@ -60,6 +60,7 @@ import {
   endPiPrimaryTurn,
   forgetPiMessageThread,
   invalidatePiPrimaryModel,
+  observePiCompaction,
   observePiUserPrompt,
   startPiCacheKeepSession,
   stopPiCacheKeep,
@@ -231,6 +232,10 @@ export default async function cortexKitPiAnthropicAuth(
       return
     const sessionId = ctx.sessionManager.getSessionId()
     if (sessionId) invalidatePiPrimaryModel(storagePath, sessionId)
+  })
+  pi.on('session_compact', (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId()
+    if (sessionId) observePiCompaction(sessionId)
   })
   pi.on('agent_settled', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()

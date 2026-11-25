@@ -204,6 +204,28 @@ test('a first Pi track saves its accepted target identity on the first change', 
   }
 })
 
+test('Pi drops an unsupported restart source model instead of warming it', async () => {
+  const f = await fixture()
+  const first = f.create()
+  const input = f.input('unsupported-source')
+  await first.process.trackAccepted(
+    {
+      ...input,
+      hostMetadata: { refusalSourceModel: 'claude-sonnet-4-6' },
+    },
+    f.snapshot,
+  )
+  await first.process.stop()
+  const next = f.create()
+  await next.process.startSession('pi-storage', 'unsupported-source')
+  expect(
+    next.process.manager.trackedRequest('unsupported-source'),
+  ).toBeUndefined()
+  f.advance(56 * 60_000)
+  await next.tick()
+  expect(f.sends).toBeEmpty()
+})
+
 test('a superseded Pi acceptance cannot relabel the newer account on disk', async () => {
   const f = await fixture()
   f.snapshot.accounts.push({

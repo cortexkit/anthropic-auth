@@ -136,13 +136,13 @@ function hasLoneSurrogate(text: string): boolean {
  * Cross-provider IDs (e.g. OpenAI Codex `call_xxx|fc_xxx`) contain characters
  * Anthropic rejects. Deterministic — same input always yields the same output.
  */
-function sanitizeToolId(id: string): string {
+export function sanitizeToolId(id: string): string {
   if (!id) return 'tool_call_unknown'
   const cleaned = id.replace(/[^a-zA-Z0-9_-]/g, '_')
   return cleaned.length > 256 ? cleaned.slice(0, 256) : cleaned
 }
 
-function toClaudeCodeToolName(name: string): string {
+export function toClaudeCodeToolName(name: string): string {
   return CLAUDE_CODE_TOOLS.get(name.toLowerCase()) ?? name
 }
 

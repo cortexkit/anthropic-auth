@@ -96,6 +96,7 @@ import {
   type ProviderAccountUuid,
   type ProviderErrorResponseScope,
   parseSseFrame,
+  peekRoutingAccount,
   prepareMessageThreadRequest,
   protectFallbackCreditResponse,
   QuotaManager,
@@ -109,7 +110,14 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  RecoveryThinkingStore,
+  type RefusalFallbackCacheRoute,
+  type RefusalFallbackDispatchOptions,
   type RefusalFallbackMode,
+  RefusalFallbackRoundEngine,
+  type RefusalFallbackRoundEvent,
+  type RefusalFallbackRoundInput,
+  type RefusalFallbackRoundPlan,
   type RoutingChoice,
   raceWithSignal,
   readSessionCachePolicy,
@@ -165,6 +173,8 @@ import {
   buildAnthropicRequest,
   fromClaudeCodeToolName,
   piThreadCacheSlot,
+  sanitizeToolId,
+  toClaudeCodeToolName,
 } from './convert.ts'
 import type { PiEffortTransition } from './effort-history.ts'
 import {
@@ -201,6 +211,43 @@ import {
 } from './transport.ts'
 
 const messageThreads = MessageThreadTracker.withTailPersistence('pi')
+const replanPiRound = Symbol('replan Pi refusal round')
+const refusalRounds = new Map<string, RefusalFallbackRoundEvent>()
+const roundRoutes = new Map<
+  string,
+  RefusalFallbackCacheRoute & { storagePath: string; routeId: string }
+>()
+const roundNotices = new Map<string, (message?: string) => void>()
+
+export function piRefusalRoundStatus(sessionId: string | undefined) {
+  const round = sessionId && refusalRounds.get(sessionId)
+  if (!round) return undefined
+  const { requestedModel, servingModel, category, stepsLeft } = round
+  return `Claude safety fallback: ${requestedModel} → ${servingModel} (${category}; ${stepsLeft} steps left)`
+}
+
+function observePiRefusalRound(event: RefusalFallbackRoundEvent) {
+  if (event.kind === 'round_ended') refusalRounds.delete(event.sessionId)
+  else refusalRounds.set(event.sessionId, event)
+  logger.info('refusal-fallback', event.kind, event)
+  roundNotices.get(event.sessionId)?.(piRefusalRoundStatus(event.sessionId))
+}
+
+export function forgetPiRefusalAccount(accountId: string) {
+  rounds.forgetAccount(accountId)
+  for (const [sessionId, route] of roundRoutes)
+    if (route.accountId === accountId) roundRoutes.delete(sessionId)
+}
+
+export function forgetPiRefusalRoute(storagePath: string, routeId?: string) {
+  for (const route of roundRoutes.values()) {
+    if (
+      route.storagePath === storagePath &&
+      (!routeId || route.routeId === routeId)
+    )
+      forgetPiRefusalAccount(route.accountId)
+  }
+}
 const dumpResponseObservers = new WeakMap<
   Response,
   ReturnType<typeof createDumpResponseObserver>
@@ -215,6 +262,7 @@ const primarySessions = new Map<
     previousRequestId?: string
     sent: number
     committed: number
+    compacted?: boolean
   }
 >()
 
@@ -242,7 +290,8 @@ export function beginPiPrimaryTurn(
   sessionId?: string,
 ): void {
   if (!sessionId) return
-  piCacheKeep.realTurn(sessionId)
+  const lease = piCacheKeep.realTurn(sessionId)
+  if (refusalRounds.has(sessionId)) piCacheKeep.preserveTurn(lease)
   const previous = primarySessions.get(sessionId)
   const session =
     previous?.storagePath === storagePath
@@ -256,6 +305,9 @@ export function beginPiPrimaryTurn(
     const oldest = primarySessions.keys().next().value
     if (oldest === undefined) break
     primarySessions.delete(oldest)
+    roundRoutes.delete(oldest)
+    roundNotices.delete(oldest)
+    refusalRounds.delete(oldest)
   }
 }
 
@@ -275,7 +327,19 @@ export function invalidatePiPrimaryModel(
   sessionId: string,
 ) {
   const session = primarySessions.get(sessionId)
-  if (session?.storagePath === storagePath) session.sent += 1
+  if (session?.storagePath === storagePath) {
+    session.sent += 1
+    roundRoutes.delete(sessionId)
+  }
+}
+
+export function observePiCompaction(sessionId: string) {
+  const session = primarySessions.get(sessionId)
+  if (session) {
+    session.compacted = true
+    session.sent += 1
+  }
+  roundRoutes.delete(sessionId)
 }
 
 export function endPiPrimaryTurn(
@@ -319,6 +383,19 @@ function piPrimarySession(
     : undefined
 }
 
+function piRoundSideRequest(
+  options: SimpleStreamOptions | undefined,
+  storagePath: string,
+  origin: 'agent-loop' | 'direct' | undefined,
+) {
+  const sessionId = options?.sessionId
+  return (
+    !!sessionId &&
+    primarySessions.get(sessionId)?.storagePath === storagePath &&
+    !piPrimarySession(storagePath, options, origin)
+  )
+}
+
 export function forgetPiMessageThread(
   sessionId: string,
   disposition: 'session_closed' | 'session_deleted' = 'session_deleted',
@@ -326,6 +403,11 @@ export function forgetPiMessageThread(
   messageThreads.forget(sessionId, disposition)
   cacheDiagnostics.forgetSession(sessionId)
   cacheDiagnosticsSessions.delete(sessionId)
+  roundRoutes.delete(sessionId)
+  roundNotices.get(sessionId)?.()
+  roundNotices.delete(sessionId)
+  refusalRounds.delete(sessionId)
+  if (disposition === 'session_deleted') rounds.forgetSession(sessionId)
 }
 
 /** Dump label for a physical send that failed before any response arrived. */
@@ -562,6 +644,12 @@ function piBillingPayer(attempt: PiNativeAttempt) {
   }
 }
 
+function piCredentialId(account: NativeAccountView | undefined) {
+  return account?.source === 'vault'
+    ? account.credentialId
+    : account?.binding && localMessageThreadCredential(account.binding)
+}
+
 const nativePrewarmAttempts = new Map<
   number,
   {
@@ -592,10 +680,20 @@ const piCacheKeep = new PiCacheKeep(
     // the target's own runtime.
     fetchForTarget: (target) => {
       const storagePath = target.accountStoragePath ?? getPiAccountStoragePath()
-      return createPiOAuthModelFetch(
+      const fetch = createPiOAuthModelFetch(
         () => piClaudeGatewayFromMemory(storagePath),
         getRequestGzipLatch(getRequestGzipLatchPath(storagePath)),
       )
+      const base = target.hostMetadata?.sourceWarmBaseUrl
+      return target.sourceWarm && typeof base === 'string'
+        ? Object.assign(
+            (_: Parameters<typeof fetch>[0], init?: RequestInit) =>
+              fetch(base, init),
+            {
+              preconnect: fetch.preconnect,
+            },
+          )
+        : fetch
     },
     loadStorage: async () => (await getPiNativeRuntime().view()).policyStorage,
     resolveSettings: resolvePiSettingsFromMemory,
@@ -605,11 +703,15 @@ const piCacheKeep = new PiCacheKeep(
     onTrackedSessionsChanged: (sessions) =>
       getPiCacheKeepRegistry().publish(sessions),
     prepareHeaders: async (headers, target, attempt) => {
-      requirePiOAuthOrigin(target.url)
       const runtime = getPiNativeRuntime(
         target.accountStoragePath ?? getPiAccountStoragePath(),
       )
-      const id = target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID
+      requirePiOAuthOrigin(target.url, runtime.claudeGateway())
+      const warmRoute = target.hostMetadata?.sourceWarmRouteId
+      const id =
+        typeof warmRoute === 'string'
+          ? warmRoute
+          : (target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID)
       const current = await runtime.view()
       const body = JSON.parse(target.bodyText) as Record<string, unknown>
       const served = await runtime.authorize(
@@ -620,7 +722,10 @@ const piCacheKeep = new PiCacheKeep(
       )
       if (
         !target.oauthAccountIdentity ||
-        served.accountIdentity !== target.oauthAccountIdentity
+        (target.sourceWarm
+          ? served.accountIdentity !== target.oauthAccountId ||
+            piBillingPayer(served).credentialId !== target.oauthAccountIdentity
+          : served.accountIdentity !== target.oauthAccountIdentity)
       )
         throw new NativeAccountRefusal('credential-changed')
       const identity = getClaudeCodeIdentityForVerifiedAccount(
@@ -660,7 +765,9 @@ const piCacheKeep = new PiCacheKeep(
       const retryBody = JSON.parse(target.bodyText) as Record<string, unknown>
       const rotated = await entry.runtime
         .retry(
-          target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID,
+          typeof target.hostMetadata?.sourceWarmRouteId === 'string'
+            ? target.hostMetadata.sourceWarmRouteId
+            : (target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID),
           entry.served,
           attempt.signal,
           typeof retryBody.model === 'string' ? retryBody.model : undefined,
@@ -729,6 +836,14 @@ const piCacheKeep = new PiCacheKeep(
   },
 )
 const cacheKeepManager = piCacheKeep.manager
+const thinkingStore = new RecoveryThinkingStore()
+function createPiRefusalRounds() {
+  return new RefusalFallbackRoundEngine(observePiRefusalRound, {
+    thinkingStore,
+    cacheKeep: cacheKeepManager,
+  })
+}
+let rounds = createPiRefusalRounds()
 
 export function startPiCacheKeepSession(
   storagePath: string,
@@ -740,6 +855,9 @@ export function startPiCacheKeepSession(
 export async function stopPiCacheKeep() {
   await piCacheKeep.stop()
   await getPiCacheKeepRegistry().dispose()
+  // Pi may reload the extension in the same process. Discard its old rounds
+  // without deleting the saved thinking of sessions the user can still resume.
+  rounds = createPiRefusalRounds()
 }
 
 export async function getPiTrackedCacheKeepSessions() {
@@ -1090,6 +1208,11 @@ async function sendAnthropicRequest(
       !turn &&
       !forkHead &&
       !options.prime &&
+      !piRoundSideRequest(
+        options.streamOptions,
+        options.storagePath,
+        options.requestOrigin,
+      ) &&
       options.streamOptions?.sessionId
     )
       turn = deps.cacheKeep
@@ -1097,9 +1220,15 @@ async function sendAnthropicRequest(
         : piCacheKeep.requestTurn(options.streamOptions.sessionId)
   } catch {}
   try {
-    return await withCacheKeepRealTurn(turn, () =>
-      sendAnthropicRequestAttempt(...args),
-    )
+    return await withCacheKeepRealTurn(turn, async () => {
+      for (;;) {
+        try {
+          return await sendAnthropicRequestAttempt(...args)
+        } catch (error) {
+          if (error !== replanPiRound) throw error
+        }
+      }
+    })
   } finally {
     if (!inherited) piCacheKeep.finishTurn(turn)
   }
@@ -1126,10 +1255,7 @@ async function sendAnthropicRequestAttempt(
     onCacheUsageRecorder?: (
       record: (usage?: Record<string, number>) => void,
     ) => void
-    onRefusalRetryCommitted?: (model: string) => void
-    onClientCacheCompletion?: (
-      complete: (usage: Record<string, number>) => Promise<void>,
-    ) => void
+    onServingModel?: (model: string | undefined) => void
     prime?: {
       beforeSend: () => Promise<void>
       onServed: (attempt: PiNativeAttempt) => void
@@ -1145,7 +1271,7 @@ async function sendAnthropicRequestAttempt(
   // request-owned lease with the callback rather than looking it up later.
   const realTurn = currentCacheKeepRealTurn()
   options.onCacheUsageRecorder?.(() => {})
-  options.onClientCacheCompletion?.(async () => {})
+  options.onServingModel?.(undefined)
   assertHostAuthorityStable()
   const fetchImpl = deps.fetch ?? globalThis.fetch
   const fetchResponse = async (
@@ -1155,10 +1281,11 @@ async function sendAnthropicRequestAttempt(
     return fetchPiStreamResponse(input, init, fetchImpl)
   }
   const keep = deps.cacheKeep ?? cacheKeepManager
+  const roundEngine = rounds
   const realSession = options.streamOptions?.sessionId
   const forkHead = piForkHeadSession(options.streamOptions)
   const primary =
-    !options.prime && !options.apiAccount && !forkHead
+    !options.prime && !forkHead
       ? piPrimarySession(
           options.storagePath,
           options.streamOptions,
@@ -1248,6 +1375,7 @@ async function sendAnthropicRequestAttempt(
     ).accountIdentity
   }
   let nextAttempt: PiNativeAttempt | undefined
+  let physicalModel = options.model.id
   const identity = verifiedUuid
     ? getClaudeCodeIdentityForVerifiedAccount(
         routeId === STICKY_ROUTING_MAIN_ACCOUNT_ID
@@ -1328,6 +1456,7 @@ async function sendAnthropicRequestAttempt(
     )
   const bodyMode = options.apiAccount ? 'off' : mode
   const sanitized = sanitizeClaudeCodeRequestBody(body, bodyMode)
+  if (typeof body.model === 'string') physicalModel = body.model
   if (bodyMode === 'server') applyServerSideFallbackToBody(body, true)
   options.onResolvedToolNames?.(toolNames)
   options.onForkEffortApplied?.(
@@ -1342,7 +1471,7 @@ async function sendAnthropicRequestAttempt(
         refusalFallbackMode: mode,
         ...(options.prime && { requestClass: 'auxiliary' }),
       })
-  const bodyText =
+  const sourceBodyText =
     sanitized || bodyMode === 'server'
       ? JSON.stringify(
           options.apiAccount
@@ -1350,13 +1479,14 @@ async function sendAnthropicRequestAttempt(
             : orderClaudeCodeBody(body, { isOAuth: !!identity }),
         )
       : builtBodyText
-  let wireBodyText = bodyText
+  let bodyText = sourceBodyText
+  let wireBodyText = sourceBodyText
   const relayAffinity = options.streamOptions?.sessionId ?? null
   const observeResponseHeaders = (
     attempt: PiNativeAttempt,
     responseHeaders: Headers,
     status: number,
-    sentModel = typeof body.model === 'string' ? body.model : options.model.id,
+    sentModel = physicalModel,
   ) => {
     native.observeQuotaHeaders(attempt, responseHeaders, servingRuntime)
     if (options.prime || !relayAffinity) return
@@ -1382,6 +1512,9 @@ async function sendAnthropicRequestAttempt(
   const billingInput = async (
     attempt?: PiNativeAttempt,
     apiSubject?: NativeApiSubject,
+    sentBody = wireBodyText,
+    sentModel = physicalModel,
+    after?: () => Promise<void> | undefined,
   ): Promise<AnthropicBillingRequest | undefined> => {
     // Prime (the five-hour window starter) has no session transcript, and
     // Agent Runner bills a fork's answer itself from the answer's usage, so
@@ -1398,19 +1531,19 @@ async function sendAnthropicRequestAttempt(
       : apiSubject?.credentialFingerprint
     if (!credentialId) return undefined
     const ttlMs = requestShortestCacheLifetimeMs(
-      await withoutFallbackCredit(wireBodyText),
+      await withoutFallbackCredit(sentBody),
     )
     const sessionId = relayAffinity
     return {
       ...(attempt ? piBillingPayer(attempt) : { credentialId }),
       sessionId,
-      model: typeof body.model === 'string' ? body.model : options.model.id,
+      model: sentModel,
       requestKind: options.requestOrigin === 'direct' ? 'generate' : 'primary',
       chargeBasis: options.apiAccount ? 'metered_api' : 'subscription_included',
       ...(ttlMs > 0 ? { cache: { ttlMs } } : {}),
-      // Read when the response finishes. API-key routes are never warmed. An
-      // OAuth answer waits for nothing: until this attempt's CacheKeep
-      // tracking has settled, the state is left out.
+      // Only the accepted report waits for a round template publication;
+      // the stream itself never waits.
+      cacheWarmingAfter: after,
       cacheWarming: () => {
         if (options.apiAccount) return { on: false }
         if (!attempt || cacheTracking.get(attempt) !== 'settled')
@@ -1449,12 +1582,15 @@ async function sendAnthropicRequestAttempt(
     isFresh = () => true,
     refusalSourceModel?: string,
     finalUsage?: Record<string, number>,
+    prepare?: (bodyText: string) => Promise<string>,
   ) => {
     if (options.prime || options.apiAccount || init.signal?.aborted) return
     if (cacheAccepted.has(attempt)) return
     cacheAccepted.add(attempt)
     const at = Date.now()
-    const cleanTemplate = await withoutFallbackCredit(template)
+    const cleanTemplate = prepare
+      ? template
+      : await withoutFallbackCredit(template)
     const cleanSentBody =
       template === sentBody
         ? cleanTemplate
@@ -1491,9 +1627,26 @@ async function sendAnthropicRequestAttempt(
       ...(refusalSourceModel && { hostMetadata: { refusalSourceModel } }),
     }
     const activeTurn = realTurn?.active ? realTurn : undefined
+    let usageBody = cleanTemplate
+    const prepareTemplate =
+      prepare &&
+      (async (text: string) => {
+        usageBody = await prepare(text)
+        return usageBody
+      })
     const tracked = deps.cacheKeep
-      ? Promise.resolve(activeTurn?.track(target) ?? keep.track(target))
-      : piCacheKeep.trackAccepted(target, snapshot, activeTurn, isFresh)
+      ? (async () => {
+          if (prepareTemplate)
+            target.bodyText = await prepareTemplate(cleanTemplate)
+          if (isFresh()) return activeTurn?.track(target) ?? keep.track(target)
+        })()
+      : piCacheKeep.trackAccepted(
+          target,
+          snapshot,
+          activeTurn,
+          isFresh,
+          prepareTemplate,
+        )
     cacheTracking.set(attempt, 'pending')
     void tracked.then(
       () => cacheTracking.set(attempt, 'settled'),
@@ -1501,9 +1654,9 @@ async function sendAnthropicRequestAttempt(
     )
     let latestUsage: Record<string, number> = finalUsage ?? {}
     if (finalUsage && relayAffinity) {
-      void tracked.then(() => {
+      await tracked.then(() => {
         if (isFresh())
-          keep.recordAcceptedUsage(relayAffinity, cleanTemplate, finalUsage)
+          keep.recordAcceptedUsage(relayAffinity, usageBody, finalUsage)
       })
       return
     }
@@ -1547,7 +1700,7 @@ async function sendAnthropicRequestAttempt(
       (await native.authorize(
         routeId,
         init.signal ?? undefined,
-        options.model.id,
+        targetPlan ? physicalModel : requestedModel,
         'serve',
         options.routingChoice,
       ))
@@ -1595,8 +1748,16 @@ async function sendAnthropicRequestAttempt(
         options.streamOptions,
         options.requestOrigin,
       )
+  const sideRequest =
+    !primaryRequest &&
+    piRoundSideRequest(
+      options.streamOptions,
+      options.storagePath,
+      options.requestOrigin,
+    )
   const primaryThread =
     primaryRequest &&
+    !options.apiAccount &&
     // Gateways may refuse the thread route: send full requests.
     !gateway &&
     typeof options.streamOptions?.onPayload === 'function' &&
@@ -1605,6 +1766,217 @@ async function sendAnthropicRequestAttempt(
     (!relayConfig ||
       effectiveRelayTransport(relayConfig.transport, relayConfig.url) !==
         'websocket')
+  const requestedModel = options.model.id
+  const currentMode = () => {
+    try {
+      return servingRuntime.getRefusalFallbackMode?.() ?? mode
+    } catch {
+      // A response can finish after its account runtime closes.
+      return undefined
+    }
+  }
+  const resolvedUrl = () => {
+    try {
+      const currentGateway = servingRuntime.getClaudeGateway?.()
+      return (
+        (currentGateway && claudeGatewayModelUrl(input, currentGateway)) ||
+        input
+      ).toString()
+    } catch {
+      return undefined
+    }
+  }
+  const originUrl = (gatewayUrl ?? input).toString()
+  const boundCredential = piCredentialId(selected)
+  const accountMatches = (payer: ReturnType<typeof piBillingPayer>) => {
+    const current = native.peek?.()
+    if (!current) return false
+    const account = current.accounts.find((row) => row.id === routeId)
+    if (
+      account?.accountIdentity !== payer.accountId ||
+      piCredentialId(account) !== payer.credentialId
+    ) {
+      forgetPiRefusalAccount(payer.accountId)
+      return false
+    }
+    return account?.type === 'oauth' && nativeAccountCanServe(account)
+  }
+  const targetAllowed = (model: string, view = native.peek?.() ?? snapshot) => {
+    const account = view.accounts.find((row) => row.id === routeId)
+    const policyStorage =
+      servingRuntime.resolveSettings?.(view.policyStorage, model) ??
+      view.policyStorage
+    return (
+      account?.type === 'oauth' &&
+      nativeAccountCanServe(account) &&
+      killswitchPassesPolicy(
+        account.quota,
+        policyStorage,
+        routeId === STICKY_ROUTING_MAIN_ACCOUNT_ID ? undefined : routeId,
+        model,
+      ) &&
+      quotaSnapshotPassesPolicy(account.quota, policyStorage) &&
+      quotaSnapshotPassesModelScope(account.quota, model)
+    )
+  }
+  const currentPrimary = (payer: ReturnType<typeof piBillingPayer>) =>
+    !init.signal?.aborted &&
+    !!realSession &&
+    !!primary &&
+    !!lineage &&
+    primarySessions.get(realSession) === primary &&
+    primary.sent === lineage.sequence &&
+    options.model.id === requestedModel &&
+    (!primary.turn || primary.turn === turn) &&
+    accountMatches(payer)
+  const isFresh = (payer: ReturnType<typeof piBillingPayer>) =>
+    currentPrimary(payer) &&
+    currentMode() === mode &&
+    resolvedUrl() === originUrl
+
+  // The SDK's one-token warm, Prime, and fork dispatches choose their own
+  // model. None becomes a round request or advances a thread.
+  const routedRequest =
+    !primaryRequest &&
+    !options.prime &&
+    !forkHead &&
+    !options.apiAccount &&
+    !options.laneStart &&
+    options.streamOptions?.maxTokens !== 1
+  let roundPlan: RefusalFallbackRoundPlan | undefined
+  if (realSession && (primaryRequest || routedRequest)) {
+    await roundEngine.loadThinking(realSession)
+    const route = roundRoutes.get(realSession)
+    if (route && route.storagePath === options.storagePath) {
+      const priorAccount = (native.peek?.() ?? snapshot).accounts.find(
+        (row) => row.id === route.routeId,
+      )
+      if (
+        priorAccount?.accountIdentity !== route.accountId ||
+        piCredentialId(priorAccount) !== route.credentialId
+      )
+        forgetPiRefusalAccount(route.accountId)
+    }
+    const planInput: RefusalFallbackRoundInput = {
+      sessionId: realSession,
+      requestedModel,
+      kind: primaryRequest
+        ? 'primary'
+        : options.requestOrigin === 'direct'
+          ? 'generate'
+          : 'summary',
+      mode,
+      bodyText: sourceBodyText,
+      compacted: primaryRequest && primary.compacted,
+      oauth:
+        !options.apiAccount && verifiedUuid && boundCredential
+          ? {
+              accountId: verifiedUuid,
+              credentialId: boundCredential,
+              targetAllowed,
+              ...(primaryRequest &&
+                requestCacheLifetimeMs(sourceBodyText) > 0 && {
+                  sourceWarm: {
+                    url: originUrl,
+                    headers: new Headers(headers),
+                    loadStorage: async () =>
+                      (await native.view(undefined, requestedModel))
+                        .policyStorage,
+                    cacheMode: isCacheKeepHybridActive(storage)
+                      ? 'hybrid'
+                      : 'disabled',
+                    accountStoragePath: options.storagePath,
+                    hostMetadata: {
+                      sourceWarmRouteId: routeId,
+                      sourceWarmBaseUrl: input.toString(),
+                    },
+                    currentRoute: () => {
+                      const route = roundRoutes.get(realSession)
+                      const view = native.peek?.()
+                      const current = currentMode()
+                      if (
+                        !route ||
+                        !view ||
+                        !current ||
+                        !accountMatches(route) ||
+                        route.routeId !== routeId ||
+                        route.storagePath !== options.storagePath
+                      )
+                        return undefined
+                      const routed = peekRoutingAccount({
+                        snapshot: view,
+                        router: view.routingPath
+                          ? stickyRouters.get(view.routingPath)
+                          : undefined,
+                        sessionId: realSession,
+                        modelId: requestedModel,
+                        affinityModelId: requestedModel,
+                      })
+                      if (routed !== undefined && routed !== routeId)
+                        return undefined
+                      const url = resolvedUrl()
+                      return url ? { ...route, url, mode: current } : undefined
+                    },
+                  },
+                }),
+            }
+          : undefined,
+    }
+    if (
+      primaryRequest &&
+      route?.requestedModel === requestedModel &&
+      route.url !== originUrl
+    )
+      roundEngine.plan({ ...planInput, oauth: undefined })
+    roundPlan = primaryRequest
+      ? roundEngine.plan(planInput)
+      : roundEngine.planRouted(planInput)
+    bodyText = roundPlan.bodyText
+    wireBodyText = bodyText
+    init.body = bodyText
+    if (roundPlan.kind !== 'source') physicalModel = roundPlan.servingModel
+  }
+  if (
+    roundPlan?.request ||
+    (sideRequest &&
+      (!options.laneStart || (realSession && refusalRounds.has(realSession))))
+  )
+    piCacheKeep.preserveTurn(realTurn)
+  const roundRequest = roundPlan?.request
+  const targetPlan = roundPlan?.kind === 'round' || roundPlan?.kind === 'routed'
+  const engineOwnsTemplate = !!roundRequest && roundPlan?.kind !== 'routed'
+  const trackOrdinary =
+    !engineOwnsTemplate &&
+    !targetPlan &&
+    (!sideRequest ||
+      (options.laneStart && !(realSession && refusalRounds.has(realSession))))
+  let roundMarked = false
+  const markRoundSent = (attempt?: PiNativeAttempt) => {
+    if (roundMarked) return
+    if (
+      roundRequest &&
+      attempt &&
+      (piBillingPayer(attempt).credentialId !== boundCredential ||
+        currentMode() !== mode ||
+        resolvedUrl() !== originUrl)
+    )
+      throw replanPiRound
+    if (roundRequest && !roundEngine.markSent(roundRequest)) throw replanPiRound
+    roundMarked = true
+    if (primaryRequest && realSession) {
+      delete primary.compacted
+      if (attempt)
+        roundRoutes.set(realSession, {
+          ...piBillingPayer(attempt),
+          requestedModel,
+          mode,
+          url: originUrl,
+          storagePath: options.storagePath,
+          routeId,
+        })
+      else roundRoutes.delete(realSession)
+    }
+  }
   if (primaryThread) {
     nextAttempt = await takeAttempt()
     threadRequest = await prepareMessageThreadRequest(messageThreads, {
@@ -1616,7 +1988,10 @@ async function sendAnthropicRequestAttempt(
           : localMessageThreadCredential(nextAttempt.admission.binding),
       bodyText,
       replyToolNames: toolNames,
-      cacheSlot: piThreadCacheSlot,
+      cacheSlot:
+        roundPlan?.kind === 'source' && roundPlan.sourceCacheMarkerRestored
+          ? undefined
+          : piThreadCacheSlot,
       headers,
       signal: init.signal ?? undefined,
     })
@@ -1627,7 +2002,6 @@ async function sendAnthropicRequestAttempt(
     wireBodyText = await signRequestBody(bodyText)
     init.body = wireBodyText
   }
-  const requestedModel = options.model.id
   const clientStream =
     mode === 'client' &&
     (headers
@@ -1635,14 +2009,137 @@ async function sendAnthropicRequestAttempt(
       ?.split(',')
       .includes(SERVER_SIDE_FALLBACK_BETA) ??
       false)
-  const clientSource = clientStream && primaryRequest
-  const currentMode = () => {
-    try {
-      return servingRuntime.getRefusalFallbackMode?.() ?? mode
-    } catch {
-      // A response can finish after its account runtime closes.
-      return undefined
+  const clientSource = clientStream && primaryRequest && !targetPlan
+  const lifecycleFor = (attempt: PiNativeAttempt) =>
+    roundRequest &&
+    roundEngine.lifecycle(roundRequest, {
+      isFresh: () => isFresh(piBillingPayer(attempt)),
+      targetAllowed,
+      projectReply: (blocks) =>
+        blocks.map((block) =>
+          block.type === 'tool_use'
+            ? {
+                ...block,
+                ...(typeof block.name === 'string' && {
+                  name: toClaudeCodeToolName(
+                    fromClaudeCodeToolName(block.name, toolNames),
+                  ),
+                }),
+                ...(typeof block.id === 'string' && {
+                  id: sanitizeToolId(block.id),
+                }),
+              }
+            : block,
+        ),
+      async onCacheKeepTemplate(template, isCurrent) {
+        if (!isCurrent() || !realSession) return
+        if (!template) {
+          keep.untrack(realSession)
+          return
+        }
+        const model = template.servingModel
+        const signedRetry =
+          roundPlan?.kind === 'source' && model !== requestedModel
+        const usage = Object.fromEntries(
+          Object.entries(template.usage ?? {}).filter(
+            (entry): entry is [string, number] => typeof entry[1] === 'number',
+          ),
+        )
+        await trackAcceptedRequest(
+          attempt,
+          template.bodyText,
+          template.bodyText,
+          isCurrent,
+          model === requestedModel ? undefined : requestedModel,
+          usage,
+          signedRetry ? async (text) => text : signRequestBody,
+        )
+      },
+    })
+  const extraSender = () => {
+    let candidate: PiNativeAttempt | undefined
+    let dump: DumpHandle | null = null
+    let scope: ProviderErrorResponseScope | undefined
+    const authorize: RefusalFallbackDispatchOptions['authorize'] = async ({
+      model,
+      signal,
+    }) => {
+      candidate = undefined
+      try {
+        // No routing override or quota wait is allowed for an extra send.
+        const attempt = await native.authorize(routeId, signal, model, 'serve')
+        const view = await native.view(signal, model)
+        const account = view.accounts.find((row) => row.id === routeId)
+        const payer = piBillingPayer(attempt)
+        if (
+          !targetAllowed(model, view) ||
+          account?.accountIdentity !== payer.accountId ||
+          piCredentialId(account) !== payer.credentialId
+        )
+          return { kind: 'denied' }
+        const url = resolvedUrl()
+        if (!url) return { kind: 'denied' }
+        candidate = attempt
+        return {
+          kind: 'authorized',
+          ...piBillingPayer(attempt),
+          url,
+          accessToken: piAttemptAccessToken(attempt),
+        }
+      } catch {
+        return { kind: 'denied' }
+      }
     }
+    const send: RefusalFallbackDispatchOptions['send'] = async ({
+      url,
+      headers,
+      body,
+      bodyText,
+      signal,
+    }) => {
+      const currentGateway = servingRuntime.getClaudeGateway?.()
+      requirePiOAuthOrigin(url, currentGateway)
+      signal.throwIfAborted()
+      assertHostAuthorityStable()
+      const response = await fetchResponse(url, {
+        method: 'POST',
+        body,
+        headers,
+        signal,
+        redirect: 'error',
+      })
+      scope = createProviderErrorResponseScope(
+        [
+          ...(candidate ? [piAttemptAccessToken(candidate)] : []),
+          ...claudeGatewayHeaderValues(currentGateway),
+        ],
+        'event-stream',
+      )
+      dump = await dumpDirectRequest({
+        affinity: relayAffinity,
+        route: options.route ?? 'oauth',
+        status: response.status,
+        bodyText,
+        url,
+        method: 'POST',
+        headers,
+      })
+      return response
+    }
+    const observe = (
+      guarded: Response,
+      model: string,
+      onComplete?: () => void,
+    ) => {
+      const safe = scope?.redactResponse(guarded) ?? guarded
+      if (candidate) {
+        observeResponseHeaders(candidate, safe.headers, safe.status, model)
+        if (safe.ok) markServed(candidate)
+        void report(candidate, safe.status, 'direct')
+      }
+      return observePiFallbackAttempt(safe, dump, () => onComplete?.())
+    }
+    return { authorize, send, observe }
   }
   const dispatchClient = (
     response: Response,
@@ -1654,6 +2151,7 @@ async function sendAnthropicRequestAttempt(
     originDump: DumpHandle | null,
     protectedOrigin?: { takeRefusalCredit: () => string | undefined },
     sourceScope?: ProviderErrorResponseScope,
+    lifecycle?: ReturnType<typeof lifecycleFor>,
   ) => {
     const originHeaders = new Headers(sentHeaders)
     originHeaders.delete('content-length')
@@ -1664,158 +2162,21 @@ async function sendAnthropicRequestAttempt(
       bodyText: sentBody,
       fullBodyText: bodyText,
     }
-    const resolvedUrl = () => {
-      const currentGateway = servingRuntime.getClaudeGateway?.()
-      return (
-        (currentGateway && claudeGatewayModelUrl(input, currentGateway)) ||
-        input
-      ).toString()
-    }
-    const isFresh = () => {
-      if (
-        init.signal?.aborted ||
-        !realSession ||
-        !primary ||
-        !lineage ||
-        primarySessions.get(realSession) !== primary ||
-        primary.sent !== lineage.sequence ||
-        primary.turn !== turn ||
-        options.model.id !== requestedModel ||
-        currentMode() !== mode ||
-        resolvedUrl() !== origin.url
-      )
-        return false
-      const current = native
-        .peek?.()
-        ?.accounts.find((account) => account.id === routeId)
-      if (!current) return !native.peek?.()
-      if (
-        !nativeAccountCanServe(current) ||
-        current.accountIdentity !== origin.accountId
-      )
-        return false
-      const credential =
-        current.source === 'vault'
-          ? current.credentialId
-          : current.binding && localMessageThreadCredential(current.binding)
-      return !credential || credential === origin.credentialId
-    }
-    let candidate: PiNativeAttempt | undefined
-    let retryDump: DumpHandle | null = null
-    let retryScope: ProviderErrorResponseScope | undefined
-    let sourceCompleted = false
-    let retryCompleted = false
-    type Served = {
-      attempt: PiNativeAttempt
-      template: string
-      headers: Headers
-    }
-    let served: Served | undefined
-    let pending: Served | undefined
+    const extra = extraSender()
+    const fresh = () => isFresh(origin)
     const originalThread = threadRequest
-    options.onClientCacheCompletion?.(async (usage) => {
-      if (!isFresh()) return
-      if (served) {
-        if (!retryCompleted) return
-        observeRequestId(served.headers)
-        await trackAcceptedRequest(
-          served.attempt,
-          served.template,
-          served.template,
-          isFresh,
-          requestedModel,
-          usage,
-        )
-      } else if (sourceCompleted) {
-        observeRequestId(response.headers)
-        await trackAcceptedRequest(
-          originAttempt,
-          sentBody,
-          bodyText,
-          isFresh,
-          undefined,
-          usage,
-        )
-      }
-    })
     return dispatchRefusalFallback(response, {
       sourceModel: requestedModel,
       origin,
       billing,
       protectedOrigin,
-      isFresh,
+      isFresh: fresh,
+      lifecycle,
       signal: init.signal ?? undefined,
-      authorize: async ({ model, signal }) => {
-        candidate = undefined
-        try {
-          const attempt = await native.authorize(
-            routeId,
-            signal,
-            model,
-            'serve',
-          )
-          const current = await native.view(signal, model)
-          const account = current.accounts.find((row) => row.id === routeId)
-          if (
-            account?.type !== 'oauth' ||
-            account.accountIdentity !== attempt.accountIdentity ||
-            !nativeAccountCanServe(account) ||
-            !killswitchPassesPolicy(
-              account.quota,
-              current.policyStorage,
-              routeId === STICKY_ROUTING_MAIN_ACCOUNT_ID ? undefined : routeId,
-              model,
-            ) ||
-            !quotaSnapshotPassesPolicy(account.quota, current.policyStorage) ||
-            !quotaSnapshotPassesModelScope(account.quota, model)
-          )
-            return { kind: 'denied' }
-          candidate = attempt
-          return {
-            kind: 'authorized',
-            ...piBillingPayer(attempt),
-            url: resolvedUrl(),
-            accessToken: piAttemptAccessToken(attempt),
-          }
-        } catch {
-          return { kind: 'denied' }
-        }
-      },
-      send: async ({ url, headers, body, bodyText, signal }) => {
-        const currentGateway = servingRuntime.getClaudeGateway?.()
-        requirePiOAuthOrigin(url, currentGateway)
-        signal.throwIfAborted()
-        assertHostAuthorityStable()
-        const response = await fetchResponse(url, {
-          method: 'POST',
-          body,
-          headers,
-          signal,
-          redirect: 'error',
-        })
-        retryScope = createProviderErrorResponseScope(
-          [
-            ...(candidate ? [piAttemptAccessToken(candidate)] : []),
-            ...claudeGatewayHeaderValues(currentGateway),
-          ],
-          'event-stream',
-        )
-        retryDump = await dumpDirectRequest({
-          affinity: relayAffinity,
-          route: options.route ?? 'oauth',
-          status: response.status,
-          bodyText,
-          url,
-          method: 'POST',
-          headers,
-        })
-        return response
-      },
-      onRetryCommitted: ({ model }) => {
-        served = pending
-        options.onRefusalRetryCommitted?.(model)
-      },
-      observePhysicalResponse: (guarded, physical, template) => {
+      authorize: extra.authorize,
+      send: extra.send,
+      onRetryCommitted: ({ model }) => options.onServingModel?.(model),
+      observePhysicalResponse: (guarded, physical) => {
         if (!physical.refusalRetry) {
           const safe = sourceScope?.redactResponse(guarded) ?? guarded
           if (!protectedOrigin)
@@ -1825,45 +2186,37 @@ async function sendAnthropicRequestAttempt(
             observed,
             originDump,
             async (usage) => {
-              sourceCompleted = true
-              if (!isFresh()) {
+              if (!fresh()) {
                 originalThread?.fail()
                 return
               }
-              if (!options.onClientCacheCompletion)
+              observeRequestId(safe.headers)
+              if (!lifecycle && trackOrdinary)
                 await trackAcceptedRequest(
                   originAttempt,
                   sentBody,
                   bodyText,
-                  isFresh,
+                  fresh,
                   undefined,
                   usage,
                 )
             },
           )
         }
-        const safe = retryScope?.redactResponse(guarded) ?? guarded
-        retryCompleted = false
-        if (candidate) {
-          observeResponseHeaders(
-            candidate,
-            safe.headers,
-            safe.status,
-            physical.model,
-          )
-          if (safe.ok) {
-            markServed(candidate)
-            if (template)
-              pending = { attempt: candidate, template, headers: safe.headers }
-          }
-          void report(candidate, safe.status, 'direct')
-        }
-        return observePiFallbackAttempt(safe, retryDump, () => {
-          retryCompleted = true
+        return extra.observe(guarded, physical.model, () => {
+          if (fresh()) observeRequestId(guarded.headers)
         })
       },
     })
   }
+  let physicalRound:
+    | {
+        attempt: PiNativeAttempt
+        url: string
+        headers: Headers
+        lifecycle: ReturnType<typeof lifecycleFor>
+      }
+    | undefined
   let observedThreadResponse: Response | undefined
   const directFetch = async () => {
     let attempt: PiNativeAttempt | undefined
@@ -1937,7 +2290,14 @@ async function sendAnthropicRequestAttempt(
     const physicalFetch = async (destination: URL, request: RequestInit) => {
       const requestHeaders = new Headers(request.headers)
       const sentBody = wireBodyText
-      const billing = await billingInput(attempt, apiSubject)
+      const lifecycle = attempt && lifecycleFor(attempt)
+      const billing = await billingInput(
+        attempt,
+        apiSubject,
+        sentBody,
+        physicalModel,
+        lifecycle && (() => lifecycle.cacheKeepTemplateSettled),
+      )
       const scope = createProviderErrorResponseScope(
         [secret, ...claudeGatewayHeaderValues(gateway)],
         'event-stream',
@@ -1947,8 +2307,17 @@ async function sendAnthropicRequestAttempt(
       try {
         request.signal?.throwIfAborted()
         assertHostAuthorityStable()
+        if (attempt)
+          physicalRound = {
+            attempt,
+            url: destination.toString(),
+            headers: requestHeaders,
+            lifecycle,
+          }
+        markRoundSent(attempt)
         raw = await fetchResponse(destination, request)
       } catch (error) {
+        if (error === replanPiRound) throw error
         if (billing) reportAnthropicBillingFailure(billing)
         throw error
       }
@@ -1972,6 +2341,7 @@ async function sendAnthropicRequestAttempt(
           handle,
           undefined,
           scope,
+          lifecycle,
         )
         observedThreadResponse = response
         return response
@@ -2005,7 +2375,7 @@ async function sendAnthropicRequestAttempt(
                   routeId,
                   attempt,
                   init.signal ?? undefined,
-                  options.model.id,
+                  targetPlan ? physicalModel : requestedModel,
                   options.routingChoice,
                 )
                 .catch(() => undefined)
@@ -2066,6 +2436,7 @@ async function sendAnthropicRequestAttempt(
     } catch (caught) {
       // No response leaves this send, so its credentials retire here.
       physical.scope?.dispose()
+      if (caught === replanPiRound) throw caught
       const scope = createProviderErrorResponseScope(
         // A gateway error may echo the gateway's own header values.
         [secret, ...claudeGatewayHeaderValues(gateway)],
@@ -2098,7 +2469,7 @@ async function sendAnthropicRequestAttempt(
       )
     }
     if (attempt && response.ok) {
-      if (!clientSource) await trackAcceptedRequest(attempt)
+      if (!clientSource && trackOrdinary) await trackAcceptedRequest(attempt)
       markServed(attempt)
     }
     if (options.apiAccount && dumpHandle) {
@@ -2132,6 +2503,7 @@ async function sendAnthropicRequestAttempt(
           bodyText: string
           billing: NonNullable<Awaited<ReturnType<typeof billingInput>>>
           takeRefusalCredit: () => string | undefined
+          lifecycle: ReturnType<typeof lifecycleFor>
         }
       | undefined
     const response = await sendViaRelay({
@@ -2167,7 +2539,14 @@ async function sendAnthropicRequestAttempt(
         const sentBody = wireBodyText
         const access = piAttemptAccessToken(attempt)
         authorizedHeaders.set('authorization', `Bearer ${access}`)
-        const billing = await billingInput(attempt)
+        const lifecycle = lifecycleFor(attempt)
+        const billing = await billingInput(
+          attempt,
+          undefined,
+          sentBody,
+          physicalModel,
+          lifecycle && (() => lifecycle.cacheKeepTemplateSettled),
+        )
         let credit: string | undefined
         if (clientSource && billing) {
           clientRelay = {
@@ -2175,6 +2554,7 @@ async function sendAnthropicRequestAttempt(
             headers: authorizedHeaders,
             bodyText: sentBody,
             billing,
+            lifecycle,
             takeRefusalCredit: () => {
               const token = credit
               credit = undefined
@@ -2182,6 +2562,13 @@ async function sendAnthropicRequestAttempt(
             },
           }
         }
+        physicalRound = {
+          attempt,
+          url: input.toString(),
+          headers: authorizedHeaders,
+          lifecycle,
+        }
+        markRoundSent(attempt)
         return {
           headers: authorizedHeaders,
           billing,
@@ -2193,7 +2580,7 @@ async function sendAnthropicRequestAttempt(
           errorSecrets: [access],
           onUpstreamStatus: (status) => {
             upstream = { attempt, status }
-            if (!clientSource && status >= 200 && status < 300)
+            if (!clientSource && trackOrdinary && status >= 200 && status < 300)
               accepted = trackAcceptedRequest(attempt, sentBody)
             if (status === 401) {
               relay401Attempt = attempt
@@ -2216,6 +2603,8 @@ async function sendAnthropicRequestAttempt(
       clientRelay.billing,
       dumpHandle,
       clientRelay,
+      undefined,
+      clientRelay.lifecycle,
     )
     observedThreadResponse = joined
     dumpHandle = null
@@ -2235,7 +2624,7 @@ async function sendAnthropicRequestAttempt(
         routeId,
         relay401Attempt,
         init.signal ?? undefined,
-        options.model.id,
+        targetPlan ? physicalModel : requestedModel,
         options.routingChoice,
       )
       .catch(() => undefined)
@@ -2260,11 +2649,52 @@ async function sendAnthropicRequestAttempt(
       init.body = createBody
       return sendRelayAttempt()
     })
-    if (response !== observedThreadResponse)
-      response = threadRequest.observe(response)
   }
+  let terminalResend = false
+  if (targetPlan && roundRequest && physicalRound && response.status === 400) {
+    const { attempt, url, headers, lifecycle } = physicalRound
+    const payer = piBillingPayer(attempt)
+    const extra = extraSender()
+    const sourceBilling = await billingInput(
+      attempt,
+      undefined,
+      sourceBodyText,
+      requestedModel,
+      lifecycle && (() => lifecycle.cacheKeepTemplateSettled),
+    )
+    const resendHeaders = new Headers(headers)
+    resendHeaders.delete('content-length')
+    const resent = await roundEngine.handleTarget400(roundRequest, response, {
+      sourceModel: requestedModel,
+      origin: { ...payer, url, headers: resendHeaders },
+      signal: init.signal ?? undefined,
+      isCurrentPrimary: () => currentPrimary(payer),
+      authorize: extra.authorize,
+      send: extra.send,
+      observeResendResponse: (guarded, model) => {
+        const observed = extra.observe(guarded, model)
+        return sourceBilling
+          ? observeAnthropicBillingResponse(sourceBilling, observed)
+          : observed
+      },
+    })
+    terminalResend = resent !== response
+    if (terminalResend) {
+      threadRequest?.fail()
+      options.onThreadPrepared?.(() => {})
+      dumpHandle = null
+    }
+    response = resent
+  }
+  if (threadRequest && response !== observedThreadResponse && !terminalResend)
+    response = threadRequest.observe(response)
   if (lastTransport === 'direct') observeRequestId(response.headers)
-  if (response.ok && lastTransport === 'relay' && relayAttempt) {
+  if (
+    !terminalResend &&
+    response.ok &&
+    lastTransport === 'relay' &&
+    relayAttempt
+  ) {
     if (
       options.prime &&
       !/^req_[A-Za-z0-9_-]+$/.test(response.headers.get('request-id') ?? '')
@@ -2276,20 +2706,29 @@ async function sendAnthropicRequestAttempt(
     // Optimistic WebSocket responses must wait for their real upstream status.
     if (
       !clientSource &&
+      trackOrdinary &&
       response.headers.get('x-cortexkit-relay-optimistic') !== 'true'
     )
       await trackAcceptedRequest(relayAttempt)
     markServed(relayAttempt)
   }
+  if (targetPlan && !terminalResend && response.ok)
+    options.onServingModel?.(physicalModel)
   if (
+    !terminalResend &&
+    response.ok &&
+    response !== observedThreadResponse &&
     clientStream &&
-    !clientSource &&
-    typeof body.model === 'string' &&
-    body.model !== requestedModel
+    (clientSource || targetPlan)
   )
     response = joinRefusalFallbackStream(response, {
       sourceModel: requestedModel,
-      isFresh: () => currentMode() === mode && !init.signal?.aborted,
+      lifecycle: physicalRound?.lifecycle,
+      isFresh: () =>
+        currentMode() === mode &&
+        !init.signal?.aborted &&
+        (!primaryRequest ||
+          (!!physicalRound && isFresh(piBillingPayer(physicalRound.attempt)))),
       signal: init.signal ?? undefined,
     })
   if (
@@ -3562,8 +4001,25 @@ export function streamCortexKitAnthropic(
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream()
   let turn: CacheKeepRealTurn | undefined
+  const noticeSession = options?.sessionId
+  if (
+    noticeSession &&
+    wait?.setWorkingMessage &&
+    requestOrigin === 'agent-loop' &&
+    options?.maxTokens !== 1 &&
+    options?.cacheRetention !== 'none' &&
+    !piForkHeadSession(options)
+  ) {
+    roundNotices.set(noticeSession, wait.setWorkingMessage)
+    const notice = piRefusalRoundStatus(noticeSession)
+    if (notice) wait.setWorkingMessage(notice)
+  }
   try {
-    if (options?.sessionId && !piForkHeadSession(options))
+    if (
+      options?.sessionId &&
+      !piForkHeadSession(options) &&
+      !piRoundSideRequest(options, getPiAccountStoragePath(), requestOrigin)
+    )
       turn = piCacheKeep.requestTurn(options.sessionId)
   } catch {}
 
@@ -3586,10 +4042,6 @@ export function streamCortexKitAnthropic(
         | ((usage?: Record<string, number>) => void)
         | undefined
       let servingModel: string | undefined
-      let completeClientCache:
-        | ((usage: Record<string, number>) => Promise<void>)
-        | undefined
-      let finalUsage: Record<string, number> = {}
       const setWorkingMessage = wait?.setWorkingMessage
       const request = {
         model,
@@ -3603,7 +4055,8 @@ export function streamCortexKitAnthropic(
               setWorkingMessage(
                 'Waiting for a free account slot (Esc to cancel)',
               )
-              return () => setWorkingMessage()
+              return () =>
+                setWorkingMessage(piRefusalRoundStatus(noticeSession))
             }
           : undefined,
         onThreadPrepared: (fail: () => void) => {
@@ -3614,12 +4067,7 @@ export function streamCortexKitAnthropic(
         ) => {
           recordCacheUsage = record
         },
-        onClientCacheCompletion: (
-          complete: (usage: Record<string, number>) => Promise<void>,
-        ) => {
-          completeClientCache = complete
-        },
-        onRefusalRetryCommitted: (model: string) => {
+        onServingModel: (model: string | undefined) => {
           servingModel = model
         },
         effortTransitions,
@@ -3642,7 +4090,15 @@ export function streamCortexKitAnthropic(
         withPiQuotaWait({
           signal: options?.signal,
           sessionId: options?.sessionId,
-          wait,
+          wait: wait && {
+            ...wait,
+            setWorkingMessage:
+              setWorkingMessage &&
+              ((message) =>
+                setWorkingMessage(
+                  message ?? piRefusalRoundStatus(noticeSession),
+                )),
+          },
           run: () => executeWithFallback(request),
           resume: async (hold) => {
             const native = getPiNativeRuntime(storagePath)
@@ -3733,7 +4189,6 @@ export function streamCortexKitAnthropic(
       for await (const event of parseSse(response, completion)) {
         if (event.type === 'message_start') {
           output.responseId = event.message?.id
-          finalUsage = { ...event.message?.usage }
           recordCacheUsage?.(event.message?.usage)
           updateUsage(model, output, event.message?.usage)
         } else if (event.type === 'content_block_start') {
@@ -3871,7 +4326,6 @@ export function streamCortexKitAnthropic(
             })
           }
         } else if (event.type === 'message_delta') {
-          finalUsage = { ...finalUsage, ...event.usage }
           recordCacheUsage?.(event.usage)
           output.stopReason = mapStopReason(
             String(event.delta?.stop_reason ?? ''),
@@ -3881,7 +4335,7 @@ export function streamCortexKitAnthropic(
           if (servingModel && !servingCost)
             logger.warn(
               'pi',
-              'Retry model has no Pi prices; using requested model rates',
+              'Serving model has no Pi prices; using requested model rates',
               {
                 requestedModel: model.id,
                 servingModel,
@@ -3936,7 +4390,6 @@ export function streamCortexKitAnthropic(
         throw incomplete
       }
       if (output.errorMessage) throw new Error(output.errorMessage)
-      await completeClientCache?.(finalUsage)
       for (const block of output.content as Block[]) delete block.index
       stream.push({
         type: 'done',

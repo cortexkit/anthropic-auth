@@ -1257,7 +1257,7 @@ test('audit downstream refusal: Pi revokes a response aborted after raw EOF', as
   }
 })
 
-test('audit hot path: Pi retains an unsigned full template and signs only the sent shape', async () => {
+test('Pi signs the full round-engine template separately from the threaded wire body', async () => {
   // Tracking runs detached after the reply, once the session's keep-warm
   // claim is confirmed for this real turn, so wait for the call itself.
   let sessionId: string | undefined
@@ -1283,7 +1283,8 @@ test('audit hot path: Pi retains an unsigned full template and signs only the se
       track.mock.calls.findLast(
         ([request]) => request.sessionId === h.options.sessionId,
       )?.[0].bodyText ?? ''
-    expect(template).toContain('cch=00000;')
+    expect(template).not.toContain('cch=00000;')
+    expect(await signRequestBody(template)).toBe(template)
     expect(JSON.parse(template).thread).toBeUndefined()
     const wire = JSON.stringify(h.sent[0]?.body ?? {})
     expect(JSON.parse(wire).thread).toEqual({ type: 'create' })
