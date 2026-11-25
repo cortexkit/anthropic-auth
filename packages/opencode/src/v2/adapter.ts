@@ -2,8 +2,8 @@
 // Claude Code request transforms and response classification to common-auth's
 // transport hooks. The injected source uses Core's account and policy services.
 // Each response keeps the credential version and account of its own request,
-// including HTTP relay responses. Only a rejected message-thread continuation
-// is resent here, once as a full create, before the host reads any bytes.
+// including HTTP relay responses. Message-thread recovery and Core's client
+// refusal fallback can make an extra send within the same host request.
 
 import { createHash, randomUUID } from 'node:crypto'
 import {
@@ -28,6 +28,7 @@ import {
   type DumpHandle,
   type DumpTag,
   decideRequestGzip,
+  dispatchRefusalFallback,
   dumpDirectRequest,
   dumpRelayRequest,
   dumpResponseArtifact,
@@ -37,9 +38,11 @@ import {
   getRequestGzipLatchPath,
   guardAnthropicStreamResponse,
   hasCacheDiagnosticsBeta,
+  hasFallbackCreditInRequest,
   type IncompleteStreamDiagnostics,
   isDumpEnabled as isDumpEnabledCore,
   isNativeTransientAccountError,
+  joinRefusalFallbackStream,
   type MessageThreadRequest,
   MessageThreadTracker,
   observeAnthropicBillingResponse,
@@ -47,7 +50,9 @@ import {
   type ProviderErrorResponseScope,
   type ProviderResponseMode,
   prepareMessageThreadRequest,
+  protectFallbackCreditResponse,
   RELAY_PROXY_REFUSAL,
+  type RefusalFallbackDispatchOptions,
   type RefusalFallbackMode,
   type RequestGzipLatch,
   relayProxyApplies,
@@ -56,9 +61,11 @@ import {
   requestCacheLifetimeMs,
   requestShortestCacheLifetimeMs,
   requestSignal,
+  resolveClaudeModelCapabilities,
   resolveNativePoolPaths,
   rewriteApiKeyRequestBody,
   runWithRequestSignal,
+  SERVER_SIDE_FALLBACK_BETA,
   sanitizeClaudeCodeRequestBody,
   sendWithRequestGzip,
   setDumpEnabled as setDumpEnabledCore,
@@ -68,6 +75,7 @@ import {
   stateRefusalPublicMessage,
   summarizeCacheTtl,
   TrailingAssistantHistoryError,
+  withoutFallbackCredit,
 } from '@cortexkit/anthropic-auth-core'
 import type {
   AccountHeadersResult,
@@ -97,6 +105,7 @@ import { requireOAuthDestination } from '../oauth-destination'
 import { isAuxiliaryAgent } from '../request-class'
 import {
   createStrippedStream,
+  observeCompletedCacheReply,
   rewriteRequestBody,
   rewriteUrl,
   setOAuthHeaders,
@@ -253,7 +262,17 @@ export interface NativeAnthropicAttemptData<P> {
  * One send, as the source's response, error and end callbacks receive it:
  * the host's request scope, the attempt, and what the source authorized.
  */
-export interface NativeAnthropicAttemptContext<P> extends AccountRequest {
+export interface NativeAnthropicSendScope extends RequestScope {
+  /** An extra send reuses the binding, not the original admission or wait budget. */
+  readonly extraSend?: {
+    readonly kind: 'refusal' | 'thread'
+    readonly credentialId: string
+  }
+}
+
+export interface NativeAnthropicAttemptContext<P>
+  extends AccountRequest,
+    NativeAnthropicSendScope {
   readonly attemptId: string
   readonly transport: Transport | undefined
   readonly route: NativeAnthropicRoute
@@ -398,7 +417,7 @@ export interface NativeAnthropicSource<Q, P> {
    * the request before anything is sent.
    */
   readonly authorizeAccount: (
-    scope: RequestScope,
+    scope: NativeAnthropicSendScope,
     accountId: string,
   ) =>
     | Promise<NativeAnthropicAuthorization<P> | undefined>
@@ -411,6 +430,23 @@ export interface NativeAnthropicSource<Q, P> {
   /** Rechecks policy after asynchronous rewriting, immediately before dispatch. */
   readonly admitRequest?: (
     input: NativeAnthropicAttemptContext<P>,
+  ) => Promise<void> | void
+  /** Memory-only check; dispatch still authorizes and admits against current policy. */
+  readonly isRefusalFallbackCurrent?: (
+    input: NativeAnthropicAttemptContext<P> & {
+      readonly credentialId: string
+      readonly baseUrl: string
+      readonly url: string
+    },
+  ) => boolean
+  readonly onCompletedFallbackRequest?: (
+    input: Parameters<
+      NonNullable<NativeAnthropicSource<Q, P>['onRequestPrepared']>
+    >[0] & {
+      readonly usage: Record<string, unknown>
+      readonly acceptedAt: number
+      readonly isFresh: () => boolean
+    },
   ) => Promise<void> | void
   /** Observe the full stateless template; the cache warmer signs its replay. */
   readonly onRequestPrepared?: (
@@ -868,6 +904,24 @@ export function createNativeAnthropicAdapter<Q, P>(
   >()
   const cacheDiagnosticsSends = new WeakMap<Data, CacheDiagnosticsSend>()
   const serverFallbackSends = new WeakMap<Data, string>()
+  type PhysicalSend = {
+    headers: Headers
+    bodyText: string
+    framing: ProviderResponseMode
+    join?: { sourceModel: string; isFresh: () => boolean; signal: AbortSignal }
+    fallback?: RefusalFallbackDispatchOptions
+    observeCompletion?: (response: Response) => Response
+  }
+  const physicalSends = new WeakMap<Data, PhysicalSend>()
+  const latestPrimary = new Map<string, object>()
+  const markPrimary = (sessionID: string, marker: object) => {
+    latestPrimary.delete(sessionID)
+    latestPrimary.set(sessionID, marker)
+    if (latestPrimary.size > maxPending) {
+      const oldest = latestPrimary.keys().next()
+      if (!oldest.done) latestPrimary.delete(oldest.value)
+    }
+  }
   // Each sent request privately holds its own credentials, so errors about
   // it can be scrubbed after rewriteSend has dropped the pending credential:
   // a response scope for the one response the request gets, and a redactor
@@ -1277,6 +1331,13 @@ export function createNativeAnthropicAdapter<Q, P>(
     const headers = new Headers(request.headers)
     if (data.route === 'api') applyCustomHeaders(headers)
     const correlation = takeInternalHeaders(headers)
+    const primary =
+      attempt.kind === 'primary' &&
+      !isAuxiliaryAgent(attempt.agent) &&
+      attempt.agent !== 'cachekeep' &&
+      attempt.agent !== 'compaction' &&
+      correlation[LANE_START_REQUEST_HEADER] !== '1'
+    const primaryMarker = {}
     let body = request.body === null ? undefined : await request.text()
     let threadCacheSlot: Parameters<
       typeof prepareMessageThreadRequest
@@ -1323,6 +1384,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     // the gateway must never carry it, so it is dropped here for every send.
     headers.delete('x-relay-token')
 
+    let refusalFallbackMode: RefusalFallbackMode | undefined
     try {
       if (data.route === 'oauth' && send.oauth) {
         // The request URL comes from provider configuration, which a project
@@ -1339,7 +1401,6 @@ export function createNativeAnthropicAdapter<Q, P>(
           else headers.set(name, value)
         }
         let finalBody: Record<string, unknown> | null = null
-        let refusalFallbackMode: RefusalFallbackMode | undefined
         if (body !== undefined && messages) {
           const context: NativeAnthropicRequestContext<P> = {
             ...contextOf(attempt, data),
@@ -1466,6 +1527,32 @@ export function createNativeAnthropicAdapter<Q, P>(
       isRecord(finalPayload) && finalPayload.stream === true
         ? 'event-stream'
         : 'http'
+    const sentModel =
+      isRecord(finalPayload) && typeof finalPayload.model === 'string'
+        ? finalPayload.model
+        : undefined
+    const fullBodyText = body
+    const routed =
+      sentModel !== undefined && remapModelId(input.modelID) !== sentModel
+    const clientStream =
+      data.route === 'oauth' &&
+      messages &&
+      responseMode === 'event-stream' &&
+      refusalFallbackMode === 'client' &&
+      (headers
+        .get('anthropic-beta')
+        ?.split(',')
+        .some((beta) => beta.trim() === SERVER_SIDE_FALLBACK_BETA) ??
+        false)
+    const clientSource =
+      clientStream &&
+      primary &&
+      !routed &&
+      Boolean(
+        sentModel &&
+          resolveClaudeModelCapabilities(sentModel)?.refusalFallbacks?.length,
+      )
+    const deferredCache = clientStream && primary && (clientSource || routed)
     holdRedactor(
       data,
       send,
@@ -1473,11 +1560,16 @@ export function createNativeAnthropicAdapter<Q, P>(
       headers,
       claudeGatewayHeaderValues(gateway),
     )
-    if (data.route === 'oauth' && messages && body !== undefined) {
+    if (
+      data.route === 'oauth' &&
+      messages &&
+      body !== undefined &&
+      !deferredCache
+    ) {
       await source.onRequestPrepared?.({
         ...contextOf(attempt, data),
         url,
-        bodyText: body,
+        bodyText: await withoutFallbackCredit(body),
         signal: request.signal,
       })
       ensureLive()
@@ -1487,11 +1579,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       send.oauth &&
       messages &&
       body !== undefined &&
-      attempt.kind === 'primary' &&
-      !isAuxiliaryAgent(attempt.agent) &&
-      attempt.agent !== 'cachekeep' &&
-      attempt.agent !== 'compaction' &&
-      correlation[LANE_START_REQUEST_HEADER] !== '1' &&
+      primary &&
       // Gateways may refuse the thread route: send full requests.
       !gateway
     ) {
@@ -1515,9 +1603,10 @@ export function createNativeAnthropicAdapter<Q, P>(
           if (classifiedForRetry.has(data) || !owned.has(data)) return false
           ensureLive()
           request.signal.throwIfAborted()
-          const authorized = await runWithRequestSignal(
+          const authorized = await authorizeResend(
+            sentModel ?? input.modelID,
+            'thread',
             request.signal,
-            async () => source.authorizeAccount(input, input.accountId),
           )
           ensureLive()
           request.signal.throwIfAborted()
@@ -1525,6 +1614,7 @@ export function createNativeAnthropicAdapter<Q, P>(
             !owned.has(data) ||
             authorized?.route !== 'oauth' ||
             !authorized.accessToken ||
+            authorized.gateway ||
             !expectedAccountUuid ||
             authorized.identity?.accountUuid !== expectedAccountUuid
           )
@@ -1534,12 +1624,6 @@ export function createNativeAnthropicAdapter<Q, P>(
             (send.dispatch?.kind ?? 'direct')
           )
             return false
-          await runWithRequestSignal(request.signal, async () =>
-            source.admitRequest?.({
-              ...contextOf(attempt, data),
-              provenance: authorized.provenance,
-            }),
-          )
           ensureLive()
           if (!owned.has(data)) return false
           resendAuthorization = authorized
@@ -1576,12 +1660,18 @@ export function createNativeAnthropicAdapter<Q, P>(
             let billingSend: BillingSend | undefined
             try {
               assertHostAuthorityStable()
-              billingSend = observeFinalWire(request, createBody)
+              billingSend = await observeFinalWire(request, createBody)
+              assertHostAuthorityStable()
               let received = await (deps.fetch ?? globalThis.fetch)(url, init)
               if (request.signal.aborted) {
                 void received.body?.cancel().catch(() => {})
                 request.signal.throwIfAborted()
               }
+              received = protectFallbackCreditResponse(received, {
+                requestHeaders: retryHeaders,
+                requestBodyText: createBody,
+                framing: responseMode,
+              })
               if (billingSend) {
                 billingSend.received = true
                 if (fromUpstream(received.headers, data))
@@ -1629,6 +1719,8 @@ export function createNativeAnthropicAdapter<Q, P>(
           }
           let response: Response
           if (dispatch?.kind === 'http-relay') {
+            if (hasFallbackCreditInRequest(createBody))
+              throw new NativeAnthropicTransportRefusal()
             // Checked again at send time: the dispatch was chosen before a
             // proxy setting could have appeared.
             if (relayProxyApplies(dispatch.url))
@@ -1716,6 +1808,8 @@ export function createNativeAnthropicAdapter<Q, P>(
       // A host retry authorizes credentials again and builds a new envelope;
       // it must not reuse this attempt's authorization.
       const upstreamBody = body ?? ''
+      if (hasFallbackCreditInRequest(upstreamBody))
+        throw new NativeAnthropicTransportRefusal()
       headers.delete('x-relay-token')
       const envelope = {
         protocol: 1,
@@ -1774,8 +1868,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         signal: request.signal,
         body: JSON.stringify(envelope),
       })
-      const billingSend = observeFinalWire(relayRequest, body)
-      if (billingSend) billingSends.set(data, billingSend)
+      await registerPhysical(relayRequest, headers, url)
       return relayRequest
     }
     let wireBody: string | Uint8Array | undefined = body
@@ -1829,11 +1922,278 @@ export function createNativeAnthropicAdapter<Q, P>(
       signal: request.signal,
       ...(wireBody !== undefined ? { body: wireBody } : {}),
     })
-    const billingSend = observeFinalWire(finalRequest, body)
-    if (billingSend) billingSends.set(data, billingSend)
+    await registerPhysical(finalRequest, finalRequest.headers, finalRequest.url)
     return finalRequest
 
-    function observeFinalWire(prepared: Request, bodyText: string | undefined) {
+    function notifyFinal(
+      headers: Headers,
+      attemptId: string,
+      cleanBody: string,
+    ) {
+      try {
+        source.onFinalRequestPrepared?.({
+          attemptId,
+          requestId: headers.get('x-client-request-id') ?? undefined,
+          bodyText: cleanBody,
+          ttlMs: requestCacheLifetimeMs(cleanBody),
+        })
+      } catch {
+        /* Optional cache observation cannot fail a physical send. */
+      }
+    }
+
+    async function authorizeResend(
+      modelID: string,
+      kind: 'refusal' | 'thread',
+      signal: AbortSignal,
+    ) {
+      if (!data || !send?.oauth) return undefined
+      const extraSend = { kind, credentialId: send.oauth.credentialId }
+      return runWithRequestSignal(signal, async () => {
+        const authorized = await source.authorizeAccount(
+          { ...input, modelID, extraSend },
+          input.accountId,
+        )
+        signal.throwIfAborted()
+        if (
+          authorized?.route !== 'oauth' ||
+          !authorized.accessToken ||
+          authorized.credentialId !== extraSend.credentialId ||
+          authorized.identity?.accountUuid !== send.oauth?.identity?.accountUuid
+        )
+          return undefined
+        await source.admitRequest?.({
+          ...contextOf(attempt, data),
+          modelID,
+          extraSend,
+          provenance: authorized.provenance,
+        })
+        signal.throwIfAborted()
+        return authorized
+      })
+    }
+
+    async function registerPhysical(
+      prepared: Request,
+      upstreamHeaders: Headers,
+      destination: string,
+    ) {
+      if (!data) return
+      const billing = await observeFinalWire(prepared, body)
+      ensureLive()
+      request.signal.throwIfAborted()
+      assertHostAuthorityStable()
+      if (billing) billingSends.set(data, billing)
+      if (primary && messages) markPrimary(input.sessionID, primaryMarker)
+      if (!send?.oauth || !messages || body === undefined) return
+
+      const originHeaders = new Headers(upstreamHeaders)
+      originHeaders.delete('content-length')
+      const context = contextOf(attempt, data)
+      const physical: PhysicalSend = {
+        headers: originHeaders,
+        bodyText: body,
+        framing: responseMode,
+      }
+      physicalSends.set(data, physical)
+      if (!clientStream || (!clientSource && !routed)) return
+
+      const credentialId = send.oauth.credentialId
+      const isFresh = () =>
+        !disposed &&
+        !request.signal.aborted &&
+        (!primary || latestPrimary.get(input.sessionID) === primaryMarker) &&
+        (source.isRefusalFallbackCurrent?.({
+          ...context,
+          credentialId,
+          baseUrl: url,
+          url: destination,
+        }) ??
+          true)
+      const complete = (
+        response: Response,
+        template: string,
+        served: NativeAnthropicAttemptContext<P>,
+      ) => {
+        const onCompleted = source.onCompletedFallbackRequest
+        if (!onCompleted) return response
+        const acceptedAt = deps.now?.() ?? Date.now()
+        return observeCompletedCacheReply(response, true, (usage) => {
+          if (!isFresh()) return
+          void Promise.resolve()
+            .then(() => {
+              if (!isFresh()) return
+              return onCompleted({
+                ...served,
+                url,
+                bodyText: template,
+                signal: request.signal,
+                usage,
+                acceptedAt,
+                isFresh,
+              })
+            })
+            .catch(() => {})
+        })
+      }
+      const signal = request.signal
+      const sourceModel = input.modelID
+      physical.join = { sourceModel, isFresh, signal }
+      if (deferredCache && fullBodyText !== undefined)
+        physical.observeCompletion = (response) =>
+          complete(response, fullBodyText, {
+            ...context,
+            modelID: sentModel ?? input.modelID,
+          })
+      if (!clientSource) return
+
+      const accountId =
+        billing?.input.accountId ??
+        send.oauth.identity?.accountUuid ??
+        input.accountId
+      let candidate:
+        | Extract<NativeAnthropicAuthorization<P>, { route: 'oauth' }>
+        | undefined
+      let retry:
+        | {
+            context: NativeAnthropicAttemptContext<P>
+            scope: ProviderErrorResponseScope
+          }
+        | undefined
+      physical.fallback = {
+        sourceModel,
+        origin: {
+          accountId,
+          credentialId,
+          url: destination,
+          headers: originHeaders,
+          bodyText: body,
+          fullBodyText,
+        },
+        isFresh,
+        signal,
+        billing: billing?.input ?? {
+          sessionId: context.sessionID,
+          requestKind: context.kind,
+          chargeBasis: 'subscription_included',
+        },
+        onBillingReport: billing?.input.onReport,
+        authorize: async ({ model, signal }) => {
+          if (!isFresh()) return { kind: 'denied' }
+          candidate = await authorizeResend(model, 'refusal', signal)
+          if (!candidate || !isFresh()) return { kind: 'denied' }
+          const gateway = candidate.gateway
+          const nextUrl = gateway && claudeGatewayModelUrl(url, gateway)
+          if (
+            !nextUrl &&
+            candidate.dispatch &&
+            candidate.dispatch.kind !== 'direct'
+          )
+            return { kind: 'denied' }
+          const resolved = nextUrl?.toString() ?? url
+          requireOAuthDestination(resolved, nextUrl ? gateway : undefined)
+          return {
+            kind: 'authorized',
+            accountId,
+            credentialId: candidate.credentialId,
+            url: resolved,
+            accessToken: candidate.accessToken,
+          }
+        },
+        send: async ({ url, headers, body, bodyText, signal }) => {
+          const authorization = candidate
+          if (!authorization || !isFresh()) throw refuse(input)
+          signal.throwIfAborted()
+          assertHostAuthorityStable()
+          const payload = parseJson(bodyText)
+          const modelID =
+            isRecord(payload) && typeof payload.model === 'string'
+              ? payload.model
+              : input.modelID
+          const retryContext = {
+            ...context,
+            modelID,
+            attemptId: randomUUID(),
+            provenance: authorization.provenance,
+            dispatch: 'direct' as const,
+          }
+          const scope = createProviderErrorResponseScope(
+            [
+              authorization.accessToken,
+              ...claudeGatewayHeaderValues(authorization.gateway),
+            ],
+            'event-stream',
+          )
+          retry = { context: retryContext, scope }
+          let status: number | undefined
+          try {
+            const response = await (deps.fetch ?? globalThis.fetch)(url, {
+              method: prepared.method,
+              headers,
+              body: body as RequestInit['body'],
+              signal,
+              redirect: 'error',
+            })
+            status = response.status
+            return response
+          } catch (error) {
+            scope.dispose()
+            throw error
+          } finally {
+            // Keep the fallback credit token out of the final-wire callback.
+            // Dumps get the real JSON so Core can write a token placeholder.
+            try {
+              notifyFinal(
+                headers,
+                retryContext.attemptId,
+                await withoutFallbackCredit(bodyText),
+              )
+              if (await dumpEnabledForSend()) {
+                setDumpEnabledCore(true)
+                await dumpDirectRequest({
+                  affinity: input.sessionID,
+                  route: input.accountId,
+                  status,
+                  ...(status === undefined && {
+                    error: DUMP_PHYSICAL_SEND_FAILED,
+                  }),
+                  bodyText,
+                  url,
+                  method: prepared.method,
+                  headers,
+                })
+              }
+            } catch {}
+          }
+        },
+        observePhysicalResponse(response, physicalAttempt, reusableBodyText) {
+          if (!physicalAttempt.refusalRetry) return response
+          if (!retry) return response
+          const { scope, context } = retry
+          retry = undefined
+          const safe = scope.redactResponse(response)
+          try {
+            source.quotaFromHeaders?.(safe.headers, {
+              ...context,
+              status: safe.status,
+              reportRouting: false,
+            })
+          } catch {}
+          return reusableBodyText
+            ? complete(safe, reusableBodyText, context)
+            : safe
+        },
+      }
+    }
+
+    async function observeFinalWire(
+      prepared: Request,
+      physicalBodyText: string | undefined,
+    ) {
+      const bodyText =
+        physicalBodyText === undefined
+          ? undefined
+          : await withoutFallbackCredit(physicalBodyText)
       let billingSend: BillingSend | undefined
       const payload =
         messages && bodyText !== undefined ? parseJson(bodyText) : undefined
@@ -1890,12 +2250,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         }
       }
       try {
-        source.onFinalRequestPrepared?.({
-          attemptId: attempt.attemptId,
-          requestId: prepared.headers.get('x-client-request-id') ?? undefined,
-          bodyText,
-          ttlMs: requestCacheLifetimeMs(bodyText),
-        })
+        notifyFinal(prepared.headers, attempt.attemptId, bodyText)
       } catch {
         /* Optional cache observation cannot fail a physical send. */
       }
@@ -1943,25 +2298,54 @@ export function createNativeAnthropicAdapter<Q, P>(
       const quotaStopMessage = data ? quotaStopMessages.get(data) : undefined
       if (data) quotaStopMessages.delete(data)
       const billingSend = data ? billingSends.get(data) : undefined
+      const physical = data ? physicalSends.get(data) : undefined
+      if (data) physicalSends.delete(data)
+      const upstream = data && fromUpstream(response.headers, data)
+      const threaded = data ? threadRequests.get(data) : undefined
+      const failThread = threaded?.thread.fail
+      if (data) threadRequests.delete(data)
+      const fallback = upstream && response.ok && physical?.fallback
       if (billingSend) {
         billingSend.received = true
-        if (data && fromUpstream(response.headers, data))
+      }
+      if (fallback) {
+        response = dispatchRefusalFallback(response, {
+          ...fallback,
+          observePhysicalResponse: (guarded, attempt, template) => {
+            if (attempt.refusalRetry)
+              return (
+                fallback.observePhysicalResponse?.(
+                  guarded,
+                  attempt,
+                  template,
+                ) ?? guarded
+              )
+            let observed = scrubResponse(data, guarded)
+            if (threaded) observed = threaded.thread.observe(observed)
+            return physical.observeCompletion?.(observed) ?? observed
+          },
+        })
+      } else {
+        if (physical)
+          response = protectFallbackCreditResponse(response, {
+            requestHeaders: physical.headers,
+            requestBodyText: physical.bodyText,
+            framing: physical.framing,
+          })
+        if (billingSend && upstream)
           response = observeAnthropicBillingResponse(
             billingSend.input,
             response,
           )
+        if (threaded && upstream) {
+          response = await threaded.thread.recover(
+            inspectableThreadError(response),
+            threaded.resend,
+            threaded.beforeResend,
+          )
+          response = threaded.thread.observe(response)
+        } else threaded?.thread.fail()
       }
-      const threaded = data ? threadRequests.get(data) : undefined
-      const failThread = threaded?.thread.fail
-      if (data) threadRequests.delete(data)
-      if (threaded && data && fromUpstream(response.headers, data)) {
-        response = await threaded.thread.recover(
-          inspectableThreadError(response),
-          threaded.resend,
-          threaded.beforeResend,
-        )
-        response = threaded.thread.observe(response)
-      } else threaded?.thread.fail()
       if (data && !fromUpstream(response.headers, data)) {
         if (data) dropDumpContext(data)
         // Relay authentication errors must not appear as an OAuth 401 to the
@@ -2098,7 +2482,15 @@ export function createNativeAnthropicAdapter<Q, P>(
       }
       // Remove this send's secrets from provider errors before any other
       // reader; successful bytes pass through unchanged.
-      const safe = scrubResponse(data, response)
+      let safe = fallback ? response : scrubResponse(data, response)
+      if (
+        !fallback &&
+        physical?.join &&
+        !/\bjson\b/i.test(safe.headers.get('content-type') ?? '')
+      ) {
+        safe = physical.observeCompletion?.(safe) ?? safe
+        safe = joinRefusalFallbackStream(safe, physical.join)
+      }
       let incompleteObserver:
         | ReturnType<typeof createDumpResponseObserver>
         | undefined
@@ -2305,8 +2697,24 @@ export function createNativeAnthropicAdapter<Q, P>(
           ...contextOf(attempt, data),
           status,
           headers,
-          body: async () =>
-            rewritten ? await body() : scrubber.redactText(await body()),
+          body: async () => {
+            const text = await body()
+            if (rewritten) return text
+            const physical = physicalSends.get(data)
+            // The host can classify an HTTP error before rewriting it. Guard
+            // its clone so fallback credit tokens never reach the classifier.
+            const guarded = physical
+              ? await protectFallbackCreditResponse(
+                  new Response(text, { status, headers }),
+                  {
+                    requestHeaders: physical.headers,
+                    requestBodyText: physical.bodyText,
+                    framing: 'http',
+                  },
+                ).text()
+              : text
+            return scrubber.redactText(guarded)
+          },
         })
       } catch (error) {
         if (!isNativeTransientAccountError(error) || !error.poolRead)
@@ -2546,10 +2954,12 @@ export function createNativeAnthropicAdapter<Q, P>(
       hostAttempts.clear()
       quotaStopMessages = new WeakMap()
       retryAttempts.clear()
+      latestPrimary.clear()
       dumpContexts.clear()
       for (const data of [...owned.keys()]) release(data)
     },
     forgetSession(sessionID) {
+      latestPrimary.delete(sessionID)
       for (const [data, send] of hostAttempts)
         if (send.sessionID === sessionID) {
           hostAttempts.delete(data)

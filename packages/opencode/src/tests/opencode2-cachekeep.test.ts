@@ -41,6 +41,7 @@ import {
   StickySessionRouter,
   sessionCacheActivity,
   setLogLevel,
+  signRequestBody,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type Attempt,
@@ -3186,7 +3187,7 @@ test('OC2 aborted recovery reports nothing', async () => {
   }
 })
 
-test('OC2 ordinary acceptance captures the byte-identical pre-thread snapshot before returning', async () => {
+test('OC2 ordinary acceptance tracks the signed pre-thread snapshot before returning', async () => {
   const f = await fixture()
   const originalRewrite = wireTransform.rewriteRequestBody
   let captured: string | undefined
@@ -3203,7 +3204,9 @@ test('OC2 ordinary acceptance captures the byte-identical pre-thread snapshot be
     expect(JSON.parse(captured!).thread).toBeUndefined()
     await f.respond(draft, Response.json({ content: [], usage: {} }), false)
     expect(track).toHaveBeenCalledTimes(1)
-    expect(track.mock.calls[0]![0].bodyText).toBe(captured!)
+    expect(track.mock.calls[0]![0].bodyText).toBe(
+      await signRequestBody(captured!),
+    )
   } finally {
     rewrite.mockRestore()
     track.mockRestore()

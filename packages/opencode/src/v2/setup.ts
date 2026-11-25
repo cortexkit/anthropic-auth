@@ -31,10 +31,12 @@ import {
   type SettingsPaths,
   setDumpEnabled,
   setLogLevel,
+  signRequestBody,
   startSettings,
   stateLayoutIoFailure,
   stateLayoutOfPaths,
   unmovedRegistrationPolicy,
+  withoutFallbackCredit,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type PoolLoginMethod,
@@ -527,9 +529,31 @@ export async function setupAnthropicAuth(
     },
     onRequestPrepared: async (input) => {
       try {
-        await cacheKeep?.track(input)
+        await cacheKeep?.track({
+          ...input,
+          bodyText: await withoutFallbackCredit(input.bodyText),
+        })
       } catch {
         logger.warn('cachekeep', 'live request tracking failed')
+      }
+    },
+    onCompletedFallbackRequest: async (input) => {
+      if (!cacheKeep) return
+      const bodyText = await signRequestBody(
+        await withoutFallbackCredit(input.bodyText),
+      )
+      if (!input.isFresh()) return
+      try {
+        await cacheKeep.track({ ...input, bodyText })
+        if (!input.isFresh()) return
+        cacheKeep.onResponseHeaders({
+          attemptId: input.attemptId,
+          status: 200,
+          acceptedAt: input.acceptedAt,
+          acceptedUsage: input.usage,
+        })
+      } finally {
+        cacheKeep.discardAttempt(input.attemptId)
       }
     },
     onCacheResponse: (input) => {

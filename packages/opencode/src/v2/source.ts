@@ -1,20 +1,24 @@
 import {
   type AnthropicBillingWarming,
   type ClaudeGateway,
+  claudeGatewayModelUrl,
   createExhaustedNoRouteResponse,
   createNativeUsagePublisher,
   createNativeVaultNoRouteResponse,
   createQuotaRefusalResponse,
+  DEFAULT_REFUSAL_FALLBACK_MODE,
   decideStickyQuotaFailure,
   effectiveRelayTransport,
   formatNativeValidationBackoffMessage,
   getClaudeCodeIdentityForVerifiedAccount,
+  getKillswitchThresholdsForAccount,
   getMaxSameAccountWait,
   getQuotaCheckIntervalMs,
   getRoutingMode,
   getScopedQuotaWindowForModel,
   getWaitForReset,
   isDumpPersistentlyEnabled,
+  isKillswitchEnabled,
   isQuotaBearingHeaderFrame,
   localMessageThreadCredential,
   logger,
@@ -33,6 +37,7 @@ import {
   NativeVaultNoAccountError,
   NativeVaultQuotaPolicyError,
   nativeAccountCanServe,
+  nativeAccountPolicy,
   nativeLocalAccountRefusal,
   nativeLocalQuotaLineage,
   nativePollQuotaGenerallyExhausted,
@@ -62,6 +67,7 @@ import {
   sessionCacheActivity,
   setDumpEnabled,
   shouldFallbackStatus,
+  signRequestBody,
   startRoutingWait,
   stickyQuotaBlockerInForce,
   stickyQuotaSnapshotIsFresh,
@@ -94,6 +100,7 @@ import {
   type NativeAnthropicRequestContext,
   type NativeAnthropicResponseContext,
   type NativeAnthropicResponseOptions,
+  type NativeAnthropicSendScope,
   type NativeAnthropicSource,
   NativeAnthropicTransportRefusal,
 } from './adapter'
@@ -300,6 +307,7 @@ export interface NativeSourceOptions {
   readonly onRequestPrepared?: (
     input: NativeCacheRequestPrepared,
   ) => Promise<void> | void
+  readonly onCompletedFallbackRequest?: NativeSource['onCompletedFallbackRequest']
   readonly onResponseHeaders?: (
     input: NativeAnthropicResponseContext<NativeSourceProvenance>,
   ) => void
@@ -337,7 +345,7 @@ export interface NativeSource
   extends NativeAnthropicSource<OAuthQuotaSnapshot, NativeSourceProvenance> {
   /** Background sends can stop retrying terminal refusals without changing live routing. */
   readonly authorizeAccount: (
-    scope: RequestScope,
+    scope: NativeAnthropicSendScope,
     accountId: string,
     onRefusal?: OnAccountRefusal,
   ) => Promise<Authorization | undefined>
@@ -512,11 +520,50 @@ export function createNativeAnthropicSource(
     snapshot: NativeAccountSnapshot,
     modelID: string,
     sessionID = '',
+    extraSend?: NativeAnthropicSendScope['extraSend'],
   ) =>
     nativeAccountCanServe(account) &&
-    (account.type === 'api' ||
-      routingRelay.policy(sessionID, account, snapshot, remapModelId(modelID))
-        .status === 'allowed')
+    (extraSend
+      ? account.type === 'oauth' &&
+        extraSendPolicy(account, snapshot, modelID).status === 'allowed'
+      : account.type === 'api' ||
+        routingRelay.policy(sessionID, account, snapshot, remapModelId(modelID))
+          .status === 'allowed')
+
+  const extraSendPolicy = (
+    account: NativeAccountView,
+    snapshot: NativeAccountSnapshot,
+    modelID: string,
+  ): NativeAccountPolicy => {
+    const policy = nativeAccountPolicy(account, snapshot, modelID)
+    if (
+      policy.status !== 'allowed' ||
+      !isKillswitchEnabled(snapshot.policyStorage)
+    )
+      return policy
+    // A discretionary extra send must also leave quota at the killswitch
+    // threshold untouched. Ordinary account routing has its own policy.
+    const floor = getKillswitchThresholdsForAccount(
+      snapshot.policyStorage,
+      account.id === 'main' ? undefined : account.id,
+    )
+    const quota = account.quota
+    if (
+      quota?.five_hour?.remainingPercent === floor.five_hour ||
+      quota?.seven_day?.remainingPercent === floor.seven_day
+    )
+      return {
+        status: 'blocked',
+        reason: 'quota-ineligible',
+        quotaPolicyLimits: ['killswitch'],
+      }
+    return policy
+  }
+
+  const credentialFor = (account: NativeAccountView) =>
+    account.binding
+      ? localMessageThreadCredential(account.binding)
+      : account.credentialId
 
   const refusalInForce = (
     scope: RequestScope,
@@ -810,8 +857,8 @@ export function createNativeAnthropicSource(
     modelID: string,
     route: 'oauth' | 'api',
     active: AbortController,
+    scope: NativeAnthropicSendScope,
     onRefusal?: (reason: NativeAccountRefusalReason) => void,
-    sessionID = '',
   ) => {
     const current = await runtime.read(modelID)
     syncDumpEnabled(current)
@@ -821,7 +868,10 @@ export function createNativeAnthropicSource(
     if (
       !account ||
       account.type !== route ||
-      !eligible(account, current, modelID, sessionID)
+      !eligible(account, current, modelID, scope.sessionID, scope.extraSend) ||
+      (scope.extraSend &&
+        (credentialFor(account) !== scope.extraSend.credentialId ||
+          exhaustionInForce(scope, account, current, modelID, true)))
     ) {
       onRefusal?.(
         !account || !nativeAccountCanServe(account)
@@ -1020,6 +1070,29 @@ export function createNativeAnthropicSource(
   }
 
   const source: NativeSource = {
+    isRefusalFallbackCurrent(input) {
+      if (closed || states.get(input.provenance)?.active.signal.aborted)
+        return false
+      const snapshot = runtime.peek?.()
+      const mode =
+        runtime.getRefusalFallbackMode?.() ??
+        snapshot?.refusalFallbackMode ??
+        DEFAULT_REFUSAL_FALLBACK_MODE
+      const currentGateway = gateway()
+      const url =
+        currentGateway && claudeGatewayModelUrl(input.baseUrl, currentGateway)
+      if (mode !== 'client' || (url?.toString() || input.baseUrl) !== input.url)
+        return false
+      if (!snapshot) return true
+      const account = snapshot.accounts.find(
+        (row) => row.id === input.accountId,
+      )
+      return Boolean(
+        account?.type === 'oauth' &&
+          nativeAccountCanServe(account) &&
+          credentialFor(account) === input.credentialId,
+      )
+    },
     billingRequest(input) {
       if (input.agent === 'prime') return undefined
       const state = states.get(input.provenance)
@@ -1528,15 +1601,22 @@ export function createNativeAnthropicSource(
     },
     async authorizeAccount(scope, accountId, onRefusal) {
       const active = controller(scope)
-      const modelID = remapModelId(
-        (await options.resolveModelId?.(scope)) ?? scope.modelID,
-      )
+      const { extraSend } = scope
+      const modelID = extraSend
+        ? scope.modelID
+        : remapModelId((await options.resolveModelId?.(scope)) ?? scope.modelID)
       const snapshot = await runtime.read(modelID)
       syncDumpEnabled(snapshot)
       active.signal.throwIfAborted()
       assertTransport(snapshot, gateway())
       const account = snapshot.accounts.find((row) => row.id === accountId)
-      if (!account || !eligible(account, snapshot, modelID, scope.sessionID)) {
+      if (
+        !account ||
+        !eligible(account, snapshot, modelID, scope.sessionID, extraSend) ||
+        (extraSend &&
+          (credentialFor(account) !== extraSend.credentialId ||
+            exhaustionInForce(scope, account, snapshot, modelID, true)))
+      ) {
         onRefusal?.(
           !account || !nativeAccountCanServe(account)
             ? 'account-unavailable'
@@ -1545,7 +1625,7 @@ export function createNativeAnthropicSource(
         return undefined
       }
       const queueKey = key(scope, accountId)
-      const queue = recoveries.get(queueKey)
+      const queue = extraSend ? undefined : recoveries.get(queueKey)
       const choice = queue?.shift()
       if (queue?.length === 0) recoveries.delete(queueKey)
       if (choice && !sameAccount(account, choice.account)) return undefined
@@ -1553,7 +1633,11 @@ export function createNativeAnthropicSource(
         dispatch,
         relayFallback,
         gateway: sendGateway,
-      } = await dispatchFor(snapshot, choice?.direct === true, account.type)
+      } = await dispatchFor(
+        snapshot,
+        extraSend?.kind === 'refusal' || choice?.direct === true,
+        account.type,
+      )
       const gatewayField = sendGateway ? { gateway: sendGateway } : {}
       active.signal.throwIfAborted()
       if (choice?.auth) {
@@ -1563,8 +1647,8 @@ export function createNativeAnthropicSource(
             modelID,
             choice.auth.route,
             active,
+            scope,
             onRefusal,
-            scope.sessionID,
           ))
         )
           return undefined
@@ -1608,16 +1692,7 @@ export function createNativeAnthropicSource(
           return undefined
         const material = await runtime.authorizeApi(accountId, active.signal)
         active.signal.throwIfAborted()
-        if (
-          !(await admitted(
-            accountId,
-            modelID,
-            'api',
-            active,
-            undefined,
-            scope.sessionID,
-          ))
-        )
+        if (!(await admitted(accountId, modelID, 'api', active, scope)))
           return undefined
         const provenance: NativeSourceProvenance = {
           kind: 'api',
@@ -1641,9 +1716,11 @@ export function createNativeAnthropicSource(
         const receipt = await runtime.authorizeVault(accountId, active.signal)
         active.signal.throwIfAborted()
         if (
-          choice &&
-          (receipt.credentialId !== choice.account.credentialId ||
-            receipt.assertedAccountIdentity !== choice.account.accountIdentity)
+          (extraSend && receipt.credentialId !== extraSend.credentialId) ||
+          (choice &&
+            (receipt.credentialId !== choice.account.credentialId ||
+              receipt.assertedAccountIdentity !==
+                choice.account.accountIdentity))
         )
           return undefined
         if (
@@ -1652,8 +1729,8 @@ export function createNativeAnthropicSource(
             modelID,
             'oauth',
             active,
+            scope,
             onRefusal,
-            scope.sessionID,
           ))
         )
           return undefined
@@ -1668,7 +1745,7 @@ export function createNativeAnthropicSource(
           onRefusal?.('account-unavailable')
           return undefined
         }
-        recordServed(scope, account)
+        if (!extraSend) recordServed(scope, account)
         return {
           route: 'oauth',
           accessToken: receipt.accessToken,
@@ -1685,7 +1762,9 @@ export function createNativeAnthropicSource(
       const material = await runtime.authorizeLocal(accountId, {
         signal: active.signal,
         policy: (row, view) =>
-          routingRelay.policy(scope.sessionID, row, view, modelID),
+          extraSend
+            ? extraSendPolicy(row, view, modelID)
+            : routingRelay.policy(scope.sessionID, row, view, modelID),
       })
       active.signal.throwIfAborted()
       if (material.status !== 'usable') {
@@ -1699,14 +1778,7 @@ export function createNativeAnthropicSource(
         return undefined
       }
       if (
-        !(await admitted(
-          accountId,
-          modelID,
-          'oauth',
-          active,
-          onRefusal,
-          scope.sessionID,
-        ))
+        !(await admitted(accountId, modelID, 'oauth', active, scope, onRefusal))
       )
         return undefined
       const provenance: NativeSourceProvenance = {
@@ -1714,7 +1786,7 @@ export function createNativeAnthropicSource(
         subject: material.subject,
       }
       states.set(provenance, { ...common, access: material.access })
-      recordServed(scope, account)
+      if (!extraSend) recordServed(scope, account)
       const identity = material.subject.binding.identity
       return {
         route: 'oauth',
@@ -1773,8 +1845,8 @@ export function createNativeAnthropicSource(
           input.modelID,
           input.route,
           state.active,
+          input,
           onRefusal,
-          input.sessionID,
         ))
       if (!state || !admission)
         throw new Error(
@@ -1788,7 +1860,9 @@ export function createNativeAnthropicSource(
       })
     },
     isDumpEnabled: () => readDumpEnabled(),
-    onRequestPrepared: (input) => {
+    onCompletedFallbackRequest: options.onCompletedFallbackRequest,
+    onRequestPrepared: async (input) => {
+      const bodyText = await signRequestBody(input.bodyText)
       if (
         input.route === 'oauth' &&
         input.agent !== 'prime' &&
@@ -1799,10 +1873,10 @@ export function createNativeAnthropicSource(
           sessionID: input.sessionID,
           accountId: input.accountId,
           signal: input.signal,
-          cacheTtlMs: requestCacheLifetimeMs(input.bodyText),
+          cacheTtlMs: requestCacheLifetimeMs(bodyText),
           ttlOverridden:
             readSessionCachePolicy(input.sessionID, true)?.ttl !== undefined,
-          bodyText: input.bodyText,
+          bodyText,
           sessionSignal: states.get(input.provenance)?.active.signal,
         })
         if (cacheAttempts.size > 4096) {
@@ -1813,6 +1887,7 @@ export function createNativeAnthropicSource(
       const state = states.get(input.provenance)
       return options.onRequestPrepared?.({
         ...input,
+        bodyText,
         ...(state?.snapshot && {
           admission: { snapshot: state.snapshot, account: state.account },
         }),

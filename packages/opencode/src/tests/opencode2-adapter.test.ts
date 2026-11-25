@@ -574,7 +574,7 @@ test.each([
   ['server', 'claude-fable-5', false, 'refusal'],
   ['server', 'claude-opus-4-8', true, 'refusal'],
   ['off', 'claude-fable-5', true, 'refusal'],
-  ['client', 'claude-fable-5', true, 'refusal'],
+  ['client', 'claude-fable-5', true, 'tool_use'],
 ] as const)(
   'OpenCode 2 in %s with sent model %s and closed call %s delivers %s',
   async (mode, model, closedCall, stopReason) => {
@@ -659,6 +659,271 @@ test.each([
     }
   },
 )
+
+const FALLBACK_SOURCE = 'claude-fable-5-2'
+const FALLBACK_TARGET = 'claude-opus-4-8'
+const PRIVATE_CREDIT = 'oc2_private_credit_sentinel_932'
+
+function fallbackReply(model: string, refuses = false) {
+  return sseResponse(
+    [
+      sse('message_start', {
+        type: 'message_start',
+        message: {
+          id: `msg_${model}`,
+          model,
+          usage: { input_tokens: refuses ? 12 : 25 },
+        },
+      }),
+      ...(!refuses
+        ? [
+            sse('content_block_start', {
+              type: 'content_block_start',
+              index: 0,
+              content_block: { type: 'text', text: 'the retry answered' },
+            }),
+            sse('content_block_stop', { type: 'content_block_stop', index: 0 }),
+          ]
+        : []),
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: refuses
+          ? {
+              stop_reason: 'refusal',
+              stop_details: {
+                type: 'refusal',
+                category: 'cyber',
+                fallback_credit_token: PRIVATE_CREDIT,
+              },
+            }
+          : { stop_reason: 'end_turn' },
+        usage: { output_tokens: 7 },
+      }),
+      sse('message_stop', { type: 'message_stop' }),
+    ].join(''),
+  )
+}
+
+test.each(['answer', 'reject', 'gateway moved', 'new primary'] as const)(
+  'OpenCode 2 client fallback: %s',
+  async (scenario) => {
+    let gateway: core.ClaudeGateway = {
+      origin: 'https://gateway.example',
+      pathPrefix: '/claude',
+      headers: [['x-gateway-test', 'value']],
+    }
+    const authModels: string[] = []
+    const admittedModels: string[] = []
+    const reports: core.AnthropicBillingReport[] = []
+    const prepared = spyOn(
+      { record: (_input: { bodyText: string }) => {} },
+      'record',
+    )
+    const sent: Request[] = []
+    const completed: string[] = []
+    const { source } = makeSource({
+      authorizeAccount(input) {
+        authModels.push(input.modelID)
+        return oauth(
+          input.extraSend ? 'retry-oauth-bearer' : 'origin-oauth-bearer',
+          { custody: 'local', receipt: 'local:1' },
+          { gateway },
+        )
+      },
+      admitRequest(input) {
+        admittedModels.push(input.modelID)
+      },
+      onFinalRequestPrepared: prepared,
+      onCompletedFallbackRequest(input) {
+        completed.push(input.bodyText)
+      },
+      billingRequest: (input) => ({
+        sessionId: input.sessionID,
+        credentialId: 'synthetic-credential-row',
+        requestKind: input.kind,
+        model: input.modelID,
+        onReport: (report) => reports.push(report),
+      }),
+    })
+    const native = createNativeAnthropicAdapter({
+      source,
+      fetch: (async (url, init) => {
+        sent.push(
+          new Request(url instanceof Request ? url.url : url.toString(), init),
+        )
+        return scenario === 'reject'
+          ? Response.json(
+              {
+                type: 'error',
+                error: { message: `rejected ${PRIVATE_CREDIT}` },
+              },
+              { status: 429 },
+            )
+          : fallbackReply(FALLBACK_TARGET)
+      }) as typeof fetch,
+    })
+    const host = new Host(native.adapter)
+    const scope = scopeOf({ modelID: FALLBACK_SOURCE })
+    const input = () =>
+      hostRequest({ ...sonnetPayload(), model: FALLBACK_SOURCE, stream: true })
+    try {
+      const { attempt, final } = await host.run(scope, input())
+      if (scenario === 'gateway moved')
+        gateway = { ...gateway, origin: 'https://other.example' }
+      if (scenario === 'new primary') await host.run(scope, input())
+      const response = await native.adapter.rewriteResponse?.({
+        ...attempt,
+        attempt,
+        request: final,
+        response: fallbackReply(FALLBACK_SOURCE, true),
+      })
+      const text = await response?.text()
+      expect(text).not.toContain(PRIVATE_CREDIT)
+      expect(text?.match(/event: message_start/g)).toHaveLength(1)
+      expect(text).toContain(`"model":"${FALLBACK_SOURCE}"`)
+      if (scenario === 'gateway moved' || scenario === 'new primary') {
+        expect(sent).toHaveLength(0)
+        expect(text).toContain('"stop_reason":"refusal"')
+        expect(completed).toEqual([])
+        return
+      }
+      expect(authModels).toEqual([FALLBACK_SOURCE, FALLBACK_TARGET])
+      expect(admittedModels).toEqual([FALLBACK_SOURCE, FALLBACK_TARGET])
+      expect(sent).toHaveLength(1)
+      const retry = sent[0]!
+      expect(retry.url).toBe(final.url)
+      expect(retry.redirect).toBe('error')
+      expect(retry.headers.get('authorization')).toBe(
+        'Bearer retry-oauth-bearer',
+      )
+      expect(retry.headers.get('x-gateway-test')).toBe('value')
+      const physical = await retry.text()
+      expect(JSON.parse(physical)).toMatchObject({
+        model: FALLBACK_TARGET,
+        fallback_credit_token: PRIVATE_CREDIT,
+      })
+      expect(await core.hasValidRequestBodySignature(physical)).toBe(true)
+      const original = await final.clone().text()
+      const sameHeaders = (request: Request) =>
+        [...request.headers].filter(([name]) => name !== 'authorization')
+      expect(sameHeaders(retry)).toEqual(sameHeaders(final))
+      expect(await core.withoutFallbackCredit(physical)).toBe(
+        await signRequestBody(
+          original.replace(FALLBACK_SOURCE, FALLBACK_TARGET),
+        ),
+      )
+      expect(prepared.mock.calls).toHaveLength(2)
+      for (const [entry] of prepared.mock.calls)
+        expect(entry.bodyText).not.toContain(PRIVATE_CREDIT)
+      expect(JSON.parse(prepared.mock.calls[1]![0].bodyText).model).toBe(
+        FALLBACK_TARGET,
+      )
+      await until(() => reports.length >= 2)
+      expect(reports.map(({ model }) => model)).toEqual([
+        FALLBACK_SOURCE,
+        FALLBACK_TARGET,
+      ])
+      expect(JSON.stringify(reports)).not.toContain(PRIVATE_CREDIT)
+      if (scenario === 'answer') {
+        expect(text).toContain('the retry answered')
+        expect(text).toContain('"input_tokens":25')
+        expect(text).not.toContain('"stop_reason":"refusal"')
+        expect(completed).toHaveLength(1)
+        expect(completed[0]).not.toContain(PRIVATE_CREDIT)
+      } else {
+        expect(text).toContain('"stop_reason":"refusal"')
+        expect(text).not.toContain('the retry answered')
+        expect(completed).toEqual([])
+      }
+    } finally {
+      native.dispose()
+    }
+  },
+)
+
+test.each([
+  ['title kind', scopeOf({ kind: 'title' }), false],
+  ['title agent', scopeOf({ agent: 'title' }), false],
+  ['compaction', scopeOf({ agent: 'compaction' }), false],
+  ['cachekeep', scopeOf({ agent: 'cachekeep' }), false],
+  ['lane start', scopeOf(), true],
+] as const)(
+  'OpenCode 2 client fallback does not retry %s',
+  async (_label, scope, laneStart) => {
+    const send = spyOn(
+      { run: async () => fallbackReply(FALLBACK_TARGET) },
+      'run',
+    )
+    const native = createNativeAnthropicAdapter({
+      source: makeSource().source,
+      fetch: send as unknown as typeof fetch,
+    })
+    try {
+      const { attempt, final } = await new Host(native.adapter).run(
+        { ...scope, modelID: FALLBACK_SOURCE },
+        hostRequest(
+          { ...sonnetPayload(), model: FALLBACK_SOURCE, stream: true },
+          laneStart
+            ? { headers: { [LANE_START_REQUEST_HEADER]: '1' } }
+            : undefined,
+        ),
+      )
+      const response = await native.adapter.rewriteResponse?.({
+        ...attempt,
+        attempt,
+        request: final,
+        response: fallbackReply(FALLBACK_SOURCE, true),
+      })
+      const text = await response?.text()
+      expect(text).toContain('"stop_reason":"refusal"')
+      expect(text).not.toContain(PRIVATE_CREDIT)
+      expect(send).not.toHaveBeenCalled()
+    } finally {
+      native.dispose()
+    }
+  },
+)
+
+test('OpenCode 2 bills the sent model on a routed title, not on a routed Prime', async () => {
+  const reports: core.AnthropicBillingReport[] = []
+  const { source } = makeSource({
+    billingRequest: (input) =>
+      input.agent === 'prime'
+        ? undefined
+        : {
+            sessionId: input.sessionID,
+            credentialId: 'synthetic-credential-row',
+            requestKind: input.kind,
+            model: input.modelID,
+            onReport: (report) => reports.push(report),
+          },
+  })
+  const native = createNativeAnthropicAdapter({ source })
+  const host = new Host(native.adapter)
+  try {
+    for (const agent of ['title', 'prime']) {
+      const { attempt, final } = await host.run(
+        scopeOf({ modelID: FALLBACK_SOURCE, agent }),
+        hostRequest({
+          ...sonnetPayload(),
+          model: 'claude-opus-5',
+          stream: true,
+        }),
+      )
+      const response = await native.adapter.rewriteResponse?.({
+        ...attempt,
+        request: final,
+        attempt,
+        response: fallbackReply('claude-opus-5'),
+      })
+      await response?.text()
+    }
+    await until(() => reports.length >= 1)
+    expect(reports.map(({ model }) => model)).toEqual(['claude-opus-5'])
+  } finally {
+    native.dispose()
+  }
+})
 
 function cacheDiagnosticsHost() {
   const wire = createNativeWirePolicy()
