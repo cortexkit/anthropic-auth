@@ -58,7 +58,11 @@ import {
   CLAUDE_VAULT_ACTIVATION_METHOD_ID,
 } from './activation'
 import { stateRefusalFrom } from './adapter'
-import { createNativeCacheKeep, type NativeCacheKeepOptions } from './cachekeep'
+import {
+  createNativeCacheKeep,
+  type NativeCacheKeepOptions,
+  sourceWarmRestartIdentity,
+} from './cachekeep'
 import { installNativeAnthropic } from './install'
 import { startNativeAnthropicLifecycle } from './lifecycle'
 import { createNativeMenuCapabilities } from './menu'
@@ -675,6 +679,11 @@ export async function setupAnthropicAuth(
                 url: input.url,
                 headers: input.headers,
                 cacheMode,
+                // A refusal can arrive before CacheKeep tracks the source model's accepted prefix.
+                restartIdentity: sourceWarmRestartIdentity(
+                  initial?.accounts.find((row) => row.id === accountId),
+                  credentialId,
+                ),
                 hostMetadata: { sourceBaseUrl: input.baseUrl },
                 isSubagent: subagent(sessionID),
                 loadStorage: async () => {

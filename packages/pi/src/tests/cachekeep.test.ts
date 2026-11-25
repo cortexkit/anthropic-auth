@@ -208,14 +208,20 @@ test('Pi drops an unsupported restart source model instead of warming it', async
   const f = await fixture()
   const first = f.create()
   const input = f.input('unsupported-source')
-  await first.process.trackAccepted(
-    {
-      ...input,
-      hostMetadata: { refusalSourceModel: 'claude-sonnet-4-6' },
-    },
-    f.snapshot,
-  )
+  await first.process.trackAccepted(input, f.snapshot)
   await first.process.stop()
+  const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
+  const [name] = (await readdir(directory)).filter((file) =>
+    file.endsWith('.json.gz'),
+  )
+  const path = join(directory, name!)
+  const record = JSON.parse(gunzipSync(await readFile(path)).toString())
+  await writeFile(
+    path,
+    gzipSync(
+      JSON.stringify({ ...record, refusalSourceModel: 'claude-sonnet-4-6' }),
+    ),
+  )
   const next = f.create()
   await next.process.startSession('pi-storage', 'unsupported-source')
   expect(

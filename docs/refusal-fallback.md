@@ -52,7 +52,7 @@ A successful retry counts as the first response of a round. If the round starts 
 
 During a round, CacheKeep can also keep the requested model's last accepted prefix warm, when the refused request extends that prefix and keep-warm policy allows it. The first request back carries a cache marker at the kept prefix when it still matches, so Anthropic can read the cache again.
 
-The live round and that separate warm of the requested model's cache do not survive a restart. The active keep-warm request for the serving model can be restored: its saved record holds the requested model's ID, not its headers, so the plugin can rebuild the requested model's beta list for the replay.
+The serving model's keep-warm target is used only while the round is live. When the round ends, CacheKeep can continue warming the requested model's prefix until the first successful response back on that model, unless a change such as history compaction invalidates it. A restart ends the round, but the saved requested-model prefix and its keep-warm budget can be restored. The restored warm targets the model that will serve the next request.
 
 On requests to the requested model, the plugin removes recorded fallback-model thinking wherever it follows that requested model's thinking in the same turn. It checks every turn, not only the latest one, and the record survives restarts. Pi and OpenCode 2 save the record on shutdown.
 

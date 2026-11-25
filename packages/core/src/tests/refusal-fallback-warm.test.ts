@@ -188,12 +188,31 @@ test('warm uses only the last full accepted source prefix, waits until near expi
     expect(kept.oauthAccountIdentity).toBe(route.credentialId)
     expect(await hasValidRequestBodySignature(kept.bodyText)).toBe(true)
     for (let i = 0; i < 10; i++) {
-      const { lifecycle, plan } = h.send({
-        bodyText: JSON.stringify(refusedBody),
-      })
+      const { lifecycle, plan } = h.send(
+        { bodyText: JSON.stringify(refusedBody) },
+        {
+          onCacheKeepTemplate(template) {
+            if (!template) return
+            h.cacheKeep.track({
+              sessionId: 'session',
+              url: route.url,
+              headers,
+              storage: stored,
+              cacheMode: 'hybrid',
+              bodyText: template.bodyText,
+              acceptedUsage: usage,
+            })
+          },
+        },
+      )
       expect(plan.kind).toBe('round')
       lifecycle.onCompleted?.(completion)
+      if (i < 9)
+        expect(h.cacheKeep.trackedRequest('session')?.bodyText).toBe(
+          plan.bodyText,
+        )
     }
+    expect(h.cacheKeep.trackedRequest('session')).toBeUndefined()
     expect(
       h.engine.plan({ ...h.input(), bodyText: JSON.stringify(refusedBody) })
         .kind,
@@ -326,7 +345,7 @@ test.each(['matching prefix', 'edited prefix', 'changed lifetime'] as const)(
       expect(
         h.engine.planRouted({ ...outbound, kind: 'summary' }).bodyText,
       ).toBe(outbound.bodyText)
-      const { plan } = h.send(outbound)
+      const { plan, lifecycle } = h.send(outbound)
       expect(plan.kind).toBe('source')
       if (scenario !== 'matching prefix') {
         expect(plan.bodyText).toBe(outbound.bodyText)
@@ -339,6 +358,7 @@ test.each(['matching prefix', 'edited prefix', 'changed lifetime'] as const)(
       expect(JSON.stringify(returned).match(/"cache_control":/g)).toHaveLength(
         4,
       )
+      lifecycle.onCompleted?.(completion)
       expect(h.send(outbound).plan.bodyText).toBe(outbound.bodyText)
     } finally {
       h.cacheKeep.stop()
@@ -400,6 +420,192 @@ test('return marker leaves the body unchanged if a five-minute marker precedes t
   const original = structuredClone(current)
   expect(restoreRefusalFallbackReturnMarker(current, body)).toBe(false)
   expect(current).toEqual(original)
+})
+
+const hourMarker = { type: 'ephemeral', ttl: '1h' }
+const textBlock = (text: string, cache_control?: typeof hourMarker) => ({
+  type: 'text',
+  text,
+  ...(cache_control && { cache_control }),
+})
+const toolResult = (content: ReturnType<typeof textBlock>[]) => ({
+  type: 'tool_result',
+  tool_use_id: 'toolu_read',
+  content,
+})
+
+test('Pi onPayload-shaped return body counts a nested tool-result marker toward four', () => {
+  const source = {
+    ...body,
+    tools: [
+      {
+        name: 'read',
+        input_schema: { type: 'object' },
+        cache_control: hourMarker,
+      },
+    ],
+    system: [textBlock('Pi coding assistant')],
+  }
+  const current = {
+    ...source,
+    system: [textBlock('Pi coding assistant', hourMarker)],
+    messages: [
+      { role: 'user', content: [textBlock('accepted prefix')] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'toolu_read', name: 'read', input: {} },
+        ],
+      },
+      {
+        role: 'user',
+        content: [toolResult([textBlock('output', hourMarker)])],
+      },
+      { role: 'user', content: [textBlock('newest prompt', hourMarker)] },
+    ],
+  }
+  expect(restoreRefusalFallbackReturnMarker(current, source)).toBe(true)
+  expect(JSON.stringify(current).match(/"cache_control":/g)).toHaveLength(4)
+  expect(current.system).toEqual(source.system)
+  expect(current.messages[0]?.content).toEqual([
+    textBlock('accepted prefix', hourMarker),
+  ])
+})
+
+test('a nested five-minute marker prevents restoring a later hour marker', () => {
+  const messages = [
+    { role: 'user', content: [toolResult([textBlock('output')])] },
+    { role: 'user', content: [textBlock('anchor', hourMarker)] },
+  ]
+  const source = { ...body, messages }
+  const current = {
+    ...source,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          toolResult([textBlock('output', { ...hourMarker, ttl: '5m' })]),
+        ],
+      },
+      { role: 'user', content: [textBlock('anchor')] },
+      { role: 'user', content: [textBlock('newest prompt', hourMarker)] },
+    ],
+  }
+  const original = structuredClone(current)
+  expect(restoreRefusalFallbackReturnMarker(current, source)).toBe(false)
+  expect(current).toEqual(original)
+})
+
+test('a saved tail inside a tool result can be restored before newly appended content', () => {
+  const source = {
+    ...body,
+    messages: [
+      {
+        role: 'user',
+        content: [toolResult([textBlock('kept output', hourMarker)])],
+      },
+    ],
+  }
+  const current = {
+    ...source,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          toolResult([textBlock('kept output'), textBlock('new output')]),
+        ],
+      },
+      { role: 'user', content: [textBlock('newest prompt', hourMarker)] },
+    ],
+  }
+  expect(restoreRefusalFallbackReturnMarker(current, source)).toBe(true)
+  expect(current.messages[0]?.content).toEqual([
+    toolResult([textBlock('kept output', hourMarker), textBlock('new output')]),
+  ])
+})
+
+const returnBody = JSON.stringify({
+  ...body,
+  messages: [
+    { role: 'user', content: [textBlock('accepted prefix')] },
+    { role: 'user', content: 'refused suffix' },
+    { role: 'user', content: [textBlock('newest prompt', hourMarker)] },
+  ],
+})
+
+test('a target 400 resends the source with its return marker', async () => {
+  const h = harness()
+  try {
+    h.send().lifecycle.onCompleted?.(completion)
+    h.start()
+    await h.registered
+    const { plan } = h.send({ bodyText: returnBody })
+    expect(plan.kind).toBe('round')
+    const sent: string[] = []
+    const answer = await h.engine.handleTarget400(
+      plan.request!,
+      new Response('rejected target', { status: 400 }),
+      {
+        sourceModel: fable,
+        origin: { ...route, headers: new Headers() },
+        isCurrentPrimary: allowed,
+        authorize: () => ({
+          ...route,
+          kind: 'authorized',
+          accessToken: 'test',
+        }),
+        send: async ({ bodyText }) => {
+          sent.push(bodyText)
+          return new Response('transient failure', { status: 503 })
+        },
+      },
+    )
+    expect(answer.status).toBe(503)
+    expect(sent).toHaveLength(1)
+    expect(JSON.parse(sent[0]!).messages[0].content[0].cache_control).toEqual(
+      hourMarker,
+    )
+    expect(await hasValidRequestBodySignature(sent[0]!)).toBe(true)
+    expect(h.engine.plan({ ...h.input(), bodyText: returnBody })).toMatchObject(
+      {
+        kind: 'source',
+        sourceCacheMarkerRestored: true,
+      },
+    )
+  } finally {
+    h.cacheKeep.stop()
+  }
+})
+
+test('a transient return failure leaves the marker until the retry is accepted', async () => {
+  const h = harness()
+  try {
+    h.send().lifecycle.onCompleted?.(completion)
+    h.start()
+    await h.registered
+    const overrides = {
+      bodyText: returnBody,
+      oauth: { ...h.input().oauth!, targetAllowed: () => false },
+    }
+    const failed = h.send(overrides)
+    expect(failed.plan).toMatchObject({
+      kind: 'source',
+      sourceCacheMarkerRestored: true,
+    })
+    // A 429/503 or a socket failure never invokes the completion or refusal hook.
+    const retry = h.send(overrides)
+    expect(retry.plan).toMatchObject({
+      kind: 'source',
+      sourceCacheMarkerRestored: true,
+    })
+    expect(retry.plan.bodyText).toBe(failed.plan.bodyText)
+    retry.lifecycle.onCompleted?.(completion)
+    expect(h.engine.plan({ ...h.input(), ...overrides }).bodyText).toBe(
+      returnBody,
+    )
+  } finally {
+    h.cacheKeep.stop()
+  }
 })
 
 test.each(['mode', 'credential', 'destination', 'sign-out', 'delete'] as const)(

@@ -38,8 +38,10 @@ import {
   type NativeLockEvent,
   RecoveryThinkingStore,
   RequestGzipLatch,
+  resolveClaudeModelCapabilities,
   resolveNativePoolPaths,
   runNativeMigration,
+  SERVER_SIDE_FALLBACK_BETA,
   StickyQuotaRetryCounter,
   StickySessionRouter,
   sessionCacheActivity,
@@ -2044,7 +2046,7 @@ test('OpenCode 2 saves pending recovery thinking before server disposal returns'
   )
 })
 
-test('OpenCode 2 keeps separate warm targets and replays the live refusal-round warm headers on restart', async () => {
+test('OpenCode 2 keeps separate live warm targets and restores the requested-model prefix', async () => {
   const f = await fixture()
   await f.setQuota('first')
   await f.store.updateSettings((settings) => ({
@@ -2217,18 +2219,26 @@ test('OpenCode 2 keeps separate warm targets and replays the live refusal-round 
   await f.timers.fire()
   expect(next.sent).toHaveLength(1)
   const wire = await next.sent[0]!.text()
-  expect(JSON.parse(wire)).toMatchObject({ model: target, max_tokens: 0 })
+  expect(JSON.parse(wire)).toMatchObject({ model: source, max_tokens: 0 })
+  expect(JSON.parse(wire).messages).toEqual(
+    JSON.parse(warmByModel.get(source)!.wire).messages,
+  )
   const modelBetas = (headers: Headers) =>
     headers
       .get('anthropic-beta')!
       .split(',')
       .filter((beta) => beta !== MESSAGE_THREADS_BETA)
-  expect(modelBetas(next.sent[0]!.headers)).toEqual(
-    modelBetas(warmByModel.get(target)!.headers),
-  )
+  expect(modelBetas(next.sent[0]!.headers)).toEqual([
+    ...resolveClaudeModelCapabilities(source)!.claudeCodeBetas.title,
+    SERVER_SIDE_FALLBACK_BETA,
+  ])
   expect(await hasValidRequestBodySignature(wire)).toBe(true)
-  expect(record.refusalSourceModel).toBe(source)
+  expect(record).not.toHaveProperty('refusalSourceModel')
   expect(record).not.toHaveProperty('headers')
+  expect(record.policyState.warmsSinceLastRealRequest).toBe(1)
+  expect(record.nextPrewarmAt).toBeGreaterThan(
+    record.policyState.lastRealRequestAt + 60 * 60_000,
+  )
 })
 
 const CACHE_KEEP_SLOT = Symbol.for(

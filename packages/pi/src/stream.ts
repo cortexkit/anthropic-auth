@@ -170,7 +170,7 @@ import {
   type ThinkingContent,
   type ToolCall,
 } from '@earendil-works/pi-ai'
-import { PiCacheKeep } from './cachekeep.ts'
+import { PiCacheKeep, piCacheKeepAccountKey } from './cachekeep.ts'
 import {
   buildAnthropicRequest,
   fromClaudeCodeToolName,
@@ -1891,6 +1891,10 @@ async function sendAnthropicRequestAttempt(
                     cacheMode: isCacheKeepHybridActive(storage)
                       ? 'hybrid'
                       : 'disabled',
+                    restartIdentity:
+                      selected?.accountIdentity === verifiedUuid
+                        ? piCacheKeepAccountKey(selected)
+                        : undefined,
                     accountStoragePath: options.storagePath,
                     hostMetadata: {
                       sourceWarmRouteId: routeId,
@@ -2040,7 +2044,7 @@ async function sendAnthropicRequestAttempt(
       async onCacheKeepTemplate(template, isCurrent) {
         if (!isCurrent() || !realSession) return
         if (!template) {
-          keep.untrack(realSession)
+          keep.releaseTarget(realSession)
           return
         }
         const model = template.servingModel

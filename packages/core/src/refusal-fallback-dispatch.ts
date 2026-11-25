@@ -434,6 +434,7 @@ export async function resendRefusalFallbackSource(
     completion: RefusalFallbackCompletion,
     bodyText: string,
   ) => void,
+  onSourceAccepted?: () => void,
 ): Promise<Response> {
   const signal = options.signal ?? new AbortController().signal
   const fresh = () => !signal.aborted && isCurrent()
@@ -494,18 +495,25 @@ export async function resendRefusalFallbackSource(
   })
   const observed = options.observeResendResponse?.(guarded, model) ?? guarded
   const bodyText = prepared.bodyText
-  return eventStream(guarded)
-    ? joinRefusalFallbackStream(observed, {
-        sourceModel: options.sourceModel,
-        isFresh: () => !signal.aborted && isNewest(),
-        ...(onSourceCompleted && {
-          lifecycle: {
-            onCompleted: (completion) =>
-              onSourceCompleted(completion, bodyText),
+  const accepted = guarded.ok ? onSourceAccepted : undefined
+  if (!eventStream(guarded)) {
+    if (!signal.aborted && isNewest()) accepted?.()
+    return observed
+  }
+  return joinRefusalFallbackStream(observed, {
+    sourceModel: options.sourceModel,
+    isFresh: () => !signal.aborted && isNewest(),
+    ...(guarded.ok &&
+      (onSourceCompleted || accepted) && {
+        lifecycle: {
+          onRefusal: accepted,
+          onCompleted: (completion) => {
+            accepted?.()
+            onSourceCompleted?.(completion, bodyText)
           },
-        }),
-        signal,
-        maxPendingBytes: options.maxPendingBytes,
-      })
-    : observed
+        },
+      }),
+    signal,
+    maxPendingBytes: options.maxPendingBytes,
+  })
 }

@@ -687,7 +687,7 @@ describe('auth.loader', () => {
   })
 
   const exerciseRoundWarm = async (
-    restart: 'valid' | 'unsupported' | false,
+    restart: 'valid' | 'unsupported' | 'legacy' | false,
   ) => {
     await useTempAccountFile(
       createFallbackStorage({
@@ -715,8 +715,10 @@ describe('auth.loader', () => {
       headers: Headers
     }> = []
     let now = Date.now()
+    const originalExpiry = now + 60 * 60_000
     let refuse = false
     let rejectTarget = false
+    let rejectIndependent = false
     globalThis.fetch = mock(
       withNativeAdmission(
         (input: string | URL | Request, init?: RequestInit) => {
@@ -737,6 +739,11 @@ describe('auth.loader', () => {
           if (body.model === target && rejectTarget)
             return Response.json(
               { error: { message: 'rejected target' } },
+              { status: 400 },
+            )
+          if (rejectIndependent)
+            return Response.json(
+              { error: { message: 'unaccepted probe' } },
               { status: 400 },
             )
           const refused = body.model === source && refuse
@@ -823,8 +830,14 @@ describe('auth.loader', () => {
       target,
     ])
     const third = append(second, 'the next primary')
-    await request(other, third)
-    expect(sends.at(-1)?.body.model).toBe(source)
+    if (!restart) {
+      // Probe the other instance's routing without accepting a newer source
+      // prefix and transferring the shared session's warm ownership to it.
+      rejectIndependent = true
+      await request(other, third)
+      rejectIndependent = false
+      expect(sends.at(-1)?.body.model).toBe(source)
+    }
     await request(host, third)
     const round = sends.at(-1)!
     expect(round.body.model).toBe(target)
@@ -881,13 +894,18 @@ describe('auth.loader', () => {
       expect(entries).toHaveLength(1)
       const path = join(disk, entries[0]!)
       const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
-      if (restart === 'unsupported') {
+      if (restart !== 'valid') {
         await writeFile(
           path,
           gzipSync(
             JSON.stringify({
               ...saved,
-              refusalSourceModel: 'claude-sonnet-4-6',
+              bodyText: JSON.stringify({
+                ...JSON.parse(saved.bodyText),
+                model: target,
+              }),
+              refusalSourceModel:
+                restart === 'legacy' ? source : 'claude-sonnet-4-6',
             }),
           ),
         )
@@ -904,7 +922,7 @@ describe('auth.loader', () => {
       const before = sends.length
       await handles.cacheKeepManager.tick()
       const restored = sends.slice(before)
-      if (restart === 'unsupported') {
+      if (restart !== 'valid') {
         expect(restored).toBeEmpty()
         expect(await readdir(disk)).not.toContain(entries[0]!)
         expect(
@@ -921,13 +939,19 @@ describe('auth.loader', () => {
         return
       }
       expect(restored).toHaveLength(1)
-      expect(restored[0]!.body).toMatchObject({ model: target, max_tokens: 0 })
+      expect(restored[0]!.body).toMatchObject({
+        model: source,
+        max_tokens: 0,
+        messages: sends[0]!.body.messages,
+      })
       expect(modelBetas(restored[0]!.headers)).toEqual(
-        modelBetas(liveWarm!.headers),
+        modelBetas(warm!.headers),
       )
       expect(await hasValidRequestBodySignature(restored[0]!.text)).toBe(true)
-      expect(saved.refusalSourceModel).toBe(source)
+      expect(saved).not.toHaveProperty('refusalSourceModel')
       expect(saved).not.toHaveProperty('headers')
+      expect(saved.policyState.warmsSinceLastRealRequest).toBe(1)
+      expect(saved.nextPrewarmAt).toBeGreaterThan(originalExpiry)
       return
     }
 
@@ -960,8 +984,10 @@ describe('auth.loader', () => {
 
   test('OpenCode 1 warms the last clean source and serves a signed round only in its own plugin instance', () =>
     exerciseRoundWarm(false))
-  test('OpenCode 1 restart replays the live refusal-round warm headers', () =>
+  test('OpenCode 1 restart warms the last accepted requested-model prefix', () =>
     exerciseRoundWarm('valid'))
   test('OpenCode 1 restart drops an unsupported refusal source without sending it', () =>
     exerciseRoundWarm('unsupported'))
+  test('OpenCode 1 accepts the legacy record layout but does not replay its serving-model body', () =>
+    exerciseRoundWarm('legacy'))
 })

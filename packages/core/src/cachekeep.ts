@@ -453,11 +453,13 @@ export type CacheKeepTarget = {
    * A recovery-round warm for the original (source) model, tracked under a
    * key that cannot collide with the session's live target. It follows the
    * same send, auth, retry and logging path; the caller stops it through
-   * untrack() when the round ends or its prefix becomes unusable.
+   * untrack() when its prefix becomes unusable and replaces it on source return.
    */
   sourceWarm?: boolean
   /** In-process validity check for a kept source prefix; never serialized. */
   sourceWarmCurrent?: (bodyText: string) => boolean
+  /** Identity that lets this warm persist the accepted source prefix. */
+  sourceWarmRestartIdentity?: string
 } & Pick<CacheKeepTrackedSession, 'ttlMs' | 'lastTouchAt' | 'lastTouchKind'>
 
 type AcceptedCacheUsage = {
@@ -1264,6 +1266,50 @@ export class CacheKeepManager {
     this.scheduleDueTimer()
   }
 
+  /** Move an already accepted source prefix to the round's separate warm slot. */
+  moveToSourceWarm(
+    sessionId: string,
+    id: string,
+    matches: (target: Readonly<CacheKeepTarget>) => boolean,
+    warm: Pick<
+      CacheKeepTarget,
+      | 'headers'
+      | 'oauthAccountId'
+      | 'oauthAccountIdentity'
+      | 'hostMetadata'
+      | 'accountStoragePath'
+      | 'sourceWarmCurrent'
+      | 'sourceWarmRestartIdentity'
+    >,
+  ): boolean {
+    const previous = this.targets.get(sessionId)
+    if (!previous || this.targets.has(id) || !matches(previous)) return false
+    const target = {
+      ...previous,
+      ...warm,
+      id,
+      sourceWarm: true,
+      hostMetadata: { ...previous.hostMetadata, ...warm.hostMetadata },
+      sourceWarmRestartIdentity:
+        warm.sourceWarmRestartIdentity ?? previous.oauthAccountIdentity,
+    }
+    // Stop any send using the old target. A distinct policy object also
+    // prevents a late completion from updating the moved target.
+    if (target.policyState) target.policyState = { ...target.policyState }
+    this.releaseTarget(sessionId)
+    this.targets.set(id, target)
+    this.options.onTargetChanged?.(target)
+    this.publishTrackedSessions()
+    this.scheduleDueTimer()
+    return true
+  }
+
+  releaseSourceWarm(sessionId: string) {
+    for (const target of this.targets.values())
+      if (target.sourceWarm && target.policyState?.ownerSessionId === sessionId)
+        this.releaseTarget(target.id)
+  }
+
   trackedCount(): number {
     return this.targets.size
   }
@@ -1807,6 +1853,7 @@ export class CacheKeepManager {
     isSubagent?: boolean
     sourceWarm?: boolean
     sourceWarmCurrent?: CacheKeepTarget['sourceWarmCurrent']
+    sourceWarmRestartIdentity?: string
     /** Source targets use a synthetic id but belong to a real host session. */
     ownerSessionId?: string
     acceptedAt?: number
@@ -2051,6 +2098,9 @@ export class CacheKeepManager {
               : (previous?.policyState?.hasWarmed ?? false),
           },
       ...(input.sourceWarm === true && { sourceWarm: true }),
+      ...(input.sourceWarmRestartIdentity && {
+        sourceWarmRestartIdentity: input.sourceWarmRestartIdentity,
+      }),
       ...(input.sourceWarm &&
         input.sourceWarmCurrent && {
           sourceWarmCurrent: input.sourceWarmCurrent,

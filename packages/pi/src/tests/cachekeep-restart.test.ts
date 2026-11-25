@@ -98,7 +98,7 @@ test(
   20_000,
 )
 
-test('Pi signs both round warms and restores only the target with its source headers', async () => {
+test('Pi signs both live round warms and restores only the requested-model prefix', async () => {
   await withProcesses(async (spawn) => {
     expect(await spawn('round-seed').result).toEqual({ live: 4, warm: 2 })
     expect(await spawn('round-resume').result).toEqual({ live: 0, warm: 1 })

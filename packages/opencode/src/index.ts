@@ -7923,7 +7923,7 @@ const anthropicAuthPlugin = async (
               )
                 return
               if (bodyText === null) {
-                cacheKeepRestart.forget(cacheRequest.sessionId)
+                cacheKeepManager.releaseTarget(cacheRequest.sessionId)
                 return
               }
               const storeTemplate = (template: string) => {
@@ -8334,6 +8334,8 @@ const anthropicAuthPlugin = async (
                               sourceWarm: {
                                 url,
                                 headers: new Headers(requestHeaders),
+                                restartIdentity:
+                                  cacheKeepCredential(requestAuthority),
                                 cacheMode: wireSettings.cacheMode,
                                 loadStorage: () =>
                                   loadAccounts(accountStoragePath, model),

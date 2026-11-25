@@ -96,7 +96,7 @@ export type SavedCacheKeepTarget = Pick<
 > & {
   v: typeof RECORD_FORMAT_VERSION
   pluginVersion: string
-  /** Model used to rebuild OAuth feature headers for a switched-model body. */
+  /** Legacy round record: the saved body contains only the serving prefix. */
   refusalSourceModel?: string
 }
 
@@ -482,6 +482,20 @@ export class CacheKeepClaim {
   }
 }
 
+/** The source slot and the ordinary target share one durable session record. */
+export function cacheKeepRestartTarget(
+  target: Readonly<CacheKeepTarget>,
+): Readonly<CacheKeepTarget> | undefined {
+  if (typeof target.hostMetadata?.refusalSourceModel === 'string')
+    return undefined
+  if (!target.sourceWarm) return target
+  const id = target.policyState?.ownerSessionId
+  const oauthAccountIdentity = target.sourceWarmRestartIdentity
+  return id && oauthAccountIdentity
+    ? { ...target, id, oauthAccountIdentity }
+    : undefined
+}
+
 function record(
   target: Readonly<CacheKeepTarget>,
   pluginVersion: string,
@@ -501,9 +515,6 @@ function record(
     ttlMs: target.ttlMs,
     lastTouchAt: target.lastTouchAt,
     lastTouchKind: target.lastTouchKind,
-    ...(typeof target.hostMetadata?.refusalSourceModel === 'string' && {
-      refusalSourceModel: target.hostMetadata.refusalSourceModel,
-    }),
     ...(target.policyState && {
       policyState: {
         ownerSessionId: target.policyState.ownerSessionId,

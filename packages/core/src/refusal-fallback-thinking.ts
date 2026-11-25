@@ -8,6 +8,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { join } from 'node:path'
+import { withLock } from '@cortexkit/common-auth/fs'
 import { getHostDataHome } from './host-paths.ts'
 import { logger } from './logger.ts'
 import {
@@ -232,7 +233,13 @@ const WRITE_DELAY_MS = 1_000
  */
 const SHUTDOWN_GRACE_MS = 1_000
 const MAX_FILE_BYTES = 2 * 1024 * 1024
-const READ_GRACE_MS = 100
+const READ_GRACE_MS = 2_000
+const RECORD_LOCK = {
+  name: 'recovery-thinking',
+  ttlMs: 10_000,
+  timeoutMs: 1_000,
+  renew: true,
+}
 
 type Families = Map<string, Map<string, symbol | undefined>>
 
@@ -273,6 +280,7 @@ export class RecoveryThinkingStore {
   private timer: ReturnType<typeof setTimeout> | undefined
   private swept = false
   private warned = false
+  private warnedTimeout = false
 
   constructor(
     options: {
@@ -293,7 +301,7 @@ export class RecoveryThinkingStore {
     this.ownerOnly = options.ownerOnly
   }
 
-  /** Allow a slow read to finish in the background without delaying the request. */
+  /** Wait for the first disk record, but do not block a request indefinitely. */
   async loadSession(sessionId: string): Promise<void> {
     if (!this.directory) return
     const record = this.session(sessionId)
@@ -305,7 +313,13 @@ export class RecoveryThinkingStore {
         new Promise<void>((resolve) => {
           timer = setTimeout(() => {
             record.ready = true
-            this.warn('read-timeout')
+            if (!this.warnedTimeout) {
+              this.warnedTimeout = true
+              logger.warn(
+                'fable-fallback',
+                'recovery thinking record read timed out; sending without it',
+              )
+            }
             resolve()
           }, READ_GRACE_MS)
         }),
@@ -445,8 +459,27 @@ export class RecoveryThinkingStore {
     sessionId: string,
     record: SessionRecord,
   ) {
+    const disk = await this.readRecord(
+      join(directory, sessionFileName(sessionId)),
+    )
+    for (const [family, loaded] of disk) {
+      // Digests recorded before the load finished are newer; keep them last.
+      const current = record.families.get(family)
+      const fromDisk = new Set(loaded.keys())
+      record.families.set(family, loaded)
+      for (const [digest, round] of current ?? [])
+        addDigest(
+          record.families,
+          family,
+          digest,
+          fromDisk.has(digest) ? undefined : round,
+        )
+    }
+  }
+
+  private async readRecord(path: string): Promise<Families> {
+    const families: Families = new Map()
     try {
-      const path = join(directory, sessionFileName(sessionId))
       const stat = await lstat(path)
       if (
         !stat.isFile() ||
@@ -459,7 +492,7 @@ export class RecoveryThinkingStore {
         ))
       ) {
         this.warn('read')
-        return
+        return families
       }
       const bytes =
         (await readWindowsOwnerOnly(path, this.ownerOnly)) ??
@@ -470,30 +503,18 @@ export class RecoveryThinkingStore {
         !isRecord(parsed.families)
       ) {
         this.warn('read')
-        return
+        return families
       }
       for (const [family, digests] of Object.entries(parsed.families)) {
         if (!FAMILY.test(family) || !Array.isArray(digests)) continue
-        const loaded = digests.filter(
-          (digest): digest is string =>
-            typeof digest === 'string' && DIGEST.test(digest),
-        )
-        // Digests recorded before the load finished are newer; keep them last.
-        const current = record.families.get(family)
-        record.families.delete(family)
-        for (const digest of loaded) addDigest(record.families, family, digest)
-        const fromDisk = new Set(loaded)
-        for (const [digest, round] of current ?? [])
-          addDigest(
-            record.families,
-            family,
-            digest,
-            fromDisk.has(digest) ? undefined : round,
-          )
+        for (const digest of digests)
+          if (typeof digest === 'string' && DIGEST.test(digest))
+            addDigest(families, family, digest)
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') this.warn('read')
     }
+    return families
   }
 
   /**
@@ -602,20 +623,32 @@ export class RecoveryThinkingStore {
     record: SessionRecord,
   ) {
     const path = join(directory, sessionFileName(sessionId))
-    const temp = `${path}.${randomUUID()}.tmp`
-    const families: Record<string, string[]> = {}
-    for (const [family, digests] of record.families)
-      families[family] = [...digests.keys()]
-    const bytes = JSON.stringify({ version: STORE_FORMAT_VERSION, families })
-    try {
-      if (!(await createWindowsOwnerOnly(temp, bytes, this.ownerOnly)))
-        await writeFile(temp, bytes, { flag: 'wx', mode: 0o600 })
-      await renameWithWindowsSharingRetry(temp, path, {
-        platform: this.ownerOnly?.platform,
-      })
-    } finally {
-      await rm(temp, { force: true })
-    }
+    await withLock(path, RECORD_LOCK, async (lease) => {
+      // Another host may have committed digests since we first read the file.
+      const disk = await this.readRecord(path)
+      if (record.deleted) return
+      for (const [family, digests] of record.families) {
+        const known = new Set(disk.get(family)?.keys())
+        for (const digest of digests.keys())
+          if (!known.has(digest)) addDigest(disk, family, digest)
+      }
+      const families = Object.fromEntries(
+        [...disk].map(([family, digests]) => [family, [...digests.keys()]]),
+      )
+      const bytes = JSON.stringify({ version: STORE_FORMAT_VERSION, families })
+      const temp = `${path}.${randomUUID()}.tmp`
+      try {
+        if (!(await createWindowsOwnerOnly(temp, bytes, this.ownerOnly)))
+          await writeFile(temp, bytes, { flag: 'wx', mode: 0o600 })
+        await lease.assertOwned()
+        if (record.deleted) return
+        await renameWithWindowsSharingRetry(temp, path, {
+          platform: this.ownerOnly?.platform,
+        })
+      } finally {
+        await rm(temp, { force: true })
+      }
+    })
   }
 
   private warn(stage: string) {

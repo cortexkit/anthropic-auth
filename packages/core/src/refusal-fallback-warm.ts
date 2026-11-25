@@ -1,5 +1,8 @@
 import type { AccountStorage } from './accounts.ts'
-import type { CacheKeepManager } from './cachekeep.ts'
+import {
+  type CacheKeepManager,
+  cacheWarmCacheablePrefixFingerprint,
+} from './cachekeep.ts'
 import { signRequestBody } from './cch.ts'
 import type { ClaudeRefusalRecoveryFamily } from './model-capabilities.ts'
 import type { RefusalFallbackBinding } from './refusal-fallback-dispatch.ts'
@@ -31,6 +34,7 @@ export type RefusalFallbackSourceWarmInput = Pick<
   currentRoute: () => RefusalFallbackCacheRoute | undefined
   loadStorage: () => Promise<AccountStorage | null>
   cacheMode: string
+  restartIdentity?: string
   accountStoragePath?: string
   hostMetadata?: Readonly<Record<string, unknown>>
   isSubagent?: boolean
@@ -116,7 +120,7 @@ export class RefusalFallbackSourceWarm {
 
   restoreReturnMarker(sessionId: string, body: Record<string, unknown>) {
     const kept = this.#kept.get(sessionId)
-    if (!kept) return false
+    if (!kept || !this.#isCurrent(sessionId, kept)) return false
     const source = refusalBodyRecord(JSON.parse(kept.bodyText))
     return Boolean(source && restoreRefusalFallbackReturnMarker(body, source))
   }
@@ -132,8 +136,7 @@ export class RefusalFallbackSourceWarm {
   ) {
     // Even a source response with no cached input stops the earlier warm.
     const previous = this.#kept.get(sessionId)
-    if (previous && this.cacheKeep.untrack(previous.id))
-      previous.registered = false
+    this.#kept.delete(sessionId)
     if (
       !route ||
       !warm ||
@@ -146,13 +149,20 @@ export class RefusalFallbackSourceWarm {
         (usage.cache_read_input_tokens ?? 0) > 0 ||
         (usage.cache_creation_input_tokens ?? 0) > 0
       )
-    )
-      return
-    try {
-      if (!sameRoute(route, warm.currentRoute())) return
-    } catch {
+    ) {
+      if (previous) this.cacheKeep.untrack(previous.id)
       return
     }
+    try {
+      if (!sameRoute(route, warm.currentRoute())) {
+        if (previous) this.cacheKeep.untrack(previous.id)
+        return
+      }
+    } catch {
+      if (previous) this.cacheKeep.untrack(previous.id)
+      return
+    }
+    if (previous) this.cacheKeep.releaseTarget(previous.id)
     const headers = new Headers(warm.headers)
     headers.delete('content-encoding')
     headers.delete('content-length')
@@ -178,24 +188,49 @@ export class RefusalFallbackSourceWarm {
   register(
     sessionId: string,
     refused: Record<string, unknown>,
-    roundIsLive: () => boolean,
+    stillReturning: () => boolean,
   ) {
     this.checkSourceHistory(sessionId, refused)
     const kept = this.#kept.get(sessionId)
     if (!kept) return
     this.#kept.delete(sessionId)
     this.#kept.set(sessionId, kept)
-    if (!kept.registered)
-      void this.#register(sessionId, kept, roundIsLive).catch(() => {})
+    if (kept.registered || !this.#isCurrent(sessionId, kept)) return
+    const { url, requestedModel, accountId, credentialId } = kept.route
+    const moved = this.cacheKeep.moveToSourceWarm(
+      sessionId,
+      kept.id,
+      (target) => {
+        if (target.url !== url) return false
+        const accepted = refusalBodyRecord(JSON.parse(target.bodyText))
+        return (
+          accepted?.model === requestedModel &&
+          extendsRefusalFallbackPrefix(accepted, kept.prefix) &&
+          cacheWarmCacheablePrefixFingerprint(target.bodyText) ===
+            cacheWarmCacheablePrefixFingerprint(kept.bodyText)
+        )
+      },
+      {
+        headers: Object.fromEntries(kept.warm.headers),
+        oauthAccountId: accountId,
+        oauthAccountIdentity: credentialId,
+        hostMetadata: kept.warm.hostMetadata,
+        accountStoragePath: kept.warm.accountStoragePath,
+        sourceWarmRestartIdentity: kept.warm.restartIdentity,
+        sourceWarmCurrent: () => this.#isCurrent(sessionId, kept),
+      },
+    )
+    if (moved) kept.registered = true
+    else void this.#register(sessionId, kept, stillReturning).catch(() => {})
   }
 
   async #register(
     sessionId: string,
     kept: KeptSource,
-    roundIsLive: () => boolean,
+    stillReturning: () => boolean,
   ) {
     const live = () =>
-      roundIsLive() && !kept.registered && this.#isCurrent(sessionId, kept)
+      stillReturning() && !kept.registered && this.#isCurrent(sessionId, kept)
     if (!live()) return
     const bodyText = await signRequestBody(kept.bodyText)
     if (!live()) return
@@ -215,6 +250,7 @@ export class RefusalFallbackSourceWarm {
       acceptedAt: kept.acceptedAt,
       acceptedUsage: kept.usage,
       sourceWarm: true,
+      sourceWarmRestartIdentity: kept.warm.restartIdentity,
       sourceWarmCurrent: (candidate) =>
         candidate === bodyText && this.#isCurrent(sessionId, kept),
     })

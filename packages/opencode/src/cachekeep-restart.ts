@@ -6,13 +6,13 @@ import {
   CacheKeepStore,
   type CacheKeepTarget,
   CacheKeepWarmRefusal,
+  cacheKeepRestartTarget,
   isCacheKeepSubagentsEnabled,
   localMessageThreadCredential,
   logger,
   type NativeAccountSnapshot,
   nativeAccountCanServe,
   readSessionCachePolicy,
-  resolveClaudeModelCapabilities,
 } from '@cortexkit/anthropic-auth-core'
 import { version as pluginVersion } from '../package.json'
 
@@ -107,13 +107,8 @@ function restore(shared: Shared): Promise<void> {
         if (!lease.allowUrl(entry.url)) return 'invalid'
         const account = accounts.get(entry.oauthAccountIdentity)
         if (!account) return 'account-gone'
-        const { refusalSourceModel } = entry
-        if (
-          refusalSourceModel !== undefined &&
-          !resolveClaudeModelCapabilities(refusalSourceModel)
-            ?.refusalRecoveryFamily
-        )
-          return 'invalid'
+        // Older round records contain only the serving model's prefix.
+        if (entry.refusalSourceModel !== undefined) return 'invalid'
         if (
           entry.isSubagent &&
           !entry.policyState?.planned &&
@@ -136,9 +131,6 @@ function restore(shared: Shared): Promise<void> {
           oauthAccountIdentity: account.accountIdentity,
           hostMetadata: {
             restartCredential: entry.oauthAccountIdentity,
-            ...(refusalSourceModel !== undefined && {
-              refusalSourceModel,
-            }),
           },
           isSubagent: entry.isSubagent,
           acceptedAt,
@@ -187,6 +179,7 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
         shared.owners.delete(hash)
         shared.restored.delete(hash)
         owner?.manager.releaseTarget(id)
+        owner?.manager.releaseSourceWarm(id)
       },
     }),
     leases: new Set<Lease>(),
@@ -202,14 +195,15 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
   const active = () => shared.leases.has(lease)
   const persisted = (target: Readonly<CacheKeepTarget>) => {
     const credential = target.hostMetadata?.restartCredential
-    return !target.sourceWarm && typeof credential === 'string'
-      ? { ...target, oauthAccountIdentity: credential }
+    const entry = cacheKeepRestartTarget(target)
+    return entry && typeof credential === 'string'
+      ? { ...entry, oauthAccountIdentity: credential }
       : undefined
   }
   const reserve = (target: Readonly<CacheKeepTarget>) => {
     const entry = persisted(target)
     if (!entry) return Promise.resolve(true)
-    if (!active() || shared.owners.get(sessionHash(target.id)) !== lease)
+    if (!active() || shared.owners.get(sessionHash(entry.id)) !== lease)
       return Promise.resolve(false)
     return shared.store.reserveWarm(entry)
   }
@@ -220,22 +214,29 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
     changed(target: Readonly<CacheKeepTarget>) {
       const entry = persisted(target)
       if (!entry || !active()) return
-      const hash = sessionHash(target.id)
+      const hash = sessionHash(entry.id)
       const previous = shared.owners.get(hash)
       if (previous !== lease) {
         shared.owners.set(hash, lease)
         shared.restored.delete(hash)
-        previous?.manager.releaseTarget(target.id)
+        previous?.manager.releaseTarget(entry.id)
+        previous?.manager.releaseSourceWarm(entry.id)
       }
-      shared.store.changed(entry, !lease.manager.isRestoredTarget(target))
+      shared.store.changed(
+        entry,
+        (!target.sourceWarm || target.lastTouchKind === undefined) &&
+          !lease.manager.isRestoredTarget(target),
+      )
     },
     removed(target: Readonly<CacheKeepTarget>) {
-      const hash = sessionHash(target.id)
+      const entry = cacheKeepRestartTarget(target)
+      if (!entry) return
+      const hash = sessionHash(entry.id)
       if (shared.owners.get(hash) !== lease) return
       shared.owners.delete(hash)
       shared.restored.delete(hash)
       shared.store.removed(
-        persisted(target) ?? { ...target, oauthAccountIdentity: undefined },
+        persisted(target) ?? { ...entry, oauthAccountIdentity: undefined },
       )
     },
     forget(id: string, deleted = false, acceptedAt?: number) {

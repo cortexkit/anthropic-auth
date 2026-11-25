@@ -7,6 +7,7 @@ import {
   CacheKeepStore,
   type CacheKeepStoreOptions,
   type CacheKeepTarget,
+  cacheKeepRestartTarget,
   currentCacheKeepRealTurn,
   type HolderLiveness,
   isCacheKeepSubagentsEnabled,
@@ -17,7 +18,6 @@ import {
   peekRoutingAccount,
   readSessionCachePolicy,
   remapModelId,
-  resolveClaudeModelCapabilities,
   type StickySessionRouter,
 } from '@cortexkit/anthropic-auth-core'
 import { version as pluginVersion } from '../package.json'
@@ -41,6 +41,8 @@ function accountKey(account: NativeAccountView) {
     account.binding?.credentialEpoch,
   ])
 }
+
+export { accountKey as piCacheKeepAccountKey }
 
 /** One Pi process owns only the sessions its lifecycle actually opened. */
 export class PiCacheKeep {
@@ -84,16 +86,18 @@ export class PiCacheKeep {
     this.schedule = schedule
     this.cancel = managerOptions.clearIntervalImpl ?? clearInterval
     const persisted = (target: Readonly<CacheKeepTarget>) => {
-      if (target.sourceWarm) return undefined
-      const identity = target.hostMetadata?.accountIdentity
-      return typeof identity === 'string'
-        ? { ...target, oauthAccountIdentity: identity }
+      const entry = cacheKeepRestartTarget(target)
+      const identity = target.sourceWarm
+        ? entry?.oauthAccountIdentity
+        : target.hostMetadata?.accountIdentity
+      return entry && typeof identity === 'string'
+        ? { ...entry, oauthAccountIdentity: identity }
         : undefined
     }
     const persistWarm = async (target: Readonly<CacheKeepTarget>) => {
-      if (target.sourceWarm) return true
-      const session = this.sessions.get(target.id)
       const entry = persisted(target)
+      if (!cacheKeepRestartTarget(target)) return true
+      const session = entry && this.sessions.get(entry.id)
       if (this.stopping || !session || !entry) return 'not-owner' as const
       return session.store.reserveWarm(entry)
     }
@@ -115,8 +119,8 @@ export class PiCacheKeep {
           : managerOptions.peekRoutingAccount?.(target, route)
       },
       onTargetChanged: (target) => {
-        const session = this.sessions.get(target.id)
         const entry = persisted(target)
+        const session = entry && this.sessions.get(entry.id)
         if (session && entry) session.store.changed(entry)
         managerOptions.onTargetChanged?.(target)
       },
@@ -127,8 +131,9 @@ export class PiCacheKeep {
           : Promise.resolve(false),
       onTargetRemoved: (id, target) => {
         this.restored.delete(id)
-        if (!target.sourceWarm)
-          this.sessions.get(id)?.store.removed(persisted(target) ?? target)
+        const entry = cacheKeepRestartTarget(target)
+        if (entry)
+          this.sessions.get(entry.id)?.store.removed(persisted(target) ?? entry)
         managerOptions.onTargetRemoved?.(id, target)
       },
       prepareHeaders: async (headers, target, attempt, isTargetCurrent) => {
@@ -204,6 +209,7 @@ export class PiCacheKeep {
     this.starts.delete(sessionId)
     this.restored.delete(sessionId)
     this.manager.releaseTarget(sessionId)
+    this.manager.releaseSourceWarm(sessionId)
   }
 
   private claim(
@@ -372,17 +378,7 @@ export class PiCacheKeep {
           if (!account) return 'foreign-identity'
           if (account.type !== 'oauth' || !nativeAccountCanServe(account))
             return 'account-gone'
-          if (
-            entry.refusalSourceModel !== undefined &&
-            !resolveClaudeModelCapabilities(entry.refusalSourceModel)
-              ?.refusalRecoveryFamily
-          ) {
-            logger.warn(
-              'cachekeep',
-              'Ignoring restored warm for unsupported refusal source model',
-            )
-            return 'invalid'
-          }
+          if (entry.refusalSourceModel !== undefined) return 'invalid'
           if (
             entry.isSubagent &&
             !entry.policyState?.planned &&
@@ -404,9 +400,6 @@ export class PiCacheKeep {
             oauthAccountIdentity: account.accountIdentity,
             hostMetadata: {
               accountIdentity: accountKey(account),
-              ...(entry.refusalSourceModel !== undefined && {
-                refusalSourceModel: entry.refusalSourceModel,
-              }),
             },
             accountStoragePath: storagePath,
             isSubagent: entry.isSubagent,

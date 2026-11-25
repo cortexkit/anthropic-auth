@@ -56,6 +56,8 @@ if (roundSeed) {
     ) {
       roundManager = this
       roundTemplateReady.resolve()
+      if (this.trackedRequest(`source-warm:${sessionId}:fable-5-2`))
+        sourceWarmReady.resolve()
     }
     return result
   }
@@ -67,6 +69,18 @@ __setLogTestSink((record) => {
 const storagePath = process.env.PI_ANTHROPIC_AUTH_FILE
 if (!storagePath) throw new Error('Missing isolated Pi storage path')
 const transcript = join(dirname(storagePath), 'thinking-transcript.json')
+async function roundRestartRecord(storage: string) {
+  const paths = await resolveNativePoolPaths(
+    storage,
+    undefined,
+    LEGACY_STATE_LAYOUT,
+  )
+  const directory = cacheKeepStoreDirectory(paths.storageId, undefined, 'pi')
+  const name = `${createHash('sha256').update(sessionId).digest('hex')}.json.gz`
+  return JSON.parse(
+    gunzipSync(await readFile(join(directory, name))).toString(),
+  )
+}
 let now = Number(process.env.PI_RESTART_CLOCK)
 Date.now = () => now
 const intervals = new Map<ReturnType<typeof setInterval>, () => unknown>()
@@ -162,6 +176,19 @@ globalThis.fetch = Object.assign(
           )
         if (body.model === roundSource && text.includes('blocked next prompt'))
           probeFailures.push('Source warm replayed the refused prefix')
+        if (!roundSeed && body.model !== roundSource)
+          probeFailures.push(
+            `Restored Pi round warm used ${body.model}, not ${roundSource}`,
+          )
+        if (roundSeed && body.model === roundSource) {
+          const saved = await roundRestartRecord(storagePath).catch(
+            () => undefined,
+          )
+          if (saved?.policyState.warmsSinceLastRealRequest !== 1)
+            probeFailures.push(
+              'Pi dispatched the requested-model warm before saving its reservation',
+            )
+        }
       }
       return Response.json({ usage: { cache_read_input_tokens: 100 } })
     }
@@ -248,16 +275,10 @@ if (roundSeed || thinkingSeed || phase === 'seed' || phase === 'locked') {
     cacheKeep: { enabled: !thinkingSeed, always: !thinkingSeed },
   }))
 } else if (phase === 'round-resume') {
-  const paths = await resolveNativePoolPaths(
-    storagePath,
-    undefined,
-    LEGACY_STATE_LAYOUT,
-  )
-  const directory = cacheKeepStoreDirectory(paths.storageId, undefined, 'pi')
-  const name = `${createHash('sha256').update(sessionId).digest('hex')}.json.gz`
-  const saved = JSON.parse(
-    gunzipSync(await readFile(join(directory, name))).toString(),
-  )
+  const saved = await roundRestartRecord(storagePath)
+  deepStrictEqual(JSON.parse(saved.bodyText).model, roundSource)
+  deepStrictEqual(saved.refusalSourceModel, undefined)
+  deepStrictEqual(saved.policyState.warmsSinceLastRealRequest, 1)
   now = saved.nextPrewarmAt
 } else if (phase === 'resume') {
   now += 55 * 60_000

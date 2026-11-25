@@ -135,7 +135,7 @@ type Session = {
   lifetime: object
   latest?: symbol
   accountId?: string
-  returning?: boolean
+  returning?: symbol
   families: Map<ClaudeRefusalRecoveryFamily, FamilyState>
 }
 
@@ -156,7 +156,7 @@ type Request = {
   identity: symbol
   folded: boolean
   phase: 'planned' | 'sent' | 'refusal' | 'finished'
-  returning?: boolean
+  returning?: symbol
   category?: string
   handling400?: boolean
   publishTemplate?: (
@@ -261,6 +261,7 @@ export class RefusalFallbackRoundEngine {
   readonly #sessionLifetimes = new Map<string, object>()
   readonly #requests = new WeakMap<RefusalFallbackRoundRequest, Request>()
   readonly #thinking: RecoveryThinkingStore
+  readonly #cacheKeep: CacheKeepManager | undefined
   readonly #warm: RefusalFallbackSourceWarm | undefined
 
   constructor(
@@ -269,6 +270,7 @@ export class RefusalFallbackRoundEngine {
   ) {
     this.#thinking =
       options.thinkingStore ?? new RecoveryThinkingStore({ persist: false })
+    this.#cacheKeep = options.cacheKeep
     if (options.cacheKeep)
       this.#warm = new RefusalFallbackSourceWarm(
         options.cacheKeep,
@@ -341,7 +343,10 @@ export class RefusalFallbackRoundEngine {
     family.round = undefined
     round.releaseThinking()
     const session = this.#sessions.get(round.sessionId)
-    if (session) session.returning = true
+    if (session) session.returning = round.identity
+    const template = this.#cacheKeep?.trackedRequest(round.sessionId)
+    if (template && parse(template.bodyText)?.model === round.servingModel)
+      this.#cacheKeep?.releaseTarget(round.sessionId)
     if (reason === 'compaction') this.#warm?.forgetSession(round.sessionId)
     this.#emit(round, 'round_ended', reason)
   }
@@ -559,7 +564,8 @@ export class RefusalFallbackRoundEngine {
       request?.phase !== 'planned' ||
       this.#sessions.get(request.sessionId) !== request.session ||
       request.family.round !== request.round ||
-      (request.returning && !request.session.returning) ||
+      (request.kind === 'source' &&
+        request.returning !== request.session.returning) ||
       (request.round?.folded && !request.folded)
     )
       return false
@@ -568,7 +574,6 @@ export class RefusalFallbackRoundEngine {
       request.session.latest = request.identity
       request.session.accountId = request.accountId
       if (request.round && request.folded) request.round.folded = true
-      if (request.returning) request.session.returning = false
     }
     return true
   }
@@ -620,7 +625,8 @@ export class RefusalFallbackRoundEngine {
         sessionId,
         refused,
         () =>
-          this.#sessions.get(sessionId) === session && family.round === round,
+          this.#sessions.get(sessionId) === session &&
+          (family.round === round || session.returning === round.identity),
       )
   }
 
@@ -706,14 +712,20 @@ export class RefusalFallbackRoundEngine {
       usage?: RefusalFallbackCompletion['usage'],
     ) => {
       if (!onCacheKeepTemplate || !publication) return
-      if (!templateIsCurrent()) {
+      const liveRound =
+        servingModel !== request.session.model && bodyText !== null
+          ? request.family.round
+          : undefined
+      const current = () =>
+        templateIsCurrent() &&
+        (!liveRound || request.family.round === liveRound)
+      if (!current()) {
         publication.resolve()
         return
       }
       try {
         let pending: void | Promise<void>
-        if (bodyText === null)
-          pending = onCacheKeepTemplate(null, templateIsCurrent)
+        if (bodyText === null) pending = onCacheKeepTemplate(null, current)
         else {
           const body = parse(bodyText)
           if (!body || refusalBodyRecord(body.thread)?.type === 'continue') {
@@ -726,7 +738,7 @@ export class RefusalFallbackRoundEngine {
             bodyText = update(bodyText, 'fallback_credit_token', undefined)
           pending = onCacheKeepTemplate(
             { bodyText, servingModel, usage },
-            templateIsCurrent,
+            current,
           )
         }
         void Promise.resolve(pending).then(
@@ -766,9 +778,15 @@ export class RefusalFallbackRoundEngine {
           Object.assign(round, this.#step(request, completion, projectReply))
           round.stepsLeft--
           this.#emit(round, 'step_served')
-          if (round.stepsLeft === 0) this.#end(request.family, round, 'count')
-        } else
+          if (round.stepsLeft === 0) {
+            this.#end(request.family, round, 'count')
+            publication?.resolve()
+            return
+          }
+        } else {
+          request.session.returning = undefined
           this.#sourceCompleted(request, request.templateBodyText, completion)
+        }
         publish(
           request.templateBodyText,
           request.round?.servingModel ?? request.session.model,
@@ -789,6 +807,7 @@ export class RefusalFallbackRoundEngine {
         },
         onRefusal: (refusal) => {
           if (request.phase !== 'sent' || !fresh()) return
+          request.session.returning = undefined
           request.phase = 'refusal'
           request.family.clean = 0
           request.category = refusal.category
@@ -875,9 +894,15 @@ export class RefusalFallbackRoundEngine {
       (request.kind === 'routed' || request.family.round === round)
     if (!isCurrent() || options.signal?.aborted) return response
     request.handling400 = true
+    let sourceBodyText = request.sourceBodyText
+    if (request.kind === 'round') {
+      const body = parse(sourceBodyText)
+      if (body && this.#warm?.restoreReturnMarker(request.sessionId, body))
+        sourceBodyText = JSON.stringify(body)
+    }
     return resendRefusalFallbackSource(
       response,
-      request.sourceBodyText,
+      sourceBodyText,
       options,
       isCurrent,
       () => {
@@ -895,6 +920,12 @@ export class RefusalFallbackRoundEngine {
               request.session.model,
               completion.usage,
             )
+          }
+        : undefined,
+      request.kind === 'round'
+        ? () => {
+            if (isNewest() && request.session.returning === round.identity)
+              request.session.returning = undefined
           }
         : undefined,
     )

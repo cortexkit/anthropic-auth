@@ -10,6 +10,7 @@ import {
   CacheKeepSessionRegistry,
   type CacheKeepTarget,
   CacheKeepWarmRefusal,
+  cacheKeepRestartTarget,
   claudeGatewayModelUrl,
   currentCacheKeepRealTurn,
   getCacheKeepRegistryDirectories,
@@ -30,7 +31,6 @@ import {
   RefusalFallbackRoundEngine,
   readSessionCachePolicy,
   requestCacheLifetimeMs,
-  resolveClaudeModelCapabilities,
   sessionCacheActivity,
 } from '@cortexkit/anthropic-auth-core'
 import type { Attempt, RequestScope } from '@cortexkit/common-auth/opencode2'
@@ -71,6 +71,19 @@ function accountKey(account: NativeAccountView) {
     account.binding?.rowId,
     account.binding?.credentialEpoch,
   ])
+}
+
+export function sourceWarmRestartIdentity(
+  account: NativeAccountView | undefined,
+  credentialId: string,
+) {
+  if (
+    account &&
+    (account.binding
+      ? localMessageThreadCredential(account.binding)
+      : account.credentialId) === credentialId
+  )
+    return accountKey(account)
 }
 
 function missingAccountReason(
@@ -243,8 +256,15 @@ function createSharedCacheKeep(
     onClaimLost(id) {
       restored.delete(id)
       manager.releaseTarget(id)
+      manager.releaseSourceWarm(id)
     },
   })
+  const reserveRestartWarm = (target: Readonly<CacheKeepTarget>) => {
+    const entry = cacheKeepRestartTarget(target)
+    return entry
+      ? persistence.reserveWarm(entry)
+      : Promise.resolve(true as const)
+  }
   const registry = new CacheKeepSessionRegistry({
     ...getCacheKeepRegistryDirectories('opencode', options.registryDirectory),
     now: options.now,
@@ -281,25 +301,26 @@ function createSharedCacheKeep(
     clearIntervalImpl: options.clearIntervalImpl,
     setTimeoutImpl: options.setTimeoutImpl,
     clearTimeoutImpl: options.clearTimeoutImpl,
-    reserveWarm: (target) =>
-      target.sourceWarm
-        ? Promise.resolve(true)
-        : shared.persistence.reserveWarm(target),
+    reserveWarm: reserveRestartWarm,
     settleWarm: (target) =>
-      target.sourceWarm
-        ? Promise.resolve(true)
-        : manager.isCurrentTarget(target)
-          ? shared.persistence.reserveWarm(target)
-          : Promise.resolve(false),
+      manager.isCurrentTarget(target)
+        ? reserveRestartWarm(target)
+        : Promise.resolve(false),
     deferWarmReservation: true,
     responseTtlMs: (response) => warmResponseLifetimes.get(response),
     onTargetChanged: (target) => {
-      if (!target.sourceWarm)
-        shared.persistence.changed(target, !manager.isRestoredTarget(target))
+      const entry = cacheKeepRestartTarget(target)
+      if (entry)
+        shared.persistence.changed(
+          entry,
+          (!target.sourceWarm || target.lastTouchKind === undefined) &&
+            !manager.isRestoredTarget(target),
+        )
     },
     onTargetRemoved: (id, target) => {
       restored.delete(id)
-      if (!target.sourceWarm) shared.persistence.removed(target)
+      const entry = cacheKeepRestartTarget(target)
+      if (entry) shared.persistence.removed(entry)
     },
     onRealTurnsSettled: (id) => {
       const deferred = restoreAfterTurn.get(id)
@@ -497,13 +518,7 @@ function createSharedCacheKeep(
               )
             if (account.type !== 'oauth' || !nativeAccountCanServe(account))
               return 'account-gone'
-            const { refusalSourceModel } = entry
-            if (
-              refusalSourceModel !== undefined &&
-              !resolveClaudeModelCapabilities(refusalSourceModel)
-                ?.refusalRecoveryFamily
-            )
-              return 'invalid'
+            if (entry.refusalSourceModel !== undefined) return 'invalid'
             if (
               entry.isSubagent &&
               !entry.policyState?.planned &&
@@ -530,9 +545,6 @@ function createSharedCacheKeep(
               cacheMode: 'hybrid',
               oauthAccountId: account.id,
               oauthAccountIdentity: entry.oauthAccountIdentity,
-              ...(refusalSourceModel !== undefined && {
-                hostMetadata: { refusalSourceModel },
-              }),
               isSubagent: entry.isSubagent,
               acceptedAt,
               retained: {
@@ -1040,7 +1052,8 @@ export function createNativeCacheKeep(
       for (const [sessionID, route] of owner.roundRoutes)
         if (route.accountId === accountId) owner.roundRoutes.delete(sessionID)
     },
-    retireRoundTemplate: (sessionID: string) => manager.untrack(sessionID),
+    retireRoundTemplate: (sessionID: string) =>
+      manager.releaseTarget(sessionID),
     beginRealTurn,
     async track(
       input: NativeCacheRequestPrepared & { refusalSourceModel?: string },

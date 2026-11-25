@@ -20,9 +20,24 @@ function lifetime(control: Body) {
   return control.ttl ?? '5m'
 }
 
+function* messageHolders(
+  blocks: unknown[],
+  parent: readonly number[] = [],
+): Generator<{ holder: Body; path: readonly number[] }> {
+  for (const [index, value] of blocks.entries()) {
+    const holder = refusalBodyRecord(value)
+    if (!holder) continue
+    const path = [...parent, index]
+    // A marker on the result itself covers all of its nested content.
+    if (holder.type === 'tool_result' && Array.isArray(holder.content))
+      yield* messageHolders(holder.content, path)
+    yield { holder, path }
+  }
+}
+
 function markedHolders(
   body: Body,
-  candidate?: { message: Body; blockIndex: number; control: Body },
+  candidate?: { message: Body; path: readonly number[]; control: Body },
 ) {
   const marked: { holder: Body; control: Body; replaceable: boolean }[] = []
   const add = (
@@ -41,11 +56,15 @@ function markedHolders(
     for (const value of body.messages) {
       const message = refusalBodyRecord(value)
       if (message)
-        for (const [index, block] of (contentBlocks(message) ?? []).entries())
+        for (const { holder, path } of messageHolders(
+          contentBlocks(message) ?? [],
+        ))
           add(
-            block,
+            holder,
             true,
-            candidate?.message === message && candidate.blockIndex === index
+            candidate?.message === message &&
+              path.length === candidate.path.length &&
+              path.every((index, i) => index === candidate.path[i])
               ? candidate.control
               : undefined,
           )
@@ -71,22 +90,24 @@ export function restoreRefusalFallbackReturnMarker(body: Body, source: Body) {
     const saved = refusalBodyRecord(source.messages[messageIndex])
     const savedBlocks = saved && contentBlocks(saved)
     if (!savedBlocks) continue
-    for (
-      let blockIndex = savedBlocks.length - 1;
-      blockIndex >= 0;
-      blockIndex--
-    ) {
-      const savedBlock = refusalBodyRecord(savedBlocks[blockIndex])
-      const control = savedBlock && cacheControl(savedBlock)
+    for (const { holder, path } of [...messageHolders(savedBlocks)].reverse()) {
+      const control = cacheControl(holder)
       if (!control) continue
 
-      const prefix = messageThreadCachePrefix(source, messageIndex, blockIndex)
+      const prefix = messageThreadCachePrefix(source, messageIndex, path)
       const message = refusalBodyRecord(body.messages[messageIndex])
       const blocks = message && contentBlocks(message)
-      const block = blocks && refusalBodyRecord(blocks[blockIndex])
+      const block =
+        blocks &&
+        path.reduce<Body | undefined>((parent, index, i) => {
+          const content = i === 0 ? blocks : parent?.content
+          return Array.isArray(content)
+            ? refusalBodyRecord(content[index])
+            : undefined
+        }, undefined)
       if (
         !prefix ||
-        prefix !== messageThreadCachePrefix(body, messageIndex, blockIndex) ||
+        prefix !== messageThreadCachePrefix(body, messageIndex, path) ||
         !message ||
         !blocks ||
         !block
@@ -108,7 +129,7 @@ export function restoreRefusalFallbackReturnMarker(body: Body, source: Body) {
       if (displaced.length !== excess) return false
       const ordered = markedHolders(body, {
         message,
-        blockIndex,
+        path,
         control,
       }).filter(
         ({ holder }) => !displaced.some((entry) => entry.holder === holder),
