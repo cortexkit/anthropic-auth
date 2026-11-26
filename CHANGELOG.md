@@ -2,6 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+- Vault accounts: a profile or quota check that retries after a sign-in error no longer sends a vault credential the plugin already knows has been replaced (#900).
+- OpenCode: saving the sidebar's collapsed state no longer overwrites preference changes saved in the meantime, and leaves the preferences file untouched when it can't be read (#902).
+- Legacy import from 1.x: when the configuration and state files hold different logins for a fallback account and both record a refresh time, the more recently refreshed login is kept (#903).
+
 ## 2.17.1
 
 - Shared routing learns when Claude refuses a request because its Fable quota window is full, even if the refusal and the last quota check each tell only part of the story. OpenCode 2 also reports the HTTP error status and Claude request ID for failed attempts.
