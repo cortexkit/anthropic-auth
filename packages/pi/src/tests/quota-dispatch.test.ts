@@ -18,7 +18,6 @@ function isRuntimeStage(path: string, runtime: string) {
   return basename(path).startsWith(`${basename(runtime)}.native-runtime`)
 }
 
-
 const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
 
 test('Pi paces physical usage GETs for two due fallback accounts before a single model request', async () => {

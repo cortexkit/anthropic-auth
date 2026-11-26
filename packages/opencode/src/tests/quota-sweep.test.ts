@@ -25,7 +25,6 @@ function isRuntimeStage(path: string, runtime: string) {
   return basename(path).startsWith(`${basename(runtime)}.native-runtime`)
 }
 
-
 /*
  * Fallback quota sweeps decide which accounts are due from a pool snapshot,
  * then poll each due account's usage endpoint. Two properties are tested here

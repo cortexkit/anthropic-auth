@@ -62,7 +62,6 @@ function isRuntimeStage(path: string, runtime: string) {
   return basename(path).startsWith(`${basename(runtime)}.native-runtime`)
 }
 
-
 const testContext = createOpencode1TestContext()
 installOpencode1TestHooks(testContext)
 const test = createOpencode1Test(testContext)
