@@ -1,7 +1,17 @@
 import { expect, spyOn } from 'bun:test'
+import { randomUUID } from 'node:crypto'
 import * as filesystem from 'node:fs/promises'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  utimes,
+  writeFile,
+} from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
 import { disconnectClaustrumEnrollment } from '@cortexkit/common-auth/claustrum'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import { ClaudeOAuthRefreshError } from '../auth.ts'
@@ -35,7 +45,10 @@ import {
   nativePollQuotaGenerallyExhausted,
 } from '../native-quota-observations.ts'
 import * as runtimeWriter from '../native-runtime.ts'
-import { readNativeRuntime } from '../native-runtime.ts'
+import {
+  type NativeRuntimeState,
+  readNativeRuntime,
+} from '../native-runtime.ts'
 import { createNativeUsagePublisher } from '../native-usage-publication.ts'
 import { nativeVaultPaths } from '../native-vault-paths.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
@@ -47,6 +60,8 @@ import { createTestLifetimeSuite } from './test-lifetime.ts'
 
 const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
 const uuid = '11111111-2222-4333-8444-555555555555' as ProviderAccountUuid
+const fallbackUuid =
+  'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' as ProviderAccountUuid
 const now = 1_000_000
 // A bookkeeping write that ignores a held pool lock finishes well inside this
 // bound; one that waits on the lock would block for the lock's whole acquire
@@ -58,34 +73,328 @@ async function localSubject(f: Awaited<ReturnType<typeof fixture>>) {
     throw new Error('Missing fixture authorization')
   return admission.subject
 }
+
+function holdQuotaMetadataSync(runtimePath: string) {
+  const staged = gate()
+  const release = gate()
+  const stages: string[] = []
+  const open = filesystem.open
+  const spy = spyOn(filesystem, 'open').mockImplementation(
+    async (path, flags, mode) => {
+      const file = await open(path, flags, mode)
+      if (
+        typeof path === 'string' &&
+        (path.startsWith(`${runtimePath}.native-runtime-metadata.`) ||
+          path.startsWith(`${runtimePath}.native-runtime.`))
+      ) {
+        const sync = file.sync.bind(file)
+        file.sync = async () => {
+          const saved = JSON.parse(
+            await readFile(path, 'utf8'),
+          ) as NativeRuntimeState
+          if (saved.accounts['imported-main']?.quotaErrorClearedAt === now) {
+            stages.push(path)
+            if (stages.length === 1) {
+              staged.open()
+              await release.wait
+            }
+          }
+          await sync()
+        }
+      }
+      return file
+    },
+  )
+  deferCleanup(() => spy.mockRestore())
+  return { staged: staged.wait, release: release.open, stages }
+}
+
+async function beforeMetadataSyncRelease<T>(work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  trackDetached(work)
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new Error(
+              'Concurrent operation waited for the quota metadata fsync',
+            ),
+          )
+        }, BOOKKEEPING_BOUND_MS)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function fixtureWithColdFallback() {
+  const f = await fixture({
+    resolveIdentity: async (access) => ({
+      deviceId: 'synthetic-device',
+      sessionId: 'synthetic-session',
+      accountUuid: access.endsWith('fallback-access') ? fallbackUuid : uuid,
+    }),
+  })
+  await f.store.add({
+    id: 'fallback',
+    identity: fallbackUuid,
+    credential: {
+      type: 'oauth',
+      access: 'sk-ant-oat01-fallback-access',
+      refresh: 'fallback-refresh',
+      expires: now + 3_600_000,
+    },
+  })
+  const subject = await localSubject(f)
+  const before = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  expect(
+    before.status === 'ready' &&
+      before.state.accounts.fallback?.credentialValidation,
+  ).toBeUndefined()
+  return { ...f, subject }
+}
+
+test('quota metadata: a cold fallback request proceeds while the main poll fsync is held', async () => {
+  const f = await fixtureWithColdFallback()
+  const held = holdQuotaMetadataSync(f.paths.runtime)
+  const transport = Object.assign(
+    async () => Response.json({ five_hour: { utilization: 100 } }),
+    { preconnect: fetch.preconnect },
+  )
+  try {
+    const quota = await f.runtime.fetchQuota('main', transport)
+    expect(quota.five_hour?.remainingPercent).toBe(0)
+    await held.staged
+    // The request cannot use a cold fallback until it has a durable credential proof.
+    const fallback = await beforeMetadataSyncRelease(
+      f.runtime.authorizeLocal('fallback'),
+    )
+    expect(fallback.status).toBe('usable')
+    const durable = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+    expect(durable).toMatchObject({
+      status: 'ready',
+      state: {
+        accounts: {
+          fallback: {
+            credentialValidation: { binding: { identity: fallbackUuid } },
+          },
+        },
+      },
+    })
+  } finally {
+    held.release()
+    await f.runtime.drainQuotaPublications()
+  }
+})
+
+test('quota metadata: a newer metadata write survives a retry', async () => {
+  const f = await fixture()
+  const subject = await localSubject(f)
+  const held = holdQuotaMetadataSync(f.paths.runtime)
+  const write = f.runtime.publishLocal(subject, {
+    quotaErrorClearedAt: now,
+    lastUsed: now,
+  })
+  trackDetached(write)
+  try {
+    await held.staged
+    // Bypass the in-process metadata queue to model a separate process writing the same file.
+    await beforeMetadataSyncRelease(
+      runtimeWriter.updateNativeRuntimeMetadata(
+        f.paths.runtime,
+        f.paths.storageId,
+        (current) => {
+          const row = current.accounts[subject.binding.rowId]!
+          row.lastUsed = now + 1
+          row.quotaErrorGeneration = 4
+          return current
+        },
+      ),
+    )
+  } finally {
+    held.release()
+  }
+  expect(await write).toBe(true)
+  expect(held.stages).toHaveLength(2)
+  expect(new Set(held.stages).size).toBe(2)
+  const saved = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  expect(saved).toMatchObject({
+    status: 'ready',
+    state: {
+      accounts: {
+        'imported-main': {
+          lastUsed: now + 1,
+          quotaErrorGeneration: 4,
+          quotaErrorClearedAt: now,
+        },
+      },
+    },
+  })
+})
+
+test('quota metadata: a concurrent credential validation survives a retry', async () => {
+  const f = await fixtureWithColdFallback()
+  const held = holdQuotaMetadataSync(f.paths.runtime)
+  const write = f.runtime.publishLocal(f.subject, { quotaErrorClearedAt: now })
+  trackDetached(write)
+  let proof: unknown
+  try {
+    await held.staged
+    expect(
+      (await beforeMetadataSyncRelease(f.runtime.authorizeLocal('fallback')))
+        .status,
+    ).toBe('usable')
+    const saved = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+    proof =
+      saved.status === 'ready' &&
+      saved.state.accounts.fallback?.credentialValidation
+    expect(proof).toBeTruthy()
+  } finally {
+    held.release()
+  }
+  expect(await write).toBe(true)
+  expect(held.stages).toHaveLength(2)
+  const saved = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  expect(saved).toMatchObject({
+    status: 'ready',
+    state: {
+      accounts: {
+        'imported-main': { quotaErrorClearedAt: now },
+        fallback: { credentialValidation: proof },
+      },
+    },
+  })
+})
+
+test('quota metadata: an under-lock fence refusal discards the stage without retrying', async () => {
+  const f = await fixture()
+  const subject = await localSubject(f)
+  const before = await readFile(f.paths.runtime)
+  let acquired = false
+  let checks = 0
+  const update = runtimeWriter.updateNativeRuntimeMetadata
+  const spy = spyOn(
+    runtimeWriter,
+    'updateNativeRuntimeMetadata',
+  ).mockImplementation((path, storageId, change, hooks) =>
+    update(path, storageId, change, {
+      ...hooks,
+      onLockEvent: (event) => {
+        if (event.type === 'acquired') acquired = true
+        if (event.type === 'released') acquired = false
+      },
+      beforePublish: async () => {
+        await hooks?.beforePublish?.()
+        if (acquired) checks++
+        throw new Error('Fence refused')
+      },
+    }),
+  )
+  deferCleanup(() => spy.mockRestore())
+  const held = holdQuotaMetadataSync(f.paths.runtime)
+  held.release()
+  expect(
+    await f.runtime.publishLocal(subject, { quotaErrorClearedAt: now }),
+  ).toBe(false)
+  expect(checks).toBe(1)
+  expect(held.stages).toHaveLength(1)
+  expect(await readFile(f.paths.runtime)).toEqual(before)
+  expect(await readdir(dirname(f.paths.runtime))).not.toContain(
+    basename(held.stages[0]!),
+  )
+})
+
+test('quota metadata: an under-lock missing runtime is not recreated or retried', async () => {
+  const f = await fixture()
+  const subject = await localSubject(f)
+  const held = holdQuotaMetadataSync(f.paths.runtime)
+  const before = await readFile(f.paths.runtime)
+  const moved = `${f.paths.runtime}.moved`
+  const write = f.runtime.publishLocal(subject, { quotaErrorClearedAt: now })
+  trackDetached(write)
+  try {
+    await held.staged
+    await rename(f.paths.runtime, moved)
+  } finally {
+    held.release()
+  }
+  expect(await write).toBe(false)
+  expect(await readNativeRuntime(f.paths.runtime, f.paths.storageId)).toEqual({
+    status: 'missing',
+  })
+  expect(await readFile(moved)).toEqual(before)
+  expect(held.stages).toHaveLength(1)
+  expect(await readdir(dirname(f.paths.runtime))).not.toContain(
+    basename(held.stages[0]!),
+  )
+})
+
+test('quota metadata: sweep removes only old metadata stages for this runtime', async () => {
+  const f = await fixture()
+  const subject = await localSubject(f)
+  const paths = {
+    old: `${f.paths.runtime}.native-runtime-metadata.123.0.${randomUUID()}.partial`,
+    young: `${f.paths.runtime}.native-runtime-metadata.123.1.${randomUUID()}.partial`,
+    lockedWriter: `${f.paths.runtime}.native-runtime.${randomUUID()}.partial`,
+    otherRuntime: `${f.paths.runtime}-other.native-runtime-metadata.123.2.${randomUUID()}.partial`,
+  }
+  const oldTime = new Date(Date.now() - 60 * 60_000)
+  for (const [kind, path] of Object.entries(paths)) {
+    await writeFile(path, 'not an account document', { mode: 0o600 })
+    if (kind !== 'young') await utimes(path, oldTime, oldTime)
+  }
+  const open = filesystem.open
+  const spy = spyOn(filesystem, 'open').mockImplementation(
+    (path, flags, mode) => open(path, flags, mode),
+  )
+  deferCleanup(() => spy.mockRestore())
+  expect(
+    await f.runtime.publishLocal(subject, { quotaErrorClearedAt: now }),
+  ).toBe(true)
+  expect(
+    spy.mock.calls.some(([path]) =>
+      Object.values(paths).some((stage) => stage === path),
+    ),
+  ).toBe(false)
+  const names = await readdir(dirname(f.paths.runtime))
+  expect(names).not.toContain(basename(paths.old))
+  for (const path of [paths.young, paths.lockedWriter, paths.otherRuntime])
+    expect(names).toContain(basename(path))
+})
+
 test('local bookkeeping refuses an account replaced immediately before runtime rename', async () => {
   const f = await fixture()
   const subject = await localSubject(f)
-  const update = runtimeWriter.updateNativeRuntime
-  const writer = spyOn(runtimeWriter, 'updateNativeRuntime').mockImplementation(
-    (path, storageId, change, hooks) =>
-      update(path, storageId, change, {
-        ...hooks,
-        beforeRename: async () => {
-          await f.store.replace(
-            'imported-main',
-            {
-              type: 'oauth',
-              access: 'sk-ant-oat01-replacement-access',
-              refresh: 'replacement-refresh',
-              expires: now + 3600_000,
+  const update = runtimeWriter.updateNativeRuntimeMetadata
+  const writer = spyOn(
+    runtimeWriter,
+    'updateNativeRuntimeMetadata',
+  ).mockImplementation((path, storageId, change, hooks) =>
+    update(path, storageId, change, {
+      ...hooks,
+      beforeRename: async () => {
+        await f.store.replace(
+          'imported-main',
+          {
+            type: 'oauth',
+            access: 'sk-ant-oat01-replacement-access',
+            refresh: 'replacement-refresh',
+            expires: now + 3600_000,
+          },
+          { identity: uuid },
+          {
+            attribution: {
+              credentialEpoch: subject.binding.credentialEpoch,
+              identity: uuid,
             },
-            { identity: uuid },
-            {
-              attribution: {
-                credentialEpoch: subject.binding.credentialEpoch,
-                identity: uuid,
-              },
-            },
-          )
-          await hooks?.beforeRename?.()
-        },
-      }),
+          },
+        )
+        await hooks?.beforeRename?.()
+      },
+    }),
   )
   deferCleanup(() => writer.mockRestore())
   expect(await f.runtime.publishLocal(subject, { lastUsed: now })).toBe(false)
@@ -269,31 +578,33 @@ test('local runtime metadata combines across handles and each close drains its p
 test('local readers reject bookkeeping if replacement lands after the final row check', async () => {
   const f = await fixture()
   const subject = await localSubject(f)
-  const update = runtimeWriter.updateNativeRuntime
-  const writer = spyOn(runtimeWriter, 'updateNativeRuntime').mockImplementation(
-    (path, storageId, change, hooks) =>
-      update(path, storageId, change, {
-        ...hooks,
-        beforeRename: async () => {
-          await hooks?.beforeRename?.()
-          await f.store.replace(
-            'imported-main',
-            {
-              type: 'oauth',
-              access: 'sk-ant-oat01-replacement-access',
-              refresh: 'replacement-refresh',
-              expires: now + 3600_000,
+  const update = runtimeWriter.updateNativeRuntimeMetadata
+  const writer = spyOn(
+    runtimeWriter,
+    'updateNativeRuntimeMetadata',
+  ).mockImplementation((path, storageId, change, hooks) =>
+    update(path, storageId, change, {
+      ...hooks,
+      beforeRename: async () => {
+        await hooks?.beforeRename?.()
+        await f.store.replace(
+          'imported-main',
+          {
+            type: 'oauth',
+            access: 'sk-ant-oat01-replacement-access',
+            refresh: 'replacement-refresh',
+            expires: now + 3600_000,
+          },
+          { identity: uuid },
+          {
+            attribution: {
+              credentialEpoch: subject.binding.credentialEpoch,
+              identity: uuid,
             },
-            { identity: uuid },
-            {
-              attribution: {
-                credentialEpoch: subject.binding.credentialEpoch,
-                identity: uuid,
-              },
-            },
-          )
-        },
-      }),
+          },
+        )
+      },
+    }),
   )
   deferCleanup(() => writer.mockRestore())
   expect(

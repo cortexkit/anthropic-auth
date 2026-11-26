@@ -82,6 +82,7 @@ import {
   type NativeRuntimeState,
   readNativeRuntime,
   updateNativeRuntime,
+  updateNativeRuntimeMetadata,
 } from './native-runtime.ts'
 import {
   NativeRuntimeRegistry,
@@ -795,7 +796,7 @@ function buildNativeAccountRuntime(
     await localAuthority()
     if (!matches) return false
     try {
-      await updateNativeRuntime(
+      await updateNativeRuntimeMetadata(
         paths.runtime,
         paths.storageId,
         (current) => {
