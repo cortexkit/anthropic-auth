@@ -5,6 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { logger } from '@cortexkit/anthropic-auth-core'
 import {
   computeEffectiveOrder,
   DEFAULT_PREFS,
@@ -346,6 +347,90 @@ describe('queueTuiPreferenceUpdate', () => {
     expect((root['anthropic-auth'] as Record<string, unknown>).collapsed).toBe(
       false,
     )
+  })
+
+  test('collapse save reapplies the edit after an independent preference write', async () => {
+    const preference = (order: number) =>
+      JSON.stringify({
+        'other-plugin': { order },
+        'anthropic-auth': { collapsed: false },
+      })
+    await writeFile(file, preference(1))
+    const realReadFile = fsPromises.readFile
+    let intercepted = false
+    const read = spyOn(fsPromises, 'readFile').mockImplementation((async (
+      path,
+      options,
+    ) => {
+      const snapshot = await realReadFile(path, options)
+      if (!intercepted && path === file) {
+        intercepted = true
+        await writeFile(file, preference(2))
+      }
+      return snapshot
+    }) as typeof realReadFile)
+    try {
+      await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
+    } finally {
+      read.mockRestore()
+    }
+    expect(await readTuiPreferencesFile()).toEqual({
+      'other-plugin': { order: 2 },
+      'anthropic-auth': { collapsed: true },
+    })
+  })
+
+  test('collapse save leaves existing preferences untouched on a read error', async () => {
+    const original = JSON.stringify({ 'other-plugin': { forceToTop: true } })
+    await writeFile(file, original)
+    const realReadFile = fsPromises.readFile
+    const read = spyOn(fsPromises, 'readFile').mockImplementation((async (
+      path,
+      options,
+    ) => {
+      if (path === file)
+        throw Object.assign(new Error('permission denied'), {
+          code: 'EACCES',
+        })
+      return realReadFile(path, options)
+    }) as typeof realReadFile)
+    try {
+      await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
+    } finally {
+      read.mockRestore()
+    }
+    expect(await readFile(file, 'utf8')).toBe(original)
+  })
+
+  test('collapse save gives up after three retries and logs once', async () => {
+    await writeFile(file, '{}')
+    const realWriteFile = fsPromises.writeFile
+    let order = 0
+    const write = spyOn(fsPromises, 'writeFile').mockImplementation(
+      async (path, data, options) => {
+        await realWriteFile(path, data, options)
+        if (path !== file) {
+          order++
+          await realWriteFile(
+            file,
+            JSON.stringify({ 'other-plugin': { order } }),
+          )
+        }
+      },
+    )
+    const warn = spyOn(logger, 'warn').mockImplementation(() => {})
+    try {
+      await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
+      expect(await readTuiPreferencesFile()).toEqual({
+        'other-plugin': { order: 4 },
+      })
+      expect(warn).toHaveBeenCalledTimes(1)
+      const { readdir } = await import('node:fs/promises')
+      expect(await readdir(dir)).toEqual(['tui-preferences.jsonc'])
+    } finally {
+      write.mockRestore()
+      warn.mockRestore()
+    }
   })
 
   test('no temp files are left behind', async () => {

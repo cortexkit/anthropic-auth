@@ -6,10 +6,14 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 - New default on OpenCode 1, OpenCode 2 and Pi: client refusal fallback. When Claude refuses a step for safety on Fable 5.x, Opus 5.5 or Opus 5, the plugin retries it on a supported fallback model (Opus 4.8 or Opus 5) inside the same reply. When Anthropic attaches a fallback credit to the refusal (a one-time token that lets the retry bill the cached prompt as a cache read), the retry uses it. The session then stays on that model for a short round (10, then 20, then 40 responses while refusals recur) and returns to the requested model. If the retry can't answer, the original refusal is shown. OpenCode 1 and 2 previously used Anthropic's server-side fallback by default (#861).
 - New `refusal_fallback` setting in the shared settings file: `client` (default), `server` (Anthropic's server-side fallback, now on Pi too) or `off`. It replaces `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` and `OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK`, which no longer have any effect. In `server` mode a refusal the server doesn't absorb now stands; OpenCode 1 no longer adds its own recovery round on top.
-- During a round, the requested model's cache is kept warm, and the first request back reads it again instead of rewriting the conversation. A round's keep-warm survives a restart.
+- During a round, keep-warm warms only the requested model's cache; the round's own steps keep the fallback model's cache warm. A round ends early when the session sits idle longer than the fallback model's cache lifetime, and the first request back reads the requested model's cache instead of rewriting the conversation.
 - Requests back to the requested model drop the fallback model's reasoning wherever it follows the requested model's own reasoning in the same turn, which Anthropic would refuse. This holds after a restart too.
 - OpenCode and Pi show the requested model, the serving model and the steps left in a round. Pi prices fallback replies at the serving model's rates. Billing reports carry the refused attempt and its retry as separate rows.
 - Fallback credits never appear in logs, request dumps or saved keep-warm templates.
+- Vault accounts: a profile or quota check that retries after a sign-in error no longer sends a vault credential the plugin already knows has been replaced (#900).
+- OpenCode: saving the sidebar's collapsed state no longer overwrites preference changes saved in the meantime, and leaves the preferences file untouched when it can't be read (#902).
+- Legacy import from 1.x: when the configuration and state files hold different logins for a fallback account and both record a refresh time, the more recently refreshed login is kept (#903).
+- Billing reports a streamed reply as completed only when it ends normally; a reply cut off after its usage update is reported as cut, with its usage kept (#901).
 
 ## 2.17.1
 

@@ -85,10 +85,17 @@ function id(value: unknown): string {
     refuse()
   return value
 }
-function time(value: unknown): number {
+function timestamp(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0
     ? value
-    : 0
+    : undefined
+}
+function legacyCredentialClock(row: Record<string, unknown>): number {
+  return Math.max(
+    timestamp(row.lastRefreshedAt) ?? 0,
+    timestamp(row.lastUsed) ?? 0,
+    timestamp(row.addedAt) ?? 0,
+  )
 }
 function identity(value: unknown): string | undefined {
   if (value === undefined) return undefined
@@ -324,7 +331,8 @@ function runtime(
       ]
     if (
       !record(error) ||
-      (typeof clear === 'number' && time(error.checkedAt) <= clear) ||
+      (typeof clear === 'number' &&
+        (timestamp(error.checkedAt) ?? 0) <= clear) ||
       (error.accountIdentity !== undefined &&
         error.accountIdentity !== accountIdentity)
     )
@@ -567,24 +575,29 @@ export function projectNativeMigrationSource(
         stateRow.claustrumScopedCredentialId ===
           row.claustrumScopedCredentialId &&
         stateRow.anthropicAccountUuid === row.anthropicAccountUuid
-      const configClock = Math.max(
-        time(row.lastRefreshedAt),
-        time(row.lastUsed),
-        time(row.addedAt),
-      )
-      const stateClock = Math.max(
-        time(stateRow.lastRefreshedAt),
-        time(stateRow.lastUsed),
-        time(stateRow.addedAt),
-      )
       const changedSecret = ['access', 'refresh', 'apiKey'].some(
         (key) =>
           row[key] !== undefined &&
           stateRow[key] !== undefined &&
           row[key] !== stateRow[key],
       )
-      const configNewer = changedSecret && configClock > stateClock
-      if (changedSecret && configClock === stateClock) refuse()
+      let configNewer = false
+      if (changedSecret) {
+        const configRefresh = timestamp(row.lastRefreshedAt)
+        const stateRefresh = timestamp(stateRow.lastRefreshedAt)
+        const bothRefreshed =
+          configRefresh !== undefined && stateRefresh !== undefined
+        // Keep the legacy ordering when a refresh timestamp is missing: 1.x
+        // refreshed into the sidecar only, so an unstamped config row is normal.
+        const configClock = bothRefreshed
+          ? configRefresh
+          : legacyCredentialClock(row)
+        const stateClock = bothRefreshed
+          ? stateRefresh
+          : legacyCredentialClock(stateRow)
+        if (configClock === stateClock) refuse()
+        configNewer = configClock > stateClock
+      }
       const merged = scoped
         ? { ...(sameScope ? stateRow : {}), ...row }
         : configNewer

@@ -1986,6 +1986,7 @@ async function fixture(
 
 for (const outcome of [
   'resume',
+  'superseded-resume',
   'abort',
   'identity-change',
   'still-blocked',
@@ -2032,9 +2033,26 @@ for (const outcome of [
     }
     let healthy = !pool
     let sends = 0
-    globalThis.fetch = (async (input: string | URL | Request) => {
+    let rejectResumeQuota = false
+    let pauseResumeQuotaRetry = false
+    const quotaBearers: Array<string | null> = []
+    globalThis.fetch = (async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
       const url = input instanceof Request ? input.url : input.toString()
-      if (url.includes('/api/oauth/usage'))
+      if (url.includes('/api/oauth/usage')) {
+        quotaBearers.push(
+          new Headers(
+            init?.headers ??
+              (input instanceof Request ? input.headers : undefined),
+          ).get('authorization'),
+        )
+        if (rejectResumeQuota) {
+          rejectResumeQuota = false
+          pauseResumeQuotaRetry = true
+          return new Response('{}', { status: 401 })
+        }
         return Response.json({
           five_hour: {
             utilization: healthy ? 0 : 100,
@@ -2045,6 +2063,7 @@ for (const outcome of [
             resets_at: new Date(Date.now() + 3_600_000).toISOString(),
           },
         })
+      }
       if (url.includes('/v1/messages')) {
         sends++
         if (sends === 1 && !pool) {
@@ -2126,7 +2145,42 @@ for (const outcome of [
         f.rows[0] = row('oauth:anthropic', 'changed-account')
         await runtime.vault.refresh()
       }
-      timer?.()
+      if (outcome === 'superseded-resume') {
+        const retryIssued = Promise.withResolvers<{
+          bearer: string
+          version: number
+        }>()
+        const resumeRetry = lifetimes.gate()
+        const get = f.client.getScoped
+        f.client.getScoped = async (input) => {
+          const receipt = await get(input)
+          if (pauseResumeQuotaRetry) {
+            pauseResumeQuotaRetry = false
+            retryIssued.resolve({
+              bearer: `Bearer ${receipt.material}`,
+              version: receipt.recordVersion,
+            })
+            await resumeRetry.wait
+          }
+          return receipt
+        }
+        rejectResumeQuota = true
+        timer?.()
+        const retry = await Promise.race([
+          retryIssued.promise,
+          drained.then(() => {
+            throw new Error('Pi did not reauthorize the resumed quota read')
+          }),
+        ])
+        try {
+          const newer = await runtime.authorizeVault('main')
+          expect(newer.recordVersion).toBeGreaterThan(retry.version)
+        } finally {
+          resumeRetry.open()
+        }
+        await drained
+        expect(quotaBearers).not.toContain(retry.bearer)
+      } else timer?.()
     }
     await drained
     const result = await stream.result()
