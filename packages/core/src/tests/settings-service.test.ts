@@ -16,7 +16,10 @@ import { CLAUDE_MODEL_CAPABILITIES } from '../model-capabilities.ts'
 import { acquireNativeAccountRuntime } from '../native-account-runtime.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { settingsDefinition } from '../settings-definition.ts'
-import type { SettingsHost } from '../settings-paths.ts'
+import {
+  __waitForSettingsRecordMirrorsForTest,
+  type SettingsHost,
+} from '../settings-paths.ts'
 import {
   readSettingsProtectionCopy,
   writeSettingsProtectionCopy,
@@ -34,7 +37,13 @@ import { settingsTestPaths } from './settings-record-paths-fixture.ts'
 const cleanup: (() => void | Promise<void>)[] = []
 afterEach(async () => {
   __setLogTestSink(null)
-  for (const close of cleanup.splice(0).reverse()) await close()
+  // State-folder mirror writes are detached. Let each one finish before its
+  // folder is removed, or it fails later and warns inside another test.
+  for (const close of cleanup.splice(0).reverse()) {
+    await __waitForSettingsRecordMirrorsForTest()
+    await close()
+  }
+  await __waitForSettingsRecordMirrorsForTest()
 })
 
 function gate() {
