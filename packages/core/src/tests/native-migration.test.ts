@@ -1305,6 +1305,67 @@ test('offline transaction imports actual source, commits and retires in the same
   })
 })
 
+async function conflictingFallbackFixture(
+  configTimes: Record<string, number | undefined>,
+  stateTimes: Record<string, number | undefined>,
+) {
+  const f = await fixture()
+  const config = JSON.parse(await readFile(f.paths.legacyConfig, 'utf8'))
+  config.accounts[0] = {
+    ...config.accounts[0],
+    access: 'config-access',
+    refresh: 'config-refresh',
+    expires: 4000,
+    ...configTimes,
+  }
+  const state = JSON.parse(await readFile(f.paths.legacyState, 'utf8'))
+  state.accounts['fallback-route'] = {
+    ...state.accounts['fallback-route'],
+    access: 'state-access',
+    refresh: 'state-refresh',
+    ...stateTimes,
+  }
+  await writeFile(f.paths.legacyConfig, JSON.stringify(config))
+  await writeFile(f.paths.legacyState, JSON.stringify(state))
+  return f
+}
+
+for (const { name, configTimes, stateTimes, winner } of [
+  {
+    name: 'fallback migration keeps a newer refresh despite later state usage',
+    configTimes: { lastRefreshedAt: 20 },
+    stateTimes: { lastRefreshedAt: 10, lastUsed: 30 },
+    winner: 'config',
+  },
+  {
+    name: 'fallback migration keeps the sidecar refresh over an older unstamped config login',
+    configTimes: { addedAt: 1, lastUsed: 1 },
+    stateTimes: { lastRefreshedAt: 1000, lastUsed: undefined },
+    winner: 'state',
+  },
+  {
+    name: 'fallback migration keeps a newer unstamped same-label relogin over an older sidecar refresh',
+    configTimes: { addedAt: 1, lastUsed: 2000 },
+    stateTimes: { lastRefreshedAt: 1000, lastUsed: undefined },
+    winner: 'config',
+  },
+]) {
+  test(name, async () => {
+    const f = await conflictingFallbackFixture(configTimes, stateTimes)
+    expect((await runNativeMigration(f.input)).phase).toBe('retired')
+    const pool = await f.store.read()
+    if (pool.status !== 'ready') throw new Error('Fixture pool not ready')
+    expect(
+      pool.rows.find((row) => row.id === 'fallback-route')?.credential,
+    ).toMatchObject({
+      access: `${winner}-access`,
+      refresh: `${winner}-refresh`,
+    })
+    for (const path of [f.paths.legacyConfig, f.paths.legacyState])
+      await expect(stat(path)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+}
+
 test('preflight conflicts and unaccounted native material publish no journal', async () => {
   for (const pathName of ['config', 'state', 'runtime', 'roster'] as const) {
     const { input, paths } = await fixture()
