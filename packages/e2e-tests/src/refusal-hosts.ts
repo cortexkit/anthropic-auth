@@ -186,6 +186,23 @@ export type HostFixture = {
   overlap?: boolean
   relay?: { url: string; token: string; port: number }
   dump?: boolean
+  routingCapture?: string
+}
+
+export function routingCaptureSource(file: string | undefined) {
+  if (!file) return ''
+  return `
+import { appendFileSync as recordRouting } from 'node:fs';
+globalThis[Symbol.for('cortexkit.routing')] = (sessionId) => ({
+  accountFor(ask) {
+    recordRouting(${JSON.stringify(file)}, JSON.stringify({ sessionId, ask }) + '\\n');
+  },
+  report(report) {
+    recordRouting(${JSON.stringify(file)}, JSON.stringify({ sessionId, report }) + '\\n');
+    return new Promise(() => {});
+  },
+});
+`
 }
 
 export type Outcome = {
@@ -252,15 +269,19 @@ export async function startOc1(fixture: HostFixture): Promise<HostSession> {
       }
       if (shortTimeout)
         config.provider.anthropic.options = { chunkTimeout: toolChunkTimeoutMs }
-      if (newer) {
+      if (newer || fixture.routingCapture) {
         const addon = join(configDir, 'fixture-overlap.mjs')
         await writeFile(
           addon,
-          `${newer.source}
+          `${newer?.source ?? ''}
+${routingCaptureSource(fixture.routingCapture)}
 import { AnthropicAuthPlugin } from ${JSON.stringify(config.plugin[1])};
-export const FixtureAnthropicPlugin = async (input) => {
-  const plugin = await AnthropicAuthPlugin(input);
-  const loader = plugin.auth.loader;
+ export const FixtureAnthropicPlugin = async (input) => {
+   const plugin = await AnthropicAuthPlugin(input);
+   ${
+     newer
+       ? `
+   const loader = plugin.auth.loader;
   plugin.auth.loader = async (...args) => {
     const auth = await loader(...args);
     if (!auth.fetch) return auth;
@@ -278,8 +299,11 @@ export const FixtureAnthropicPlugin = async (input) => {
       }
       return auth.fetch(url, init);
     } };
-  };
-  return plugin;
+   };
+   `
+       : ''
+   }
+   return plugin;
 };
 `,
         )

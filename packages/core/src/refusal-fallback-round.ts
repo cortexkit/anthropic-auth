@@ -6,6 +6,10 @@ import {
   resolveClaudeModelTokenLimits,
 } from './model-capabilities.ts'
 import {
+  createRefusalBillingFacts,
+  reportClientFallbackAttempt,
+} from './refusal-fallback-billing.ts'
+import {
   type RefusalFallbackDispatchLifecycle,
   type RefusalFallbackResendOptions,
   resendRefusalFallbackSource,
@@ -121,6 +125,7 @@ type Round = Omit<RoundInfo, 'stepsLeft'> & {
   credentialId?: string
   mode: 'client'
   stepsLeft: number
+  steps: number
   folded: boolean
   base?: RefusalFallbackEstimateBase
   checkpoint: RefusalFallbackPrefix | null
@@ -163,6 +168,11 @@ type Request = {
   returning?: symbol
   category?: string
   handling400?: boolean
+  billing?: {
+    hostRequestId: string
+    requestedModel: string
+    result: ReturnType<typeof createRefusalBillingFacts>
+  }
   publishTemplate?: (
     bodyText: string,
     servingModel: string,
@@ -582,6 +592,48 @@ export class RefusalFallbackRoundEngine {
     return true
   }
 
+  billingForRound(
+    handle: RefusalFallbackRoundRequest,
+    hostRequestId: string,
+    requestedModel?: string,
+  ) {
+    const request = this.#requests.get(handle)
+    if (!request?.round) return undefined
+    request.billing ??= {
+      hostRequestId,
+      requestedModel: requestedModel ?? request.round.requestedModel,
+      // Routed requests may use JSON and never consume a round step.
+      result: createRefusalBillingFacts(
+        false,
+        request.kind === 'routed'
+          ? () => this.#roundBillingFacts(request)
+          : undefined,
+      ),
+    }
+    return request.billing.result
+  }
+
+  /** Report each physical target send, including one that may be rejected. */
+  reportRoundSend(handle: RefusalFallbackRoundRequest, hostRequestId: string) {
+    const request = this.#requests.get(handle)
+    if (request?.round)
+      reportClientFallbackAttempt(request.sessionId, hostRequestId, 'round')
+  }
+
+  #roundBillingFacts(request: Request) {
+    const { round, billing } = request
+    if (!round || !billing) return
+    return {
+      hostRequestId: billing.hostRequestId,
+      requestedModel: billing.requestedModel,
+      category: round.category,
+      role: 'answer' as const,
+      by: 'client' as const,
+      cause: 'round' as const,
+      round: { steps: round.steps, steps_left: round.stepsLeft },
+    }
+  }
+
   #isNewestPrimary(request: Request) {
     return (
       this.#sessions.get(request.sessionId) === request.session &&
@@ -606,6 +658,7 @@ export class RefusalFallbackRoundEngine {
     family.level = family.recent ? Math.min(family.level + 1, 2) : 0
     family.clean = 0
     family.recent = true
+    const steps = 10 * 2 ** family.level
     const round: Round = {
       identity: request.identity,
       sessionId,
@@ -615,7 +668,8 @@ export class RefusalFallbackRoundEngine {
       accountId,
       credentialId: request.credentialId,
       mode: 'client',
-      stepsLeft: 10 * 2 ** family.level - (retry ? 1 : 0),
+      steps,
+      stepsLeft: steps - (retry ? 1 : 0),
       folded: target.folded,
       releaseThinking: this.#thinking.retainSession(sessionId),
       ...step,
@@ -798,12 +852,16 @@ export class RefusalFallbackRoundEngine {
     return {
       captureReply: true,
       cacheKeepTemplateSettled: publication?.promise,
+      onFinished: () => request.billing?.result.resolve(undefined),
       ...(request.round && {
         onThinkingDigest: (digest) =>
           record(digest, request.round?.identity ?? request.identity),
       }),
       onCompleted: (completion) => {
         if (request.phase !== 'sent' || !fresh()) {
+          // A superseded response can still answer, but cannot spend a round step.
+          if (request.phase === 'sent')
+            request.billing?.result.resolve(this.#roundBillingFacts(request))
           publication?.resolve()
           return
         }
@@ -812,6 +870,7 @@ export class RefusalFallbackRoundEngine {
           const round = request.round
           Object.assign(round, this.#step(request, completion, projectReply))
           round.stepsLeft--
+          request.billing?.result.resolve(this.#roundBillingFacts(request))
           this.#emit(round, 'step_served')
           if (round.stepsLeft === 0) {
             this.#end(request.family, round, 'count')
@@ -829,6 +888,8 @@ export class RefusalFallbackRoundEngine {
         )
       },
       ...(request.kind === 'source' && {
+        refusalDeferred: () =>
+          request.family.round?.identity === request.identity,
         onRetryThinkingDigest: (digest) => {
           if (!sessionStillExists()) return
           releaseRetryThinking ??= this.#thinking.retainSession(

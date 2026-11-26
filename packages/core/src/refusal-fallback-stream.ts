@@ -69,6 +69,7 @@ export type RefusalFallbackLifecycle = {
   onDeferredRefusal?: (refusal: RefusalFallbackCompletedRefusal) => void
   captureReply?: boolean
   onThinkingDigest?: (digest: string) => void
+  onFinished?: () => void
 }
 
 type HeartbeatClock = {
@@ -858,6 +859,7 @@ export function joinRefusalFallbackStream(
   function finish(end?: () => void) {
     if (finished) return
     finished = true
+    notify(options.lifecycle?.onFinished, undefined)
     signal?.removeEventListener('abort', onAbort)
     stopTimer?.()
     stopTimer = undefined

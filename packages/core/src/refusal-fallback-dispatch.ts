@@ -10,6 +10,12 @@ import {
 import { signRequestBody } from './cch.ts'
 import { protectFallbackCreditResponse } from './fallback-credit.ts'
 import {
+  clientRefusalBilling,
+  clientRetryBilling,
+  createRefusalBillingFacts,
+  reportClientFallbackAttempt,
+} from './refusal-fallback-billing.ts'
+import {
   joinRefusalFallbackStream,
   type RefusalFallbackCompletion,
   type RefusalFallbackLifecycle,
@@ -55,6 +61,7 @@ export type RefusalFallbackPhysicalAttempt = Readonly<{
 
 export type RefusalFallbackDispatchLifecycle = RefusalFallbackLifecycle & {
   cacheKeepTemplateSettled?: Promise<void>
+  refusalDeferred?: () => boolean
   onRetryCompleted?: (
     completion: RefusalFallbackCompletion,
     target: Readonly<{ model: string; folded: boolean; bodyText?: string }>,
@@ -64,6 +71,7 @@ export type RefusalFallbackDispatchLifecycle = RefusalFallbackLifecycle & {
 }
 
 export type RefusalFallbackDispatchOptions = {
+  hostRequestId?: string
   /** The host-requested model, even if its wire spelling differs. */
   sourceModel: string
   origin: RefusalFallbackBinding & {
@@ -194,6 +202,17 @@ export function dispatchRefusalFallback(
     typeof sourceBody?.model === 'string'
       ? sourceBody.model
       : options.sourceModel
+  const billingContext = options.hostRequestId && {
+    hostRequestId: options.hostRequestId,
+    requestedModel: options.sourceModel,
+  }
+  // A relay starts collecting billing before dispatch joins the retry to the reply.
+  const sourceFacts =
+    options.billing.refusalBilling ?? createRefusalBillingFacts(true)
+  const markRefused = (category: string | undefined) => {
+    if (billingContext)
+      sourceFacts.resolve(clientRefusalBilling(billingContext, category))
+  }
   const billingInput = (
     attempt: RefusalFallbackPhysicalAttempt,
   ): AnthropicBillingRequest => ({
@@ -242,7 +261,10 @@ export function dispatchRefusalFallback(
   const source = options.protectedOrigin
     ? observedSource
     : observeAnthropicBillingResponse(
-        billingInput(sourceAttempt),
+        {
+          ...billingInput(sourceAttempt),
+          ...(billingContext && { refusalBilling: sourceFacts }),
+        },
         observedSource,
         eventStream(guardedSource),
       )
@@ -278,6 +300,7 @@ export function dispatchRefusalFallback(
         }
         return choice
       }
+      markRefused(refusal.category)
 
       const folded = phase === 'folded'
       const token = folded ? undefined : refusal.creditToken
@@ -344,11 +367,21 @@ export function dispatchRefusalFallback(
         paysCacheWrite: !token,
         folded,
       })
-      const billing = billingInput(attempt)
+      const retryFacts = createRefusalBillingFacts()
+      const billing = {
+        ...billingInput(attempt),
+        refusalBilling: billingContext ? retryFacts : undefined,
+      }
       if (!isFresh()) break
       triedTargets.add(choice.model)
       let raw: Response
       try {
+        if (billingContext)
+          reportClientFallbackAttempt(
+            billing.sessionId,
+            billingContext.hostRequestId,
+            'refused_here',
+          )
         raw = await options.send({
           url: origin.url,
           headers,
@@ -380,14 +413,22 @@ export function dispatchRefusalFallback(
           onCommitted: () =>
             options.onRetryCommitted?.({ model: attempt.model, attempt }),
           onThinkingDigest: options.lifecycle?.onRetryThinkingDigest,
-          onFinished: options.lifecycle?.onRetryFinished,
-          ...(options.lifecycle?.onRetryCompleted && {
-            onCompleted: (completion: RefusalFallbackCompletion) =>
+          onFinished: () => {
+            retryFacts.resolve(undefined)
+            options.lifecycle?.onRetryFinished?.()
+          },
+          ...((billingContext || options.lifecycle?.onRetryCompleted) && {
+            onCompleted: (completion: RefusalFallbackCompletion) => {
+              if (billingContext)
+                retryFacts.resolve(
+                  clientRetryBilling(billingContext, refusal.category, !!token),
+                )
               options.lifecycle?.onRetryCompleted?.(completion, {
                 model: attempt.model,
                 folded,
                 bodyText: reusableBodyText,
-              }),
+              })
+            },
           }),
         }
       try {
@@ -411,7 +452,18 @@ export function dispatchRefusalFallback(
       return token
     },
     retry,
-    lifecycle: options.lifecycle,
+    lifecycle: {
+      ...options.lifecycle,
+      onRefusal(refusal) {
+        options.lifecycle?.onRefusal?.(refusal)
+        if (refusal.releasedTool && options.lifecycle?.refusalDeferred?.())
+          markRefused(refusal.category)
+      },
+      onFinished() {
+        sourceFacts.resolve(undefined)
+        options.lifecycle?.onFinished?.()
+      },
+    },
     signal: options.signal,
     maxPendingBytes: options.maxPendingBytes,
   })

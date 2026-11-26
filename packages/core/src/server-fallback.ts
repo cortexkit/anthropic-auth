@@ -362,6 +362,77 @@ function sameRequestedModel(requestedModel: string, servedModel: string) {
   return requestedModel === servedModel
 }
 
+function fallbackIterationModel(usage: Record<string, unknown> | undefined) {
+  if (!Array.isArray(usage?.iterations)) return
+  let target: string | undefined
+  for (const value of usage.iterations) {
+    const iteration = asRecord(value)
+    if (iteration?.type === 'fallback_message' && safeModelId(iteration.model))
+      target = iteration.model
+  }
+  return target
+}
+
+function stickyFallbackModel(requestedModel: string, servedModel: unknown) {
+  return safeModelId(servedModel) &&
+    !sameRequestedModel(requestedModel, servedModel)
+    ? servedModel
+    : undefined
+}
+
+/** Read the original provider frames, before handoffs are hidden from the host. */
+export function createServerFallbackBilling({
+  hostRequestId,
+  requestedModel,
+  sentModel = requestedModel,
+}: {
+  hostRequestId: string
+  requestedModel: string
+  sentModel?: string
+}) {
+  let servedModel: string | undefined
+  let handoff = false
+  let target: string | undefined
+  let category: string | undefined
+  const observeBlock = (block: Record<string, unknown> | undefined) => {
+    if (!block || !markerFromFallbackBlock(block)) return
+    handoff = true
+    const from = asRecord(block.from)
+    category =
+      stringField(block, 'category') ??
+      stringField(from, 'category') ??
+      stringField(asRecord(from?.stop_details), 'category')
+  }
+  return {
+    observe(event: Record<string, unknown>) {
+      const message = asRecord(event.message) ?? event
+      servedModel = stringField(message, 'model') ?? servedModel
+      target = fallbackIterationModel(asRecord(message.usage)) ?? target
+      if (Array.isArray(message.content)) {
+        for (const block of message.content) observeBlock(asRecord(block))
+      }
+      if (event.type === 'content_block_start')
+        observeBlock(asRecord(event.content_block))
+      const details = asRecord(
+        asRecord(event.delta)?.stop_details ?? message.stop_details,
+      )
+      category ??= stringField(details, 'category')
+    },
+    facts() {
+      if (!handoff && !target && !stickyFallbackModel(sentModel, servedModel))
+        return
+      return {
+        hostRequestId,
+        requestedModel,
+        role: 'answer' as const,
+        by: 'provider' as const,
+        cause: handoff ? ('refused_here' as const) : ('round' as const),
+        ...(handoff && category && { category }),
+      }
+    },
+  }
+}
+
 export function createServerSideFallbackStreamRewriter(options: {
   requestedModel: string
   /** True only when this response's request was sent in server mode with `fallbacks: "default"`. */
@@ -378,7 +449,7 @@ export function createServerSideFallbackStreamRewriter(options: {
   let splitCr: 'forward' | 'discard' | undefined
   let servedModel: string | undefined
   let handoff: ServerSideFallbackMarker | undefined
-  let fallbackIterationModel: string | undefined
+  let iterationModel: string | undefined
   let completed = false
   let hasCompletedToolUse = false
   let maxBlockIndex = -1
@@ -386,13 +457,7 @@ export function createServerSideFallbackStreamRewriter(options: {
   const openToolUseIndexes = new Set<number>()
 
   const observeIterations = (usage: Record<string, unknown> | undefined) => {
-    if (!Array.isArray(usage?.iterations)) return
-    for (const rawIteration of usage.iterations) {
-      const iteration = asRecord(rawIteration)
-      if (iteration?.type !== 'fallback_message') continue
-      const model = stringField(iteration, 'model')
-      if (safeModelId(model)) fallbackIterationModel = model
-    }
+    iterationModel = fallbackIterationModel(usage) ?? iterationModel
   }
 
   const complete = (
@@ -403,10 +468,8 @@ export function createServerSideFallbackStreamRewriter(options: {
     completed = true
     const targetModel =
       handoff?.toModel ??
-      fallbackIterationModel ??
-      (servedModel && !sameRequestedModel(options.requestedModel, servedModel)
-        ? servedModel
-        : undefined)
+      iterationModel ??
+      stickyFallbackModel(options.requestedModel, servedModel)
     options.onOutcome?.({
       requestedModel: options.requestedModel,
       servedModel,

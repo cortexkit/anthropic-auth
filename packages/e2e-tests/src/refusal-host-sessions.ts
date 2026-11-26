@@ -29,6 +29,7 @@ import {
   readFixtureDumps,
   repo,
   requireHostEnv,
+  routingCaptureSource,
   run,
 } from './refusal-hosts'
 import { newerPrimaryControl } from './refusal-newer-primary'
@@ -158,6 +159,7 @@ export async function startOc2(fixture: HostFixture): Promise<HostSession> {
     join(plugin, 'server.js'),
     `import native, { setupAnthropicAuth } from ${JSON.stringify(native)};
 ${newer?.source ?? ''}
+ ${routingCaptureSource(fixture.routingCapture)}
  globalThis[Symbol.for('cortexkit.anthropic-auth.test-oauth-loopback-origin')] = ${JSON.stringify(origin)};
  globalThis[Symbol.for('cortexkit.anthropic-auth.test-only.relay-account-home')] = 'unchecked';
  export default { ...native, async setup(ctx) {
@@ -432,7 +434,8 @@ import auth from ${JSON.stringify(pathToFileURL(extension).href)};
 `
         : "import { existsSync, readFileSync, unlinkSync } from 'node:fs';"
     }
- export default async function (pi) {
+ ${routingCaptureSource(fixture.routingCapture)}
+  export default async function (pi) {
    globalThis[Symbol.for('cortexkit.anthropic-auth.test-only.relay-account-home')] = 'unchecked';
    const file = ${JSON.stringify(edit)};
    pi.on('context', (event) => {
