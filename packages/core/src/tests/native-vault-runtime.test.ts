@@ -617,6 +617,61 @@ test('vault background 401 reports only the final rejected receipt and retries o
   expect(await f.runtime.prepareRetry(served)).toMatchObject({ retry: false })
 })
 
+test('profile retry refuses a receipt superseded during retry authorization', async () => {
+  const f = await fixture()
+  const retryIssued = gate()
+  const resumeRetry = gate()
+  const runtime = createNativeVaultRuntime({
+    ...f.options,
+    connect: async () => ({
+      ...f.client,
+      getScoped: async (input) => {
+        const receipt = await f.client.getScoped(input)
+        if (receipt.recordVersion === 8) {
+          retryIssued.open()
+          await resumeRetry.wait
+        }
+        return receipt
+      },
+    }),
+  })
+  deferCleanup(async () => {
+    await runtime.drainQuotaPublications()
+    runtime.close()
+  })
+  const headers: string[] = []
+  const transport: typeof fetch = Object.assign(
+    async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      headers.push(new Headers(init?.headers).get('authorization') ?? '')
+      if (headers.length === 1) {
+        f.version(8)
+        return new Response('{}', { status: 401 })
+      }
+      return Response.json({
+        organization: {
+          organization_type: 'claude_pro',
+          rate_limit_tier: 'default',
+        },
+      })
+    },
+    { preconnect: fetch.preconnect },
+  )
+  const pending = runtime
+    .fetchProfile('main', transport)
+    .catch((error: unknown) => error)
+  await retryIssued.wait
+  try {
+    f.version(9)
+    expect((await runtime.authorize('main')).recordVersion).toBe(9)
+  } finally {
+    resumeRetry.open()
+  }
+  const result = await pending
+  expect(headers).toEqual(['Bearer synthetic-bearer-7'])
+  expect(result).toBeInstanceOf(NativeCustodyError)
+  expect(result).toMatchObject({ code: 'identity-changed' })
+})
+
 // A 401 is reported only for the receipt whose response is final. A strictly
 // newer replay makes the served version obsolete whatever the replay's outcome.
 const finalReportCases = [

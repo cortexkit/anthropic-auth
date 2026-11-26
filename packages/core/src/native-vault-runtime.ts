@@ -1666,12 +1666,22 @@ export function createNativeVaultRuntime(
   ) {
     const combined = signalFor(signal)
     let served = await runtime.authorize(routeId, combined)
+    const isSuperseded = (servedRouteId: string) => {
+      const key = JSON.stringify([
+        servedRouteId,
+        served.credentialId,
+        served.assertedAccountIdentity,
+      ])
+      return (versions.get(key) ?? served.recordVersion) > served.recordVersion
+    }
     const send = (
       input: Parameters<typeof fetch>[0],
       init?: Parameters<typeof fetch>[1],
     ) => {
       const physical = () => {
-        requireIssued(served)
+        const route = requireIssued(served)
+        if (!dispatch && isSuperseded(route.routeId))
+          throw new NativeCustodyError('identity-changed')
         return fetchImpl(input, {
           ...init,
           signal: init?.signal
@@ -1687,11 +1697,6 @@ export function createNativeVaultRuntime(
           await readVaultRoster(paths.roster),
           route.logicalId,
         )
-        const key = JSON.stringify([
-          route.routeId,
-          served.credentialId,
-          served.assertedAccountIdentity,
-        ])
         if (
           !current ||
           !nativeAccountCanServe(current) ||
@@ -1699,7 +1704,7 @@ export function createNativeVaultRuntime(
           current.accountIdentity !== served.assertedAccountIdentity ||
           (current.credentialId !== served.credentialId &&
             !current.aliases?.includes(served.credentialId)) ||
-          (versions.get(key) ?? served.recordVersion) > served.recordVersion
+          isSuperseded(route.routeId)
         )
           throw new NativeCustodyError('identity-changed')
         await requireActive(combined)
