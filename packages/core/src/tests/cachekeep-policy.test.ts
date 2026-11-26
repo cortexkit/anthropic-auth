@@ -674,6 +674,110 @@ test('round activity retires the kept prefix after a requested model switch', as
   expect(f.sends).toBe(0)
 })
 
+test('a reservation waiting for storage charges the budget renewed by round activity', async () => {
+  const storageRead = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<AccountStorage>()
+  const savedCounts: Array<number | undefined> = []
+  const f = plannedFixture({
+    loadStorage: () => {
+      storageRead.resolve()
+      return resume.promise
+    },
+    reserveWarm: async (target) => {
+      savedCounts.push(target.policyState?.warmsSinceLastRealRequest)
+      return true
+    },
+  })
+  const route = {
+    url: f.input.url,
+    accountId: 'first',
+    accountIdentity: 'login',
+    requestedModel: 'claude-opus-5-5',
+  }
+  f.track({
+    oauthAccountId: route.accountId,
+    oauthAccountIdentity: route.accountIdentity,
+  })
+  f.advance(150_000)
+  const previousBudget = f.target.policyState
+  const dispatch = async () => 'sent'
+  const reservation = f.manager.reserveWarmDispatch(
+    f.target,
+    dispatch,
+    new AbortController().signal,
+  )
+  try {
+    await Promise.race([storageRead.promise, reservation])
+    f.manager.recordRoundActivity(f.input.sessionId, route)
+    expect(f.target.policyState).not.toBe(previousBudget)
+  } finally {
+    resume.resolve(f.input.storage)
+  }
+  expect(await reservation).toBe('sent')
+  expect(savedCounts).toEqual([1])
+  expect(f.target.policyState?.warmsSinceLastRealRequest).toBe(1)
+  expect(previousBudget?.warmsSinceLastRealRequest).toBe(0)
+})
+
+test('a delayed source send excludes warms until the extended target expiry', async () => {
+  const timers: Array<() => void> = []
+  const f = plannedFixture({
+    setTimeoutImpl: ((callback: () => void) => {
+      timers.push(callback)
+      return { unref() {} }
+    }) as unknown as typeof setTimeout,
+    clearTimeoutImpl: (() => {}) as typeof clearTimeout,
+  })
+  f.track()
+  const originalExpiry = f.target.cacheExpiresAt
+  const leaseTimer = timers.length
+  const turn = f.manager.beginRealTurn(f.input.sessionId, {
+    deferWarmExclusion: true,
+  })
+  try {
+    f.advance(150_000)
+    await f.manager.tick()
+    expect(f.sends).toBe(1)
+    expect(f.target.cacheExpiresAt).toBeGreaterThan(originalExpiry)
+    f.advance(originalExpiry - f.now + 1)
+    timers[leaseTimer]!()
+    turn.excludeWarms()
+    await f.manager.tick()
+    expect(f.sends).toBe(1)
+    turn.allowWarms()
+    await f.manager.tick()
+    expect(f.sends).toBe(2)
+  } finally {
+    turn.pause()
+  }
+})
+
+test('untracking a session aborts its in-flight warm', async () => {
+  const started = Promise.withResolvers<AbortSignal>()
+  const response = Promise.withResolvers<Response>()
+  const f = plannedFixture({
+    fetchImpl: Object.assign(
+      async (_url: unknown, init?: RequestInit) => {
+        started.resolve(init!.signal!)
+        return response.promise
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  f.track()
+  f.advance(150_000)
+  const warming = f.manager.tick()
+  try {
+    const signal = await Promise.race([started.promise, warming])
+    expect(signal?.aborted).toBe(false)
+    expect(f.manager.untrack(f.input.sessionId)).toBe(true)
+    expect(signal?.aborted).toBe(true)
+  } finally {
+    response.resolve(Response.json({}))
+    await warming
+  }
+})
+
 test('planned timeout is clipped to expiry minus safety and authorization cannot consume the margin', async () => {
   const deadlines: number[] = []
   const timeout = spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {

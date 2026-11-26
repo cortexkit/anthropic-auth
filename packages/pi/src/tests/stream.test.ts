@@ -26,12 +26,14 @@ import { getPiAccountStoragePath } from '../paths.ts'
 import {
   __executePiWithFallbackForTest,
   __prewarmPiCacheKeepForTest,
+  __sendPiAnthropicRequestForTest,
   beginPiPrimaryTurn,
   buildExplicitBaseMessagesUrl,
   clearPiStickyQuotaRetries,
   configureApiRouteHeaders,
   endPiPrimaryTurn,
   forgetPiMessageThread,
+  getPiTrackedCacheKeepSessions,
   parseSse,
   piRefusalRoundStatus,
   primaryResponseAllowsApiFallback,
@@ -400,6 +402,169 @@ function sseFixture(frames: Record<string, unknown>[], lineEnding = '\n') {
     { headers: { 'content-type': 'text/event-stream' } },
   )
 }
+
+test.each(['API key', 'source authorization failure'] as const)(
+  'Pi retires the kept target when planning ends a round before tracking: %s',
+  async (scenario) => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-round-retire-'))
+    const storagePath = join(tempDir, 'accounts.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveNativePiFixture(
+      {
+        version: 1,
+        accounts: [
+          {
+            id: 'api-route',
+            type: 'api',
+            apiKey: 'test-api-key',
+            baseURL: 'https://provider.example/anthropic',
+            authHeader: 'x-api-key',
+          },
+        ],
+      },
+      storagePath,
+    )
+    const native = getPiNativeRuntime(storagePath)
+    const runtime = await native.service()
+    await runtime.updateSettings((settings) => ({
+      ...settings,
+      quota: { enabled: false },
+    }))
+    let mode: 'client' | 'off' = 'client'
+    const read = runtime.read.bind(runtime)
+    const readSpy = spyOn(runtime, 'read').mockImplementation(
+      async (...args) => ({
+        ...(await read(...args)),
+        refusalFallbackMode: mode,
+      }),
+    )
+    const sessionId = `pi-round-retire-${scenario}`
+    const source = serverFallbackSource
+    const target = 'claude-opus-4-8'
+    const fetchImpl = Object.assign(
+      async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const text =
+          init?.body instanceof Uint8Array
+            ? gunzipSync(init.body).toString()
+            : String(init?.body)
+        const { model } = JSON.parse(text)
+        return sseFixture([
+          {
+            type: 'message_start',
+            message: { model, usage: { input_tokens: 20 } },
+          },
+          {
+            type: 'message_delta',
+            delta:
+              model === target || new Headers(init?.headers).has('x-api-key')
+                ? { stop_reason: 'end_turn' }
+                : {
+                    stop_reason: 'refusal',
+                    stop_details: {
+                      type: 'refusal',
+                      category: 'cyber',
+                      fallback_credit_token: 'test-credit',
+                    },
+                  },
+          },
+          { type: 'message_stop' },
+        ])
+      },
+      { preconnect: originalFetch.preconnect },
+    )
+    globalThis.fetch = fetchImpl
+    const captured: core.CacheKeepManager[] = []
+    const trackedSessions = core.CacheKeepManager.prototype.trackedSessions
+    const capture = spyOn(
+      core.CacheKeepManager.prototype,
+      'trackedSessions',
+    ).mockImplementation(function (this: core.CacheKeepManager) {
+      captured.push(this)
+      return trackedSessions.call(this)
+    })
+    const authorizeSpy = spyOn(native, 'authorize')
+    try {
+      await getPiTrackedCacheKeepSessions()
+      const manager = captured[0]!
+      capture.mockRestore()
+      beginPiPrimaryTurn(storagePath, sessionId)
+      expect(
+        (
+          await streamCortexKitAnthropic(
+            source,
+            anthropicContext,
+            { sessionId },
+            undefined,
+            undefined,
+            'agent-loop',
+          ).result()
+        ).stopReason,
+      ).toBe('stop')
+      expect(piRefusalRoundStatus(sessionId)).toContain(target)
+      endPiPrimaryTurn(storagePath, sessionId)
+      expect(
+        manager.track({
+          sessionId,
+          url: 'https://api.anthropic.com/v1/messages?beta=true',
+          headers: new Headers(),
+          cacheMode: 'hybrid',
+          storage: {
+            version: 1,
+            accounts: [],
+            claudeCache: { enabled: true, mode: 'hybrid' },
+            cacheKeep: { enabled: true, always: true },
+          },
+          bodyText: JSON.stringify({
+            model: source.id,
+            system: [
+              {
+                type: 'text',
+                text: 'old prefix',
+                cache_control: { type: 'ephemeral' },
+              },
+            ],
+          }),
+        }).tracked,
+      ).toBe(true)
+      beginPiPrimaryTurn(storagePath, sessionId)
+      const send = (apiAccount?: core.NativeAccountView) =>
+        __sendPiAnthropicRequestForTest(
+          {
+            model: source,
+            context: anthropicContext,
+            storagePath,
+            requestOrigin: 'agent-loop',
+            streamOptions: { sessionId },
+            apiAccount,
+          },
+          { native, fetch: fetchImpl },
+        )
+      if (scenario === 'API key') {
+        const apiAccount = (await native.view()).accounts.find(
+          (account) => account.id === 'api-route',
+        )
+        expect(apiAccount?.type).toBe('api')
+        await (await send(apiAccount)).text()
+      } else {
+        mode = 'off'
+        authorizeSpy.mockRejectedValue(
+          new Error('synthetic source authorization failure'),
+        )
+        await expect(send()).rejects.toThrow(
+          'synthetic source authorization failure',
+        )
+      }
+      expect(piRefusalRoundStatus(sessionId)).toBeUndefined()
+      expect(manager.trackedRequest(sessionId)).toBeUndefined()
+    } finally {
+      capture.mockRestore()
+      authorizeSpy.mockRestore()
+      readSpy.mockRestore()
+      endPiPrimaryTurn(storagePath, sessionId, true)
+      forgetPiMessageThread(sessionId)
+    }
+  },
+)
 
 async function piServerFallbackFixture(mode: 'server' | 'off') {
   tempDir = await mkdtemp(join(tmpdir(), 'pi-server-fallback-'))

@@ -297,9 +297,7 @@ export function beginPiPrimaryTurn(
   sessionId?: string,
 ): void {
   if (!sessionId) return
-  const deferWarmExclusion = rounds.hasRound(sessionId)
-  const lease = piCacheKeep.realTurn(sessionId, deferWarmExclusion)
-  if (deferWarmExclusion) piCacheKeep.preserveTurn(lease)
+  piCacheKeep.realTurn(sessionId, rounds.hasRound(sessionId))
   const previous = primarySessions.get(sessionId)
   const session =
     previous?.storagePath === storagePath
@@ -1325,7 +1323,7 @@ async function sendAnthropicRequestAttempt(
         }
       : undefined
   if (!options.prime && !forkHead && realSession) {
-    if (options.apiAccount || !options.storagePath) {
+    if ((options.apiAccount && !primary) || !options.storagePath) {
       try {
         realTurn?.finish()
       } catch {}
@@ -1898,7 +1896,12 @@ async function sendAnthropicRequestAttempt(
     init.body = bodyText
     if (roundPlan.kind !== 'source') physicalModel = roundPlan.servingModel
   }
-  if (
+  if (primaryRequest && realSession && roundPlan) {
+    // A source plan can start a new round as its reply is read. Use the
+    // resulting round state, not the tentative lease's state at turn start.
+    piCacheKeep.preserveTurn(realTurn, () => roundEngine.hasRound(realSession))
+    if (options.apiAccount) piCacheKeep.finishTurn(realTurn)
+  } else if (
     roundPlan?.request ||
     (sideRequest &&
       (!options.laneStart || (realSession && refusalRounds.has(realSession))))

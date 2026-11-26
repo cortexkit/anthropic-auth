@@ -51,7 +51,10 @@ export class PiCacheKeep {
     { turn: CacheKeepRealTurn; claimed: boolean }
   >()
   private readonly pendingTurns = new Set<CacheKeepRealTurn>()
-  private readonly preservedTurns = new WeakSet<CacheKeepRealTurn>()
+  private readonly preserveTurns = new WeakMap<
+    CacheKeepRealTurn,
+    () => boolean
+  >()
   readonly manager: CacheKeepManager
   private readonly stores = new Map<string, Promise<CacheKeepStore>>()
   private readonly sessions = new Map<string, Session>()
@@ -466,14 +469,15 @@ export class PiCacheKeep {
   finishTurn(turn: CacheKeepRealTurn | undefined) {
     try {
       if (turn && !this.pendingTurns.has(turn)) {
-        if (this.preservedTurns.has(turn)) turn.pause()
-        else turn.finish()
+        const preserve = this.preserveTurns.get(turn)
+        if (preserve?.()) turn.pause()
+        else turn.finish({ retireTentative: preserve !== undefined })
       }
     } catch {}
   }
 
-  preserveTurn(turn: CacheKeepRealTurn | undefined) {
-    if (turn) this.preservedTurns.add(turn)
+  preserveTurn(turn: CacheKeepRealTurn | undefined, preserve = () => true) {
+    if (turn) this.preserveTurns.set(turn, preserve)
   }
 
   trackAccepted(

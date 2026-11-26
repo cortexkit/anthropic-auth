@@ -122,7 +122,15 @@ test('an idle round ends only past the last accepted primary step lifetime and a
   expect(events.at(-1)).toMatchObject({ kind: 'step_served', stepsLeft: 19 })
 })
 
-test.each(['count', 'idle', 'off', 'restart'] as const)(
+test.each([
+  'count',
+  'idle',
+  'off',
+  'restart',
+  'restart in off mode',
+  'restart with fallback-only thinking',
+  'restart after a deferred round step',
+] as const)(
   'the %s return restores the ordinary kept prefix marker without replacing the tail marker',
   async (end) => {
     let now = 1
@@ -170,33 +178,57 @@ test.each(['count', 'idle', 'off', 'restart'] as const)(
       }
       let returned: RefusalFallbackRoundPlan
       let expectedMessages: unknown[] = [first, tail]
-      if (end === 'restart') {
+      if (end.startsWith('restart')) {
         const initial = plan(extended)
         const { lifecycle } = send(initial)
         lifecycle?.onRefusal?.(refusal)
-        lifecycle?.onRetryThinkingDigest?.(
-          recoveryThinkingDigest('thinking', targetThought.signature),
+        const digest = recoveryThinkingDigest(
+          'thinking',
+          targetThought.signature,
         )
-        lifecycle?.onRetryCompleted?.(completion, {
-          model: opus,
-          folded: false,
-        })
-        lifecycle?.onRetryFinished?.()
+        if (end === 'restart after a deferred round step') {
+          lifecycle?.onDeferredRefusal?.(refusal)
+          const step = plan(extended)
+          expect(step.kind).toBe('round')
+          const stepLifecycle = send(step).lifecycle
+          stepLifecycle?.onThinkingDigest?.(digest)
+          stepLifecycle?.onCompleted?.(completion)
+        } else {
+          lifecycle?.onRetryThinkingDigest?.(digest)
+          lifecycle?.onRetryCompleted?.(completion, {
+            model: opus,
+            folded: false,
+          })
+          lifecycle?.onRetryFinished?.()
+        }
         await thinkingStore.flush()
         const restarted = fixture({
           ...options,
           thinkingStore: new RecoveryThinkingStore({ directory }),
         })
         await restarted.engine.loadThinking('s')
-        returned = restarted.plan({
+        const mixed = end === 'restart' || end === 'restart in off mode'
+        const afterRestart = {
           oauth: route,
+          mode: end === 'restart in off mode' ? 'off' : 'client',
           bodyText: replay(
             prompt,
-            assistant(sourceThought, targetThought),
+            mixed
+              ? assistant(sourceThought, targetThought)
+              : assistant(targetThought),
             tail,
           ),
-        })
-        expectedMessages = [first, assistant(sourceThought), tail]
+        } as const
+        returned = restarted.plan(afterRestart)
+        expectedMessages = [
+          first,
+          assistant(mixed ? sourceThought : targetThought),
+          tail,
+        ]
+        if (end === 'restart in off mode')
+          expect(restarted.plan(afterRestart)).not.toHaveProperty(
+            'sourceCacheMarkerRestored',
+          )
         expect(restarted.events).toEqual([])
       } else {
         begin('retry', plan(extended))
@@ -209,6 +241,10 @@ test.each(['count', 'idle', 'off', 'restart'] as const)(
           kind: 'round_ended',
           reason: end === 'off' ? 'mode' : end,
         })
+        if (end === 'off')
+          expect(plan({ ...extended, mode: 'off' })).not.toHaveProperty(
+            'sourceCacheMarkerRestored',
+          )
       }
       expect(returned).toMatchObject({
         kind: 'source',
@@ -218,6 +254,57 @@ test.each(['count', 'idle', 'off', 'restart'] as const)(
     } finally {
       cacheKeep.stop()
       await rm(directory, { recursive: true, force: true })
+    }
+  },
+)
+
+test.each(['deferred', 'released tool'] as const)(
+  'a %s refusal retires the previous model target when it installs the round',
+  (kind) => {
+    const storage = {
+      version: 1 as const,
+      accounts: [],
+      claudeCache: { enabled: true, mode: 'hybrid' as const },
+      cacheKeep: { enabled: true, always: true },
+    }
+    const cacheKeep = new CacheKeepManager({ loadStorage: async () => storage })
+    try {
+      const { begin, plan, send, engine } = fixture({ cacheKeep })
+      const previousModel = 'claude-fable-5-1'
+      const previousEnginePlan = plan({ requestedModel: previousModel })
+      expect(previousEnginePlan.kind).toBe('source')
+      expect(
+        cacheKeep.track({
+          sessionId: 's',
+          url: binding.url,
+          storage,
+          cacheMode: 'hybrid',
+          headers: new Headers(),
+          bodyText: JSON.stringify({
+            model: previousModel,
+            system: [
+              {
+                type: 'text',
+                text: 'Stable',
+                cache_control: { type: 'ephemeral' },
+              },
+            ],
+          }),
+        }).tracked,
+      ).toBe(true)
+      const next = plan()
+      expect(cacheKeep.trackedRequest('s')).toBeDefined()
+      if (kind === 'released tool') begin('tool', next)
+      else {
+        const { lifecycle } = send(next)
+        lifecycle?.onRefusal?.(refusal)
+        expect(cacheKeep.trackedRequest('s')).toBeDefined()
+        lifecycle?.onDeferredRefusal?.(refusal)
+      }
+      expect(engine.hasRound('s')).toBe(true)
+      expect(cacheKeep.trackedRequest('s')).toBeUndefined()
+    } finally {
+      cacheKeep.stop()
     }
   },
 )

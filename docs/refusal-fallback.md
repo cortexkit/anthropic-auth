@@ -54,7 +54,7 @@ During a round, keep-warm still targets only the requested model's last accepted
 
 The next primary request returns to the requested model if the time since the last accepted round step exceeds the cache lifetime sent with that step: one hour or five minutes (five minutes if it had no cache marker). Before a deferred round serves its first step, the clock starts at the refusal that created it. Titles and compaction requests do not refresh that clock. An idle end advances the next round's length just like using all its steps.
 
-When the first request back extends the kept prefix, it carries a cache marker at that prefix so Anthropic can read the cache again. A restart also ends the round; the requested model's saved prefix and warm budget can be restored and warmed normally.
+When the first request back extends the kept prefix, it carries a cache marker at that prefix so Anthropic can read the cache again. A restart also ends the round; the requested model's saved prefix and warm budget can be restored and warmed normally. After a restart, the plugin recognizes the return if the request includes recorded fallback-model thinking, even when that thinking doesn't need to be removed. A round that left no such record (for example, one without thinking or deferred before its first fallback step) can require a cache rewrite on the first request back.
 
 On requests to the requested model, the plugin removes recorded fallback-model thinking wherever it follows that requested model's thinking in the same turn. It checks every turn, not only the latest one, and the record survives restarts. Pi and OpenCode 2 save the record on shutdown.
 

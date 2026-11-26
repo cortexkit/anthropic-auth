@@ -105,12 +105,15 @@ test.each(['request', 'untrack', 'stop'] as const)(
   'CacheKeep %s invalidates an in-flight standalone immediate generation',
   async (change) => {
     const response = Promise.withResolvers<Response>()
-    const started = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<AbortSignal>()
     const current: boolean[] = []
     const manager = new CacheKeepManager({
       loadStorage: async () => storage,
-      fetchImpl: (async () => {
-        started.resolve()
+      fetchImpl: (async (
+        _url: Parameters<typeof fetch>[0],
+        init?: RequestInit,
+      ) => {
+        started.resolve(init!.signal!)
         return response.promise
       }) as unknown as typeof fetch,
       onResponse: ({ target }) => {
@@ -118,7 +121,7 @@ test.each(['request', 'untrack', 'stop'] as const)(
       },
     })
     const warm = manager.prewarmNow(target)
-    await started.promise
+    const signal = await started.promise
     try {
       if (change === 'request')
         manager.track({ ...target, storage, cacheMode: 'hybrid' })
@@ -132,7 +135,16 @@ test.each(['request', 'untrack', 'stop'] as const)(
           reason: 'scheduler-paused',
         })
         expect(current).toEqual([])
+      } else if (change === 'untrack') {
+        expect(signal.aborted).toBe(true)
+        expect(await warm).toEqual({
+          ok: false,
+          skipped: true,
+          reason: 'warm-cancelled',
+        })
+        expect(current).toEqual([])
       } else {
+        expect(signal.aborted).toBe(false)
         expect(await warm).toEqual({ ok: true, ttlMs: 300_000 })
         expect(current).toEqual([false])
       }

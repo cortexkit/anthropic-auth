@@ -296,7 +296,7 @@ export class RefusalFallbackRoundEngine {
     input: RefusalFallbackRoundInput,
     familyId?: ClaudeRefusalRecoveryFamily,
     round?: symbol,
-    onStrippedThinking?: () => void,
+    onRecordedThinking?: () => void,
   ): string {
     const text =
       input.filterBody?.(
@@ -307,8 +307,11 @@ export class RefusalFallbackRoundEngine {
     const digests = this.#thinking.peek(input.sessionId, familyId)
     if (!digests?.size) return text
     const body = parse(text)
-    if (!body || !stripRecoveryRoundThinking(body, digests, round)) return text
-    onStrippedThinking?.()
+    if (
+      !body ||
+      !stripRecoveryRoundThinking(body, digests, round, onRecordedThinking)
+    )
+      return text
     return update(text, 'messages', body.messages)
   }
 
@@ -426,11 +429,23 @@ export class RefusalFallbackRoundEngine {
       }
     }
     let returning = session?.returning
-    let bodyText = this.#filter(input, familyId, undefined, () => {
-      // After restart the live round is gone, but recorded fallback thinking
-      // after source thinking still identifies a return to the requested model.
-      if (!session) returning = Symbol()
-    })
+    // After a restart only a recorded digest in the request identifies the
+    // round, even if the block is kept. A round that left no digest is unknown.
+    const inferReturn = !this.#sessionLifetimes.has(sessionId)
+    let bodyText = this.#filter(
+      input,
+      familyId,
+      undefined,
+      inferReturn
+        ? () => {
+            returning ??= Symbol()
+          }
+        : undefined,
+    )
+    if (input.mode !== 'client' || !oauth) {
+      if (session) session.returning = undefined
+      if (inferReturn && returning) this.#sessionLifetimes.set(sessionId, {})
+    }
     if (input.mode === 'server' || !oauth) return { kind: 'source', bodyText }
     const parsed = returning && !input.compacted ? parse(bodyText) : undefined
     const sourceCacheMarkerRestored = Boolean(
@@ -602,6 +617,7 @@ export class RefusalFallbackRoundEngine {
     if (request.kind !== 'routed') {
       request.session.latest = request.identity
       request.session.accountId = request.accountId
+      if (request.kind === 'source') request.session.returning = undefined
       if (request.round && request.folded) request.round.folded = true
     }
     return true
@@ -646,6 +662,11 @@ export class RefusalFallbackRoundEngine {
       ...step,
     }
     family.round = round
+    try {
+      this.#cacheKeep?.untrackIfModelChanged(sessionId, round.requestedModel)
+    } catch {
+      // CacheKeep bookkeeping must not interrupt the response.
+    }
     this.#emit(round, 'round_started')
     if (retry) this.#emit(round, 'step_served')
   }
@@ -830,7 +851,6 @@ export class RefusalFallbackRoundEngine {
           }
           return
         }
-        request.session.returning = undefined
         this.#sourceCompleted(request)
         publish(request.templateBodyText, completion.usage)
       },
@@ -849,7 +869,6 @@ export class RefusalFallbackRoundEngine {
         onRefusal: (refusal) => {
           if (request.phase !== 'sent' || !fresh()) return
           refusalClock = clockFrom(wireCacheTtl())
-          request.session.returning = undefined
           request.phase = 'refusal'
           request.family.clean = 0
           request.category = refusal.category

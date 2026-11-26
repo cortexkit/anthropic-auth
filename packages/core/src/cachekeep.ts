@@ -672,7 +672,8 @@ export interface CacheKeepRealTurn {
   track(
     input: Parameters<CacheKeepManager['track']>[0],
   ): ReturnType<CacheKeepManager['track']>
-  finish(): void
+  /** Use retireTentative when planning returns to the requested model but no send excludes warms. */
+  finish(options?: { retireTentative?: boolean }): void
   /** Release a host being paused without terminally ending its retained target. */
   pause(): void
 }
@@ -717,7 +718,10 @@ export class CacheKeepManager {
   private readonly turnTimers = new Set<ReturnType<typeof setTimeout>>()
   private readonly ticks = new Set<Promise<void>>()
   private readonly warmRuns = new Set<Promise<CacheKeepPrewarmResult>>()
-  private readonly warmControllers = new Map<AbortController, string>()
+  private readonly warmControllers = new Map<
+    AbortController,
+    { targetId: string; sessionId: string }
+  >()
   private nextPrewarmAttemptId = 0
   private readonly reportedStops = new WeakSet<CacheKeepPolicyState>()
   private readonly restoredTargets = new WeakSet<object>()
@@ -907,14 +911,16 @@ export class CacheKeepManager {
     try {
       now = this.options.now?.() ?? now
     } catch {}
-    const ownerExpiry = Math.min(
-      ...[...this.targets.values()]
-        .filter((target) => target.policyState?.ownerSessionId === sessionId)
-        .map((target) => target.cacheExpiresAt),
-    )
-    const expiresAt =
-      this.targets.get(sessionId)?.cacheExpiresAt ??
-      (Number.isFinite(ownerExpiry) ? ownerExpiry : now + CACHE_KEEP_TTL_MS)
+    const targetExpiry = () => {
+      const primary = this.targets.get(sessionId)
+      if (primary) return primary.cacheExpiresAt
+      const ownerExpiry = Math.min(
+        ...[...this.targets.values()]
+          .filter((target) => target.policyState?.ownerSessionId === sessionId)
+          .map((target) => target.cacheExpiresAt),
+      )
+      return Number.isFinite(ownerExpiry) ? ownerExpiry : undefined
+    }
     const turns = this.realTurns.get(sessionId) ?? {
       latest: id,
       pending: 0,
@@ -945,7 +951,7 @@ export class CacheKeepManager {
       busy = false
       turns.leases.delete(record)
     }
-    const release = (silent = false) => {
+    const release = (silent = false, retireTentative = false) => {
       if (!active) return
       active = false
       releaseBusy()
@@ -954,10 +960,10 @@ export class CacheKeepManager {
       try {
         if (
           !silent &&
-          everExcludedWarms &&
+          (everExcludedWarms || retireTentative) &&
           lifetime === this.lifetime &&
           turns.latest === id &&
-          currentTime() < expiresAt + CACHE_KEEP_TTL_MS
+          currentTime() < record.expiresAt + CACHE_KEEP_TTL_MS
         )
           this.finishSessionTargets(
             sessionId,
@@ -980,7 +986,7 @@ export class CacheKeepManager {
     // more cache lifetime, so a legitimate late response can still replace it.
     const record = {
       id,
-      expiresAt,
+      expiresAt: targetExpiry() ?? now + CACHE_KEEP_TTL_MS,
       expire: () => {
         if (!active || lifetime !== this.lifetime) {
           release(true)
@@ -990,7 +996,7 @@ export class CacheKeepManager {
         leaseExpired = true
         releaseBusy()
         clearTimer()
-        const remaining = expiresAt + CACHE_KEEP_TTL_MS - currentTime()
+        const remaining = record.expiresAt + CACHE_KEEP_TTL_MS - currentTime()
         if (remaining <= 0) release(true)
         else {
           try {
@@ -1005,31 +1011,46 @@ export class CacheKeepManager {
         }
       },
     }
+    const armExpiry = (now: number) => {
+      timer = (this.options.setTimeoutImpl ?? setTimeout)(
+        record.expire,
+        Math.max(0, record.expiresAt - now),
+      )
+      timer.unref?.()
+      this.turnTimers.add(timer)
+    }
     const excludeWarms = () => {
+      const now = currentTime()
       if (
         !active ||
         busy ||
-        leaseExpired ||
         lifetime !== this.lifetime ||
-        currentTime() >= expiresAt
+        turns.latest !== id ||
+        now >= record.expiresAt + CACHE_KEEP_TTL_MS
       )
         return
+      // A warm allowed during fallback may have renewed the same kept cache.
+      // Use its current deadline without reviving a superseded or ended turn.
+      const expiresAt = targetExpiry() ?? record.expiresAt
+      if (now >= expiresAt) return
+      if (leaseExpired || expiresAt !== record.expiresAt) {
+        clearTimer()
+        leaseExpired = false
+        record.expiresAt = expiresAt
+        try {
+          armExpiry(now)
+        } catch {}
+      }
       busy = true
       everExcludedWarms = true
       turns.leases.add(record)
-      for (const [controller, session] of this.warmControllers)
-        if (session === sessionId) controller.abort()
+      this.abortSessionWarms(sessionId)
       try {
         this.scheduleDueTimer()
       } catch {}
     }
     try {
-      timer = (this.options.setTimeoutImpl ?? setTimeout)(
-        record.expire,
-        Math.max(0, expiresAt - now),
-      )
-      timer.unref?.()
-      this.turnTimers.add(timer)
+      armExpiry(now)
       if (!deferWarmExclusion) excludeWarms()
     } catch {}
     const thisManager = this
@@ -1040,7 +1061,7 @@ export class CacheKeepManager {
             active &&
             !leaseExpired &&
             lifetime === thisManager.lifetime &&
-            (thisManager.options.now?.() ?? Date.now()) < expiresAt
+            (thisManager.options.now?.() ?? Date.now()) < record.expiresAt
           )
         } catch {
           return false
@@ -1062,7 +1083,7 @@ export class CacheKeepManager {
         if (
           !active ||
           lifetime !== this.lifetime ||
-          currentTime() >= expiresAt + CACHE_KEEP_TTL_MS
+          currentTime() >= record.expiresAt + CACHE_KEEP_TTL_MS
         ) {
           release(true)
           return { tracked: false, reason: 'real turn ended' }
@@ -1077,7 +1098,8 @@ export class CacheKeepManager {
           release()
         }
       },
-      finish: () => release(),
+      finish: ({ retireTentative = false } = {}) =>
+        release(false, retireTentative),
       pause: () => release(true),
     }
   }
@@ -1183,10 +1205,14 @@ export class CacheKeepManager {
   ): boolean {
     this.immediateTargets.delete(id)
     const target = this.targets.get(id)
+    if (target) {
+      const now = this.options.now?.() ?? Date.now()
+      this.reportStop(target, reason, now)
+      this.retainStopped(target, reason, now)
+      this.targets.delete(id)
+    }
+    this.abortSessionWarms(id)
     if (!target) return false
-    this.reportStop(target, reason, this.options.now?.() ?? Date.now())
-    this.retainStopped(target, reason, this.options.now?.() ?? Date.now())
-    this.targets.delete(id)
     this.options.onTargetRemoved?.(id, target)
     this.publishTrackedSessions()
     return true
@@ -1196,10 +1222,14 @@ export class CacheKeepManager {
   releaseTarget(id: string) {
     this.immediateTargets.delete(id)
     if (!this.targets.delete(id)) return
-    for (const [controller, sessionId] of this.warmControllers)
-      if (sessionId === id) controller.abort()
+    this.abortSessionWarms(id)
     this.publishTrackedSessions()
     this.scheduleDueTimer()
+  }
+
+  private abortSessionWarms(id: string) {
+    for (const [controller, { targetId, sessionId }] of this.warmControllers)
+      if (targetId === id || sessionId === id) controller.abort()
   }
 
   trackedCount(): number {
@@ -1223,6 +1253,16 @@ export class CacheKeepManager {
    */
   trackedPolicyState(id: string): Readonly<CacheKeepPolicyState> | undefined {
     return this.targets.get(id)?.policyState
+  }
+
+  untrackIfModelChanged(sessionId: string, requestedModel: string): boolean {
+    const target = this.targets.get(sessionId)
+    if (!target) return false
+    let model: unknown
+    try {
+      model = JSON.parse(target.bodyText)?.model
+    } catch {}
+    return model !== requestedModel && this.untrack(sessionId)
   }
 
   /** A fallback step spends on a different cache, so it only renews the budget. */
@@ -1253,14 +1293,7 @@ export class CacheKeepManager {
       this.scheduleDueTimer()
       return
     }
-    let model: unknown
-    try {
-      model = JSON.parse(target.bodyText)?.model
-    } catch {}
-    if (model !== route.requestedModel) {
-      this.untrack(sessionId)
-      return
-    }
+    if (this.untrackIfModelChanged(sessionId, route.requestedModel)) return
     const state = target.policyState
     if (!state || now >= target.cacheExpiresAt) return
     // Keep the replay target so an in-flight warm can extend its lifetime.
@@ -1487,11 +1520,10 @@ export class CacheKeepManager {
     signal?: AbortSignal,
   ): Promise<T | undefined> {
     const generation = this.schedulerGeneration
-    const current = this.targets.get(target.id)
-    if (!current || !this.isCurrentTarget(target))
+    const initial = this.targets.get(target.id)
+    if (!initial || !this.isCurrentTarget(target))
       throw new CacheKeepWarmRefusal('stopped')
-    const state = current.policyState
-    if (this.realTurnBusy(state?.ownerSessionId ?? target.id))
+    if (this.realTurnBusy(initial.policyState?.ownerSessionId ?? target.id))
       throw new CacheKeepWarmWait()
     const loaded = await this.options.loadStorage()
     const cancelled = () =>
@@ -1504,7 +1536,10 @@ export class CacheKeepManager {
             target.bodyText,
           )
         : loaded
-    if (!this.isCurrentTarget(target)) throw new CacheKeepWarmRefusal('stopped')
+    const current = this.targets.get(target.id)
+    if (!current || !this.isCurrentTarget(target))
+      throw new CacheKeepWarmRefusal('stopped')
+    const state = current.policyState
     if (this.realTurnBusy(state?.ownerSessionId ?? target.id))
       throw new CacheKeepWarmWait()
     const now = this.options.now?.() ?? Date.now()
@@ -2358,10 +2393,10 @@ export class CacheKeepManager {
       return { ok: false, refused: true, reason: 'retry-window-ended' }
     const startedAt = this.options.now?.() ?? Date.now()
     const controller = new AbortController()
-    this.warmControllers.set(
-      controller,
-      target.policyState?.ownerSessionId ?? target.id,
-    )
+    this.warmControllers.set(controller, {
+      targetId: target.id,
+      sessionId: target.policyState?.ownerSessionId ?? target.id,
+    })
     let headersMs: number | null = null
     const attempt: CacheKeepPrewarmAttempt & { signal: AbortSignal } = {
       id: ++this.nextPrewarmAttemptId,

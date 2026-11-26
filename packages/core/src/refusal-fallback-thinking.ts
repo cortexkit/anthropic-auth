@@ -94,12 +94,13 @@ function isToolResultOnlyUserMessage(message: Record<string, unknown>) {
  * results; any other user message starts a new turn. Other roles, such as
  * mid-conversation system messages, do not end a turn. A block is kept when
  * removing it would leave its message empty. Returns the number of blocks
- * removed; the body is untouched when nothing matches.
+ * removed. Reports matching digests even for blocks that stay in the body.
  */
 export function stripRecoveryRoundThinking(
   body: Record<string, unknown>,
   recorded: ReadonlyMap<string, symbol | undefined>,
   liveRound?: symbol,
+  onRecordedThinking?: () => void,
 ): number {
   if (recorded.size === 0 || !Array.isArray(body.messages)) return 0
   let removed = 0
@@ -126,6 +127,7 @@ export function stripRecoveryRoundThinking(
         kept?.push(block)
         continue
       }
+      onRecordedThinking?.()
       if (
         !sourceThinkingInTurn ||
         (liveRound && recorded.get(digest) === liveRound)
