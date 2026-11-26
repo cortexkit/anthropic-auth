@@ -152,6 +152,61 @@ test('applied records use state only when the whole beside copy is missing', asy
   await expect(floor('pi')).rejects.toThrow()
 })
 
+test('release A: rebuilding a missing beside copy preserves the peer floor', async () => {
+  const f = await fixture('{broken')
+  const { beside, state } = f.records
+  if (!state) throw new Error('Missing state layout')
+  const { refusal_fallback, ...values } = complete
+  const pi = {
+    readAt: 1,
+    values: { ...values, killswitch_default_five_hour: 80 },
+    refusal_fallback,
+  }
+  await writeFile(state.applied, JSON.stringify({ pi }))
+
+  await writeSettingsProtectionCopy(f.records, 'opencode', {
+    readAt: 2,
+    values: complete,
+  })
+
+  const copy = JSON.parse(await readFile(beside.applied, 'utf8'))
+  expect(copy.opencode).toEqual({ readAt: 2, values, refusal_fallback })
+  const peer = await f.open('pi', {
+    protection: {
+      readLegacyProtection: async () => ({
+        ...complete,
+        killswitch_default_five_hour: 0,
+      }),
+    },
+  })
+  expect(peer.resolve('pi').killswitch_default_five_hour).toBe(80)
+  expect(peer.snapshot().protection.pi.rung).toBe(1)
+  expect(copy.pi).toEqual(pi)
+})
+
+test.each(['unreadable', 'malformed', 'invalid peer'])(
+  'release A: a %s state copy prevents rebuilding the beside copy',
+  async (kind) => {
+    const f = await fixture()
+    const { beside, state } = f.records
+    if (!state) throw new Error('Missing state layout')
+    if (kind === 'unreadable') await mkdir(state.applied)
+    else
+      await writeFile(
+        state.applied,
+        kind === 'malformed' ? '{broken' : '{"pi":{"readAt":1,"values":{}}}',
+      )
+
+    await expect(
+      writeSettingsProtectionCopy(f.records, 'opencode', {
+        readAt: 2,
+        values: complete,
+      }),
+    ).rejects.toThrow('state protection copy')
+    expect(await Bun.file(beside.applied).exists()).toBe(false)
+  },
+)
+
 test('release A: unknown state fallback stops at rung 3 and refuses recreation', async () => {
   const f = await fixture()
   const { refusal_fallback, ...values } = complete

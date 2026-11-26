@@ -13,7 +13,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import {
   createDumpResponseObserver,
   dumpDirectRequest,
@@ -132,6 +132,60 @@ test('credited request dumps replace the token in bytes, relay envelopes, and fa
     `"fallback_credit_token":"${FALLBACK_CREDIT_PLACEHOLDER}"`,
   )
   expect(all).toContain('private content stays in opt-in dumps')
+})
+
+test('a credited direct retry masks the token in every request artifact', async () => {
+  const dumpDir = await mkdtemp(join(tmpdir(), 'credited-direct-retry-'))
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+  const credit = 'fixture_direct_retry_credit_0113'
+  const model = 'claude-sonnet-4-6'
+  const handle = await dumpDirectRequest({
+    affinity: 'session',
+    route: 'oauth',
+    status: 400,
+    bodyText: JSON.stringify({
+      model,
+      max_tokens: 512,
+      stream: true,
+      messages: [
+        { role: 'user', content: 'Continue the story.' },
+        { role: 'assistant', content: [{ type: 'text', text: 'Once upon' }] },
+      ],
+      thread: { type: 'create' },
+      fallback_credit_token: credit,
+    }),
+    error: `Retry rejected: ${credit}`,
+    url: 'https://api.anthropic.com/v1/messages',
+    method: 'POST',
+    headers: { 'x-fixture-credit-echo': credit },
+  })
+  if (!handle) throw new Error('Expected direct retry dump')
+  const files = (await readdir(dumpDir)).sort()
+  const prefix = basename(handle.responsePath, '.response.json')
+  expect(files).toEqual(
+    ['body', 'meta', 'request'].map((kind) => `${prefix}.${kind}.json`),
+  )
+  const artifact = (kind: string) =>
+    readFile(join(dumpDir, `${prefix}.${kind}.json`), 'utf8')
+  const [body, meta, request] = await Promise.all([
+    artifact('body'),
+    artifact('meta'),
+    artifact('request'),
+  ])
+  for (const artifact of [body, meta, request])
+    expect(artifact).not.toContain(credit)
+  expect(JSON.parse(body)).toMatchObject({
+    model,
+    fallback_credit_token: FALLBACK_CREDIT_PLACEHOLDER,
+  })
+  expect(JSON.parse(meta).error).toBe(
+    `Retry rejected: ${FALLBACK_CREDIT_PLACEHOLDER}`,
+  )
+  expect(JSON.parse(request).headers['x-fixture-credit-echo']).toBe(
+    FALLBACK_CREDIT_PLACEHOLDER,
+  )
 })
 
 test('seeds a direct-request diff from the latest same-session dump after restart', async () => {

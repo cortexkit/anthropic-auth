@@ -102,7 +102,7 @@ function warnMirrorOnce(key: string, message: string, options?: MirrorOptions) {
 function warnRefusedFolder(directory: string, options?: MirrorOptions) {
   warnMirrorOnce(
     directory,
-    `Cannot use settings record folder "${directory}"; keeping records beside the settings file.`,
+    `Cannot use settings record folder "${directory}"; keeping records beside the settings file. Make sure this path is a directory owned by your account and accessible only to that account.`,
     options,
   )
 }

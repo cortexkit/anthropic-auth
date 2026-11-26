@@ -23,6 +23,7 @@ import {
   resolveSettingsPaths,
   type SettingsHost,
 } from '../settings-paths.ts'
+import { readSettingsProtectionCopy } from '../settings-protection-copy.ts'
 import { openSettingsService } from '../settings-service.ts'
 import { LEGACY_STATE_LAYOUT } from '../state-layout-paths.ts'
 
@@ -308,7 +309,7 @@ test('release A: EACCES on an existing state folder with no beside marker remain
   }
 })
 
-test('a refused state folder warns once and publishes only beside the settings file', async () => {
+test('a refused state folder warns once and publishes beside markers but not a missing applied copy', async () => {
   const f = await fixture()
   const directory = f.paths.records.state!.directory
   await fs.mkdir(dirname(directory), { recursive: true })
@@ -317,6 +318,9 @@ test('a refused state folder warns once and publishes only beside the settings f
   const started = await f.start()
   expect(started.mode).toBe('user-file')
   expect(started.paths.records.state).toBeUndefined()
+  await expect(
+    readSettingsProtectionCopy(started.paths.records, 'pi'),
+  ).rejects.toThrow('state protection copy')
   const service = await openSettingsService({
     file: started.paths.target,
     records: started.paths.records,
@@ -326,11 +330,12 @@ test('a refused state folder warns once and publishes only beside the settings f
   await service?.dispose()
   await f.start()
   const { beside } = started.paths.records
-  for (const path of [beside.moved, beside.imports.opencode, beside.applied])
+  for (const path of [beside.moved, beside.imports.opencode])
     expect(await absent(path)).toBe(false)
+  expect(await absent(beside.applied)).toBe(true)
   expect(await fs.readFile(directory, 'utf8')).toBe('not a directory')
   expect(f.messages.filter((message) => message.includes(directory))).toEqual([
-    `Cannot use settings record folder "${directory}"; keeping records beside the settings file.`,
+    `Cannot use settings record folder "${directory}"; keeping records beside the settings file. Make sure this path is a directory owned by your account and accessible only to that account.`,
   ])
 })
 

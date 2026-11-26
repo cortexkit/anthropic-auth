@@ -103,24 +103,57 @@ function validEntry(value: unknown): value is StoredProtectionCopyEntry {
   return true
 }
 
-async function readCopy(path: string): Promise<Record<string, unknown>> {
-  const text = await readFile(path, 'utf8')
-  let copy: unknown
-  try {
-    copy = JSON.parse(text)
-  } catch {
-    // Malformed JSON cannot preserve either host's saved values, so let the
-    // writer recreate the copy. Filesystem read errors still propagate.
-    return {}
-  }
-  return record(copy) ? copy : {}
-}
-
 const missingCopy = Symbol('missing protection copy')
+
+async function readCopy(
+  path: string,
+  repairMalformed = false,
+): Promise<Record<string, unknown> | typeof missingCopy> {
+  let text: string
+  try {
+    text = await readFile(path, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      // A dangling symlink still occupies the name and is not an absent copy.
+      try {
+        await lstat(path)
+      } catch (statError) {
+        if ((statError as NodeJS.ErrnoException).code === 'ENOENT')
+          return missingCopy
+        throw statError
+      }
+      if (repairMalformed) return {}
+    }
+    throw error
+  }
+  try {
+    const copy: unknown = JSON.parse(text)
+    if (!record(copy))
+      throw new Error('The applied protection copy is not a host map')
+    return copy
+  } catch (error) {
+    // Malformed JSON cannot preserve either host's saved values, so let the
+    // writer repair its own file, but don't use it as a seed for another copy.
+    if (repairMalformed) return {}
+    throw error
+  }
+}
 
 export class UnknownSettingsStateCopyError extends Error {
   constructor(cause: unknown) {
     super('Could not read the state protection copy', { cause })
+  }
+}
+
+async function readStateCopy<T>(
+  records: SettingsRecordPaths,
+  read: (path: string) => Promise<T>,
+): Promise<T | typeof missingCopy> {
+  try {
+    if (records.stateUnavailable) throw records.stateUnavailable
+    return records.state ? await read(records.state.applied) : missingCopy
+  } catch (cause) {
+    throw new UnknownSettingsStateCopyError(cause)
   }
 }
 
@@ -137,15 +170,10 @@ export async function readSettingsProtectionCopy(
 ): Promise<SettingsProtectionValues | undefined> {
   let entry = await readProtectionEntry(records.beside.applied, host)
   // A beside file with no entry for this host still outranks the mirror.
-  if (entry === missingCopy) {
-    try {
-      if (records.stateUnavailable) throw records.stateUnavailable
-      if (records.state)
-        entry = await readProtectionEntry(records.state.applied, host)
-    } catch (cause) {
-      throw new UnknownSettingsStateCopyError(cause)
-    }
-  }
+  if (entry === missingCopy)
+    entry = await readStateCopy(records, (path) =>
+      readProtectionEntry(path, host),
+    )
   return entry !== missingCopy && entry
     ? {
         ...entry.values,
@@ -159,30 +187,27 @@ async function readProtectionEntry(
   path: string,
   host: SettingsHost,
 ): Promise<StoredProtectionCopyEntry | typeof missingCopy | undefined> {
-  let text: string
-  try {
-    text = await readFile(path, 'utf8')
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      // A dangling symlink still occupies the name and is not an absent copy.
-      try {
-        await lstat(path)
-      } catch (statError) {
-        if ((statError as NodeJS.ErrnoException).code === 'ENOENT')
-          return missingCopy
-        throw statError
-      }
-    }
-    throw error
-  }
-  const copy: unknown = JSON.parse(text)
-  if (!record(copy))
-    throw new Error('The applied protection copy is not a host map')
+  const copy = await readCopy(path)
+  return copy === missingCopy ? missingCopy : protectionEntry(copy, host)
+}
+
+function protectionEntry(copy: Record<string, unknown>, host: SettingsHost) {
   if (!Object.hasOwn(copy, host)) return undefined
   const entry = copy[host]
   if (!validEntry(entry))
     throw new Error('The applied protection copy entry is invalid')
   return entry
+}
+
+function readStateSeed(records: SettingsRecordPaths) {
+  return readStateCopy(records, async (path) => {
+    const copy = await readCopy(path)
+    if (copy !== missingCopy) {
+      protectionEntry(copy, 'opencode')
+      protectionEntry(copy, 'pi')
+    }
+    return copy
+  })
 }
 
 /** Merge only the writer's host while holding the copy's cross-process lock. */
@@ -204,6 +229,7 @@ export async function writeSettingsProtectionCopy(
     stored,
     lockTimeoutMs,
     publication,
+    records,
   )
   const state = records.state?.applied
   if (state)
@@ -218,6 +244,7 @@ async function writeProtectionEntry(
   entry: StoredProtectionCopyEntry,
   lockTimeoutMs: number,
   publication: ReturnType<typeof capturePublicationOptions>,
+  seedFromState?: SettingsRecordPaths,
 ): Promise<void> {
   await withLock(
     path,
@@ -228,21 +255,22 @@ async function writeProtectionEntry(
       renew: true,
     },
     async (lease) => {
-      let copy: Record<string, unknown>
-      try {
-        copy = await readCopy(path)
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-        copy = {}
-      }
+      const current = await readCopy(path, true)
+      const missing = current === missingCopy
+      // Publishing beside makes the mirror invisible to both hosts. Preserve
+      // its entries, or leave the beside copy absent if either is unknown.
+      const seed =
+        missing && seedFromState ? await readStateSeed(seedFromState) : current
+      const copy = seed === missingCopy ? {} : seed
       const previous = copy[host]
       // A newer reader may have committed while this detached task was delayed,
       // even when the two readers belong to different processes of the same host.
-      if (validEntry(previous) && previous.readAt >= entry.readAt) return
+      const superseded = validEntry(previous) && previous.readAt >= entry.readAt
+      if (!missing && superseded) return
       const other = host === 'opencode' ? 'pi' : 'opencode'
       const merged = {
         ...(Object.hasOwn(copy, other) ? { [other]: copy[other] } : {}),
-        [host]: entry,
+        [host]: superseded ? previous : entry,
       }
       const temp = `${path}.${process.pid}.${randomUUID()}.tmp`
       try {
