@@ -94,7 +94,8 @@ function isToolResultOnlyUserMessage(message: Record<string, unknown>) {
  * results; any other user message starts a new turn. Other roles, such as
  * mid-conversation system messages, do not end a turn. A block is kept when
  * removing it would leave its message empty. Returns the number of blocks
- * removed. Reports matching digests even for blocks that stay in the body.
+ * removed. It also reports every block that matches recorded fallback-model
+ * thinking, including blocks it keeps, so a restart can tell a round happened.
  */
 export function stripRecoveryRoundThinking(
   body: Record<string, unknown>,
