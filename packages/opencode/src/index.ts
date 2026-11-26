@@ -4087,6 +4087,7 @@ const anthropicAuthPlugin = async (
     let primeGatewaySecrets: string[] = []
     // The response scope of the latest physical Prime send.
     let physicalScope: ProviderErrorResponseScope | undefined
+    const delivery = { dispatched: false }
     const matches = async (authorization: NativeOAuthAuthorization) =>
       primeAccountMatches(
         evidence,
@@ -4179,9 +4180,12 @@ const anthropicAuthPlugin = async (
           'http',
         )
         physicalScope = scope
-        return scope.redactResponse(
-          await fetchOAuthModel(primeGateway)(primeUrl, primeInit),
+        const response = await fetchOAuthModel(primeGateway)(
+          primeUrl,
+          primeInit,
         )
+        delivery.dispatched = true
+        return scope.redactResponse(response)
       }
       let response = await sendPhysical()
       if (response.status === 401 && scopedAttempt && !signal.aborted) {
@@ -4279,7 +4283,13 @@ const anthropicAuthPlugin = async (
         if (response.status === 401 && scopedAttempt) {
           await reportVault401(scopedAttempt, 'direct')
         }
-        return { ok: false, status: response.status, ms, error: reason }
+        return {
+          ok: false,
+          dispatched: true,
+          status: response.status,
+          ms,
+          error: reason,
+        }
       }
       const data = (await response.json().catch(() => null)) as Record<
         string,
@@ -4314,6 +4324,7 @@ const anthropicAuthPlugin = async (
       scope.dispose()
       return {
         ok: false,
+        ...(delivery.dispatched && { dispatched: true as const }),
         ...(caught instanceof NativeCredentialUnavailableError &&
           caught.tokenRefreshFailed && { reason: 'token-refresh' as const }),
         ms: Math.round(performance.now() - start),

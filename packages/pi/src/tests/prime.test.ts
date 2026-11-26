@@ -50,6 +50,7 @@ let now: number
 let sends: Array<{ headers: Headers; text: string }>
 let polls: number
 let quotaResponse: () => Promise<Response>
+let messageResponse: () => Response
 const intervals = new Set<ReturnType<typeof setInterval>>()
 const timeouts = new Map<
   ReturnType<typeof setTimeout>,
@@ -96,6 +97,8 @@ beforeEach(async () => {
   sends = []
   polls = 0
   quotaResponse = async () => Response.json(quota())
+  messageResponse = () =>
+    Response.json({ usage: { input_tokens: 17, output_tokens: 1 } })
   globalThis.fetch = Object.assign(
     async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       const request =
@@ -149,7 +152,7 @@ beforeEach(async () => {
           },
         )
       }
-      return Response.json({ usage: { input_tokens: 17, output_tokens: 1 } })
+      return messageResponse()
     },
     { preconnect: originalFetch.preconnect },
   )
@@ -264,6 +267,119 @@ test('Pi Prime enabled with a due account fires once through the signed model tr
     (await native.view()).accounts.find((row) => row.id === 'main')?.prime,
   ).toMatchObject({ count: 1, inputTokens: 17, outputTokens: 1 })
   expect([...timeouts.values()].map((timer) => timer.ms)).toEqual([90_000])
+})
+
+for (const changed of [false, true]) {
+  test(`Pi Prime checks the lineage on direct 401 retry (${changed ? 'changed' : 'same'})`, async () => {
+    const native = await fixture()
+    const manager = native.prime!.manager
+    const runtime = await native.service()
+    const evidence = (await manager.options.getAccountEvidence('main'))!
+    messageResponse = () =>
+      sends.length === 1
+        ? new Response('unauthorized', { status: 401 })
+        : Response.json({ usage: { input_tokens: 1, output_tokens: 1 } })
+    const getLineage = runtime.getOrCreateAuthLineage.bind(runtime)
+    let rotatedSubject: unknown
+    const lineage = spyOn(runtime, 'getOrCreateAuthLineage').mockImplementation(
+      (...args) =>
+        changed && args[1] === rotatedSubject
+          ? Promise.resolve('different-auth-lineage')
+          : getLineage(...args),
+    )
+    const retry = spyOn(native, 'retry').mockImplementation(
+      async (_id, rejected) => {
+        if (rejected.source !== 'local') throw new Error('Expected local OAuth')
+        const subject = { ...rejected.admission.subject }
+        rotatedSubject = subject
+        return {
+          ...rejected,
+          admission: {
+            ...rejected.admission,
+            subject,
+            access: 'sk-ant-oat01-rotated-access',
+          },
+        }
+      },
+    )
+    try {
+      const result = await manager.options.sendPrime('main', evidence)
+      expect(retry).toHaveBeenCalledTimes(1)
+      expect(sends.map(({ headers }) => headers.get('authorization'))).toEqual([
+        'Bearer sk-ant-oat01-main-access',
+        ...(!changed ? ['Bearer sk-ant-oat01-rotated-access'] : []),
+      ])
+      expect(result).toMatchObject(
+        changed
+          ? { ok: false, reason: 'account-changed', dispatched: true }
+          : { ok: true },
+      )
+    } finally {
+      retry.mockRestore()
+      lineage.mockRestore()
+    }
+  })
+}
+
+test('Pi Prime sends when authorization fills the UUID absent from the checked view', async () => {
+  const native = await fixture()
+  const manager = native.prime!.manager
+  const evidence = (await manager.options.getAccountEvidence('main'))!
+  const read = native.view.bind(native)
+  let hidIdentity = false
+  const view = spyOn(native, 'view').mockImplementation(async (...args) => {
+    const snapshot = await read(...args)
+    if (!args[1] || hidIdentity) return snapshot
+    hidIdentity = true
+    return {
+      ...snapshot,
+      accounts: snapshot.accounts.map((row) =>
+        row.id === 'main' ? { ...row, accountIdentity: undefined } : row,
+      ),
+    }
+  })
+  try {
+    expect(
+      await manager.options.sendPrime('main', { lineage: evidence.lineage }),
+    ).toMatchObject({ ok: true })
+    expect(hidIdentity).toBe(true)
+    expect(sends).toHaveLength(1)
+    expect(JSON.parse(sends[0]!.text).metadata.user_id).toBeString()
+  } finally {
+    view.mockRestore()
+  }
+})
+
+test('Pi Prime uses direct dispatch even with a configured relay', async () => {
+  const native = await fixture()
+  const runtime = await native.service()
+  const relay = spyOn(runtime, 'getRelayConfig').mockResolvedValue({
+    enabled: true,
+    url: 'https://relay.invalid',
+    token: 'test-relay-token',
+    transport: 'http',
+    fallbackToDirect: true,
+  })
+  const fetch = globalThis.fetch
+  const urls: string[] = []
+  globalThis.fetch = Object.assign(
+    (...[input, init]: Parameters<typeof fetch>) => {
+      urls.push(input instanceof Request ? input.url : String(input))
+      return fetch(input, init)
+    },
+    { preconnect: fetch.preconnect },
+  )
+  try {
+    await native.prime!.manager.tick()
+    expect(relay).toHaveBeenCalled()
+    expect(urls.some((url) => url.startsWith('https://relay.invalid'))).toBe(
+      false,
+    )
+    expect(sends).toHaveLength(1)
+  } finally {
+    globalThis.fetch = fetch
+    relay.mockRestore()
+  }
 })
 
 test.each(['string', 'single-block'] as const)(

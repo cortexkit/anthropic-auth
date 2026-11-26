@@ -23,9 +23,11 @@ import {
 } from '../logger.ts'
 import {
   buildPrimeRequestBody,
+  PRIME_CHECK_THROTTLE_MS,
   PRIME_DUE_OFFSET_MS,
   PRIME_MARKER_MAX_AGE_MS,
   PrimeManager,
+  type PrimeSendResult,
   primeAccountMarkerDir,
   primeMarkerNamespaceDir,
   primeStorageFingerprint,
@@ -84,7 +86,7 @@ function manager(input: {
   now: () => number
   loadStorage: () => Promise<AccountStorage>
   refreshQuota: () => Promise<OAuthQuotaSnapshot>
-  sendPrime: () => Promise<void>
+  sendPrime: () => Promise<void | PrimeSendResult>
   accountLineage?: () => Promise<string>
   accountIdentity?: () => Promise<string | undefined>
 }): PrimeManager {
@@ -101,10 +103,8 @@ function manager(input: {
       quota: await input.refreshQuota(),
       fresh: true,
     }),
-    sendPrime: async () => {
-      await input.sendPrime()
-      return { ok: true, status: 200, ms: 1 }
-    },
+    sendPrime: async () =>
+      (await input.sendPrime()) ?? { ok: true, status: 200, ms: 1 },
     recordSuccess: async () => ({
       count: 1,
       inputTokens: 0,
@@ -241,6 +241,7 @@ describe('PrimeManager storage namespaces', () => {
     test(`verified UUID deduplicates ${window} claims across different stores`, async () => {
       const markerDir = await tempMarkerRoot()
       const reset = Date.now() - PRIME_DUE_OFFSET_MS
+      let now = reset + PRIME_DUE_OFFSET_MS
       const identity = '11111111-1111-4111-8111-111111111111'
       const digest = createHash('sha256').update(identity).digest('hex')
       const config = storage(bootstrap ? undefined : reset)
@@ -252,7 +253,7 @@ describe('PrimeManager storage namespaces', () => {
         manager({
           storagePath,
           markerDir,
-          now: () => reset + PRIME_DUE_OFFSET_MS,
+          now: () => now,
           loadStorage: async () => config,
           refreshQuota: async () => config.quota!.mainQuota ?? {},
           accountLineage: async () =>
@@ -264,6 +265,8 @@ describe('PrimeManager storage namespaces', () => {
         }),
       )
 
+      await Promise.all(instances.map((instance) => instance.tick()))
+      now += PRIME_CHECK_THROTTLE_MS
       await Promise.all(instances.map((instance) => instance.tick()))
 
       expect(fires).toBe(1)
@@ -500,6 +503,175 @@ describe('PrimeManager storage namespaces', () => {
     }
     expect(fires).toBe(1)
   })
+
+  for (const ending of ['account-changed', 'stopped'] as const) {
+    test(`a losing store retries a verified claim abandoned as ${ending}`, async () => {
+      const markerDir = await tempMarkerRoot()
+      let now = Date.now()
+      const epoch = ending === 'stopped' ? undefined : now - PRIME_DUE_OFFSET_MS
+      const config = storage(epoch)
+      const entered = Promise.withResolvers<void>()
+      const release = Promise.withResolvers<void>()
+      const shared = {
+        markerDir,
+        now: () => now,
+        refreshQuota: async () => config.quota!.mainQuota ?? {},
+        accountIdentity: async () => '11111111-1111-4111-8111-111111111111',
+      }
+      let loads = 0
+      let winnerSends = 0
+      let loserSends = 0
+      const winner = manager({
+        ...shared,
+        storagePath: '/config/winner/accounts.json',
+        loadStorage: async () => {
+          if (++loads === 3 && ending === 'stopped') {
+            entered.resolve()
+            await release.promise
+          }
+          return config
+        },
+        sendPrime: async () => {
+          if (ending === 'account-changed') {
+            entered.resolve()
+            await release.promise
+            return { ok: false, reason: 'account-changed', error: 'replaced' }
+          }
+          winnerSends++
+        },
+      })
+      const loser = manager({
+        ...shared,
+        storagePath: '/config/loser/accounts.json',
+        loadStorage: async () => config,
+        sendPrime: async () => {
+          loserSends++
+        },
+      })
+      const winningTick = winner.tick()
+      try {
+        await Promise.race([
+          entered.promise,
+          winningTick.then(() => {
+            throw new Error('Winner never acquired the claim')
+          }),
+        ])
+        await loser.tick()
+        expect(loserSends).toBe(0)
+        const legacyDir = primeAccountMarkerDir(
+          markerDir,
+          loser.options.storagePath,
+          tokenFingerprint(TEST_LINEAGE),
+        )
+        expect(await readdir(legacyDir)).toEqual([
+          `main-${epoch ?? 'bootstrap'}`,
+        ])
+        if (ending === 'stopped') winner.stop()
+      } finally {
+        release.resolve()
+        await winningTick
+      }
+      expect(winnerSends).toBe(0)
+      now += PRIME_CHECK_THROTTLE_MS
+      await loser.tick()
+      await loser.tick()
+      expect(loserSends).toBe(1)
+    })
+  }
+
+  for (const outcome of [
+    'account-changed',
+    'ambiguous',
+    'dispatched',
+  ] as const) {
+    test(`an epoch claim preserves bootstrap until dispatch (${outcome})`, async () => {
+      const markerDir = await tempMarkerRoot()
+      const storagePath = '/config/epoch/accounts.json'
+      let now = Date.now()
+      let epoch: number | undefined
+      const identity = '11111111-1111-4111-8111-111111111111'
+      const digest = createHash('sha256').update(identity).digest('hex')
+      const legacyDir = primeAccountMarkerDir(
+        markerDir,
+        storagePath,
+        tokenFingerprint(TEST_LINEAGE),
+      )
+      const verifiedDir = join(markerDir, 'accounts')
+      const view = () => storage(epoch)
+      let duringSend: string[][] | undefined
+      const mgr = manager({
+        markerDir,
+        storagePath,
+        now: () => now,
+        loadStorage: async () => view(),
+        refreshQuota: async () => view().quota!.mainQuota ?? {},
+        accountIdentity: async () => identity,
+        sendPrime: async () => {
+          if (epoch === undefined) return
+          duringSend = [await readdir(legacyDir), await readdir(verifiedDir)]
+          return {
+            ok: false,
+            reason: outcome === 'ambiguous' ? 'send' : 'account-changed',
+            ...(outcome === 'dispatched' && { dispatched: true }),
+            error: 'not completed',
+          }
+        },
+      })
+      await mgr.tick()
+      epoch = now
+      now += PRIME_DUE_OFFSET_MS
+      await mgr.tick()
+      expect(duringSend?.[0]).toContain('main-bootstrap')
+      expect(duringSend?.[1]).toContain(`${digest}-bootstrap`)
+      const suffixes =
+        outcome === 'account-changed'
+          ? ['bootstrap']
+          : outcome === 'ambiguous'
+            ? ['bootstrap', epoch]
+            : [epoch]
+      expect((await readdir(legacyDir)).sort()).toEqual(
+        suffixes.map((suffix) => `main-${suffix}`).sort(),
+      )
+      expect((await readdir(verifiedDir)).sort()).toEqual(
+        suffixes.map((suffix) => `${digest}-${suffix}`).sort(),
+      )
+    })
+  }
+
+  for (const scope of ['storage', 'verified'] as const) {
+    test(`an unrelated ${scope} filename does not suppress bootstrap`, async () => {
+      const markerDir = await tempMarkerRoot()
+      const storagePath = '/config/bootstrap/accounts.json'
+      const identity = '11111111-1111-4111-8111-111111111111'
+      const digest = createHash('sha256').update(identity).digest('hex')
+      const dir =
+        scope === 'storage'
+          ? primeAccountMarkerDir(
+              markerDir,
+              storagePath,
+              tokenFingerprint(TEST_LINEAGE),
+            )
+          : join(markerDir, 'accounts')
+      const name =
+        scope === 'storage' ? 'main-bootstrap.bak' : `${digest}-not-a-marker`
+      await mkdir(dir, { recursive: true })
+      await writeFile(join(dir, name), '')
+      let sends = 0
+      await manager({
+        markerDir,
+        storagePath,
+        now: Date.now,
+        loadStorage: async () => storage(),
+        refreshQuota: async () => ({}),
+        accountIdentity: async () => identity,
+        sendPrime: async () => {
+          sends++
+        },
+      }).tick()
+      expect(sends).toBe(1)
+      expect(await readdir(dir)).toContain(name)
+    })
+  }
 
   test('disabling after a verified claim releases both owned markers', async () => {
     const markerDir = await tempMarkerRoot()

@@ -17,6 +17,7 @@ export type PiPrimeSendOptions = {
   signal: AbortSignal
   checkAccount: (attempt: PiNativeAttempt) => Promise<void>
   beforeSend: () => Promise<void>
+  onDispatched?: () => void
   onServed: (attempt: PiNativeAttempt) => void
   fetch?: typeof fetch
 }
@@ -156,7 +157,7 @@ class PiPrime {
     const signal = this.abort.signal
     const started = performance.now()
     let response: Response | undefined
-    const binding = { admitted: false, changed: false }
+    const binding = { changed: false, dispatched: false }
     try {
       const send = sendPrimeRequest
       if (!send) throw new Error('Pi Prime transport is unavailable')
@@ -179,11 +180,9 @@ class PiPrime {
               await primeAccountEvidence(runtime, accountId, fence),
             )
           ) {
-            binding.changed = !binding.admitted
+            binding.changed = true
             throw new Error('Pi Prime account changed before dispatch')
           }
-          binding.changed = false
-          binding.admitted = true
         },
         beforeSend: async () => {
           const snapshot = await native.view(signal)
@@ -194,11 +193,15 @@ class PiPrime {
         onServed: (attempt) => {
           served = attempt
         },
+        onDispatched: () => {
+          binding.dispatched = true
+        },
       })
       if (!response.ok || !served)
         return {
           ok: false,
           ...(binding.changed && { reason: 'account-changed' as const }),
+          ...(binding.dispatched && { dispatched: true as const }),
           status: response.status,
           error: 'Pi Prime upstream refused the request',
         }
@@ -223,6 +226,7 @@ class PiPrime {
       return {
         ok: false,
         ...(binding.changed && { reason: 'account-changed' as const }),
+        ...(binding.dispatched && { dispatched: true as const }),
         error: 'Pi Prime was not completed',
         ms: performance.now() - started,
       }

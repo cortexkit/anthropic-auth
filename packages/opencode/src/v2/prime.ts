@@ -56,6 +56,7 @@ export function createNativePrime(options: {
       },
     })
     const started = performance.now()
+    let dispatched = false
     try {
       for (let index = 0; index < 3; index++) {
         abort.signal.throwIfAborted()
@@ -126,6 +127,11 @@ export function createNativePrime(options: {
           }
           const final = new Request(request, { headers })
           const physical = await (options.fetch ?? fetch)(final)
+          dispatched ||=
+            attempt.data?.dispatch !== 'http-relay' ||
+            /^req_[A-Za-z0-9_-]+$/.test(
+              physical.headers.get('request-id') ?? '',
+            )
           // Rewrite each physical response before Prime reads it. The native
           // adapter scrubs error metadata and bodies with the sent credentials
           // and applies Core's 1 MiB error-body limit. Quota classification and
@@ -181,6 +187,7 @@ export function createNativePrime(options: {
             discard(response)
             return {
               ok: false,
+              ...(dispatched && { dispatched: true as const }),
               status,
               ms: performance.now() - started,
               error: 'Native Prime upstream refused the request',
@@ -243,6 +250,7 @@ export function createNativePrime(options: {
     } catch {
       return {
         ok: false,
+        ...(dispatched && { dispatched: true as const }),
         error: 'Native Prime was not completed',
         ms: performance.now() - started,
       }

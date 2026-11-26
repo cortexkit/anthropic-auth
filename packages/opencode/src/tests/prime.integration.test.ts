@@ -306,7 +306,7 @@ describe('claude-prime direct request', () => {
     expect(quotaCalls).toBeGreaterThanOrEqual(1)
   })
 
-  test('main prime uses main OAuth token + Anthropic identity headers', async () => {
+  test('main Prime binds the lineage and signs with the UUID even if the evidence lacks it', async () => {
     const requestStages: string[] = []
     const now = Date.now() - 60_000
     const past = now - 120_000
@@ -402,6 +402,14 @@ describe('claude-prime direct request', () => {
       })
     }
     expect(requestStages).not.toContain('model')
+    const getAccountEvidence = mgr.options.getAccountEvidence
+    mgr.updateOptions({
+      ...mgr.options,
+      getAccountEvidence: async (id) => {
+        const checked = await getAccountEvidence(id)
+        return checked && { lineage: checked.lineage }
+      },
+    })
     await mgr.tick()
 
     await assertPrimeWithPublicDiagnostics(mgr, requestStages, () => {

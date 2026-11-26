@@ -1247,7 +1247,10 @@ async function sendAnthropicRequestAttempt(
       record: (usage?: Record<string, number>) => void,
     ) => void
     onServingModel?: (model: string | undefined) => void
-    prime?: Pick<PiPrimeSendOptions, 'checkAccount' | 'beforeSend' | 'onServed'>
+    prime?: Pick<
+      PiPrimeSendOptions,
+      'checkAccount' | 'beforeSend' | 'onServed' | 'onDispatched'
+    >
   },
   deps: {
     fetch?: typeof fetch
@@ -2404,6 +2407,7 @@ async function sendAnthropicRequestAttempt(
           }
         markRoundSent(attempt)
         raw = await fetchResponse(destination, request)
+        options.prime?.onDispatched?.()
       } catch (error) {
         if (error === replanPiRound) throw error
         if (billing) reportAnthropicBillingFailure(billing)
@@ -2495,6 +2499,7 @@ async function sendAnthropicRequestAttempt(
           // body, since that cancellation may never settle.
           physical.scope?.dispose()
           await response.body?.cancel().catch(() => {})
+          await options.prime?.checkAccount(rotated)
           attempt = rotated
           secret = piAttemptAccessToken(rotated)
           headers.set('authorization', `Bearer ${secret}`)
