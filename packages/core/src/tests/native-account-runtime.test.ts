@@ -172,7 +172,7 @@ test('quota metadata: a cold fallback request proceeds while the main poll fsync
     const quota = await f.runtime.fetchQuota('main', transport)
     expect(quota.five_hour?.remainingPercent).toBe(0)
     await held.staged
-    // The request cannot use a cold fallback until it has a durable credential proof.
+    // The request cannot use the fallback account until its credential check is saved to disk.
     const fallback = await beforeMetadataSyncRelease(
       f.runtime.authorizeLocal('fallback'),
     )

@@ -966,9 +966,11 @@ export async function updateNativeRuntimeMetadata(
             // Never recreate a runtime file that disappeared before we got the lock.
             if (latest === undefined)
               throw new NativeRuntimeError('publication-refused')
-            // Credential, validation and metadata writers share this lock.
-            // The layout mover instead holds the layout and holder locks:
-            // no writer is admitted to its destination before the move commits.
+            // The byte check catches any writer that changed the file since our
+            // read. Credential, validation and metadata writers all take this
+            // lock. The one-time move of the state files to a new folder does
+            // not; it is safe because no process opens a writer on the new
+            // folder until that move has committed (state-layout-move.ts).
             if (!latest.equals(base)) return false
             const fence = async () => {
               try {
