@@ -12,7 +12,10 @@ import {
   type SseEvent,
   SseFrameTooLargeError,
 } from './sse.ts'
-import { copyStreamResponseTiming } from './stream-completion.ts'
+import {
+  copyStreamResponseTiming,
+  incompleteAnthropicStreamError,
+} from './stream-completion.ts'
 
 type Payload = Record<string, unknown>
 
@@ -410,12 +413,13 @@ function createPrefillCapture(maxBytes: number) {
  * response, or `none` with a reason if no retry can supply an answer.
  *
  * No retry, a stale result, or a retry failure before visible content releases
- * the original refusal blocks and terminal frames once. The first retry block
- * start or non-refusing message_delta commits the join; the retry's message_start
- * and the source refusal are dropped. Subsequent retry errors belong to the
- * host stream, not to another attempt. A non-stale refusal after a released
- * tool ends as tool_use, without its refusal blocks or stop_details. Host abort
- * or body cancellation cancels the active read/send without replaying a refusal.
+ * the original refusal blocks and terminal frames once. The first visible retry
+ * block or complete non-refusal terminal pair commits the join; the retry's
+ * message_start and the source refusal are dropped. Subsequent retry errors
+ * belong to the host stream, not to another attempt. A refusal on a current
+ * request can end as tool_use if the host received a complete tool call; the
+ * refusal blocks and stop_details are omitted in that case. Host abort or
+ * body cancellation cancels the active read/send without replaying a refusal.
  */
 export function joinRefusalFallbackStream(
   response: Response,
@@ -649,6 +653,7 @@ export function joinRefusalFallbackStream(
     const retryAbort = new AbortController()
     const retrySignal = AbortSignal.any([abort.signal, retryAbort.signal])
     let committed = false
+    let pendingTerminal: Frame | undefined
     let onCommitted: (() => void) | undefined
     let onFinished: (() => void) | undefined
     const stale = new Error('Stale fallback response')
@@ -696,19 +701,27 @@ export function joinRefusalFallbackStream(
           break
         } else if (frame.type === 'message_delta') {
           if (result.onCompleted) attempt.rememberDelta(frame)
-          const refuses =
-            record(frame.payload?.delta)?.stop_reason === 'refusal'
-          if (refuses && !committed) return false
-          const output = beforeContent()
+          const reason = record(frame.payload?.delta)?.stop_reason
+          if (!committed) {
+            if (reason === 'refusal') return false
+            if (typeof reason === 'string' && reason)
+              pendingTerminal = { ...frame, bytes: frame.bytes.slice() }
+            continue
+          }
+          const output: Uint8Array[] = []
           terminal(attempt, frame, output, {
-            repair: refuses && attempt.releasedTool && isFresh(),
+            repair: reason === 'refusal' && attempt.releasedTool && isFresh(),
             joined: true,
           })
           emit(output)
         } else if (frame.type === 'message_stop') {
+          const output: Uint8Array[] = pendingTerminal ? beforeContent() : []
+          if (pendingTerminal)
+            terminal(attempt, pendingTerminal, output, { joined: true })
           if (committed) {
             complete(attempt, result.onCompleted)
-            emit([frame.bytes])
+            output.push(frame.bytes)
+            emit(output)
           }
           break
         } else if (
@@ -777,7 +790,7 @@ export function joinRefusalFallbackStream(
           await waitForDemand()
           if (next.value.type === 'ping') emit([next.value.bytes])
           else if (next.value.type === 'error' || next.value.event === 'error')
-            source.invalidateCompletion()
+            throw incompleteAnthropicStreamError()
           else if (next.value.type === 'message_stop') {
             source.withhold(terminalKey, next.value)
             sawStop = true

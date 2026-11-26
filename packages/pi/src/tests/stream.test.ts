@@ -86,6 +86,7 @@ describe('Pi client refusal fallback', () => {
     'target exhausted',
     'relay denied',
     'relay allowed',
+    'late mandatory relay',
     'shared routing below quota floor',
   ] as const)(
     '%s preserves the beta and checks the target before retrying',
@@ -222,6 +223,18 @@ describe('Pi client refusal fallback', () => {
             headers: new Headers(envelope?.upstream.headers ?? init?.headers),
           })
           const retry = body.model === target
+          if (scenario === 'late mandatory relay' && sent.length === 1) {
+            expect(url.split('?')[0]).toBe(
+              'https://api.anthropic.com/v1/messages',
+            )
+            await runtime.updateRelay({
+              enabled: true,
+              url: relay,
+              token: 'fixture-relay-token',
+              transport: 'http',
+              fallbackToDirect: false,
+            })
+          }
           return new Response(
             [
               {

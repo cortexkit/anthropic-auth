@@ -2063,10 +2063,6 @@ async function sendAnthropicRequestAttempt(
               routingChoice,
             )
           : await native.authorize(routeId, signal, model, 'serve')
-        const transportBlocked =
-          refusalRetry &&
-          relayedOrigin &&
-          !(await (await native.service()).getRelayConfig())?.fallbackToDirect
         const view = await native.view(signal, model)
         const account = view.accounts.find((row) => row.id === routeId)
         const payer = piBillingPayer(attempt)
@@ -2076,10 +2072,20 @@ async function sendAnthropicRequestAttempt(
           piCredentialId(account) !== payer.credentialId
         )
           return { kind: 'denied' }
+        const currentRelay =
+          refusalRetry && !gateway
+            ? await (await native.service()).getRelayConfig()
+            : null
         const url = resolvedUrl()
         if (!url) return { kind: 'denied' }
         const binding = { ...payer, url }
-        if (transportBlocked) return { kind: 'defer', ...binding }
+        if (
+          refusalRetry &&
+          (relayedOrigin
+            ? !currentRelay?.fallbackToDirect
+            : currentRelay?.fallbackToDirect === false)
+        )
+          return { kind: 'defer', ...binding }
         candidate = attempt
         return {
           kind: 'authorized',

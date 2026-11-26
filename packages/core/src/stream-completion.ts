@@ -120,6 +120,15 @@ export function safeIncompleteStreamDiagnostics(
   }
 }
 
+export function incompleteAnthropicStreamError() {
+  return Object.assign(
+    new Error(
+      'Anthropic connection reset: stream ended before message_stop (ECONNRESET)',
+    ),
+    { code: 'ECONNRESET', syscall: 'anthropic-sse' },
+  )
+}
+
 /** EOF requires a complete message_stop or an explicit protocol error. */
 export function createAnthropicStreamCompletion(response: Response) {
   const framer = createSseFramer()
@@ -190,12 +199,7 @@ export function createAnthropicStreamCompletion(response: Response) {
       logger.warn('stream', 'Anthropic connection closed before message_stop', {
         ...diagnostics,
       })
-      return Object.assign(
-        new Error(
-          'Anthropic connection reset: stream ended before message_stop (ECONNRESET)',
-        ),
-        { code: 'ECONNRESET', syscall: 'anthropic-sse', diagnostics },
-      )
+      return Object.assign(incompleteAnthropicStreamError(), { diagnostics })
     },
   }
 }

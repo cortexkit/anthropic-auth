@@ -687,112 +687,122 @@ describe('auth.loader', () => {
     expect(sends).toEqual(['claude-fable-5-2', 'claude-fable-5-2'])
   })
 
-  test.each(['relay denied', 'relay allowed', 'late killswitch'] as const)(
-    'OC1 refusal retry: %s',
-    async (scenario) => {
-      const relay = 'https://relay.example.test/'
-      await useTempAccountFile(
-        createFallbackStorage({
-          accounts: [],
-          quota: { enabled: false },
-        }),
-      )
-      const sent: Array<[string, string]> = []
-      globalThis.fetch = mock(
-        withNativeAdmission(
-          (input: string | URL | Request, init?: RequestInit) => {
-            const url = extractUrl(input)
-            if (url !== relay && !url.includes('/v1/messages'))
-              return Response.json({})
-            const wire = JSON.parse(String(init?.body))
-            const body = url === relay ? JSON.parse(wire.body) : wire
-            sent.push([url.split('?')[0]!, body.model])
-            return refusalThinkingReply(body.model)
+  test.each([
+    'relay denied',
+    'relay allowed',
+    'late mandatory relay',
+    'late killswitch',
+  ] as const)('OC1 refusal retry: %s', async (scenario) => {
+    const relay = 'https://relay.example.test/'
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: false },
+      }),
+    )
+    const sent: Array<[string, string]> = []
+    globalThis.fetch = mock(
+      withNativeAdmission(
+        (input: string | URL | Request, init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url !== relay && !url.includes('/v1/messages'))
+            return Response.json({})
+          const wire = JSON.parse(String(init?.body))
+          const body = url === relay ? JSON.parse(wire.body) : wire
+          sent.push([url.split('?')[0]!, body.model])
+          return refusalThinkingReply(body.model)
+        },
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const runtime = getPluginTestHandles(plugin).nativeAccounts
+    const read = runtime.read.bind(runtime)
+    let retryReads = 0
+    let armed = false
+    let killswitch = false
+    const readSpy = spyOn(runtime, 'read').mockImplementation(
+      async (...args) => {
+        const snapshot = await read(...args)
+        if (!killswitch) return snapshot
+        const checkedAt = Date.now()
+        return {
+          ...snapshot,
+          policyStorage: {
+            ...snapshot.policyStorage,
+            killswitch: { enabled: true, main: { five_hour: 20 } },
           },
-        ),
-      ) as unknown as typeof fetch
-      const plugin = await getPlugin()
-      const runtime = getPluginTestHandles(plugin).nativeAccounts
-      const read = runtime.read.bind(runtime)
-      let retryReads = 0
-      let armed = false
-      let killswitch = false
-      const readSpy = spyOn(runtime, 'read').mockImplementation(
-        async (...args) => {
-          const snapshot = await read(...args)
-          if (!killswitch) return snapshot
-          const checkedAt = Date.now()
-          return {
-            ...snapshot,
-            policyStorage: {
-              ...snapshot.policyStorage,
-              killswitch: { enabled: true, main: { five_hour: 20 } },
-            },
-            accounts: snapshot.accounts.map((account) =>
-              account.id === 'main'
-                ? {
-                    ...account,
-                    quota: {
-                      ...account.quota,
+          accounts: snapshot.accounts.map((account) =>
+            account.id === 'main'
+              ? {
+                  ...account,
+                  quota: {
+                    ...account.quota,
+                    checkedAt,
+                    five_hour: {
                       checkedAt,
-                      five_hour: {
-                        checkedAt,
-                        usedPercent: 90,
-                        remainingPercent: 10,
-                      },
+                      usedPercent: 90,
+                      remainingPercent: 10,
                     },
-                  }
-                : account,
-            ),
-          }
-        },
-      )
-      getBodyLifetime(testContext).deferCleanup(() => readSpy.mockRestore())
-      const host = await plugin.auth.loader(
-        async () => {
-          if (scenario === 'late killswitch' && armed && ++retryReads === 2)
-            killswitch = true
-          return { type: 'oauth', ...syntheticMainHostAuth() }
-        },
-        { models: {} },
-      )
-      const relayed = scenario.startsWith('relay')
-      if (relayed)
-        await updatePoolRelay(testContext, {
-          enabled: true,
-          url: relay,
-          token: 'fixture-relay-token',
-          transport: 'http',
-          fallbackToDirect: scenario === 'relay allowed',
-        })
-      const response = await host.fetch(MESSAGES_URL, {
-        method: 'POST',
-        headers: {
-          'x-session-affinity': `ses_refusal_admission_${scenario.replaceAll(' ', '_')}`,
-        },
-        body: JSON.stringify({
-          model: SOURCE_MODEL,
-          stream: true,
-          max_tokens: 256,
-          messages: [{ role: 'user', content: 'hello' }],
-        }),
+                  },
+                }
+              : account,
+          ),
+        }
+      },
+    )
+    getBodyLifetime(testContext).deferCleanup(() => readSpy.mockRestore())
+    const host = await plugin.auth.loader(
+      async () => {
+        if (scenario === 'late killswitch' && armed && ++retryReads === 2)
+          killswitch = true
+        return { type: 'oauth', ...syntheticMainHostAuth() }
+      },
+      { models: {} },
+    )
+    const relayed = scenario.startsWith('relay')
+    if (relayed)
+      await updatePoolRelay(testContext, {
+        enabled: true,
+        url: relay,
+        token: 'fixture-relay-token',
+        transport: 'http',
+        fallbackToDirect: scenario === 'relay allowed',
       })
-      expect(sent[0]).toEqual([relayed ? relay : MESSAGES_URL, SOURCE_MODEL])
-      armed = true
-      const text = await response.text()
-      if (scenario === 'late killswitch') expect(killswitch).toBe(true)
-      const permitted = scenario === 'relay allowed'
-      expect(text).toContain(
-        permitted ? TARGET_SIGNATURE : '"stop_reason":"refusal"',
-      )
-      expect(sent).toEqual([
-        [relayed ? relay : MESSAGES_URL, SOURCE_MODEL],
-        ...(permitted
-          ? [[MESSAGES_URL, 'claude-opus-5'] as [string, string]]
-          : []),
-      ])
-    },
-  )
+    const response = await host.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: {
+        'x-session-affinity': `ses_refusal_admission_${scenario.replaceAll(' ', '_')}`,
+      },
+      body: JSON.stringify({
+        model: SOURCE_MODEL,
+        stream: true,
+        max_tokens: 256,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+    expect(sent[0]).toEqual([relayed ? relay : MESSAGES_URL, SOURCE_MODEL])
+    if (scenario === 'late mandatory relay')
+      await updatePoolRelay(testContext, {
+        enabled: true,
+        url: relay,
+        token: 'fixture-relay-token',
+        transport: 'http',
+        fallbackToDirect: false,
+      })
+    armed = true
+    const text = await response.text()
+    if (scenario === 'late killswitch') expect(killswitch).toBe(true)
+    const permitted = scenario === 'relay allowed'
+    expect(text).toContain(
+      permitted ? TARGET_SIGNATURE : '"stop_reason":"refusal"',
+    )
+    expect(sent).toEqual([
+      [relayed ? relay : MESSAGES_URL, SOURCE_MODEL],
+      ...(permitted
+        ? [[MESSAGES_URL, 'claude-opus-5'] as [string, string]]
+        : []),
+    ])
+  })
 
   test.each(['killswitch', 'model scope'] as const)(
     'OC1 final read blocks the target-400 source resend on a late %s change',

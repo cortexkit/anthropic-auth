@@ -8005,11 +8005,6 @@ const anthropicAuthPlugin = async (
                     'serve',
                   )
                   await requireCurrentNativeActivation(separateLocalLogin)
-                  const transportBlocked =
-                    protectedOrigin &&
-                    (!relayConfig?.fallbackToDirect ||
-                      !(await nativeAccounts.getRelayConfig())
-                        ?.fallbackToDirect)
                   const snapshot = await nativeAccounts.read(model)
                   const account = snapshot.accounts.find(
                     (row) => row.id === oauthAccountId,
@@ -8037,6 +8032,12 @@ const anthropicAuthPlugin = async (
                     !targetModelAllowed(quota, policy, model)
                   )
                     return { kind: 'denied' }
+                  const currentRelay =
+                    !resend &&
+                    !gateway &&
+                    (!protectedOrigin || relayConfig?.fallbackToDirect)
+                      ? await nativeAccounts.getRelayConfig()
+                      : null
                   const binding = {
                     accountId: resend
                       ? oauthAccountId
@@ -8044,7 +8045,13 @@ const anthropicAuthPlugin = async (
                     credentialId: candidate.credentialId,
                     url: finalUrl(currentGateway()),
                   }
-                  if (transportBlocked) return { kind: 'defer', ...binding }
+                  if (
+                    !resend &&
+                    (protectedOrigin
+                      ? !currentRelay?.fallbackToDirect
+                      : currentRelay?.fallbackToDirect === false)
+                  )
+                    return { kind: 'defer', ...binding }
                   retryAuthorization = candidate
                   return {
                     kind: 'authorized',

@@ -59,6 +59,11 @@ const endTurn: Payload = {
   delta: { stop_reason: 'end_turn' },
   usage: { output_tokens: 29 },
 }
+const usageOnly: Payload = {
+  type: 'message_delta',
+  delta: { stop_reason: null },
+  usage: { output_tokens: 23 },
+}
 const ping: Payload = { type: 'ping' }
 const refusalBlock = (index: number) =>
   block(index, 'refusal', { text: 'Cannot continue.' })
@@ -329,6 +334,28 @@ for (const [label, retry] of [
   ['retry error event', () => joinedRetry(response(start(targetModel), error))],
   ['retry EOF', () => joinedRetry(response(start(targetModel)))],
   [
+    'retry usage then EOF',
+    () => joinedRetry(response(start(targetModel), usageOnly)),
+  ],
+  [
+    'retry terminal delta then EOF',
+    () => joinedRetry(response(start(targetModel), endTurn)),
+  ],
+  [
+    'retry usage then refusal behind a held block',
+    () =>
+      joinedRetry(
+        response(
+          start(targetModel),
+          usageOnly,
+          refusalBlock(0),
+          blockStop(0),
+          refused({ category: 'retry' }),
+          stop,
+        ),
+      ),
+  ],
+  [
     'retry refuses behind held refusal and tool blocks',
     () =>
       joinedRetry(
@@ -355,6 +382,47 @@ for (const [label, retry] of [
     ).toEqual(standingWithText)
   })
 }
+
+test('a completed retry can commit without visible content', async () => {
+  const output = joinRefusalFallbackStream(response(...refusalWithText), {
+    ...baseOptions,
+    retry: () =>
+      joinedRetry(response(start(targetModel), usageOnly, endTurn, stop)),
+  })
+  expect(await events(output)).toEqual([
+    start(sourceModel),
+    text(0),
+    textDelta(0, 'Source'),
+    blockStop(0),
+    expect.objectContaining({ type: 'message_delta', delta: endTurn.delta }),
+    stop,
+  ])
+})
+
+test.each([false, true])(
+  'a source refusal followed by an SSE error and EOF rejects after released tool: %s',
+  async (releasedTool) => {
+    const source = response(
+      start(sourceModel),
+      ...(releasedTool ? [tool(0), toolInput(0), blockStop(0)] : []),
+      refused(),
+      error,
+    )
+    const reader = joinRefusalFallbackStream(
+      source,
+      baseOptions,
+    ).body!.getReader()
+    expect(await readChunk(reader)).toBe(wire(start(sourceModel)))
+    if (releasedTool)
+      expect(await readChunk(reader)).toBe(
+        [tool(0), toolInput(0), blockStop(0)].map(wire).join(''),
+      )
+    await expect(reader.read()).rejects.toMatchObject({
+      code: 'ECONNRESET',
+      syscall: 'anthropic-sse',
+    })
+  },
+)
 
 test('a non-refusing end_turn releases a refusal block before its unchanged message_delta', async () => {
   const output = joinRefusalFallbackStream(
