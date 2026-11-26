@@ -1,5 +1,5 @@
 import { expect } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -7,6 +7,7 @@ import {
   createNativeAccountRuntime,
   createNativePoolStore,
   type NativeAccountRuntime,
+  primeAccountMarkerDir,
   resolveNativePoolPaths,
   runNativeMigration,
 } from '@cortexkit/anthropic-auth-core'
@@ -20,15 +21,15 @@ import { createNativeAnthropicSource } from '../v2/source.ts'
 const { test, deferCleanup } = createTestLifetimeSuite()
 
 const IDENTITY = '11111111-2222-4333-8444-555555555555'
+const OTHER_IDENTITY = '22222222-2222-4333-8444-555555555555'
 const ACCESS = 'sk-ant-oat01-primeFingerprintSyntheticAccess0123'
+const SUCCESSOR = {
+  access: 'sk-ant-oat01-primeFingerprintSyntheticSuccessor',
+  refresh: 'primeFingerprintSyntheticSuccessorRefresh',
+}
 const DAY = 24 * 60 * 60_000
 
-// A due OpenCode 2 account must fire exactly once through the real Prime
-// manager: the first tick claims and sends, the second tick sees the claim
-// and skips. With the raw lineage UUID the marker folder rejects the
-// fingerprint before any refresh or send, so this test sends 0 without the
-// hash and 1 with it.
-test('a due OC2 account fires once through the real Prime manager', async () => {
+async function fixture() {
   const directory = await mkdtemp(join(tmpdir(), 'oc2-prime-fingerprint-'))
   deferCleanup(() => rm(directory, { recursive: true, force: true }))
   const paths = await resolveNativePoolPaths(
@@ -56,6 +57,7 @@ test('a due OC2 account fires once through the real Prime manager', async () => 
     removePiAnthropicAuth: false,
   })
   const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+  deferCleanup(() => store.close())
   await store.add({
     id: 'primary-row',
     identity: IDENTITY,
@@ -101,18 +103,23 @@ test('a due OC2 account fires once through the real Prime manager', async () => 
     }),
     { mode: 0o600 },
   )
+  let successorIdentity = IDENTITY
   const runtime: NativeAccountRuntime = createNativeAccountRuntime({
     paths,
     host: 'opencode',
     local: {
-      resolveIdentity: async () => ({
+      resolveIdentity: async (access) => ({
         deviceId: 'synthetic-device',
         sessionId: 'synthetic-session',
-        accountUuid: IDENTITY as never,
+        accountUuid: (access === SUCCESSOR.access
+          ? successorIdentity
+          : IDENTITY) as never,
       }),
-      refreshToken: async () => {
-        throw new Error('The fingerprint fixture never refreshes')
-      },
+      refreshToken: async () => ({
+        ...SUCCESSOR,
+        expires: Date.now() + DAY,
+        expiresIn: DAY / 1000,
+      }),
     },
     vault: {
       env: {
@@ -132,7 +139,7 @@ test('a due OC2 account fires once through the real Prime manager', async () => 
   // The quota poll answers with a past five-hour reset, so the tick treats a
   // missing stored reset as due and fires instead of recording window-active.
   const pastReset = new Date(Date.now() - 120_000).toISOString()
-  let messageSends = 0
+  const tokens: Array<string | null> = []
   const countingFetch: typeof fetch = Object.assign(
     async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       const request =
@@ -145,7 +152,7 @@ test('a due OC2 account fires once through the real Prime manager', async () => 
         })
       if (url.pathname !== '/v1/messages')
         throw new Error(`Prime fingerprint test refused ${url.pathname}`)
-      messageSends += 1
+      tokens.push(request.headers.get('authorization'))
       await request.arrayBuffer().catch(() => {})
       return Response.json(
         {
@@ -182,24 +189,103 @@ test('a due OC2 account fires once through the real Prime manager', async () => 
     fetch: countingFetch,
   })
   deferCleanup(() => prime.dispose())
-  prime.manager.updateOptions({
-    ...prime.manager.options,
-    markerDir: join(directory, 'prime-markers'),
-  })
+  const markerDir = join(directory, 'prime-markers')
+  prime.manager.updateOptions({ ...prime.manager.options, markerDir })
+  return {
+    manager: prime.manager,
+    markerDir,
+    tokens,
+    runtime,
+    async replace(identity: string) {
+      successorIdentity = identity
+      await store.replace(
+        'primary-row',
+        { type: 'oauth', ...SUCCESSOR, expires: Date.now() + DAY },
+        { identity },
+      )
+    },
+  }
+}
+
+test('a due OC2 account fires once through the real Prime manager', async () => {
+  const { manager, tokens, runtime } = await fixture()
 
   // The manager hashes the lineage before using it as a marker folder name.
-  const fingerprint = await prime.manager.options.getAccountFingerprint('main')
+  const evidence = await manager.options.getAccountEvidence('main')
+  const fingerprint = evidence && tokenFingerprint(evidence.lineage)
   expect(fingerprint).toMatch(/^[a-f0-9]{16}$/)
-  expect(await prime.manager.options.getAccountIdentity?.('main')).toBe(
-    IDENTITY,
-  )
+  expect(evidence?.accountIdentity).toBe(IDENTITY)
 
-  await prime.manager.tick()
-  await prime.manager.tick()
+  await manager.tick()
+  await manager.tick()
 
-  expect(messageSends).toBe(1)
+  expect(tokens).toEqual([`Bearer ${ACCESS}`])
   const account = (await runtime.read()).accounts.find(
     (row) => row.id === 'main',
   )
   expect(account?.prime?.count).toBe(1)
+})
+
+for (const stage of ['after evidence', 'after claim'] as const) {
+  test(`OC2 Prime refuses a slot replacement ${stage} and releases its claims`, async () => {
+    const { manager, markerDir, tokens, replace } = await fixture()
+    const options = manager.options
+    const original = (await options.getAccountEvidence('main'))!
+    const storageDir = primeAccountMarkerDir(
+      markerDir,
+      options.storagePath,
+      tokenFingerprint(original.lineage),
+    )
+    const verifiedDir = join(markerDir, 'accounts')
+    let replaced = false
+    manager.updateOptions({
+      ...options,
+      async getAccountEvidence(accountId) {
+        const evidence = await options.getAccountEvidence(accountId)
+        if (!replaced && stage === 'after evidence') {
+          replaced = true
+          await replace(OTHER_IDENTITY)
+        }
+        return evidence
+      },
+      async sendPrime(accountId, evidence) {
+        if (!replaced && stage === 'after claim') {
+          expect(await readdir(storageDir)).toHaveLength(1)
+          expect(await readdir(verifiedDir)).toHaveLength(1)
+          replaced = true
+          // Re-signing in as the same Claude account still replaces lineage.
+          await replace(IDENTITY)
+        }
+        return options.sendPrime(accountId, evidence)
+      },
+    })
+    await manager.tick()
+    expect(replaced).toBe(true)
+    expect(tokens).toEqual([])
+    expect(await readdir(storageDir)).toEqual([])
+    expect(await readdir(verifiedDir)).toEqual([])
+
+    await manager.tick()
+    expect(tokens).toEqual([`Bearer ${SUCCESSOR.access}`])
+  })
+}
+
+test('OC2 Prime uses a refreshed token for the same binding after claiming', async () => {
+  const { manager, tokens, runtime } = await fixture()
+  const options = manager.options
+  let rotated = false
+  manager.updateOptions({
+    ...options,
+    async sendPrime(accountId, evidence) {
+      const successor = await runtime.authorizeLocal(accountId, {
+        intent: 'refresh',
+      })
+      rotated =
+        successor.status === 'usable' && successor.access === SUCCESSOR.access
+      return options.sendPrime(accountId, evidence)
+    },
+  })
+  await manager.tick()
+  expect(rotated).toBe(true)
+  expect(tokens).toEqual([`Bearer ${SUCCESSOR.access}`])
 })

@@ -389,9 +389,19 @@ describe('claude-prime direct request', () => {
     const mgr = getPluginTestHandles(plugin).primeManager
     if (!(mgr instanceof Core.PrimeManager))
       throw new Error('Expected the native Prime manager')
-    expect(await mgr.options.getAccountIdentity?.('main')).toBe(
-      syntheticMainAccountUuid,
-    )
+    const evidence = await mgr.options.getAccountEvidence('main')
+    expect(evidence?.accountIdentity).toBe(syntheticMainAccountUuid)
+    if (!evidence) throw new Error('Expected a bound Prime account')
+    for (const changed of [
+      { ...evidence, lineage: crypto.randomUUID() },
+      { ...evidence, accountIdentity: crypto.randomUUID() },
+    ]) {
+      expect(await mgr.options.sendPrime('main', changed)).toMatchObject({
+        ok: false,
+        reason: 'account-changed',
+      })
+    }
+    expect(requestStages).not.toContain('model')
     await mgr.tick()
 
     await assertPrimeWithPublicDiagnostics(mgr, requestStages, () => {

@@ -55,7 +55,7 @@ function options(input: {
   return {
     storagePath: input.storagePath,
     markerDir: input.markerDir,
-    getAccountFingerprint: async () => '0123456789abcdef',
+    getAccountEvidence: async () => ({ lineage: '0123456789abcdef' }),
     now: () => input.reset + PRIME_DUE_OFFSET_MS,
     loadStorage: async () => snapshot,
     refreshQuota: async () => ({

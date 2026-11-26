@@ -339,7 +339,7 @@ describe('dispose stops per-instance background services', () => {
 describe('prime manager adoption leases', () => {
   const storageOptions = (path: string): PrimeManagerOptions => ({
     storagePath: path,
-    getAccountFingerprint: async () => '0123456789abcdef',
+    getAccountEvidence: async () => ({ lineage: '0123456789abcdef' }),
     loadStorage: async () => null,
     refreshQuota: async () => ({
       quota: {

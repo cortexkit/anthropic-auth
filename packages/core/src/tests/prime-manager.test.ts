@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import {
+  chmod,
+  lstat,
   mkdir,
   mkdtemp,
   readdir,
@@ -28,6 +30,9 @@ import {
   primeMarkerNamespaceDir,
   primeStorageFingerprint,
 } from '../prime.ts'
+import { tokenFingerprint } from '../token-fingerprint.ts'
+
+const TEST_LINEAGE = '0123456789abcdef'
 
 const tempDirs: string[] = []
 const managers: PrimeManager[] = []
@@ -80,7 +85,7 @@ function manager(input: {
   loadStorage: () => Promise<AccountStorage>
   refreshQuota: () => Promise<OAuthQuotaSnapshot>
   sendPrime: () => Promise<void>
-  accountFingerprint?: () => Promise<string>
+  accountLineage?: () => Promise<string>
   accountIdentity?: () => Promise<string | undefined>
 }): PrimeManager {
   const instance = new PrimeManager({
@@ -88,9 +93,10 @@ function manager(input: {
     markerDir: input.markerDir,
     now: input.now,
     loadStorage: input.loadStorage,
-    getAccountFingerprint:
-      input.accountFingerprint ?? (async () => '0123456789abcdef'),
-    getAccountIdentity: input.accountIdentity,
+    getAccountEvidence: async () => ({
+      lineage: (await input.accountLineage?.()) ?? TEST_LINEAGE,
+      accountIdentity: await input.accountIdentity?.(),
+    }),
     refreshQuota: async () => ({
       quota: await input.refreshQuota(),
       fresh: true,
@@ -249,7 +255,7 @@ describe('PrimeManager storage namespaces', () => {
           now: () => reset + PRIME_DUE_OFFSET_MS,
           loadStorage: async () => config,
           refreshQuota: async () => config.quota!.mainQuota ?? {},
-          accountFingerprint: async () =>
+          accountLineage: async () =>
             index === 0 ? 'aaaaaaaaaaaaaaaa' : 'bbbbbbbbbbbbbbbb',
           accountIdentity: async () => identity,
           sendPrime: async () => {
@@ -268,7 +274,9 @@ describe('PrimeManager storage namespaces', () => {
         const legacyDir = primeAccountMarkerDir(
           markerDir,
           instance.options.storagePath,
-          (await instance.options.getAccountFingerprint('main'))!,
+          tokenFingerprint(
+            (await instance.options.getAccountEvidence('main'))!.lineage,
+          ),
         )
         expect(await readdir(legacyDir)).toEqual([
           `main-${bootstrap ? 'bootstrap' : reset}`,
@@ -312,7 +320,7 @@ describe('PrimeManager storage namespaces', () => {
       const legacyDir = primeAccountMarkerDir(
         markerDir,
         storagePath,
-        '0123456789abcdef',
+        tokenFingerprint(TEST_LINEAGE),
       )
       let fires = 0
       await manager({
@@ -352,18 +360,19 @@ describe('PrimeManager storage namespaces', () => {
       .update('11111111-1111-4111-8111-111111111111')
       .digest('hex')
     await mkdir(accountDir)
-    for (const suffix of ['1', 'bootstrap', 'fresh']) {
+    for (const suffix of ['1', 'bootstrap', '2', 'not-a-marker']) {
       const path = join(accountDir, `${digest}-${suffix}`)
       await writeFile(path, '')
       const age =
-        suffix === 'fresh'
+        suffix === '2'
           ? PRIME_MARKER_MAX_AGE_MS - 1_000
           : PRIME_MARKER_MAX_AGE_MS + 1_000
       const modified = new Date(now - age)
       await utimes(path, modified, modified)
     }
     const config = storage()
-    config.prime!.enabled = false
+    config.accounts = []
+    config.main = undefined
 
     await manager({
       storagePath: '/config/sweep/accounts.json',
@@ -374,8 +383,102 @@ describe('PrimeManager storage namespaces', () => {
       sendPrime: async () => {},
     }).tick()
 
-    expect(await readdir(accountDir)).toEqual([`${digest}-fresh`])
+    expect((await readdir(accountDir)).sort()).toEqual([
+      `${digest}-2`,
+      `${digest}-not-a-marker`,
+    ])
   })
+
+  test('a disabled tick does not sweep markers', async () => {
+    const markerDir = await tempMarkerRoot()
+    const storagePath = join(markerDir, 'accounts.json')
+    const accountDir = primeAccountMarkerDir(
+      markerDir,
+      storagePath,
+      tokenFingerprint(TEST_LINEAGE),
+    )
+    await mkdir(accountDir, { recursive: true })
+    const marker = join(accountDir, 'main-bootstrap')
+    await writeFile(marker, '')
+    const old = new Date(Date.now() - PRIME_MARKER_MAX_AGE_MS - 1_000)
+    await utimes(marker, old, old)
+    await manager({
+      markerDir,
+      storagePath,
+      now: Date.now,
+      loadStorage: async () => ({ ...storage(), prime: { enabled: false } }),
+      refreshQuota: async () => ({}),
+      sendPrime: async () => {},
+    }).tick()
+    expect(await readdir(accountDir)).toEqual(['main-bootstrap'])
+  })
+
+  test.skipIf(process.platform === 'win32')(
+    'sweep ignores links, unrelated directories and unrelated files',
+    async () => {
+      const markerDir = await tempMarkerRoot()
+      const outside = await tempMarkerRoot()
+      const storagePath = join(markerDir, 'accounts.json')
+      const namespace = primeMarkerNamespaceDir(markerDir, storagePath)
+      const accountDir = join(namespace, '123456abcdef')
+      const unrelatedDir = join(namespace, 'unrelated')
+      await mkdir(accountDir, { recursive: true })
+      await mkdir(unrelatedDir)
+      await symlink(outside, join(namespace, '987654abcdef'), 'dir')
+      const old = new Date(Date.now() - PRIME_MARKER_MAX_AGE_MS - 1_000)
+      for (const path of [
+        join(accountDir, 'fallback%2Fone-12345'),
+        join(accountDir, 'keep.txt'),
+        join(unrelatedDir, 'main-bootstrap'),
+        join(outside, 'main-bootstrap'),
+      ]) {
+        await writeFile(path, '')
+        await utimes(path, old, old)
+      }
+      await manager({
+        markerDir,
+        storagePath,
+        now: Date.now,
+        loadStorage: async () => storage(Date.now()),
+        refreshQuota: async () => ({}),
+        sendPrime: async () => {},
+      }).tick()
+      expect(await readdir(accountDir)).toEqual(['keep.txt'])
+      expect(await readdir(unrelatedDir)).toEqual(['main-bootstrap'])
+      expect(await readdir(outside)).toEqual(['main-bootstrap'])
+    },
+  )
+
+  test.skipIf(process.platform === 'win32')(
+    'Prime tightens an owned marker root and refuses a writable or linked root',
+    async () => {
+      const root = await tempMarkerRoot()
+      const target = await tempMarkerRoot()
+      const link = join(root, 'linked-markers')
+      await symlink(target, link, 'dir')
+      let sends = 0
+      const tick = (markerDir: string) =>
+        manager({
+          markerDir,
+          storagePath: join(root, 'accounts.json'),
+          now: Date.now,
+          loadStorage: async () => storage(),
+          refreshQuota: async () => ({}),
+          sendPrime: async () => {
+            sends++
+          },
+        }).tick()
+      await chmod(target, 0o777)
+      await tick(target)
+      await tick(link)
+      expect(await readdir(target)).toEqual([])
+      expect(sends).toBe(0)
+      await chmod(target, 0o755)
+      await tick(target)
+      expect((await lstat(target)).mode & 0o777).toBe(0o700)
+      expect(sends).toBe(1)
+    },
+  )
 
   test('a verified epoch claim blocks a stale bootstrap view in another store', async () => {
     const markerDir = await tempMarkerRoot()
@@ -427,7 +530,7 @@ describe('PrimeManager storage namespaces', () => {
         primeAccountMarkerDir(
           markerDir,
           mgr.options.storagePath,
-          '0123456789abcdef',
+          tokenFingerprint(TEST_LINEAGE),
         ),
       ),
     ).toEqual([])
@@ -466,7 +569,7 @@ describe('PrimeManager storage namespaces', () => {
       now: () => reset + PRIME_DUE_OFFSET_MS,
       loadStorage: async () => storage(reset),
       refreshQuota: async () => storage(reset).quota!.mainQuota!,
-      accountFingerprint: async () => accountFingerprint,
+      accountLineage: async () => accountFingerprint,
       sendPrime: async () => {
         fires += 1
       },
@@ -478,8 +581,14 @@ describe('PrimeManager storage namespaces', () => {
 
     expect(fires).toBe(2)
     const namespaceDir = primeMarkerNamespaceDir(markerDir, storagePath)
-    const oldIdentityDir = join(namespaceDir, 'aaaaaaaaaaaa')
-    const newIdentityDir = join(namespaceDir, 'bbbbbbbbbbbb')
+    const oldIdentityDir = join(
+      namespaceDir,
+      tokenFingerprint('aaaaaaaaaaaaaaaa').slice(0, 12),
+    )
+    const newIdentityDir = join(
+      namespaceDir,
+      tokenFingerprint('bbbbbbbbbbbbbbbb').slice(0, 12),
+    )
     expect(await readdir(oldIdentityDir)).toEqual([`main-${reset}`])
     expect(await readdir(newIdentityDir)).toEqual([`main-${reset}`])
 
@@ -505,7 +614,7 @@ describe('PrimeManager storage namespaces', () => {
       now: () => Date.now(),
       loadStorage: async () => storage(),
       refreshQuota: async () => ({}),
-      accountFingerprint: async () => accountFingerprint,
+      accountLineage: async () => accountFingerprint,
       sendPrime: async () => {
         fires += 1
       },
@@ -517,12 +626,16 @@ describe('PrimeManager storage namespaces', () => {
 
     expect(fires).toBe(2)
     const namespaceDir = primeMarkerNamespaceDir(markerDir, storagePath)
-    expect(await readdir(join(namespaceDir, 'aaaaaaaaaaaa'))).toEqual([
-      'main-bootstrap',
-    ])
-    expect(await readdir(join(namespaceDir, 'bbbbbbbbbbbb'))).toEqual([
-      'main-bootstrap',
-    ])
+    expect(
+      await readdir(
+        join(namespaceDir, tokenFingerprint('aaaaaaaaaaaaaaaa').slice(0, 12)),
+      ),
+    ).toEqual(['main-bootstrap'])
+    expect(
+      await readdir(
+        join(namespaceDir, tokenFingerprint('bbbbbbbbbbbbbbbb').slice(0, 12)),
+      ),
+    ).toEqual(['main-bootstrap'])
   })
 
   test('bootstrap sentinels do not cross storage namespaces', async () => {

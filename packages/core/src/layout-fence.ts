@@ -1,4 +1,5 @@
-import { open, readdir } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { lstat, open, readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 
@@ -226,35 +227,67 @@ function publisherPid(
   return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined
 }
 
+const MAX_PUBLISHER_BYTES = 64 * 1024
+
 async function readArtifact(
   path: string,
   blockers: FenceBlocker[],
   malformedIsStale: (startedAt?: unknown) => Promise<boolean>,
-): Promise<
-  { value: unknown; startedAt: unknown; regular: boolean } | undefined
-> {
-  let text: string
+): Promise<{ value: unknown; startedAt: unknown } | undefined> {
+  let text: string | undefined
   let mtimeMs: number
-  let regular: boolean
+  const nonRegular = () =>
+    blockers.push({ kind: 'artifact-scan', path, reason: 'not a regular file' })
   try {
+    const noFollow = constants.O_NOFOLLOW ?? 0
+    const nonBlock = constants.O_NONBLOCK ?? 0
+    if ((!noFollow || !nonBlock) && !(await lstat(path)).isFile()) {
+      nonRegular()
+      return undefined
+    }
     // Keep the bytes and mtime from the same file if its writer replaces the path.
-    const file = await open(path, 'r')
+    const file = await open(path, constants.O_RDONLY | nonBlock | noFollow)
     try {
-      text = await file.readFile('utf8')
       const stat = await file.stat()
+      if (!stat.isFile()) {
+        nonRegular()
+        return undefined
+      }
       mtimeMs = stat.mtimeMs
-      regular = stat.isFile()
+      if (stat.size <= MAX_PUBLISHER_BYTES) {
+        // A concurrent writer can grow the file after stat. Read at most one
+        // extra byte to distinguish a complete record from a truncated one.
+        const bytes = Buffer.alloc(MAX_PUBLISHER_BYTES + 1)
+        let offset = 0
+        while (offset < bytes.length) {
+          const { bytesRead } = await file.read(
+            bytes,
+            offset,
+            bytes.length - offset,
+            offset,
+          )
+          if (bytesRead === 0) break
+          offset += bytesRead
+        }
+        if (offset <= MAX_PUBLISHER_BYTES)
+          text = bytes.toString('utf8', 0, offset)
+      }
     } finally {
       await file.close()
     }
   } catch (error) {
     // Removed between the listing and the read: its writer released it.
     if (errorCode(error) === 'ENOENT') return undefined
+    if (errorCode(error) === 'ELOOP') {
+      nonRegular()
+      return undefined
+    }
     if (!(await malformedIsStale()))
       blockers.push({ kind: 'artifact-scan', path, reason: reasonOf(error) })
     return undefined
   }
   try {
+    if (text === undefined) throw new Error('Publisher record is too large')
     const value: unknown = JSON.parse(text)
     // A recorded but unusable time must not fall back to an older mtime.
     const startedAt =
@@ -265,9 +298,9 @@ async function readArtifact(
             ? value.registeredAt
             : mtimeMs
         : mtimeMs
-    return { value, startedAt, regular }
+    return { value, startedAt }
   } catch {
-    if (!(await malformedIsStale(regular ? mtimeMs : undefined)))
+    if (!(await malformedIsStale(mtimeMs)))
       blockers.push({ kind: 'artifact-scan', path, reason: 'invalid' })
     return undefined
   }
@@ -339,13 +372,11 @@ export async function preNArtifactBlockers(
       const { value, startedAt } = record
       const pid = (value as { pid?: unknown } | null)?.pid
       if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) {
-        if (!(await isStale(record.regular ? startedAt : undefined)))
+        if (!(await isStale(startedAt)))
           blockers.push({ kind: 'artifact-scan', path, reason: 'invalid' })
         continue
       }
-      if (
-        !(await malformedIsStale(pid, record.regular ? startedAt : undefined))
-      )
+      if (!(await malformedIsStale(pid, startedAt)))
         blockers.push({ kind: 'pre-n-artifact', artifact: path, pid })
     }
   }
@@ -360,12 +391,7 @@ export async function preNArtifactBlockers(
       )
       if (record === undefined || exempt(record.value)) continue
       const pid = Number(match[1])
-      if (
-        !(await malformedIsStale(
-          pid,
-          record.regular ? record.startedAt : undefined,
-        ))
-      )
+      if (!(await malformedIsStale(pid, record.startedAt)))
         blockers.push({ kind: 'pre-n-artifact', artifact: path, pid })
     }
   }

@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { constants, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import {
   appendFile,
   chmod,
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readdir,
   readFile,
   readlink,
@@ -549,6 +550,38 @@ test('the fence: a live holder, a malformed holder file, or a live older-version
     expect(await subDataFiles(m)).toEqual([])
   }
 })
+
+test.skipIf(process.platform === 'win32')(
+  'startup promptly refuses relocation when a publisher path is a named pipe',
+  async () => {
+    const m = await machine()
+    const dir = m.artifacts.cacheKeepDirs[0]!
+    await mkdir(dir)
+    const path = join(
+      dir,
+      `${process.pid}-11111111-1111-4111-8111-111111111111.json`,
+    )
+    expect(Bun.spawnSync(['mkfifo', path]).exitCode).toBe(0)
+    // Rescue a regressed blocking open after the deadline so test teardown
+    // never leaves the reader holding the startup locks.
+    let rescue: Promise<void> | undefined
+    const timer = setTimeout(() => {
+      rescue = open(path, constants.O_RDWR | constants.O_NONBLOCK).then(
+        (pipe) => pipe.close(),
+      )
+    }, 2_000)
+    try {
+      expect(await decide(m, { liveness: liveness() })).toMatchObject({
+        kind: 'legacy',
+        reasons: [`${path} can't be read (not a regular file)`],
+      })
+      expect(rescue).toBeUndefined()
+    } finally {
+      clearTimeout(timer)
+      await rescue
+    }
+  },
+)
 
 test('the fence moves past pre-boot holders and artifacts despite live reused pids', async () => {
   const m = await machine()

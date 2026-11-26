@@ -211,10 +211,21 @@ test('Pi Prime enabled with a due account fires once through the signed model tr
   const identity = (await native.view()).accounts.find(
     (row) => row.id === 'main',
   )?.accountIdentity
+  const manager = native.prime!.manager
+  const evidence = await manager.options.getAccountEvidence('main')
   expect(identity).toBeString()
-  expect(await native.prime?.manager.options.getAccountIdentity?.('main')).toBe(
-    identity,
-  )
+  expect(evidence?.accountIdentity).toBe(identity)
+  if (!evidence) throw new Error('Expected a bound Prime account')
+  for (const changed of [
+    { ...evidence, lineage: crypto.randomUUID() },
+    { ...evidence, accountIdentity: crypto.randomUUID() },
+  ]) {
+    expect(await manager.options.sendPrime('main', changed)).toMatchObject({
+      ok: false,
+      reason: 'account-changed',
+    })
+  }
+  expect(sends).toEqual([])
   await native.prime?.manager.tick()
   await native.prime?.manager.tick()
   expect(sends).toHaveLength(1)
@@ -671,21 +682,13 @@ test('Pi Prime and an OC2-style manager sharing account storage claim only one s
   const runtime = await native.service()
   const paths = await resolveNativePoolPaths(storagePath)
   let oc2Sends = 0
-  const fingerprint = async (accountId: string) => {
-    const credential = await runtime.authorizeLocal(accountId)
-    if (credential.status !== 'usable') return undefined
-    const lineage = await runtime.getOrCreateAuthLineage(
-      accountId,
-      credential.subject,
-    )
-    return lineage ? tokenFingerprint(lineage) : undefined
-  }
+  const getAccountEvidence = native.prime!.manager.options.getAccountEvidence
   const oc2 = new PrimeManager({
     storagePath: paths.legacyConfig,
     markerDir,
     now: () => now,
     loadStorage: async () => (await runtime.read()).policyStorage,
-    getAccountFingerprint: fingerprint,
+    getAccountEvidence,
     refreshQuota: async () => ({
       quota: await runtime.fetchQuota('main'),
       fresh: true,
@@ -712,7 +715,7 @@ test('Pi Prime and an OC2-style manager sharing account storage claim only one s
     const accountDir = primeAccountMarkerDir(
       markerDir,
       paths.legacyConfig,
-      (await fingerprint('main'))!,
+      tokenFingerprint((await getAccountEvidence('main'))!.lineage),
     )
     const marker = primeMarkerPath(accountDir, 'main', now - 120_000)
     expect(await Bun.file(marker).exists()).toBe(true)
@@ -770,6 +773,7 @@ test('Pi Prime refuses host authority drift before touching the native service',
         storagePath,
         accountId: 'main',
         signal: new AbortController().signal,
+        checkAccount: async () => {},
         beforeSend: async () => {},
         onServed: () => {},
       }),
@@ -796,6 +800,7 @@ for (const [boundary, target] of [
       storagePath,
       accountId: 'main',
       signal: new AbortController().signal,
+      checkAccount: async () => {},
       beforeSend: async () => {
         if (++admissions === target) {
           entered.resolve()

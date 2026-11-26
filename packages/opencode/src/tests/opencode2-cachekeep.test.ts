@@ -1426,6 +1426,7 @@ test('OpenCode 2 prewarm classifies a vault authorization refusal without creden
       resetRouting: async () => {},
       servedAccount: () => undefined,
       recordPrime: async () => false,
+      primeEvidence: async () => undefined,
       authorizeAccount: () => {
         const error = new NativeCustodyError('unavailable')
         error.message = 'SECRET vault credential'

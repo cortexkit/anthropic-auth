@@ -180,6 +180,7 @@ import {
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   PROMPT_CACHE_1H_TTL_MS,
   PROMPT_CACHE_DEFAULT_TTL_MS,
+  type PrimeAccountEvidence,
   PrimeManager,
   type PrimeManagerOptions,
   type PrimeRefreshResult,
@@ -198,6 +199,8 @@ import {
   parseSseFrame,
   peekRoutingAccount,
   prepareMessageThreadRequest,
+  primeAccountEvidence,
+  primeAccountMatches,
   protectFallbackCreditResponse,
   type QuotaAccountSummary,
   type QuotaEntry,
@@ -4060,8 +4063,19 @@ const anthropicAuthPlugin = async (
   }
 
   const primePhysicalAttempts = new Map<string, NativeOAuthAuthorization>()
+  function evidenceForPrime(
+    accountId: string,
+    authorization: NativeOAuthAuthorization,
+  ) {
+    const fence = authorization.scopedAttempt ?? authorization.localSubject
+    return fence
+      ? primeAccountEvidence(nativeAccounts, accountId, fence)
+      : undefined
+  }
+
   async function sendPrime(
     accountId: 'main' | string,
+    evidence: PrimeAccountEvidence,
   ): Promise<PrimeSendResult> {
     const start = performance.now()
     let accessToken: string | undefined
@@ -4073,6 +4087,16 @@ const anthropicAuthPlugin = async (
     let primeGatewaySecrets: string[] = []
     // The response scope of the latest physical Prime send.
     let physicalScope: ProviderErrorResponseScope | undefined
+    const matches = async (authorization: NativeOAuthAuthorization) =>
+      primeAccountMatches(
+        evidence,
+        await evidenceForPrime(accountId, authorization),
+      )
+    const accountChanged = {
+      ok: false,
+      reason: 'account-changed',
+      error: 'Prime account changed before dispatch',
+    } as const
     try {
       // The manager already checked current quota. Validate the account and
       // tokens for this Haiku send without another quota poll. An upstream 401
@@ -4101,6 +4125,7 @@ const anthropicAuthPlugin = async (
         undefined,
         CLAUDE_HAIKU_4_5_MODEL_ID,
       )
+      if (!(await matches(initialAuthorization))) return accountChanged
       accessToken = initialAuthorization.accessToken
       scopedAttempt = initialAuthorization.scopedAttempt
       resolvedModel = CLAUDE_HAIKU_4_5_MODEL_ID
@@ -4133,6 +4158,7 @@ const anthropicAuthPlugin = async (
         undefined,
         resolvedModel,
       )
+      if (!(await matches(physicalAuthorization))) return accountChanged
       if (
         physicalAuthorization.accountIdentity !==
           initialAuthorization.accountIdentity ||
@@ -4189,7 +4215,8 @@ const anthropicAuthPlugin = async (
             !successor ||
             successor.credentialId !== scopedAttempt.credentialId ||
             successor.accountIdentity !== scopedAttempt.accountIdentity ||
-            successor.recordVersion <= scopedAttempt.recordVersion
+            successor.recordVersion <= scopedAttempt.recordVersion ||
+            !(await matches(physicalAuthorization))
           )
             throw new Error('Prime vault retry lost its strict newer receipt')
           scopedAttempt = successor
@@ -4228,7 +4255,8 @@ const anthropicAuthPlugin = async (
           if (
             physicalAuthorization.scopedAttempt ||
             physicalAuthorization.accountIdentity !==
-              initialAuthorization.accountIdentity
+              initialAuthorization.accountIdentity ||
+            !(await matches(physicalAuthorization))
           )
             throw new Error('Prime local authority changed before retry')
           primeSecret = physicalAuthorization.accessToken
@@ -4297,25 +4325,14 @@ const anthropicAuthPlugin = async (
   const primeManagerOptions: PrimeManagerOptions = {
     storagePath: accountStoragePath,
     loadStorage: () => loadAccounts(accountStoragePath),
-    getAccountFingerprint: async (accountId) => {
+    getAccountEvidence: async (accountId) => {
       if (
         accountId === 'main' &&
         (!latestGetActivation || !(await latestGetActivation()).active)
       )
         return undefined
-      const credential = await authorizeOAuth(accountId)
-      const fence = credential.scopedAttempt ?? credential.localSubject
-      if (!fence) return undefined
-      const authLineageId = await nativeAccounts.getOrCreateAuthLineage(
-        accountId,
-        fence,
-      )
-      return authLineageId ? tokenFingerprint(authLineageId) : undefined
+      return evidenceForPrime(accountId, await authorizeOAuth(accountId))
     },
-    getAccountIdentity: async (accountId) =>
-      (await nativeAccounts.read()).accounts.find(
-        (account) => account.id === accountId,
-      )?.accountIdentity,
     refreshQuota: async (accountId) => {
       if (accountId === 'main') return refreshPrimeMainQuota()
       return refreshPrimeFallbackQuota(accountId)

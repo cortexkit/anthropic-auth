@@ -1247,10 +1247,7 @@ async function sendAnthropicRequestAttempt(
       record: (usage?: Record<string, number>) => void,
     ) => void
     onServingModel?: (model: string | undefined) => void
-    prime?: {
-      beforeSend: () => Promise<void>
-      onServed: (attempt: PiNativeAttempt) => void
-    }
+    prime?: Pick<PiPrimeSendOptions, 'checkAccount' | 'beforeSend' | 'onServed'>
   },
   deps: {
     fetch?: typeof fetch
@@ -1699,6 +1696,7 @@ async function sendAnthropicRequestAttempt(
         options.routingChoice,
       ))
     nextAttempt = undefined
+    await options.prime?.checkAccount(attempt)
     if (attempt.accountIdentity !== verifiedUuid)
       throw new Error('Pi native OAuth route identity changed')
     if (

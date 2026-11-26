@@ -172,6 +172,19 @@ test('an invalid RPC record from a live filename pid and a non-directory RPC roo
   expect(blockers[0]).toMatchObject({ kind: 'artifact-scan', path })
 })
 
+test('the fence treats oversized publisher records as malformed but still clears stale files', async () => {
+  const { path, locations } = await artifact('RPC port file', {}, NOW)
+  const bytes = Buffer.from(
+    JSON.stringify({ pid: process.pid, writer: { protocol: 1 } }),
+  )
+  await writeFile(path, Buffer.concat([bytes, Buffer.alloc(64 * 1024, 32)]))
+  await utimes(path, new Date(NOW), new Date(NOW))
+  expect(await preNArtifactBlockers(locations, () => true, clock)).toEqual([
+    { kind: 'artifact-scan', path, reason: 'invalid' },
+  ])
+  expect(await preNArtifactBlockers(locations, () => false, clock)).toEqual([])
+})
+
 test('malformed holder entries and registries keep the settings fence closed without any live pid', async () => {
   const home = await folder()
   const file = join(home, '.config', 'opencode', HOLDER_FILE_NAME)

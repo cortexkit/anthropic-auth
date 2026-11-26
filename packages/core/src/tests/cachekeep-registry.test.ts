@@ -1,10 +1,13 @@
 import { afterEach, expect, test } from 'bun:test'
 import {
+  chmod,
+  mkdir,
   mkdtemp,
   readdir,
   readFile,
   rm,
   stat,
+  symlink,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -325,6 +328,46 @@ test('dual publication is private, merges both folders, and is accepted by the 2
   expect(await readdir(directory)).toEqual([])
   expect(await readdir(legacyDirectory)).toEqual(['other.json'])
 })
+
+test.skipIf(process.platform === 'win32')(
+  'legacy registry refuses a linked temp ancestor and tightens owned directories',
+  async () => {
+    const base = await makeDirectory()
+    const target = await makeDirectory()
+    const directory = await makeDirectory()
+    const original = process.env.TMPDIR
+    process.env.TMPDIR = base
+    try {
+      const legacyDirectory = getLegacyCacheKeepRegistryDirectory('opencode')
+      const ancestor = join(base, 'opencode-anthropic-auth')
+      const targetRegistry = join(target, 'cachekeep-sessions', 'opencode')
+      await mkdir(targetRegistry, { recursive: true, mode: 0o700 })
+      await symlink(target, ancestor, 'dir')
+      const writer = new CacheKeepSessionRegistry({
+        directory,
+        legacyDirectory,
+        instanceId: 'writer',
+      })
+      const tracked = session('ses_private')
+      await writer.publish([tracked])
+      expect(await readdir(targetRegistry)).toEqual([])
+      expect(await readdir(directory)).toEqual(['writer.json'])
+
+      await rm(ancestor)
+      await mkdir(legacyDirectory, { recursive: true })
+      await chmod(ancestor, 0o755)
+      await chmod(legacyDirectory, 0o755)
+      await writer.publish([tracked])
+      expect((await stat(ancestor)).mode & 0o777).toBe(0o700)
+      expect((await stat(legacyDirectory)).mode & 0o777).toBe(0o700)
+      expect(await readdir(legacyDirectory)).toEqual(['writer.json'])
+      await writer.dispose()
+    } finally {
+      if (original === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = original
+    }
+  },
+)
 
 test('stale live or unidentifiable process files survive; dead and pre-boot files are removed', async () => {
   const directory = await makeDirectory()

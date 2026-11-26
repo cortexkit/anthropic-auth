@@ -19,6 +19,7 @@ import {
   dumpDirectRequest,
   dumpRelayRequest,
   dumpResponseArtifact,
+  getDumpDirectory,
   resetDumpState,
   setDumpEnabled,
   sweepDumpDirectory,
@@ -93,6 +94,53 @@ test('request dumps return response handles only when enabled', async () => {
   expect(relay?.responsePath).toMatch(/\.response\.json$/)
   expect(await lstat(direct!.responsePath).catch(() => null)).toBeNull()
 })
+
+test.skipIf(process.platform === 'win32')(
+  'default dump folder is private and all new dump files have mode 0600',
+  async () => {
+    const base = await mkdtemp(join(tmpdir(), 'private-dumps-'))
+    dumpDirs.push(base)
+    const original = process.env.TMPDIR
+    process.env.TMPDIR = base
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    setDumpEnabled(true)
+    try {
+      const dumpDir = join(base, 'opencode-anthropic-auth-dumps')
+      // Set the override to precisely the default as well, so neither build can
+      // write to the runner's real default temp folder during this test.
+      process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+      const dump = () =>
+        dumpDirectRequest({
+          affinity: 'ses-private',
+          bodyText: '{}',
+          route: 'oauth',
+        })
+      const handle = await dump()
+      expect(handle).not.toBeNull()
+      expect(getDumpDirectory()).toBe(dumpDir)
+      expect((await lstat(dumpDir)).mode & 0o777).toBe(0o700)
+      await dumpResponseArtifact(handle, { status: 200, message: {} })
+      const entries = await readdir(dumpDir)
+      expect(entries.length).toBeGreaterThanOrEqual(3)
+      for (const name of entries)
+        expect((await lstat(join(dumpDir, name))).mode & 0o777).toBe(0o600)
+      await chmod(dumpDir, 0o755)
+      expect(await dump()).not.toBeNull()
+      expect((await lstat(dumpDir)).mode & 0o777).toBe(0o700)
+
+      await rm(dumpDir, { recursive: true })
+      const target = join(base, 'target')
+      await mkdir(target)
+      await symlink(target, dumpDir, 'dir')
+      expect(await dump()).toBeNull()
+      await dumpResponseArtifact(handle, { status: 200, message: {} })
+      expect(await readdir(target)).toEqual([])
+    } finally {
+      if (original === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = original
+    }
+  },
+)
 
 test('credited request dumps replace the token in bytes, relay envelopes, and failure text', async () => {
   const dumpDir = await mkdtemp(join(tmpdir(), 'credited-request-dump-'))

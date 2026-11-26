@@ -22,6 +22,7 @@ import {
 import { getHostDataHome } from './host-paths.ts'
 import {
   createWindowsOwnerOnly,
+  ensurePrivateDirectory,
   ensureWindowsOwnerOnlyDirectory,
   isOwnerOnly,
   type OwnerOnlyOptions,
@@ -231,32 +232,39 @@ export class CacheKeepSessionRegistry {
           writer: writerStamp(),
         }
         for (const filePath of this.filePaths) {
+          const directory = dirname(filePath)
+          const legacy = directory === this.options.legacyDirectory
+          if (
+            legacy &&
+            !(await this.ensureLegacyDirectory(directory, snapshot.length > 0))
+          )
+            continue
           if (snapshot.length === 0) {
             await rm(filePath, { force: true })
             continue
           }
-          const directory = dirname(filePath)
-          if (
-            !(await ensureWindowsOwnerOnlyDirectory(
-              directory,
-              this.options.ownerOnly,
-            ))
-          ) {
-            await mkdir(directory, { recursive: true, mode: 0o700 })
+          if (!legacy) {
+            if (
+              !(await ensureWindowsOwnerOnlyDirectory(
+                directory,
+                this.options.ownerOnly,
+              ))
+            ) {
+              await mkdir(directory, { recursive: true, mode: 0o700 })
+            }
+            const stat = await lstat(directory)
+            if (
+              !stat.isDirectory() ||
+              !(await isOwnerOnly(
+                directory,
+                () =>
+                  stat.uid === process.getuid?.() &&
+                  (stat.mode & 0o777) === 0o700,
+                this.options.ownerOnly,
+              ))
+            )
+              throw new Error('Unsafe CacheKeep registry directory')
           }
-          const stat = await lstat(directory)
-          if (
-            !stat.isDirectory() ||
-            stat.isSymbolicLink() ||
-            !(await isOwnerOnly(
-              directory,
-              () =>
-                stat.uid === process.getuid?.() &&
-                (stat.mode & 0o777) === 0o700,
-              this.options.ownerOnly,
-            ))
-          )
-            throw new Error('Unsafe CacheKeep registry directory')
           const tempPath = `${filePath}.${randomUUID()}.tmp`
           try {
             const bytes = `${JSON.stringify(record)}\n`
@@ -326,7 +334,29 @@ export class CacheKeepSessionRegistry {
 
   async dispose(): Promise<void> {
     await this.writeChain.catch(() => {})
-    await Promise.all(this.filePaths.map((path) => rm(path, { force: true })))
+    await Promise.all(
+      this.filePaths.map(async (path) => {
+        const directory = dirname(path)
+        if (
+          directory === this.options.legacyDirectory &&
+          !(await this.ensureLegacyDirectory(directory, false))
+        )
+          return
+        await rm(path, { force: true })
+      }),
+    )
+  }
+
+  private ensureLegacyDirectory(directory: string, create: boolean) {
+    const isDefaultTempPath =
+      directory === getLegacyCacheKeepRegistryDirectory('opencode') ||
+      directory === getLegacyCacheKeepRegistryDirectory('pi')
+    return ensurePrivateDirectory(directory, {
+      base: isDefaultTempPath ? tmpdir() : undefined,
+      create,
+      area: 'cachekeep',
+      ownerOnly: this.options.ownerOnly,
+    })
   }
 
   private async recordPaths(): Promise<string[]> {
@@ -334,6 +364,11 @@ export class CacheKeepSessionRegistry {
       await Promise.all(
         this.directories.map(async (directory) => {
           try {
+            if (
+              directory === this.options.legacyDirectory &&
+              !(await this.ensureLegacyDirectory(directory, false))
+            )
+              return []
             return (await readdir(directory))
               .filter((name) => name.endsWith('.json'))
               .map((name) => join(directory, name))

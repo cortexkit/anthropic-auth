@@ -44,8 +44,10 @@ import {
   nativeValidationRetryAt,
   normalizeQuotaHeaders,
   type OAuthQuotaSnapshot,
+  type PrimeAccountEvidence,
   type ProviderAccountUuid,
   peekRoutingAccount,
+  primeAccountEvidence,
   quotaExhaustionFromHeaders,
   quotaRefusalDetails,
   quotaRefusalTiming,
@@ -369,6 +371,9 @@ export interface NativeSource
     modelId: string | undefined,
     snapshot: NativeAccountSnapshot,
   ) => string | undefined
+  readonly primeEvidence: (
+    provenance: NativeSourceProvenance,
+  ) => Promise<PrimeAccountEvidence | undefined>
   readonly recordPrime: (
     provenance: NativeSourceProvenance,
     usage: { inputTokens?: number; outputTokens?: number },
@@ -2444,6 +2449,15 @@ export function createNativeAnthropicSource(
     resetRouting: async (sessionID) => {
       source.forgetTurn?.(sessionID)
       await routerFor(await runtime.read()).clear(sessionID)
+    },
+    async primeEvidence(provenance) {
+      const state = states.get(provenance)
+      if (!state || state.active.signal.aborted) return undefined
+      const fence =
+        provenance.kind === 'local' ? provenance.subject : state.receipt
+      return fence
+        ? primeAccountEvidence(runtime, state.account.id, fence)
+        : undefined
     },
     async recordPrime(provenance, usage) {
       const state = states.get(provenance)

@@ -93,4 +93,6 @@ Enable or disable request dumps in `/claude` → **Diagnostics**. Artifacts live
 | `.request.json` | Redacted direct URL, method and headers |
 | `.response.json` | Allowlisted response metadata; streamed message replies include `reply_text_edges` with each text block's index and leading/trailing whitespace and total character counts, never text or text hashes |
 
+The default folder is private to the current account. On Unix it uses mode `0700`, and new dump files use mode `0600`. On Windows the default folder and its files use owner-only access controls. The plugin logs a warning and skips dumps if the default folder cannot be used safely. If you override the folder, choose a private location.
+
 Dump bodies can contain prompts and tool content even when metadata is redacted. Treat them as private debugging artifacts, disable dumping when done, and sanitize anything shared. Lane-start dumps use `-start-`; CacheKeep uses `-prewarm-cachekeep-`. See [cache diagnostics](cache.md#diagnostics-and-history-analysis) and [safe troubleshooting](troubleshooting.md#requests-and-diagnostics).

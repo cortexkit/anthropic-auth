@@ -253,7 +253,7 @@ test('malformed files need readable regular metadata for the pre-boot proof', as
           {
             kind: 'artifact-scan',
             path: file,
-            reason: metadata === 'unreadable' ? 'EACCES' : 'invalid',
+            reason: metadata === 'unreadable' ? 'EACCES' : 'not a regular file',
           },
         ],
       })

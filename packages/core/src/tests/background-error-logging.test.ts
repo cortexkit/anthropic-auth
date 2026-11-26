@@ -430,7 +430,7 @@ async function duePrime(logs: LogCapture, overrides: Partial<PrimeOptions>) {
     storagePath: join(root, 'accounts.json'),
     markerDir: join(root, 'markers'),
     loadStorage: async () => primeStorage,
-    getAccountFingerprint: async () => '0123456789abcdef',
+    getAccountEvidence: async () => ({ lineage: '0123456789abcdef' }),
     refreshQuota: async () => passedReset,
     sendPrime: async () => ({ ok: true, status: 200, ms: 1 }),
     recordSuccess: async () => ({
@@ -492,7 +492,7 @@ test('Prime caught exceptions log fixed stages with the account label only', asy
   const logs = captureLogs()
 
   await (await duePrime(logs, { refreshQuota: rejectWithEcho })).tick()
-  await (await duePrime(logs, { getAccountFingerprint: rejectWithEcho })).tick()
+  await (await duePrime(logs, { getAccountEvidence: rejectWithEcho })).tick()
   await (await duePrime(logs, { sendPrime: rejectWithEcho })).tick()
   await (await duePrime(logs, { recordSuccess: rejectWithEcho })).tick()
 

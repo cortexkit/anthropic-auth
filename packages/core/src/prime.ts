@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import * as fs from 'node:fs'
-import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { lstat, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { canonicalFilePathSync } from '@cortexkit/common-auth/fs'
@@ -22,7 +22,10 @@ import {
   CLAUDE_HAIKU_4_5_MODEL_ID,
   CLAUDE_HAIKU_4_5_PRICING,
 } from './models.ts'
+import type { NativeAccountRuntime } from './native-account-runtime.ts'
 import { nativeAccountCanServe } from './native-account-view.ts'
+import { ensurePrivateDirectory } from './owner-only.ts'
+import { tokenFingerprint } from './token-fingerprint.ts'
 
 // Re-export pricing for downstream packages that import it through core's
 // public surface (the test suite verifies exact per-million-token values).
@@ -76,8 +79,37 @@ export type PrimeSendResult =
       error: string
       // `vault-cold` is an expected off-path cache warm state, not evidence
       // of a failed provider request, so it must not emit the fire-failure warn.
-      reason?: 'token-refresh' | 'vault-cold' | 'send'
+      reason?: 'token-refresh' | 'vault-cold' | 'send' | 'account-changed'
     }
+
+export type PrimeAccountEvidence = {
+  readonly lineage: string
+  readonly accountIdentity?: string
+}
+
+/** Derive both parts from the authorized credential, not a second slot lookup. */
+export async function primeAccountEvidence(
+  runtime: Pick<NativeAccountRuntime, 'getOrCreateAuthLineage'>,
+  accountId: string,
+  fence: Parameters<NativeAccountRuntime['getOrCreateAuthLineage']>[1],
+): Promise<PrimeAccountEvidence | undefined> {
+  const lineage = await runtime.getOrCreateAuthLineage(accountId, fence)
+  if (!lineage) return undefined
+  const accountIdentity =
+    'accessToken' in fence ? fence.accountIdentity : fence.binding.identity
+  return { lineage, accountIdentity }
+}
+
+export function primeAccountMatches(
+  expected: PrimeAccountEvidence,
+  authorized: PrimeAccountEvidence | undefined,
+): boolean {
+  return (
+    expected.lineage === authorized?.lineage &&
+    (expected.accountIdentity === undefined ||
+      expected.accountIdentity === authorized.accountIdentity)
+  )
+}
 
 /**
  * Pure command parser — accepts `''` / `on` / `off` and treats anything else
@@ -452,6 +484,16 @@ function primeBootstrapMarkerPath(
   return join(markerDir, `${encodeURIComponent(accountId)}-bootstrap`)
 }
 
+function isStorageMarkerName(name: string): boolean {
+  const account = /^(.+?)-(?:bootstrap|-?\d+)$/.exec(name)?.[1]
+  if (!account) return false
+  try {
+    return encodeURIComponent(decodeURIComponent(account)) === account
+  } catch {
+    return false
+  }
+}
+
 function primeAccountLabel(
   id: 'main' | string,
   fallback?: FallbackAccount,
@@ -537,16 +579,15 @@ function storedResetMs(window?: AccountQuotaWindow): number | undefined {
  */
 export type PrimeManagerOptions = {
   loadStorage: () => Promise<AccountStorage | null>
-  /** Returns a non-secret digest, or undefined when identity is unavailable. */
-  getAccountFingerprint: (
+  /** Returns the authorized lineage and its verified Claude UUID, when known. */
+  getAccountEvidence: (
     accountId: 'main' | string,
-  ) => Promise<string | undefined>
-  /** Returns the verified Claude account UUID, never a local route id. */
-  getAccountIdentity?: (
-    accountId: 'main' | string,
-  ) => Promise<string | undefined>
+  ) => Promise<PrimeAccountEvidence | undefined>
   refreshQuota: (accountId: 'main' | string) => Promise<PrimeRefreshResult>
-  sendPrime: (accountId: 'main' | string) => Promise<PrimeSendResult>
+  sendPrime: (
+    accountId: 'main' | string,
+    evidence: PrimeAccountEvidence,
+  ) => Promise<PrimeSendResult>
   recordSuccess: (
     accountId: 'main' | string,
     usage: { inputTokens?: number; outputTokens?: number },
@@ -650,7 +691,6 @@ export class PrimeManager {
   async tick(): Promise<void> {
     const now = this.options.now?.() ?? Date.now()
     logger.trace('prime', 'tick start', { now })
-    await this.sweepMarkers(now)
     if (this.stopped) {
       logger.trace('prime', 'tick: stopped, aborting')
       return
@@ -667,6 +707,15 @@ export class PrimeManager {
       logger.trace('prime', 'tick: feature disabled, skipping')
       return
     }
+    if (
+      !(await ensurePrivateDirectory(this.markerRoot(), {
+        base: this.options.markerDir === undefined ? tmpdir() : undefined,
+        area: 'prime',
+      })) ||
+      this.stopped
+    )
+      return
+    await this.sweepMarkers(now)
     const evaluations = evaluateAccounts(storage)
     await Promise.all(
       evaluations.map((evaluation) =>
@@ -756,20 +805,18 @@ export class PrimeManager {
         return
       }
 
-      const accountFingerprint = await this.options.getAccountFingerprint(
-        evaluation.id,
-      )
-      if (!accountFingerprint) {
+      const evidence = await this.options.getAccountEvidence(evaluation.id)
+      if (!evidence) {
         logger.debug('prime', 'credential identity unavailable', {
           account: evaluation.label,
         })
         return
       }
+      const accountFingerprint = tokenFingerprint(evidence.lineage)
+      const { accountIdentity } = evidence
       const claimIdentity = `${evaluation.id}:${accountFingerprint
         .toLowerCase()
         .slice(0, 12)}`
-      // Resolving the marker folder rejects a non-hex fingerprint before any
-      // quota or send work runs.
       stage = 'marker'
       const markerDir = this.markerDir(accountFingerprint)
       const bootstrapMarkerPath = primeBootstrapMarkerPath(
@@ -781,21 +828,23 @@ export class PrimeManager {
         storedResetEpoch === undefined
           ? bootstrapMarkerPath
           : primeMarkerPath(markerDir, evaluation.id, storedResetEpoch)
-      try {
-        await stat(expectedMarkerPath)
-        // A completed claim makes another forced poll redundant; the normal
-        // background refresh will persist the reset when the usage API catches up.
-        return
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-      }
-      if (
-        storedResetEpoch === undefined &&
-        (await this.hasAnyClaimMarker(evaluation.id, accountFingerprint))
-      ) {
-        // The bootstrap sentinel is replaced only after an epoch claim exists.
-        // A stale process must observe one side of that transition.
-        return
+      if (await this.privateMarkerDirectory(markerDir, false)) {
+        try {
+          await lstat(expectedMarkerPath)
+          // A completed claim makes another forced poll redundant; the normal
+          // background refresh will persist the reset when the usage API catches up.
+          return
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        }
+        if (
+          storedResetEpoch === undefined &&
+          (await this.hasAnyClaimMarker(evaluation.id, accountFingerprint))
+        ) {
+          // The bootstrap sentinel is replaced only after an epoch claim exists.
+          // A stale process must observe one side of that transition.
+          return
+        }
       }
       if (this.stopped) return
 
@@ -886,9 +935,6 @@ export class PrimeManager {
       // Claiming the marker is the cross-process exactly-once gate; only one
       // process per reset epoch reaches the send.
       stage = 'claim'
-      const accountIdentity = await this.options.getAccountIdentity?.(
-        evaluation.id,
-      )
       const markerPaths = await this.tryClaim(
         evaluation.id,
         accountFingerprint,
@@ -927,7 +973,7 @@ export class PrimeManager {
       // The send and its counter update run only after this process owns the
       // marker; unexpected failures there are reported with the fire stage.
       stage = 'fire'
-      await this.fire(evaluation, now, postClaimStorage)
+      await this.fire(evaluation, now, evidence, markerPaths, claimIdentity)
     } catch {
       logger.warn('prime', 'account evaluation failed', {
         account: evaluation.label,
@@ -949,8 +995,16 @@ export class PrimeManager {
         : primeMarkerPath(dir, accountId, resetsAtEpochMs)
     // Older hosts claim only the storage-scoped marker. Always win it first,
     // and leave it to age out if another store already owns the UUID claim.
-    if (!(await this.tryClaimPath(dir, markerPath))) return null
+    if (
+      !(await this.privateMarkerDirectory(dir)) ||
+      !(await this.tryClaimPath(markerPath))
+    )
+      return null
     if (!accountIdentity) return [markerPath]
+    if (!(await this.privateMarkerDirectory(this.verifiedMarkerDir()))) {
+      await rm(markerPath, { force: true })
+      return null
+    }
     const verifiedPath = this.verifiedMarkerPath(
       accountIdentity,
       resetsAtEpochMs,
@@ -966,13 +1020,12 @@ export class PrimeManager {
       )
         return null
     }
-    if (!(await this.tryClaimPath(this.verifiedMarkerDir(), verifiedPath)))
-      return null
+    if (!(await this.tryClaimPath(verifiedPath))) return null
     return [markerPath, verifiedPath]
   }
 
   private verifiedMarkerDir(): string {
-    return join(this.options.markerDir ?? defaultMarkerDir(), 'accounts')
+    return join(this.markerRoot(), 'accounts')
   }
 
   private verifiedMarkerPath(
@@ -995,17 +1048,9 @@ export class PrimeManager {
     }
   }
 
-  private async tryClaimPath(
-    dir: string,
-    markerPath: string,
-  ): Promise<string | null> {
+  private async tryClaimPath(markerPath: string): Promise<string | null> {
     try {
-      await mkdir(dir, { recursive: true })
-    } catch {
-      // Directory-create failures are propagated by the writeFile attempt below.
-    }
-    try {
-      await writeFile(markerPath, '', { encoding: 'utf8', flag: 'wx' })
+      await writeFile(markerPath, '', { flag: 'wx', mode: 0o600 })
       return markerPath
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
@@ -1031,17 +1076,25 @@ export class PrimeManager {
   private async fire(
     evaluation: AccountEvaluation,
     now: number,
-    _storage: AccountStorage,
+    evidence: PrimeAccountEvidence,
+    markerPaths: readonly string[],
+    claimIdentity: string,
   ): Promise<void> {
     let result: PrimeSendResult
     try {
-      result = await this.options.sendPrime(evaluation.id)
+      result = await this.options.sendPrime(evaluation.id, evidence)
     } catch {
       logger.warn('prime', 'prime fire threw', { account: evaluation.label })
       this.transient.set(evaluation.id, {
         lastPrimedAt: now,
         lastResult: 'error',
       })
+      return
+    }
+    if (!result.ok && result.reason === 'account-changed') {
+      // No request was sent. A later tick must evaluate the slot again.
+      await Promise.all(markerPaths.map((path) => rm(path, { force: true })))
+      this.lastForcedCheck.delete(claimIdentity)
       return
     }
     if (this.stopped) return
@@ -1145,9 +1198,22 @@ export class PrimeManager {
 
   private async sweepMarkers(now: number): Promise<void> {
     const dir = this.storageMarkerDir()
-    const swept =
-      (await this.sweepMarkerDirectory(dir, now)) +
-      (await this.sweepMarkerDirectory(this.verifiedMarkerDir(), now))
+    let swept = await this.sweepMarkerDirectory(
+      this.verifiedMarkerDir(),
+      now,
+      (name) => /^[a-f0-9]{64}-(?:bootstrap|-?\d+)$/.test(name),
+    )
+    if (await this.privateMarkerDirectory(dir, false)) {
+      for (const name of await this.readMarkerNames(dir)) {
+        if (/^[a-f0-9]{12}$/.test(name)) {
+          swept += await this.sweepMarkerDirectory(
+            join(dir, name),
+            now,
+            isStorageMarkerName,
+          )
+        }
+      }
+    }
     if (swept > 0) {
       logger.trace('prime', 'swept stale markers', { swept })
     }
@@ -1156,43 +1222,49 @@ export class PrimeManager {
   private async sweepMarkerDirectory(
     dir: string,
     now: number,
+    matches: (name: string) => boolean,
   ): Promise<number> {
-    let entries: string[]
-    try {
-      entries = await readdir(dir)
-    } catch {
-      return 0
-    }
+    if (!(await this.privateMarkerDirectory(dir, false))) return 0
+    const entries = await this.readMarkerNames(dir)
     let swept = 0
     for (const entry of entries) {
+      if (!matches(entry)) continue
       try {
         const path = join(dir, entry)
-        const s = await stat(path)
-        if (s.isDirectory()) {
-          swept += await this.sweepMarkerDirectory(path, now)
-          continue
-        }
-        if (now - s.mtimeMs > PRIME_MARKER_MAX_AGE_MS) {
+        const s = await lstat(path)
+        if (s.isFile() && now - s.mtimeMs > PRIME_MARKER_MAX_AGE_MS) {
           await rm(path, { force: true })
           swept += 1
         }
       } catch {
-        // Markers can vanish between readdir and stat; skip silently.
+        // Markers can vanish between listing and deletion.
       }
     }
     return swept
   }
 
+  private markerRoot(): string {
+    return this.options.markerDir ?? defaultMarkerDir()
+  }
+
+  private privateMarkerDirectory(
+    path: string,
+    create = true,
+  ): Promise<boolean> {
+    return ensurePrivateDirectory(path, {
+      base: this.markerRoot(),
+      create,
+      area: 'prime',
+    })
+  }
+
   private storageMarkerDir(): string {
-    return primeMarkerNamespaceDir(
-      this.options.markerDir ?? defaultMarkerDir(),
-      this.options.storagePath,
-    )
+    return primeMarkerNamespaceDir(this.markerRoot(), this.options.storagePath)
   }
 
   private markerDir(accountFingerprint: string): string {
     return primeAccountMarkerDir(
-      this.options.markerDir ?? defaultMarkerDir(),
+      this.markerRoot(),
       this.options.storagePath,
       accountFingerprint,
     )

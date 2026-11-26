@@ -340,6 +340,7 @@ test('Pi Prime is stateless and emits no session cache report', async () => {
     storagePath: f.storagePath,
     accountId: 'main',
     signal: new AbortController().signal,
+    checkAccount: async () => {},
     beforeSend: async () => {},
     onServed: () => {},
   })
