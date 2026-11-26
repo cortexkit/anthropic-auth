@@ -201,7 +201,8 @@ export function createAnthropicBillingObserver(
     const measured = anthropicBillingUsage(rawUsage)
     // message_start's zero output is not a measurement of final output.
     if (!finalUsage) delete measured.usage.output
-    const completed = sse ? stopped : finalUsage
+    // A stream is complete only once message_stop arrives after its final usage.
+    const completed = finalUsage && (!sse || stopped)
     const outcome = failed ? 'failed' : completed ? 'completed' : 'cut'
     const publish = (readWarming: boolean) => {
       let cache = failed ? undefined : base.cache

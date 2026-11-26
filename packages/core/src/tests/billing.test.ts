@@ -353,7 +353,7 @@ test.each(['EOF', 'read error', 'cancel'] as const)(
   },
 )
 
-test('billing treats message_stop as completion without final usage', async () => {
+test('billing reports message_stop without final usage as cut', async () => {
   const reports = capture()
   const sent = await withAnthropicBilling(request, async () =>
     response([start, { type: 'message_stop' }]),
@@ -362,7 +362,7 @@ test('billing treats message_stop as completion without final usage', async () =
   await Bun.sleep(10)
   expect(reports).toHaveLength(1)
   expect(reports[0]).toMatchObject({
-    outcome: 'completed',
+    outcome: 'cut',
     usage: { input: 12 },
   })
   expect(reports[0]?.usage).not.toHaveProperty('output')
