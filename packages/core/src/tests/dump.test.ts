@@ -106,8 +106,8 @@ test.skipIf(process.platform === 'win32')(
     setDumpEnabled(true)
     try {
       const dumpDir = join(base, 'opencode-anthropic-auth-dumps')
-      // Set the override to precisely the default as well, so neither build can
-      // write to the runner's real default temp folder during this test.
+      // Point the override at this test's copy of the default folder too, so the
+      // test can't write to the runner's real temp folder.
       process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
       const dump = () =>
         dumpDirectRequest({

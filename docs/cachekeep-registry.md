@@ -46,7 +46,7 @@ Readers in the plugin merge both locations so 2.5.3 processes and newer
 processes can coexist. The temp root is the OS temp directory (`TMPDIR` on
 Unix, normally `TEMP` on Windows). The compatibility folder must be private to
 the current account; the plugin logs a warning and skips it if it cannot be made
-private safely. New integrations should use the data folder.
+private safely. New integrations should use the data-folder paths in the table above.
 
 The first release shipping this data-folder interface is the transition
 release; the following release removes the compatibility paths. Version 2.5.3

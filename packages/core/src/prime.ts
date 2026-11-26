@@ -615,7 +615,7 @@ export class PrimeManager {
   // Set true by `stop()` so a tick already in flight can short-circuit
   // before claim/send, preventing a stale in-flight cycle from firing
   // after `/claude-prime off` or after a newer plugin invocation has
-  // replaced this instance (M3b).
+  // replaced this instance.
   private stopped = false
   // The registry replaces this dependency bundle on plugin reload so the
   // singleton manager cannot retain closures from an obsolete plugin context.
@@ -697,7 +697,7 @@ export class PrimeManager {
     }
     // Re-load persisted state at the start of every tick. The previous
     // read may pre-date an `/claude-prime off` from another process or
-    // a settings edit (M3b).
+    // a settings edit.
     const storage = await this.options.loadStorage()
     if (!storage) {
       logger.trace('prime', 'tick: no storage, skipping')
@@ -799,8 +799,8 @@ export class PrimeManager {
         storedResetEpoch !== undefined &&
         now < storedResetEpoch + PRIME_DUE_OFFSET_MS
       ) {
-        // "Not due" is a routine tick outcome, not an operator-visible
-        // diagnostic. Per the spec's `trace` row for tick evaluation.
+        // "Not due" is a routine outcome of most ticks, so it logs at trace
+        // level rather than as an operator-visible diagnostic.
         logger.trace('prime', 'not due', { account: evaluation.label })
         return
       }
@@ -876,7 +876,7 @@ export class PrimeManager {
       }
       // Re-check stop + persist opt-in after every await boundary so
       // an `/claude-prime off` (or a newer plugin instance's stop())
-      // aborts the cycle BEFORE claim or send (M3b).
+      // aborts the cycle BEFORE claim or send.
       if (this.stopped) return
       const reloaded = await this.options.loadStorage()
       if (reloaded?.prime?.enabled !== true) return
