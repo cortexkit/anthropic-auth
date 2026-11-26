@@ -8005,6 +8005,12 @@ const anthropicAuthPlugin = async (
                     'serve',
                   )
                   await requireCurrentNativeActivation(separateLocalLogin)
+                  const currentRelay =
+                    !resend &&
+                    !gateway &&
+                    (!protectedOrigin || relayConfig?.fallbackToDirect)
+                      ? await nativeAccounts.getRelayConfig()
+                      : null
                   const snapshot = await nativeAccounts.read(model)
                   const account = snapshot.accounts.find(
                     (row) => row.id === oauthAccountId,
@@ -8032,12 +8038,6 @@ const anthropicAuthPlugin = async (
                     !targetModelAllowed(quota, policy, model)
                   )
                     return { kind: 'denied' }
-                  const currentRelay =
-                    !resend &&
-                    !gateway &&
-                    (!protectedOrigin || relayConfig?.fallbackToDirect)
-                      ? await nativeAccounts.getRelayConfig()
-                      : null
                   const binding = {
                     accountId: resend
                       ? oauthAccountId
@@ -8045,11 +8045,20 @@ const anthropicAuthPlugin = async (
                     credentialId: candidate.credentialId,
                     url: finalUrl(currentGateway()),
                   }
+                  // Either read can veto direct transport. The account snapshot
+                  // also catches relay policy changes during the final quota read.
+                  const finalRelay = policy.relay
+                  const finalRelayUsable = effectiveRelayStatus(finalRelay)
                   if (
                     !resend &&
                     (protectedOrigin
-                      ? !currentRelay?.fallbackToDirect
-                      : currentRelay?.fallbackToDirect === false)
+                      ? !currentRelay?.fallbackToDirect ||
+                        !finalRelayUsable ||
+                        finalRelay?.fallbackToDirect === false
+                      : !gateway &&
+                        (currentRelay?.fallbackToDirect === false ||
+                          (finalRelayUsable &&
+                            finalRelay?.fallbackToDirect === false)))
                   )
                     return { kind: 'defer', ...binding }
                   retryAuthorization = candidate

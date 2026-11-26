@@ -89,6 +89,8 @@ describe('Pi client refusal fallback', () => {
     'relay denied',
     'relay allowed',
     'late mandatory relay',
+    'target scope changes during relay read',
+    'mandatory relay enabled during account read',
     'shared routing below quota floor',
   ] as const)(
     '%s preserves the beta and checks the target before retrying',
@@ -133,14 +135,32 @@ describe('Pi client refusal fallback', () => {
         })
       const source = { ...anthropicModel, id: 'claude-fable-5-2' }
       const target = 'claude-opus-4-8'
+      let targetExhausted = scenario === 'target exhausted'
+      let relayRead = false
+      let relayBecameMandatory = false
       const readSpy = spyOn(runtime, 'read').mockImplementation(
         async (...args) => {
+          if (
+            scenario === 'mandatory relay enabled during account read' &&
+            relayRead &&
+            args[0] === target &&
+            !relayBecameMandatory
+          ) {
+            relayBecameMandatory = true
+            await runtime.updateRelay({
+              enabled: true,
+              url: relay,
+              token: 'fixture-relay-token',
+              transport: 'http',
+              fallbackToDirect: false,
+            })
+          }
           const snapshot = await read(...args)
           const checkedAt = Date.now()
           return {
             ...snapshot,
             refusalFallbackMode: mode,
-            ...(scenario === 'target exhausted' && {
+            ...(targetExhausted && {
               accounts: snapshot.accounts.map((account) =>
                 account.id === 'main'
                   ? {
@@ -197,6 +217,20 @@ describe('Pi client refusal fallback', () => {
         text: string
         url: string
       }[] = []
+      const getRelayConfig = runtime.getRelayConfig.bind(runtime)
+      const relaySpy =
+        scenario === 'target scope changes during relay read' ||
+        scenario === 'mandatory relay enabled during account read'
+          ? spyOn(runtime, 'getRelayConfig').mockImplementation(async () => {
+              const config = await getRelayConfig()
+              if (sent.length > 0) {
+                relayRead = true
+                if (scenario === 'target scope changes during relay read')
+                  targetExhausted = true
+              }
+              return config
+            })
+          : undefined
       const targetUsage = {
         input_tokens: 31,
         cache_read_input_tokens: 11,
@@ -308,6 +342,10 @@ describe('Pi client refusal fallback', () => {
           'agent-loop',
           (id) => (id === target ? rates : undefined),
         ).result()
+        if (scenario === 'target scope changes during relay read')
+          expect(targetExhausted).toBe(true)
+        if (scenario === 'mandatory relay enabled during account read')
+          expect(relayBecameMandatory).toBe(true)
         expect(sent.map(({ body }) => body.model)).toEqual(
           retries ? [source.id, target] : [source.id],
         )
@@ -383,6 +421,7 @@ describe('Pi client refusal fallback', () => {
       } finally {
         authSpy.mockRestore()
         readSpy.mockRestore()
+        relaySpy?.mockRestore()
         endPiPrimaryTurn(storagePath, sessionId, true)
       }
     },

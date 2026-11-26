@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test'
+import { expect, mock, test } from 'bun:test'
 import {
   FALLBACK_CREDIT_PLACEHOLDER,
   FallbackCreditResponseTooLargeError,
@@ -423,6 +423,38 @@ test.each([false, true])(
     })
   },
 )
+
+test('a source refusal followed by bare EOF rejects without starting a retry', async () => {
+  const onRefusal = mock(() => {})
+  const retry = mock(() =>
+    joinedRetry(response(start(targetModel), endTurn, stop)),
+  )
+  const reader = joinRefusalFallbackStream(
+    response(start(sourceModel), refused()),
+    { ...baseOptions, lifecycle: { onRefusal }, retry },
+  ).body!.getReader()
+
+  expect(await readChunk(reader)).toBe(wire(start(sourceModel)))
+  await expect(reader.read()).rejects.toMatchObject({
+    code: 'ECONNRESET',
+    syscall: 'anthropic-sse',
+  })
+  expect(onRefusal).not.toHaveBeenCalled()
+  expect(retry).not.toHaveBeenCalled()
+})
+
+test('a source refusal followed by message_stop forwards the complete refusal', async () => {
+  const frames = [start(sourceModel), refused(), stop]
+  const onRefusal = mock(() => {})
+
+  const output = joinRefusalFallbackStream(response(...frames), {
+    ...baseOptions,
+    lifecycle: { onRefusal },
+  })
+
+  expect(await events(output)).toEqual(frames)
+  expect(onRefusal).toHaveBeenCalledTimes(1)
+})
 
 test('a non-refusing end_turn releases a refusal block before its unchanged message_delta', async () => {
   const output = joinRefusalFallbackStream(

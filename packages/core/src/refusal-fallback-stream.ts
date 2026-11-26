@@ -784,17 +784,15 @@ export function joinRefusalFallbackStream(
         source.dropTools()
         // Consume the source terminal pair so the physical attempt stays complete
         // and the original frames are available if the retry does not commit.
-        let sawStop = false
         for (;;) {
           const next = await frames.next()
-          if (next.done) break
+          if (next.done) throw incompleteAnthropicStreamError()
           await waitForDemand()
           if (next.value.type === 'ping') emit([next.value.bytes])
           else if (next.value.type === 'error' || next.value.event === 'error')
             throw incompleteAnthropicStreamError()
           else if (next.value.type === 'message_stop') {
             source.withhold(terminalKey, next.value)
-            sawStop = true
             break
           }
         }
@@ -809,7 +807,7 @@ export function joinRefusalFallbackStream(
               : undefined,
           usage: mergedUsage(source.startUsage, record(frame.payload?.usage)),
         }
-        if (fresh && sawStop && source.canReportRefusal)
+        if (fresh && source.canReportRefusal)
           notify(options.lifecycle?.onRefusal, {
             ...refusal,
             releasedTool: source.releasedTool,
@@ -822,7 +820,7 @@ export function joinRefusalFallbackStream(
             ? prefill?.complete()
             : undefined
         prefill?.clear()
-        if (sawStop && fresh && !source.releasedTool && retry) {
+        if (fresh && !source.releasedTool && retry) {
           const result = await runRetry({
             ...refusal,
             creditToken,

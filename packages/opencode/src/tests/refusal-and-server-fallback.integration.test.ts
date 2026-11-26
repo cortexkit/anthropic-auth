@@ -692,6 +692,8 @@ describe('auth.loader', () => {
     'relay allowed',
     'late mandatory relay',
     'late killswitch',
+    'killswitch changes during relay read',
+    'mandatory relay enabled during account read',
   ] as const)('OC1 refusal retry: %s', async (scenario) => {
     const relay = 'https://relay.example.test/'
     await useTempAccountFile(
@@ -720,8 +722,25 @@ describe('auth.loader', () => {
     let retryReads = 0
     let armed = false
     let killswitch = false
+    let relayRead = false
+    let relayBecameMandatory = false
     const readSpy = spyOn(runtime, 'read').mockImplementation(
       async (...args) => {
+        if (
+          scenario === 'mandatory relay enabled during account read' &&
+          relayRead &&
+          args[0] === 'claude-opus-5' &&
+          !relayBecameMandatory
+        ) {
+          relayBecameMandatory = true
+          await updatePoolRelay(testContext, {
+            enabled: true,
+            url: relay,
+            token: 'fixture-relay-token',
+            transport: 'http',
+            fallbackToDirect: false,
+          })
+        }
         const snapshot = await read(...args)
         if (!killswitch) return snapshot
         const checkedAt = Date.now()
@@ -751,6 +770,24 @@ describe('auth.loader', () => {
       },
     )
     getBodyLifetime(testContext).deferCleanup(() => readSpy.mockRestore())
+    if (
+      scenario === 'killswitch changes during relay read' ||
+      scenario === 'mandatory relay enabled during account read'
+    ) {
+      const getRelayConfig = runtime.getRelayConfig.bind(runtime)
+      const relaySpy = spyOn(runtime, 'getRelayConfig').mockImplementation(
+        async () => {
+          const config = await getRelayConfig()
+          if (armed) {
+            relayRead = true
+            if (scenario === 'killswitch changes during relay read')
+              killswitch = true
+          }
+          return config
+        },
+      )
+      getBodyLifetime(testContext).deferCleanup(() => relaySpy.mockRestore())
+    }
     const host = await plugin.auth.loader(
       async () => {
         if (scenario === 'late killswitch' && armed && ++retryReads === 2)
@@ -791,17 +828,19 @@ describe('auth.loader', () => {
       })
     armed = true
     const text = await response.text()
-    if (scenario === 'late killswitch') expect(killswitch).toBe(true)
+    if (scenario.includes('killswitch')) expect(killswitch).toBe(true)
+    if (scenario === 'mandatory relay enabled during account read')
+      expect(relayBecameMandatory).toBe(true)
     const permitted = scenario === 'relay allowed'
-    expect(text).toContain(
-      permitted ? TARGET_SIGNATURE : '"stop_reason":"refusal"',
-    )
     expect(sent).toEqual([
       [relayed ? relay : MESSAGES_URL, SOURCE_MODEL],
       ...(permitted
         ? [[MESSAGES_URL, 'claude-opus-5'] as [string, string]]
         : []),
     ])
+    expect(text).toContain(
+      permitted ? TARGET_SIGNATURE : '"stop_reason":"refusal"',
+    )
   })
 
   test.each(['killswitch', 'model scope'] as const)(

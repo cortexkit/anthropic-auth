@@ -46,6 +46,7 @@ import {
   dispatchRefusalFallback,
   dumpDirectRequest,
   dumpResponseArtifact,
+  effectiveRelayStatus,
   effectiveRelayTransport,
   FAST_MODE_BETA,
   formatCacheDiagnosticsLogLine,
@@ -2066,6 +2067,10 @@ async function sendAnthropicRequestAttempt(
               routingChoice,
             )
           : await native.authorize(routeId, signal, model, 'serve')
+        const currentRelay =
+          refusalRetry && !gateway
+            ? await servingRuntime.getRelayConfig()
+            : null
         const view = await native.view(signal, model)
         const account = view.accounts.find((row) => row.id === routeId)
         const payer = piBillingPayer(attempt)
@@ -2075,18 +2080,22 @@ async function sendAnthropicRequestAttempt(
           piCredentialId(account) !== payer.credentialId
         )
           return { kind: 'denied' }
-        const currentRelay =
-          refusalRetry && !gateway
-            ? await (await native.service()).getRelayConfig()
-            : null
         const url = resolvedUrl()
         if (!url) return { kind: 'denied' }
         const binding = { ...payer, url }
+        // Either read can veto direct transport. The account snapshot also
+        // catches relay policy changes during the final quota read.
+        const finalRelay = view.policyStorage.relay
+        const finalRelayUsable = effectiveRelayStatus(finalRelay)
         if (
           refusalRetry &&
           (relayedOrigin
-            ? !currentRelay?.fallbackToDirect
-            : currentRelay?.fallbackToDirect === false)
+            ? !currentRelay?.fallbackToDirect ||
+              !finalRelayUsable ||
+              finalRelay?.fallbackToDirect === false
+            : !gateway &&
+              (currentRelay?.fallbackToDirect === false ||
+                (finalRelayUsable && finalRelay?.fallbackToDirect === false)))
         )
           return { kind: 'defer', ...binding }
         candidate = attempt
