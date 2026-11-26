@@ -12,6 +12,7 @@ import {
   type RefusalFallbackMode,
 } from './settings-definition.ts'
 import {
+  checkSettingsRecordStateFolder,
   mirrorSettingsRecord,
   type SettingsHost,
   type SettingsRecordPaths,
@@ -201,6 +202,7 @@ function protectionEntry(copy: Record<string, unknown>, host: SettingsHost) {
 
 function readStateSeed(records: SettingsRecordPaths) {
   return readStateCopy(records, async (path) => {
+    await checkSettingsRecordStateFolder(records)
     const copy = await readCopy(path)
     if (copy !== missingCopy) {
       protectionEntry(copy, 'opencode')

@@ -13,6 +13,7 @@ import {
 } from '../settings-paths.ts'
 import {
   readSettingsProtectionCopy,
+  UnknownSettingsStateCopyError,
   writeSettingsProtectionCopy,
 } from '../settings-protection-copy.ts'
 import { readLegacySettingsProtection } from '../settings-protection-legacy.ts'
@@ -183,6 +184,37 @@ test('release A: rebuilding a missing beside copy preserves the peer floor', asy
   expect(peer.snapshot().protection.pi.rung).toBe(1)
   expect(copy.pi).toEqual(pi)
 })
+
+test.skipIf(process.platform === 'win32')(
+  'a state folder made writable by others after preparation prevents rebuilding the beside copy',
+  async () => {
+    const f = await fixture()
+    // Prepare with the state directory the fixture created already in place.
+    const { records } = await settingsTestPaths(f.file)
+    const { beside, state } = records
+    if (!state) throw new Error('Missing state layout')
+    await fs.chmod(state.directory, 0o777)
+    const { refusal_fallback, ...values } = complete
+    await writeFile(
+      state.applied,
+      JSON.stringify({
+        pi: {
+          readAt: 1,
+          values: { ...values, killswitch_default_five_hour: 0 },
+          refusal_fallback,
+        },
+      }),
+    )
+
+    await expect(
+      writeSettingsProtectionCopy(records, 'opencode', {
+        readAt: 2,
+        values: complete,
+      }),
+    ).rejects.toBeInstanceOf(UnknownSettingsStateCopyError)
+    expect(await Bun.file(beside.applied).exists()).toBe(false)
+  },
+)
 
 test.each(['unreadable', 'malformed', 'invalid peer'])(
   'release A: a %s state copy prevents rebuilding the beside copy',

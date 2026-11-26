@@ -135,6 +135,18 @@ async function checkStateFolder(
     throw new Error('Settings record directory is not owner-only')
 }
 
+/** Recheck the state directory without creating it. */
+export async function checkSettingsRecordStateFolder(
+  records: SettingsRecordPaths,
+) {
+  if (records.state)
+    await checkStateFolder(
+      records.state.directory,
+      mirrorOptions.get(records) ?? {},
+      false,
+    )
+}
+
 /** Check an existing state directory without writing to the optional layout. */
 export function prepareSettingsRecordPaths(
   resolved: SettingsPaths,
