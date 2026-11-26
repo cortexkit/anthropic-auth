@@ -206,7 +206,7 @@ export function dispatchRefusalFallback(
     hostRequestId: options.hostRequestId,
     requestedModel: options.sourceModel,
   }
-  // A relay starts collecting billing before dispatch joins the retry to the reply.
+  // A relay starts collecting billing before dispatch streams the retry into the refused reply.
   const sourceFacts =
     options.billing.refusalBilling ?? createRefusalBillingFacts(true)
   const markRefused = (category: string | undefined) => {

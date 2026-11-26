@@ -43,7 +43,7 @@ export type AnthropicBillingRequest = Omit<
    * warming state includes it.
    */
   cacheWarmingAfter?: () => Promise<void> | undefined
-  /** The stream join decides which attempts furnished the host's reply. */
+  /** Refusal facts, resolved once the refused attempt and any retry are combined into the host's one reply. */
   refusalBilling?: ReturnType<typeof createRefusalBillingFacts>
   /** Set only when the OAuth request actually sends provider fallback opt-in. */
   serverFallbackBilling?: Parameters<typeof createServerFallbackBilling>[0]
