@@ -25,6 +25,7 @@ import {
 import {
   createOpencode1Test,
   createOpencode1TestContext,
+  getBodyLifetime,
   installOpencode1TestHooks,
 } from './support/opencode1-test-context'
 import { extractUrl, MESSAGES_URL } from './test-fetch'
@@ -745,10 +746,9 @@ describe('OC1 shared routing relay', () => {
 
   test('sticky routing detaches refusal cancellation when the migrated send throws', async () => {
     const upstream = new Response('primary refused', { status: 403 })
-    const pending = Promise.withResolvers<void>()
-    const cancel = spyOn(upstream.body!, 'cancel').mockReturnValue(
-      pending.promise,
-    )
+    // If the request times out, teardown opens the gate so the test can drain.
+    const pending = getBodyLifetime(ctx).gate()
+    const cancel = spyOn(upstream.body!, 'cancel').mockReturnValue(pending.wait)
     let sends = 0
     const f = await fixture('normal', () => {
       if (++sends === 1) return upstream
@@ -766,16 +766,14 @@ describe('OC1 shared routing relay', () => {
     })
     const request = f.send()
     try {
-      await expect(
-        Promise.race([request, Bun.sleep(1_000).then(() => null)]),
-      ).rejects.toThrow('migration transport failed')
+      await expect(request).rejects.toThrow('migration transport failed')
       expect(cancel).toHaveBeenCalledTimes(1)
       expect(f.sends).toEqual([
         'Bearer sk-ant-oat01-main-access',
         'Bearer sk-ant-oat01-fallback-access',
       ])
     } finally {
-      pending.resolve()
+      pending.open()
       await Promise.allSettled([request])
       cancel.mockRestore()
     }
@@ -952,9 +950,9 @@ describe('OC1 shared routing relay', () => {
   for (const mode of ['sticky-balanced', 'main-first'] as const) {
     test(`${mode} returns routing refusal while abandoned body cancellation is pending`, async () => {
       const upstream = new Response('upstream refusal', { status: 403 })
-      const cancel = Promise.withResolvers<void>()
+      const cancel = getBodyLifetime(ctx).gate()
       const cancelBody = spyOn(upstream.body!, 'cancel').mockReturnValue(
-        cancel.promise,
+        cancel.wait,
       )
       const f = await fixture('normal', () => upstream, undefined, mode)
       let asks = 0
@@ -972,19 +970,15 @@ describe('OC1 shared routing relay', () => {
       })
       const request = f.send()
       try {
-        const response = await Promise.race([
-          request,
-          Bun.sleep(1_000).then(() => null),
-        ])
-        expect(response).not.toBeNull()
-        expect(response?.status).toBe(403)
-        expect(await response?.json()).toMatchObject({
+        const response = await request
+        expect(response.status).toBe(403)
+        expect(await response.json()).toMatchObject({
           error: { code: 'account_selection_final' },
         })
         expect(cancelBody).toHaveBeenCalledTimes(1)
         expect(asks).toBe(2)
       } finally {
-        cancel.resolve()
+        cancel.open()
         await Promise.allSettled([request])
         cancelBody.mockRestore()
       }
@@ -1010,8 +1004,8 @@ describe('OC1 shared routing relay', () => {
 
   test('fallback-first detaches main refusal cancellation when a later local fallback serves', async () => {
     const main = new Response('main refused', { status: 403 })
-    const pending = Promise.withResolvers<void>()
-    const cancel = spyOn(main.body!, 'cancel').mockReturnValue(pending.promise)
+    const pending = getBodyLifetime(ctx).gate()
+    const cancel = spyOn(main.body!, 'cancel').mockReturnValue(pending.wait)
     const responses = [
       new Response('first fallback refused', { status: 403 }),
       main,
@@ -1032,11 +1026,8 @@ describe('OC1 shared routing relay', () => {
     })
     const request = f.send()
     try {
-      const response = await Promise.race([
-        request,
-        Bun.sleep(1_000).then(() => null),
-      ])
-      expect(await response?.text()).toBe('second fallback served')
+      const response = await request
+      expect(await response.text()).toBe('second fallback served')
       expect(asks).toBe(3)
       expect(f.sends).toEqual([
         'Bearer sk-ant-oat01-fallback-access',
@@ -1045,7 +1036,7 @@ describe('OC1 shared routing relay', () => {
       ])
       expect(cancel).toHaveBeenCalledTimes(1)
     } finally {
-      pending.resolve()
+      pending.open()
       await Promise.allSettled([request])
       cancel.mockRestore()
     }
@@ -1053,8 +1044,8 @@ describe('OC1 shared routing relay', () => {
 
   for (const streaming of [false, true]) {
     test(`sticky routing migrates while ${streaming ? 'stream inspection' : 'refused body'} cancellation is pending`, async () => {
-      const pending = Promise.withResolvers<void>()
-      const cancel = mock(() => pending.promise)
+      const pending = getBodyLifetime(ctx).gate()
+      const cancel = mock(() => pending.wait)
       const refused = new Response(
         new ReadableStream({
           start(controller) {
@@ -1103,18 +1094,15 @@ describe('OC1 shared routing relay', () => {
         messages: [{ role: 'user', content: 'hello' }],
       })
       try {
-        const response = await Promise.race([
-          request,
-          Bun.sleep(1_000).then(() => null),
-        ])
-        expect(await response?.text()).toContain('migrated')
+        const response = await request
+        expect(await response.text()).toContain('migrated')
         expect(cancel).toHaveBeenCalledTimes(1)
         expect(f.sends).toEqual([
           'Bearer sk-ant-oat01-main-access',
           'Bearer sk-ant-oat01-fallback-access',
         ])
       } finally {
-        pending.resolve()
+        pending.open()
         await Promise.allSettled([request])
       }
     })

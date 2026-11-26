@@ -669,10 +669,7 @@ test('a stalled CacheKeep template delays only the accepted origin billing row, 
   expect(await stream.text()).toContain('message_stop')
   expect(waits).toBe(1)
   expect(warmingReads).toBe(0)
-  const result = await Promise.race([
-    report.promise,
-    Bun.sleep(1800).then(() => null),
-  ])
+  const result = await report.promise
   expect(result).toMatchObject({
     outcome: 'completed',
     cache: { warming: { on: true } },

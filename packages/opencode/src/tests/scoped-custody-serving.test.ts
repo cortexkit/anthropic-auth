@@ -1390,13 +1390,12 @@ for (const { outcome, finalStatus } of [
     )
     const request: Promise<Response> = loader.fetch(MESSAGES_URL, EMPTY_POST)
     try {
-      const replay = Promise.race([request, Bun.sleep(1_000).then(() => null)])
       if (finalStatus === 'network-error') {
-        await expect(replay).rejects.toThrow('new record transport failed')
+        await expect(request).rejects.toThrow('new record transport failed')
       } else {
-        const response = await replay
-        expect(response?.status).toBe(finalStatus)
-        expect(await response?.text()).toBe('rotated token response')
+        const response = await request
+        expect(response.status).toBe(finalStatus)
+        expect(await response.text()).toBe('rotated token response')
       }
       expect(cancelBody).toHaveBeenCalledTimes(1)
     } finally {
@@ -1586,12 +1585,9 @@ for (const finalStatus of [200, 401]) {
       headers: { 'x-session-affinity': 'relay-rotation' },
     })
     try {
-      const response = await Promise.race([
-        request,
-        Bun.sleep(1_000).then(() => null),
-      ])
-      expect(response?.status).toBe(finalStatus)
-      expect(await response?.text()).toBe('new relay token response')
+      const response = await request
+      expect(response.status).toBe(finalStatus)
+      expect(await response.text()).toBe('new relay token response')
       expect(cancelBody).toHaveBeenCalledTimes(1)
     } finally {
       pendingCancel.open()
