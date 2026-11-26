@@ -179,6 +179,7 @@ async function fixture(outageWait = false) {
     store,
     primaryRouteId,
     finish: clock.finish,
+    runTimer: clock.run,
     rows: (value: readonly Row[]) => {
       rows = value
     },
@@ -342,6 +343,31 @@ test('vault close interrupts a pending connection and closes its late client exa
   connected.open()
   await lateClosed.wait
   expect(f.counts.closes).toBe(1)
+})
+
+test('vault close gives up after one second when a roster refresh stays pending', async () => {
+  const f = await fixture(true)
+  const entered = gate()
+  const stuck = new Promise<never>(() => {})
+  const refresh = spyOn(vaultRoster, 'refreshVaultRoster').mockImplementation(
+    () => {
+      entered.open()
+      return stuck
+    },
+  )
+  deferCleanup(() => refresh.mockRestore())
+  const pending = f.runtime.refresh()
+  await entered.wait
+
+  let closed = false
+  const closing = Promise.resolve(f.runtime.close()).then(() => {
+    closed = true
+  })
+  await expect(pending).rejects.toMatchObject({ code: 'closed' })
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  expect(closed).toBe(false)
+  f.runTimer(1_000)
+  await f.finish(closing)
 })
 
 for (const alreadyPinned of [false, true])

@@ -706,10 +706,12 @@ function fallbackReply(model: string, refuses = false) {
 
 test.each([
   'relay without request-id',
+  'event-only message_stop',
+  'message_stop without stop_reason',
   'missing fallback beta',
   'JSON',
 ] as const)(
-  'OpenCode 2 settles the source return on a terminal reply without the refusal join: %s',
+  'OpenCode 2 only settles the source return on a terminal reply without the refusal join: %s',
   async (scenario) => {
     const scope = scopeOf({
       modelID: FALLBACK_SOURCE,
@@ -720,7 +722,7 @@ test.each([
       accountId: 'acct-local',
       accountIdentity: ACCOUNT_UUID,
     }
-    const relay = scenario === 'relay without request-id'
+    const relay = scenario !== 'missing fallback beta' && scenario !== 'JSON'
     const { source } = makeSource({
       authorize: () =>
         oauth(
@@ -890,19 +892,30 @@ test.each([
           await expect(body).rejects.toThrow('before message_stop')
         else expect(await body).toContain('message_stop')
       }
-      const truncated = await prepare()
-      const incomplete = (
-        await rewrite(
-          truncated,
-          sseResponse(
-            sse('message_start', {
-              type: 'message_start',
-              message: { model: FALLBACK_SOURCE },
-            }),
-          ),
+      const incompleteFrames = [
+        sse('message_start', {
+          type: 'message_start',
+          message: { model: FALLBACK_SOURCE },
+        }),
+      ]
+      if (scenario === 'event-only message_stop')
+        incompleteFrames.push(
+          sse('message_delta', {
+            type: 'message_delta',
+            delta: { stop_reason: 'end_turn' },
+          }),
+          sse('message_stop', {}),
         )
+      if (scenario === 'message_stop without stop_reason')
+        incompleteFrames.push(
+          sse('message_delta', { type: 'message_delta', delta: {} }),
+          sse('message_stop', { type: 'message_stop' }),
+        )
+      const incompleteText = incompleteFrames.join('')
+      const incomplete = (
+        await rewrite(await prepare(), sseResponse(incompleteText))
       ).text()
-      if (relay) expect(await incomplete).not.toContain('message_stop')
+      if (relay) expect(await incomplete).toBe(incompleteText)
       else await expect(incomplete).rejects.toThrow('before message_stop')
       expect(plan()).toHaveProperty('sourceCacheMarkerRestored', true)
 

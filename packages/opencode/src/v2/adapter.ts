@@ -815,6 +815,7 @@ function observeUnjoinedSourceReturn(
   let bytes = 0
   let streamStart = true
   let started = false
+  let hasStopReason = false
   let observing = true
   const inspectFrame = (frame: Uint8Array) => {
     const { event, data } = parseSseFrame(
@@ -824,10 +825,14 @@ function observeUnjoinedSourceReturn(
     if (event === 'error') observing = false
     if (!observing || !data || data === '[DONE]') return
     const payload = parseJson(data)
-    const type = isRecord(payload) ? (payload.type ?? event) : 'error'
-    if (type === 'error') observing = false
-    else if (type === 'message_start') started = true
-    else if (type === 'message_stop' && started) {
+    if (!isRecord(payload) || payload.type === 'error') observing = false
+    else if (payload.type === 'message_start') {
+      started = true
+      hasStopReason = false
+    } else if (payload.type === 'message_delta' && started) {
+      const reason = isRecord(payload.delta) && payload.delta.stop_reason
+      if (typeof reason === 'string' && reason) hasStopReason = true
+    } else if (payload.type === 'message_stop' && hasStopReason) {
       observing = false
       settle()
     }
