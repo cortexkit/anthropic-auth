@@ -257,8 +257,9 @@ async function writeProtectionEntry(
     async (lease) => {
       const current = await readCopy(path, true)
       const missing = current === missingCopy
-      // Publishing beside makes the mirror invisible to both hosts. Preserve
-      // its entries, or leave the beside copy absent if either is unknown.
+      // Once a copy exists beside the settings file, both hosts stop reading
+      // the state-folder copy. Carry its entries over, or leave the beside
+      // copy absent if the state-folder copy can't be read.
       const seed =
         missing && seedFromState ? await readStateSeed(seedFromState) : current
       const copy = seed === missingCopy ? {} : seed

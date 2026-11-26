@@ -414,7 +414,8 @@ function createPrefillCapture(maxBytes: number) {
  *
  * No retry, a stale result, or a retry failure before visible content releases
  * the original refusal blocks and terminal frames once. The first visible retry
- * block or complete non-refusal terminal pair commits the join; the retry's
+ * block, or a complete message_delta plus message_stop whose stop reason isn't
+ * a refusal, commits the join; the retry's
  * message_start and the source refusal are dropped. Subsequent retry errors
  * belong to the host stream, not to another attempt. A refusal on a current
  * request can end as tool_use if the host received a complete tool call; the
