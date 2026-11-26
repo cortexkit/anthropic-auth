@@ -704,6 +704,228 @@ function fallbackReply(model: string, refuses = false) {
   )
 }
 
+test.each([
+  'relay without request-id',
+  'missing fallback beta',
+  'JSON',
+] as const)(
+  'OpenCode 2 settles the source return on a terminal reply without the refusal join: %s',
+  async (scenario) => {
+    const scope = scopeOf({
+      modelID: FALLBACK_SOURCE,
+      sessionID: `ses_unjoined_return_${scenario}`,
+    })
+    const cacheRoute = {
+      url: UPSTREAM,
+      accountId: 'acct-local',
+      accountIdentity: ACCOUNT_UUID,
+    }
+    const relay = scenario === 'relay without request-id'
+    const { source } = makeSource({
+      authorize: () =>
+        oauth(
+          'test-source-oauth',
+          { custody: 'local', receipt: 'return' },
+          {
+            dispatch: relay
+              ? {
+                  kind: 'http-relay',
+                  url: 'https://relay.example.test',
+                  token: 'test-relay-token',
+                }
+              : { kind: 'direct' },
+          },
+        ),
+    })
+    let now = 1
+    const storage = {
+      version: 1 as const,
+      accounts: [],
+      claudeCache: { enabled: true, mode: 'hybrid' as const },
+      cacheKeep: { enabled: true, always: true },
+    }
+    const cacheKeep = new core.CacheKeepManager({
+      loadStorage: async () => storage,
+      now: () => now,
+    })
+    const events: core.RefusalFallbackRoundEvent[] = []
+    const rounds = new core.RefusalFallbackRoundEngine(
+      (event) => events.push(event),
+      { cacheKeep, now: () => now },
+    )
+    let templates = 0
+    const native = createNativeAnthropicAdapter({
+      source,
+      rounds,
+      roundPolicy: () => ({ cacheRoute, targetAllowed: () => true }),
+      onRoundCacheTemplate() {
+        templates++
+      },
+    })
+    const host = new Host(native.adapter)
+    const marker = { type: 'ephemeral' }
+    const prompt = {
+      role: 'user',
+      content: [{ type: 'text', text: 'kept prefix' }],
+    }
+    const payload = {
+      model: FALLBACK_SOURCE,
+      stream: true,
+      max_tokens: 100,
+      messages: [
+        prompt,
+        { role: 'assistant', content: 'prior answer' },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'current turn', cache_control: marker },
+          ],
+        },
+      ],
+    }
+    const plan = () =>
+      rounds.plan({
+        sessionId: scope.sessionID,
+        requestedModel: scope.modelID,
+        kind: 'primary',
+        mode: 'client',
+        bodyText: JSON.stringify(payload),
+        oauth: {
+          accountId: cacheRoute.accountId,
+          credentialId: 'synthetic-credential-row',
+          targetAllowed: () => true,
+          cache: cacheRoute,
+        },
+      })
+    const prepare = async () => {
+      const send = await host.run(scope, hostRequest(payload))
+      expect(native.preservesCacheTemplate(send.attempt.data!)).toBe(true)
+      if (relay) expect(send.final.url).toBe('https://relay.example.test/')
+      if (scenario === 'missing fallback beta')
+        expect(send.final.headers.get('anthropic-beta')).not.toContain(
+          SERVER_SIDE_FALLBACK_BETA,
+        )
+      return send
+    }
+    const rewrite = async (
+      send: Awaited<ReturnType<typeof prepare>>,
+      response: Response,
+    ) => {
+      if (relay) response.headers.delete('request-id')
+      return (
+        (await native.adapter.rewriteResponse?.({
+          ...send.attempt,
+          attempt: send.attempt,
+          request: send.final,
+          response,
+        })) ?? response
+      )
+    }
+    const applyHeaders = core.applyClaudeCodeHeaders
+    const headers =
+      scenario === 'missing fallback beta' &&
+      spyOn(core, 'applyClaudeCodeHeaders').mockImplementation((...args) => {
+        const result = applyHeaders(...args)
+        result.set(
+          'anthropic-beta',
+          (result.get('anthropic-beta') ?? '')
+            .split(',')
+            .filter((beta) => beta.trim() !== SERVER_SIDE_FALLBACK_BETA)
+            .join(','),
+        )
+        return result
+      })
+    try {
+      const initial = plan().request!
+      expect(rounds.markSent(initial)).toBe(true)
+      const start = rounds.lifecycle(initial, {
+        isFresh: () => true,
+        targetAllowed: () => true,
+      })
+      start?.onRefusal?.({ category: 'cyber', releasedTool: false })
+      start?.onRetryCompleted?.(
+        { stopReason: 'end_turn' },
+        { model: FALLBACK_TARGET, folded: false },
+      )
+      expect(rounds.hasRound(scope.sessionID)).toBe(true)
+      now += 300_001
+      // CacheKeep still has the first prompt's cache marker after the round times out.
+      expect(
+        cacheKeep.track({
+          sessionId: scope.sessionID,
+          url: cacheRoute.url,
+          oauthAccountId: cacheRoute.accountId,
+          oauthAccountIdentity: cacheRoute.accountIdentity,
+          storage,
+          cacheMode: 'hybrid',
+          headers: new Headers(),
+          bodyText: JSON.stringify({
+            ...payload,
+            messages: [
+              {
+                ...prompt,
+                content: [{ ...prompt.content[0], cache_control: marker }],
+              },
+            ],
+          }),
+        }).tracked,
+      ).toBe(true)
+      expect(plan()).toHaveProperty('sourceCacheMarkerRestored', true)
+
+      const complete = () =>
+        scenario === 'JSON'
+          ? Response.json({
+              type: 'message',
+              model: FALLBACK_SOURCE,
+              content: [],
+              stop_reason: 'end_turn',
+            })
+          : fallbackReply(FALLBACK_SOURCE, relay)
+      const readComplete = async (
+        send: Awaited<ReturnType<typeof prepare>>,
+      ) => {
+        const body = (await rewrite(send, complete())).text()
+        // This request asked for SSE; the host-facing guard still rejects JSON.
+        if (scenario === 'JSON')
+          await expect(body).rejects.toThrow('before message_stop')
+        else expect(await body).toContain('message_stop')
+      }
+      const truncated = await prepare()
+      const incomplete = (
+        await rewrite(
+          truncated,
+          sseResponse(
+            sse('message_start', {
+              type: 'message_start',
+              message: { model: FALLBACK_SOURCE },
+            }),
+          ),
+        )
+      ).text()
+      if (relay) expect(await incomplete).not.toContain('message_stop')
+      else await expect(incomplete).rejects.toThrow('before message_stop')
+      expect(plan()).toHaveProperty('sourceCacheMarkerRestored', true)
+
+      const stale = await prepare()
+      const latest = await prepare()
+      await readComplete(stale)
+      expect(plan()).toHaveProperty('sourceCacheMarkerRestored', true)
+      await readComplete(latest)
+      expect(plan()).not.toHaveProperty('sourceCacheMarkerRestored')
+      expect(events.map(({ kind }) => kind)).toEqual([
+        'round_started',
+        'step_served',
+        'round_ended',
+      ])
+      expect(templates).toBe(0)
+    } finally {
+      if (headers) headers.mockRestore()
+      native.dispose()
+      cacheKeep.stop()
+    }
+  },
+)
+
 test.each([false, true])(
   'OpenCode 2 sends round and routed title bodies with source headers and resends a target 400 once (source socket loss: %s)',
   async (loseResend) => {

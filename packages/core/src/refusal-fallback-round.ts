@@ -637,6 +637,28 @@ export class RefusalFallbackRoundEngine {
     )
   }
 
+  #settleSourceReturn(request: Request) {
+    if (request.returning === request.session.returning)
+      request.session.returning = undefined
+  }
+
+  /** For hosts that can verify the source reply without joining its stream. */
+  sourceReturnSettlement(
+    handle: RefusalFallbackRoundRequest,
+    isFresh: () => boolean,
+  ): (() => void) | undefined {
+    const request = this.#requests.get(handle)
+    if (request?.kind !== 'source' || request.returning === undefined) return
+    return () => {
+      if (
+        request.phase === 'sent' &&
+        this.#isCurrentPrimary(request) &&
+        isFresh()
+      )
+        this.#settleSourceReturn(request)
+    }
+  }
+
   #start(
     request: Request,
     category: string,
@@ -852,7 +874,7 @@ export class RefusalFallbackRoundEngine {
           }
           return
         }
-        request.session.returning = undefined
+        this.#settleSourceReturn(request)
         this.#sourceCompleted(request)
         publish(request.templateBodyText, completion.usage)
       },
@@ -871,7 +893,7 @@ export class RefusalFallbackRoundEngine {
         onRefusal: (refusal) => {
           if (request.phase !== 'sent' || !fresh()) return
           refusalClock = clockFrom(wireCacheTtl())
-          request.session.returning = undefined
+          this.#settleSourceReturn(request)
           request.phase = 'refusal'
           request.family.clean = 0
           request.category = refusal.category

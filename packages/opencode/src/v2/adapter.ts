@@ -21,15 +21,18 @@ import {
   classifyGzipRejection,
   claudeGatewayHeaderValues,
   claudeGatewayModelUrl,
+  copyStreamResponseTiming,
   createAnthropicBillingObserver,
   createDumpResponseObserver,
   createProviderErrorRedactor,
   createProviderErrorResponseScope,
+  createSseFramer,
   currentCacheKeepRealTurn,
   DEFAULT_REFUSAL_FALLBACK_MODE,
   type DumpHandle,
   type DumpTag,
   decideRequestGzip,
+  decodeSseFrame,
   dispatchRefusalFallback,
   dumpDirectRequest,
   dumpRelayRequest,
@@ -44,6 +47,7 @@ import {
   type IncompleteStreamDiagnostics,
   isDumpEnabled as isDumpEnabledCore,
   isNativeTransientAccountError,
+  isTerminatedSseFrame,
   joinRefusalFallbackStream,
   type MessageThreadRequest,
   MessageThreadTracker,
@@ -51,6 +55,7 @@ import {
   type ProviderErrorRedactor,
   type ProviderErrorResponseScope,
   type ProviderResponseMode,
+  parseSseFrame,
   prepareMessageThreadRequest,
   protectFallbackCreditResponse,
   RELAY_PROXY_REFUSAL,
@@ -111,6 +116,7 @@ import { requireOAuthDestination } from '../oauth-destination'
 import { isAuxiliaryAgent } from '../request-class'
 import {
   createStrippedStream,
+  NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
   observeCompletedCacheReply,
   rewriteRequestBody,
   rewriteUrl,
@@ -794,6 +800,85 @@ function parseJson(text: string): unknown {
   }
 }
 
+/** Observe a reply passed through without retrying or changing its bytes. */
+function observeUnjoinedSourceReturn(
+  response: Response,
+  settle: (() => void) | undefined,
+): Response {
+  if (!settle || response.status !== 200 || !response.body) return response
+  const contentType = response.headers.get('content-type') ?? ''
+  const json =
+    /\bjson\b/i.test(contentType) && !/text\/event-stream/i.test(contentType)
+  const framer = json ? undefined : createSseFramer()
+  const decoder = json ? new TextDecoder() : undefined
+  let text = ''
+  let bytes = 0
+  let streamStart = true
+  let started = false
+  let observing = true
+  const inspectFrame = (frame: Uint8Array) => {
+    const { event, data } = parseSseFrame(
+      decodeSseFrame(frame, { streamStart }),
+    )
+    streamStart = false
+    if (event === 'error') observing = false
+    if (!observing || !data || data === '[DONE]') return
+    const payload = parseJson(data)
+    const type = isRecord(payload) ? (payload.type ?? event) : 'error'
+    if (type === 'error') observing = false
+    else if (type === 'message_start') started = true
+    else if (type === 'message_stop' && started) {
+      observing = false
+      settle()
+    }
+  }
+  const body = response.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        if (observing) {
+          try {
+            if (framer) {
+              for (const frame of framer.push(chunk)) inspectFrame(frame)
+            } else if (decoder) {
+              bytes += chunk.byteLength
+              observing = bytes <= NON_STREAMING_DIAGNOSTICS_MAX_BYTES
+              text = observing
+                ? text + decoder.decode(chunk, { stream: true })
+                : ''
+            }
+          } catch {
+            observing = false
+          }
+        }
+        controller.enqueue(chunk)
+      },
+      flush() {
+        if (!observing) return
+        try {
+          if (framer) {
+            const tail = framer.finish()
+            if (tail && isTerminatedSseFrame(tail)) inspectFrame(tail)
+          } else if (decoder) {
+            const message = parseJson(text + decoder.decode())
+            if (
+              isRecord(message) &&
+              message.type === 'message' &&
+              typeof message.stop_reason === 'string' &&
+              message.stop_reason
+            )
+              settle()
+          }
+        } catch {
+          // A failed observation must not change the reply the host receives.
+        } finally {
+          text = ''
+        }
+      },
+    }),
+  )
+  return copyStreamResponseTiming(response, new Response(body, response))
+}
+
 /** Lower-cases every header name, keeping the last value for a name. */
 function lowerCaseEdits(edits: HeaderEdits | undefined) {
   const out: Record<string, string | null> = {}
@@ -946,6 +1031,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     fallback?: RefusalFallbackDispatchOptions
     target400?: (response: Response) => Promise<Response>
     observeCompletion?: (response: Response) => Response
+    settleSourceReturn?: () => void
   }
   const physicalSends = new WeakMap<Data, PhysicalSend>()
   const roundCacheSends = new WeakSet<Data>()
@@ -2162,11 +2248,6 @@ export function createNativeAnthropicAdapter<Q, P>(
         framing: responseMode,
       }
       physicalSends.set(data, physical)
-      const targetPlan =
-        roundPlan?.kind === 'round' || roundPlan?.kind === 'routed'
-      if (!targetPlan && (!clientStream || (!clientSource && !routed)))
-        return prepared
-
       const credentialId = send.oauth.credentialId
       const isCurrent = (ignoreMode = false) =>
         !disposed &&
@@ -2181,6 +2262,17 @@ export function createNativeAnthropicAdapter<Q, P>(
         }) ??
           true)
       const isFresh = () => isCurrent()
+      const handle = roundPlan?.request
+      if (handle)
+        physical.settleSourceReturn = rounds?.sourceReturnSettlement(
+          handle,
+          isFresh,
+        )
+      const targetPlan =
+        roundPlan?.kind === 'round' || roundPlan?.kind === 'routed'
+      if (!targetPlan && (!clientStream || (!clientSource && !routed)))
+        return prepared
+
       const complete = (
         response: Response,
         template: string,
@@ -2209,7 +2301,6 @@ export function createNativeAnthropicAdapter<Q, P>(
       }
       const signal = request.signal
       const sourceModel = input.modelID
-      const handle = roundPlan?.request
       // Thread preparation can change the beta list. Keep it, not the
       // gateway's transport headers, which the warmer must resolve anew.
       const templateHeaders = new Headers(sourceHeaders)
@@ -2674,14 +2765,20 @@ export function createNativeAnthropicAdapter<Q, P>(
       const failThread = threaded?.thread.fail
       if (data) threadRequests.delete(data)
       let fallback = upstream && response.ok && physical?.fallback
+      let joined = false
       let terminalResend = false
       let targetStatus: number | undefined
       // A send whose failure was already reported (the fetch threw) must not
       // be billed a second time from the response it was replaced with.
       const firstReceipt = !!billingSend && !billingSend.received
       if (billingSend) billingSend.received = true
-      const dispatchFallback = (fallback: RefusalFallbackDispatchOptions) =>
-        dispatchRefusalFallback(response, {
+      const dispatchFallback = (fallback: RefusalFallbackDispatchOptions) => {
+        // The dispatcher leaves JSON replies unjoined even on a streaming request.
+        const contentType = response.headers.get('content-type') ?? ''
+        joined =
+          /text\/event-stream/i.test(contentType) ||
+          !/\bjson\b/i.test(contentType)
+        return dispatchRefusalFallback(response, {
           ...fallback,
           observePhysicalResponse: (guarded, attempt) => {
             if (attempt.refusalRetry)
@@ -2693,6 +2790,7 @@ export function createNativeAnthropicAdapter<Q, P>(
             return physical?.observeCompletion?.(observed) ?? observed
           },
         })
+      }
       if (fallback) {
         response = dispatchFallback(fallback)
       } else {
@@ -2766,7 +2864,10 @@ export function createNativeAnthropicAdapter<Q, P>(
         }
         // The relay's own failure can repeat the relay token or the
         // credential in the envelope it was given.
-        return scrubResponse(data, response)
+        return observeUnjoinedSourceReturn(
+          scrubResponse(data, response),
+          physical?.settleSourceReturn,
+        )
       }
       if (data && gzippedSends.has(data)) {
         gzippedSends.delete(data)
@@ -2889,7 +2990,8 @@ export function createNativeAnthropicAdapter<Q, P>(
       ) {
         safe = physical.observeCompletion?.(safe) ?? safe
         safe = joinRefusalFallbackStream(safe, physical.join)
-      }
+      } else if (!joined)
+        safe = observeUnjoinedSourceReturn(safe, physical?.settleSourceReturn)
       let incompleteObserver:
         | ReturnType<typeof createDumpResponseObserver>
         | undefined

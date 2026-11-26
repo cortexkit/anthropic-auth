@@ -623,14 +623,17 @@ test.each(['API key', 'source authorization failure'] as const)(
       expect(piRefusalRoundStatus(sessionId)).toBeUndefined()
       expect(manager.trackedRequest(sessionId)).toBeUndefined()
     } finally {
-      capture.mockRestore()
-      authorizeSpy.mockRestore()
-      readSpy.mockRestore()
-      endPiPrimaryTurn(storagePath, sessionId, true)
-      forgetPiMessageThread(sessionId)
-      captured[0]?.untrack(sessionId)
-      sessionCacheActivity.forget(sessionId)
-      await cleanCacheKeep()
+      try {
+        capture.mockRestore()
+        authorizeSpy.mockRestore()
+        readSpy.mockRestore()
+        endPiPrimaryTurn(storagePath, sessionId, true)
+        forgetPiMessageThread(sessionId)
+        captured[0]?.untrack(sessionId)
+        sessionCacheActivity.forget(sessionId)
+      } finally {
+        await cleanCacheKeep()
+      }
     }
   },
 )
