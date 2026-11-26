@@ -39,6 +39,7 @@ import {
   createNativeLocalCredentialService,
   type NativeLocalCredentialServiceOptions,
 } from '../native-local-credential-service.ts'
+import { publishNativeEmptyInit } from '../native-migration.ts'
 import { fromNativeQuotaMap, nativeQuotaCodec } from '../native-quota-codec.ts'
 import {
   NativeQuotaObservations,
@@ -51,7 +52,10 @@ import {
 } from '../native-runtime.ts'
 import { createNativeUsagePublisher } from '../native-usage-publication.ts'
 import { nativeVaultPaths } from '../native-vault-paths.ts'
-import { resolveNativePoolPaths } from '../pool-paths.ts'
+import {
+  resolveLocalRoutingDestination,
+  resolveNativePoolPaths,
+} from '../pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from '../pool-store.ts'
 import { effectiveRelayStatus, effectiveRelayTransport } from '../relay.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
@@ -330,6 +334,84 @@ test('quota metadata: an under-lock missing runtime is not recreated or retried'
   expect(await readdir(dirname(f.paths.runtime))).not.toContain(
     basename(held.stages[0]!),
   )
+})
+
+test('quota metadata: first OAuth polls after empty-init work despite earlier API bookkeeping refusals', async () => {
+  // Model the pool rows becoming visible before their account adds finish
+  // initializing the runtime file. Empty-init itself only writes the journal.
+  const f = await fixture({}, false, 'empty-init')
+  await f.store.add({
+    id: 'early-api',
+    credential: {
+      type: 'api',
+      apiKey: 'synthetic-api-key',
+      baseURL: 'https://api.anthropic.com',
+    },
+  })
+  const readRuntime = () =>
+    readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  expect(await readRuntime()).toEqual({ status: 'missing' })
+
+  const previousLevel = getLogLevel()
+  const warnings: LogTestRecord[] = []
+  setLogLevel('warn')
+  __setLogTestSink((record) => warnings.push(record))
+  deferCleanup(() => {
+    __setLogTestSink(null)
+    setLogLevel(previousLevel)
+  })
+
+  // A served API request does not need OAuth validation. Its bookkeeping
+  // is detached and silently declines to create the missing runtime file.
+  const api = await f.runtime.authorizeApi('early-api')
+  const usage = createNativeUsagePublisher('early-api')
+  deferCleanup(() => usage.close())
+  const kept: boolean[] = []
+  for (let i = 0; i < 2; i++) {
+    usage.publish(async (signal) => {
+      kept.push(
+        await f.runtime.publishApi(api.subject, { lastUsed: now + i }, signal),
+      )
+    })
+    await usage.drain()
+  }
+  expect(kept).toEqual([false, false])
+  expect(await readRuntime()).toEqual({ status: 'missing' })
+
+  // The first OAuth poll must have a durable credential proof before sending.
+  const proofAtDispatch: boolean[] = []
+  const transport = Object.assign(
+    async () => {
+      const saved = await readRuntime()
+      proofAtDispatch.push(
+        saved.status === 'ready' &&
+          saved.state.accounts['imported-main']?.credentialValidation?.binding
+            .identity === uuid,
+      )
+      return Response.json({ five_hour: { utilization: 20 } })
+    },
+    { preconnect: fetch.preconnect },
+  )
+  for (let i = 0; i < 2; i++) {
+    const quota = await f.runtime.fetchQuota('main', transport)
+    expect(quota.five_hour?.remainingPercent).toBe(80)
+    await f.runtime.drainQuotaPublications()
+  }
+  expect(proofAtDispatch).toEqual([true, true])
+  expect(f.counts).toEqual({ lookups: 1, refresh: 0 })
+  expect(await f.runtime.publishApi(api.subject, { lastUsed: now + 2 })).toBe(
+    true,
+  )
+  expect(await readRuntime()).toMatchObject({
+    status: 'ready',
+    state: {
+      accounts: {
+        'imported-main': { quotaErrorClearedAt: now },
+        'early-api': { lastUsed: now + 2 },
+      },
+    },
+  })
+  expect(warnings).toEqual([])
 })
 
 test('quota metadata: sweep removes only old metadata stages for this runtime', async () => {
@@ -688,6 +770,7 @@ async function fixture(
   // Store the main row without an account UUID, as a row whose account was
   // never confirmed.
   unresolved = false,
+  initialization: 'migration' | 'empty-init' = 'migration',
 ) {
   const parent = new URL(
     '../../../../node_modules/.cache/native-account-runtime/',
@@ -697,7 +780,18 @@ async function fixture(
   const root = await mkdtemp(join(parent, 'fixture-'))
   deferCleanup(() => rm(root, { recursive: true, force: true }))
   const paths = await resolveNativePoolPaths(join(root, 'anthropic-auth.json'))
-  await initializeNativeTestAuthority(paths)
+  if (initialization === 'empty-init') {
+    await publishNativeEmptyInit({
+      paths,
+      env: {},
+      routingDestinationPath: resolveLocalRoutingDestination(
+        'opencode',
+        paths,
+        {},
+      ),
+      processFence: async () => {},
+    })
+  } else await initializeNativeTestAuthority(paths)
   const store = createNativePoolStore({
     paths,
     quota: nativeQuotaCodec,
