@@ -2,7 +2,7 @@ import { expect, spyOn } from 'bun:test'
 import * as fsPromises from 'node:fs/promises'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, basename } from 'node:path'
 import * as Core from '@cortexkit/anthropic-auth-core'
 import {
   type NativeAccountSnapshot,
@@ -16,6 +16,15 @@ import { AnthropicAuthPlugin } from '../index.ts'
 import { drainSidebarWrites } from '../sidebar-state.ts'
 import { migrateNativeOpencodeFixture } from './native-fixture.ts'
 import { getPluginTestHandles } from './plugin-test-handles'
+
+// Quota metadata stages beside the runtime file as
+// "<runtime>.native-runtime-metadata.*"; other runtime writes use
+// "<runtime>.native-runtime.*". Compare names, since the metadata writer
+// resolves the folder's canonical path first.
+function isRuntimeStage(path: string, runtime: string) {
+  return basename(path).startsWith(`${basename(runtime)}.native-runtime`)
+}
+
 
 /*
  * Fallback quota sweeps decide which accounts are due from a pool snapshot,
@@ -897,7 +906,7 @@ test('quota poll serves its reading while runtime sync is held and dispose drain
   const openSpy = spyOn(fsPromises, 'open').mockImplementation(
     async (path, flags, mode) => {
       const file = await realOpen(path, flags, mode)
-      if (String(path).startsWith(`${f.paths.runtime}.native-runtime.`)) {
+      if (isRuntimeStage(String(path), f.paths.runtime)) {
         const sync = file.sync.bind(file)
         file.sync = async () => {
           const staged = JSON.parse(await readFile(path, 'utf8'))

@@ -1,3 +1,4 @@
+import { basename } from 'node:path'
 import { describe, expect, mock, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
 import * as filesystem from 'node:fs/promises'
@@ -52,6 +53,15 @@ import {
   setSidebarWriteTestHooks as setSidebarWriteTestHooksWithCtx,
 } from './support/opencode1-test-context.ts'
 import { extractUrl, MESSAGES_URL, QUOTA_URL } from './test-fetch'
+
+// Quota metadata stages beside the runtime file as
+// "<runtime>.native-runtime-metadata.*"; other runtime writes use
+// "<runtime>.native-runtime.*". Compare names, since the metadata writer
+// resolves the folder's canonical path first.
+function isRuntimeStage(path: string, runtime: string) {
+  return basename(path).startsWith(`${basename(runtime)}.native-runtime`)
+}
+
 
 const testContext = createOpencode1TestContext()
 installOpencode1TestHooks(testContext)
@@ -246,7 +256,7 @@ describe('auth.loader', () => {
         const openSpy = spyOn(filesystem, 'open').mockImplementation(
           async (path, flags, mode) => {
             const file = await realOpen(path, flags, mode)
-            if (String(path).startsWith(`${runtimePath}.native-runtime.`)) {
+            if (isRuntimeStage(String(path), runtimePath)) {
               const sync = file.sync.bind(file)
               file.sync = async () => {
                 const staged: {
