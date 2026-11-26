@@ -2,13 +2,15 @@
 # Nothing under .cortexkit/ may be tracked except the allowed folders and files.
 #
 # The fleet layout keeps internal material (design notes, investigations, tool state)
-# under .cortexkit/, ignored by git, and tracks only release-notes/, skills/, rules/ and
-# WORKER.md there. With the .gitignore block in place, the only way to track anything
-# else is to force-add an ignored path, so the check is that `git ls-files -ci` lists no
-# tracked file that the ignore rules would exclude.
+# under .cortexkit/, ignored by git. Git tracks only release-notes/, skills/, rules/,
+# WORKER.md and top-level project settings files (.cortexkit/<module>.jsonc, which the
+# daemon reads) there. So every tracked path under .cortexkit/ must be on that list.
+# Listing only tracked files that are also ignored (`git ls-files -ci`) is not enough:
+# a stray `!` rule in a .gitignore can un-ignore a private file, which is then tracked
+# but no longer ignored, and that listing misses it.
 #
-# That check passes vacuously if the ignore block is missing, because then nothing is
-# ignored. So it first confirms the block works: an internal path must be ignored and
+# The ignore block itself must still work, or private files get committed by accident.
+# So the script first confirms it: an internal path must be ignored and
 # an allowed one must not be. If either control fails, the checker reports itself
 # BLIND and exits 2 rather than passing.
 #
@@ -26,10 +28,14 @@ if git check-ignore -q --no-index .cortexkit/release-notes/control.md; then
   exit 2
 fi
 
-tracked="$(git ls-files -ci --exclude-standard -- .cortexkit)"
-if [ -n "$tracked" ]; then
-  echo "tracked files under .cortexkit/ that the layout keeps out of git:" >&2
-  printf '  %s\n' $tracked >&2
+if ! all="$(git ls-files -- .cortexkit)"; then
+  echo "BLIND: git ls-files failed" >&2
+  exit 2
+fi
+bad="$(printf '%s\n' "$all" | grep -vE '^\.cortexkit/(release-notes/|skills/|rules/|WORKER\.md$|[a-z0-9-]+\.jsonc$)' | grep -v '^$')"
+if [ -n "$bad" ]; then
+  echo "tracked files under .cortexkit/ outside the allowed list:" >&2
+  printf '  %s\n' $bad >&2
   echo "move them to .cortexkit/internal-docs/ (or remove them) and 'git rm --cached' them" >&2
   exit 1
 fi
