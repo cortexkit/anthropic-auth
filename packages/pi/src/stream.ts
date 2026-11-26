@@ -33,6 +33,7 @@ import {
   createNativeVaultNoRouteResponse,
   createProviderErrorResponseScope,
   createQuotaRefusalResponse,
+  createRefusalBillingFacts,
   createRoutingRelay,
   createServerSideFallbackStreamRewriter,
   createSseFramer,
@@ -1202,9 +1203,16 @@ export function sendPiPrimeRequest(options: PiPrimeSendOptions) {
 registerPiPrimeSender(sendPiPrimeRequest)
 
 async function sendAnthropicRequest(
-  ...args: Parameters<typeof sendAnthropicRequestAttempt>
+  input: Omit<
+    Parameters<typeof sendAnthropicRequestAttempt>[0],
+    'hostRequestId'
+  > & { hostRequestId?: string },
+  deps: Parameters<typeof sendAnthropicRequestAttempt>[1] = {},
 ): Promise<Response> {
-  const [options, deps = {}] = args
+  const options = {
+    ...input,
+    hostRequestId: input.hostRequestId ?? randomUUID(),
+  }
   const forkHead = piForkHeadSession(options.streamOptions)
   const inherited = forkHead ? undefined : currentCacheKeepRealTurn()
   let turn = inherited
@@ -1228,7 +1236,7 @@ async function sendAnthropicRequest(
     return await withCacheKeepRealTurn(turn, async () => {
       for (;;) {
         try {
-          return await sendAnthropicRequestAttempt(...args)
+          return await sendAnthropicRequestAttempt(options, deps)
         } catch (error) {
           if (error !== replanPiRound) throw error
         }
@@ -1243,6 +1251,7 @@ async function sendAnthropicRequestAttempt(
   options: {
     model: Model<Api>
     context: Context
+    hostRequestId: string
     streamOptions?: SimpleStreamOptions
     requestOrigin?: 'agent-loop' | 'direct'
     laneStart?: boolean
@@ -1521,6 +1530,7 @@ async function sendAnthropicRequestAttempt(
     sentBody = wireBodyText,
     sentModel = physicalModel,
     after?: () => Promise<void> | undefined,
+    refusalBilling?: AnthropicBillingRequest['refusalBilling'],
   ): Promise<AnthropicBillingRequest | undefined> => {
     // Prime (the five-hour window starter) has no session transcript, and
     // Agent Runner bills a fork's answer itself from the answer's usage, so
@@ -1546,6 +1556,14 @@ async function sendAnthropicRequestAttempt(
       model: sentModel,
       requestKind: options.requestOrigin === 'direct' ? 'generate' : 'primary',
       chargeBasis: options.apiAccount ? 'metered_api' : 'subscription_included',
+      ...(serverSideFallbackSent && {
+        serverFallbackBilling: {
+          hostRequestId: options.hostRequestId,
+          requestedModel,
+          sentModel,
+        },
+      }),
+      refusalBilling,
       ...(ttlMs > 0 ? { cache: { ttlMs } } : {}),
       // Only the accepted report waits for a round template publication;
       // the stream itself never waits.
@@ -1961,6 +1979,9 @@ async function sendAnthropicRequestAttempt(
     piCacheKeep.preserveTurn(realTurn)
   const roundRequest = roundPlan?.request
   const targetPlan = roundPlan?.kind === 'round' || roundPlan?.kind === 'routed'
+  const roundBilling =
+    roundRequest &&
+    roundEngine.billingForRound(roundRequest, options.hostRequestId)
   const engineOwnsTemplate = !!roundRequest && roundPlan?.kind !== 'routed'
   const trackOrdinary =
     !engineOwnsTemplate &&
@@ -2283,6 +2304,7 @@ async function sendAnthropicRequestAttempt(
     const fresh = () => isFresh(origin)
     const originalThread = threadRequest
     return dispatchRefusalFallback(response, {
+      hostRequestId: options.hostRequestId,
       sourceModel: requestedModel,
       origin,
       billing,
@@ -2414,6 +2436,7 @@ async function sendAnthropicRequestAttempt(
         sentBody,
         physicalModel,
         lifecycle && (() => lifecycle.cacheKeepTemplateSettled),
+        roundBilling,
       )
       const scope = createProviderErrorResponseScope(
         [secret, ...claudeGatewayHeaderValues(gateway)],
@@ -2432,6 +2455,8 @@ async function sendAnthropicRequestAttempt(
             lifecycle,
           }
         markRoundSent(attempt)
+        if (roundRequest)
+          roundEngine.reportRoundSend(roundRequest, options.hostRequestId)
         raw = await fetchResponse(destination, request)
       } catch (error) {
         if (error === replanPiRound) throw error
@@ -2663,6 +2688,8 @@ async function sendAnthropicRequestAttempt(
           sentBody,
           physicalModel,
           lifecycle && (() => lifecycle.cacheKeepTemplateSettled),
+          roundBilling ??
+            (clientSource ? createRefusalBillingFacts(true) : undefined),
         )
         let credit: string | undefined
         if (clientSource && billing) {
@@ -2686,6 +2713,8 @@ async function sendAnthropicRequestAttempt(
           lifecycle,
         }
         markRoundSent(attempt)
+        if (roundRequest)
+          roundEngine.reportRoundSend(roundRequest, options.hostRequestId)
         return {
           headers: authorizedHeaders,
           billing,
@@ -3123,6 +3152,7 @@ const skippedPaidLaneStart = new Response(null, { status: 204 })
 async function executeWithFallback(options: {
   model: Model<Api>
   context: Context
+  hostRequestId?: string
   streamOptions?: SimpleStreamOptions
   requestOrigin?: 'agent-loop' | 'direct'
   laneStart?: boolean
@@ -3142,7 +3172,8 @@ async function executeWithFallback(options: {
     relay: createRoutingRelay(),
     advice: undefined,
   }
-  options = { ...options, routingRelay: routingState.relay }
+  const hostRequestId = options.hostRequestId ?? randomUUID()
+  options = { ...options, hostRequestId, routingRelay: routingState.relay }
   const native = getPiNativeRuntime(options.storagePath)
   let snapshot = await native.requestView(
     options.streamOptions?.signal,
@@ -3538,6 +3569,7 @@ async function executeWithFallback(options: {
           options.model.id,
           routingCandidates(snapshot.accounts),
           {
+            requestId: hostRequestId,
             capacityWait: 'wait',
             signal,
             onCapacityWait: options.onCapacityWait,
@@ -3637,6 +3669,7 @@ async function executeWithFallback(options: {
         options.model.id,
         routingCandidates(snapshot.accounts),
         {
+          requestId: hostRequestId,
           capacityWait: 'wait',
           signal: options.streamOptions?.signal,
           onCapacityWait: options.onCapacityWait,
@@ -4200,6 +4233,7 @@ export function streamCortexKitAnthropic(
       const request = {
         model,
         context,
+        hostRequestId: randomUUID(),
         streamOptions: options,
         requestOrigin,
         laneStart,

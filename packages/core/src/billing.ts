@@ -5,6 +5,8 @@ import {
   reportRouting,
 } from '@cortexkit/common-auth/routing-accessor'
 import { logger } from './logger.ts'
+import type { createRefusalBillingFacts } from './refusal-fallback-billing.ts'
+import { createServerFallbackBilling } from './server-fallback.ts'
 import { copyStreamResponseTiming } from './stream-completion.ts'
 
 export type AnthropicBillingReport = Extract<
@@ -41,6 +43,10 @@ export type AnthropicBillingRequest = Omit<
    * warming state includes it.
    */
   cacheWarmingAfter?: () => Promise<void> | undefined
+  /** Refusal facts, resolved once the refused attempt and any retry are combined into the host's one reply. */
+  refusalBilling?: ReturnType<typeof createRefusalBillingFacts>
+  /** Set only when the OAuth request actually sends provider fallback opt-in. */
+  serverFallbackBilling?: Parameters<typeof createServerFallbackBilling>[0]
   /** In-process consumer of each billing report; nothing it adds is sent to shared routing. */
   onReport?: (report: AnthropicBillingReport) => void
 }
@@ -157,6 +163,8 @@ function detachReport(
 function identity({
   cacheWarming: _,
   cacheWarmingAfter: _after,
+  refusalBilling: _refusal,
+  serverFallbackBilling: _server,
   onReport: _observer,
   ...input
 }: AnthropicBillingRequest) {
@@ -187,6 +195,9 @@ export function createAnthropicBillingObserver(
     status,
     providerRequestId: headers.get('request-id') ?? undefined,
   }
+  const serverFallback =
+    input.serverFallbackBilling &&
+    createServerFallbackBilling(input.serverFallbackBilling)
   let sent = false
   let finalUsage = false
   let failed = status >= 400
@@ -202,6 +213,8 @@ export function createAnthropicBillingObserver(
     // message_start's zero output is not a measurement of a cut-off answer.
     if (!finalUsage) delete measured.usage.output
     const outcome = failed ? 'failed' : !finalUsage ? 'cut' : 'completed'
+    let fallback: BillingReport['fallback'] =
+      outcome === 'completed' ? serverFallback?.facts() : undefined
     const publish = (readWarming: boolean) => {
       let cache = failed ? undefined : base.cache
       if (readWarming && !cache?.warming && input.cacheWarming) {
@@ -212,12 +225,19 @@ export function createAnthropicBillingObserver(
         if (warming) cache = { ...cache, warming }
       }
       detachReport(
-        { ...base, cache, providerResponseId, outcome, ...measured },
+        {
+          ...base,
+          cache,
+          providerResponseId,
+          outcome,
+          ...measured,
+          ...(fallback && { fallback }),
+        },
         input.onReport,
       )
     }
-    if (outcome !== 'completed' || !input.cacheWarmingAfter) {
-      publish(outcome === 'completed')
+    if (outcome !== 'completed') {
+      publish(false)
       return
     }
     let publication: Promise<void> | undefined
@@ -229,31 +249,47 @@ export function createAnthropicBillingObserver(
         stopReason === 'max_tokens')
     ) {
       try {
-        publication = input.cacheWarmingAfter()
+        publication = input.cacheWarmingAfter?.()
       } catch {}
     }
-    if (!publication) {
-      publish(false)
+    const refusal = input.refusalBilling
+    let facts: Promise<void> | undefined
+    if (refusal?.routedAnswer) {
+      if ((stopped || !sse) && stopReason !== 'refusal')
+        fallback = refusal.routedAnswer()
+    } else if (
+      stopped &&
+      refusal &&
+      (!refusal.refusalOnly || stopReason === 'refusal')
+    ) {
+      facts = refusal.promise.then((value) => {
+        fallback = value
+      })
+    }
+    if (!publication && !facts) {
+      publish(!input.cacheWarmingAfter)
       return
     }
-    // Billing may wait for signing and tracking, but must never hold the stream.
+    // Billing can wait for the join and cache bookkeeping, but never holds the reply.
     let reported = false
     const report = () => {
       if (reported) return
       reported = true
       clearTimeout(timeout)
-      publish(true)
+      publish(!input.cacheWarmingAfter || !!publication)
     }
     const timeout = setTimeout(() => {
-      logger.warn('billing', 'timed out waiting for the CacheKeep template')
+      if (publication)
+        logger.warn('billing', 'timed out waiting for the CacheKeep template')
       report()
     }, 1000)
     timeout.unref?.()
-    void publication.then(report, report)
+    void Promise.all([publication, facts]).then(report, report)
   }
   const observe = (value: unknown) => {
     const event = record(value)
     if (!event) return
+    serverFallback?.observe(event)
     const message = record(event.message) ?? event
     if (typeof message.id === 'string') providerResponseId = message.id
     const usage = record(message.usage)
@@ -278,7 +314,10 @@ export function createAnthropicBillingObserver(
       if (usage) finalUsage = true
       stopReason = record(event.delta)?.stop_reason
     }
-    if (event.type === 'message' && usage) finalUsage = true
+    if (event.type === 'message' && usage) {
+      finalUsage = true
+      stopReason = event.stop_reason
+    }
     if (event.type === 'message_stop') {
       stopped = true
       finish()

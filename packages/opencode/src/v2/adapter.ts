@@ -25,6 +25,7 @@ import {
   createDumpResponseObserver,
   createProviderErrorRedactor,
   createProviderErrorResponseScope,
+  createRefusalBillingFacts,
   DEFAULT_REFUSAL_FALLBACK_MODE,
   type DumpHandle,
   type DumpTag,
@@ -280,6 +281,7 @@ export interface NativeAnthropicAttemptContext<P>
   extends AccountRequest,
     NativeAnthropicSendScope {
   readonly attemptId: string
+  readonly hostRequestId?: string
   readonly transport: Transport | undefined
   readonly route: NativeAnthropicRoute
   readonly provenance: P
@@ -401,6 +403,7 @@ export interface NativeAnthropicSource<Q, P> {
    */
   readonly chooseAccount: (
     input: ChooseAccountInput,
+    hostRequestId?: string,
   ) => Promise<ChooseAccountResult> | ChooseAccountResult
   /** Discards one queued choice that the installer will not authorize. */
   readonly dropChoice?: (input: AccountRequest) => Promise<void> | void
@@ -604,6 +607,7 @@ export interface NativeAnthropicAdapter<Q, P> {
   bindHostAttempt(
     attempt: Attempt<NativeAnthropicAttemptData<P>>,
     hostAttempt: number,
+    hostRequestId?: string,
   ): void
   /** Drop the pending quota-stop message if the send ends before its response body is rewritten. */
   discardQuotaStopMessage(data: NativeAnthropicAttemptData<P>): void
@@ -616,6 +620,10 @@ export interface NativeAnthropicAdapter<Q, P> {
     NativeAnthropicAttemptData<P>,
     ChooseAccountResult
   > & {
+    readonly chooseAccount: (
+      input: ChooseAccountInput,
+      hostRequestId?: string,
+    ) => Promise<ChooseAccountResult>
     readonly dropChoice: (input: AccountRequest) => Promise<void> | void
   }
   /**
@@ -895,7 +903,10 @@ export function createNativeAnthropicAdapter<Q, P>(
   // Only host-owned sends belong here. Recovery fetches own their billing
   // state so ending the original host attempt cannot retire an in-flight resend.
   const billingSends = new WeakMap<Data, BillingSend>()
-  const hostAttempts = new Map<Data, { sessionID: string; attempt: number }>()
+  const hostAttempts = new Map<
+    Data,
+    { sessionID: string; attempt: number; id?: string }
+  >()
   let quotaStopMessages = new WeakMap<Data, string>()
   let requestGzipLatch = deps.requestGzipLatch
   const gzipLatch = async () => {
@@ -1213,6 +1224,9 @@ export function createNativeAnthropicAdapter<Q, P>(
     kind: attempt.kind,
     accountId: attempt.accountId,
     attemptId: attempt.attemptId,
+    ...(hostAttempts.get(data)?.id && {
+      hostRequestId: hostAttempts.get(data)?.id,
+    }),
     transport: attempt.transport,
     route: data.route,
     provenance: resendProvenance.get(data) ?? data.provenance,
@@ -1379,6 +1393,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     if (!data || !send || (data.route === 'oauth' && !send.oauth)) {
       throw refuse(input)
     }
+    const hostRequestId = hostAttempts.get(data)?.id ?? randomUUID()
 
     let headers = new Headers(request.headers)
     if (data.route === 'api') applyCustomHeaders(headers)
@@ -1796,8 +1811,13 @@ export function createNativeAnthropicAdapter<Q, P>(
               assertHostAuthorityStable()
               const cleanBody = await withoutFallbackCredit(createBody)
               billingSend = observeFinalWire(cleanBody)
+              if (billingSend && clientSource)
+                billingSend.input.refusalBilling =
+                  createRefusalBillingFacts(true)
               assertHostAuthorityStable()
               notifyFinal(retryHeaders, attempt.attemptId, cleanBody)
+              if (roundPlan?.request)
+                rounds?.reportRoundSend(roundPlan.request, hostRequestId)
               let received = await (deps.fetch ?? globalThis.fetch)(url, init)
               if (request.signal.aborted) {
                 void received.body?.cancel().catch(() => {})
@@ -2160,6 +2180,8 @@ export function createNativeAnthropicAdapter<Q, P>(
         )
       }
       if (roundPlan?.request) roundCacheSends.add(data)
+      if (roundPlan?.request)
+        rounds?.reportRoundSend(roundPlan.request, hostRequestId)
       if (billing) billingSends.set(data, billing)
       if (data.route === 'oauth' && messages && cleaned !== undefined)
         notifyFinal(prepared.headers, attempt.attemptId, cleaned)
@@ -2288,6 +2310,7 @@ export function createNativeAnthropicAdapter<Q, P>(
           }
         | undefined
       const fallback: RefusalFallbackDispatchOptions = {
+        hostRequestId,
         sourceModel,
         origin: {
           accountId,
@@ -2558,6 +2581,7 @@ export function createNativeAnthropicAdapter<Q, P>(
             attemptId: randomUUID(),
             model,
             cacheWarmingAfter: undefined,
+            refusalBilling: undefined,
           }
         physical.target400 = (response) =>
           rounds.handleTarget400(handle, response, {
@@ -2606,6 +2630,22 @@ export function createNativeAnthropicAdapter<Q, P>(
                     ? payload.model
                     : metadata.model,
                 ...(ttlMs > 0 ? { cache: { ...metadata.cache, ttlMs } } : {}),
+                ...(roundPlan?.request && {
+                  refusalBilling: rounds?.billingForRound(
+                    roundPlan.request,
+                    hostRequestId,
+                  ),
+                }),
+                ...(data.route === 'oauth' &&
+                  isRecord(payload) &&
+                  payload.fallbacks === 'default' &&
+                  typeof payload.model === 'string' && {
+                    serverFallbackBilling: {
+                      hostRequestId,
+                      requestedModel: input.modelID,
+                      sentModel: payload.model,
+                    },
+                  }),
               },
               received: false,
             }
@@ -2647,9 +2687,9 @@ export function createNativeAnthropicAdapter<Q, P>(
 
   const adapter: NativeAnthropicAdapter<Q, P>['adapter'] = {
     providerID: ANTHROPIC_PROVIDER_ID,
-    chooseAccount: (input) =>
+    chooseAccount: (input, hostRequestId?: string) =>
       tracked(input, async () => {
-        const choice = await source.chooseAccount(input)
+        const choice = await source.chooseAccount(input, hostRequestId)
         // The installer honours a hold only while judging a retry.
         if (typeof choice === 'object' && input.phase === 'retry') return choice
         if (typeof choice !== 'string' || !choice) throw refuse(input)
@@ -3355,7 +3395,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     discardQuotaStopMessage(data) {
       quotaStopMessages.delete(data)
     },
-    bindHostAttempt(attempt, hostAttempt) {
+    bindHostAttempt(attempt, hostAttempt, hostRequestId) {
       if (
         !attempt.data ||
         disposed ||
@@ -3366,6 +3406,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       hostAttempts.set(attempt.data, {
         sessionID: attempt.sessionID,
         attempt: hostAttempt,
+        id: hostRequestId,
       })
       while (hostAttempts.size > maxPending) {
         const first = hostAttempts.keys().next().value

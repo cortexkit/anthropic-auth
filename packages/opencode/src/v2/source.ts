@@ -1149,6 +1149,7 @@ export function createNativeAnthropicSource(
     beginRealTurn: options.beginRealTurn,
     async chooseAccount(
       input: ChooseAccountInput,
+      hostRequestId?: string,
     ): Promise<ChooseAccountResult> {
       // Credential maintenance and quota readings may occur without selecting
       // an account. Returning undefined must not consume a pending retry,
@@ -1225,6 +1226,7 @@ export function createNativeAnthropicSource(
         modelID,
         routingCandidates(snapshot.accounts),
         {
+          requestId: hostRequestId,
           // OpenCode times this middleware without aborting it and offers no
           // pre-send retry. Waiting longer leaves the routing wait running
           // after the host returns a generic header timeout.
@@ -2012,6 +2014,7 @@ export function createNativeAnthropicSource(
         modelID,
         routingCandidates(snapshot.accounts),
         {
+          requestId: input.hostRequestId,
           // This probe only decides the text of an existing 429 response.
           capacityWait: { maxInRequestMs: 0 },
           signal: state.active.signal,

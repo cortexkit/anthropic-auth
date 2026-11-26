@@ -28,6 +28,7 @@ export type RoutingChoice = {
 }
 type RoutingSubject = { accountIdentity?: string; credentialId?: string }
 type RoutingAskOptions = {
+  requestId?: string
   capacityWait: 'wait' | { maxInRequestMs: number; stopWithinBudget?: true }
   signal?: AbortSignal
   warmCredentialId?: string
@@ -204,6 +205,7 @@ export function createRoutingRelay(
       modelId: string,
       candidates: readonly RoutingSubject[],
       {
+        requestId,
         capacityWait,
         signal,
         warmCredentialId,
@@ -236,6 +238,7 @@ export function createRoutingRelay(
           modelId,
           deadlineMs: ROUTING_ASK_DEADLINE_MS,
           refusals: true,
+          requestId,
           ...(warmCredentialId ? { warmCredentialId } : {}),
           candidates: candidates.flatMap((row) =>
             row.accountIdentity

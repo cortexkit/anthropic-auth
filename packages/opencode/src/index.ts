@@ -59,6 +59,7 @@ import {
   createNativeVaultNoRouteResponse,
   createProviderErrorResponseScope,
   createQuotaRefusalResponse,
+  createRefusalBillingFacts,
   createSseFramer,
   createStickyNoRouteResponse,
   custodyTombstoneOAuth,
@@ -7360,6 +7361,7 @@ const anthropicAuthPlugin = async (
           async function sendWithAccessToken(
             input: string | URL | Request,
             init: RequestInit | undefined,
+            hostRequestId: string,
             accessToken: string,
             refusalFallbackMode: RefusalFallbackMode,
             trace?: PerfTrace,
@@ -7785,7 +7787,10 @@ const anthropicAuthPlugin = async (
             let lastSendRelayed = false
             let directAttempt = scopedAttempt
 
-            const billingFor = async (payer: NativeOAuthAuthorization) => {
+            const billingFor = async (
+              payer: NativeOAuthAuthorization,
+              relayed = false,
+            ) => {
               const billing = modelBillingRequest(
                 relayAffinity,
                 typeof body === 'string'
@@ -7799,10 +7804,29 @@ const anthropicAuthPlugin = async (
                 'subscription_included',
               )
               if (billing) {
+                const refusalBilling =
+                  roundPlan?.request &&
+                  (roundPlan.kind === 'round' || roundPlan.kind === 'routed')
+                    ? rounds.billingForRound(
+                        roundPlan.request,
+                        hostRequestId,
+                        modelForIdentity,
+                      )
+                    : relayed && clientStreamSource && primary
+                      ? createRefusalBillingFacts(true)
+                      : undefined
                 const publication =
                   roundLifecycle(payer)?.cacheKeepTemplateSettled
                 return {
                   ...billing,
+                  ...(serverFallbackModel && {
+                    serverFallbackBilling: {
+                      hostRequestId,
+                      requestedModel: modelForIdentity ?? serverFallbackModel,
+                      sentModel: serverFallbackModel,
+                    },
+                  }),
+                  refusalBilling,
                   cacheWarming: () =>
                     !publication || isFresh(payer)
                       ? cacheKeepManager.warming(billing.sessionId)
@@ -8034,6 +8058,7 @@ const anthropicAuthPlugin = async (
                 resend ? !primary || isCurrentPrimary(payer) : isFresh(payer)
               let retryAuthorization: NativeOAuthAuthorization | undefined
               const options: RefusalFallbackDispatchOptions = {
+                hostRequestId,
                 sourceModel: model,
                 origin: {
                   accountId,
@@ -8275,6 +8300,7 @@ const anthropicAuthPlugin = async (
                   try {
                     markRoundSent()
                     noteSessionRequestSent(trace)
+                    reportRoundSend()
                     response = scope.redactResponse(
                       await fetchOAuthPhysical(gateway)(finalUrl(gateway), {
                         ...init,
@@ -8543,6 +8569,10 @@ const anthropicAuthPlugin = async (
               }
               roundMarked = true
             }
+            const reportRoundSend = () => {
+              if (roundPlan?.request)
+                rounds.reportRoundSend(roundPlan.request, hostRequestId)
+            }
             await prepareRoundAndThread()
             const persistedFallbackAccount =
               oauthAccountId === 'main'
@@ -8631,7 +8661,7 @@ const anthropicAuthPlugin = async (
                   const cacheAcceptance = {}
                   relayCacheAcceptance = cacheAcceptance
                   const acceptedBody = body
-                  const billing = await billingFor(nextAuthorization)
+                  const billing = await billingFor(nextAuthorization, true)
                   let refusalCredit: string | undefined
                   if (typeof acceptedBody === 'string') {
                     relayOrigin = {
@@ -8648,6 +8678,7 @@ const anthropicAuthPlugin = async (
                   }
                   markRoundSent()
                   noteSessionRequestSent(trace)
+                  reportRoundSend()
                   return {
                     headers: relayHeaders,
                     billing,
@@ -9599,6 +9630,7 @@ const anthropicAuthPlugin = async (
             refusedOAuth: Set<string>
             sessionId: string | null
             modelId: string | undefined
+            hostRequestId: string
             shared?: {
               afterRefusal: (
                 id: string,
@@ -9696,6 +9728,7 @@ const anthropicAuthPlugin = async (
                 response = await sendWithAccessToken(
                   input,
                   init,
+                  routing.hostRequestId,
                   scopedAttempt.accessToken,
                   routing.refusalFallbackMode,
                   trace,
@@ -9714,6 +9747,7 @@ const anthropicAuthPlugin = async (
                 response = await sendWithAccessToken(
                   input,
                   init,
+                  routing.hostRequestId,
                   account.access,
                   routing.refusalFallbackMode,
                   trace,
@@ -9916,6 +9950,7 @@ const anthropicAuthPlugin = async (
           const authTransport = withAbortableFetch({
             apiKey: '',
             fetch: withRefusalOwner(async (input, init, refusal) => {
+              const hostRequestId = randomUUID()
               const requestSequence = ++sidebarRequestSequence
               if (input instanceof Request && init?.signal === undefined)
                 init = { ...init, signal: input.signal }
@@ -9941,6 +9976,7 @@ const anthropicAuthPlugin = async (
                     : undefined,
               })
               const requestRouting: RequestRouting = {
+                hostRequestId,
                 trace,
                 refusalFallbackMode,
                 refusal,
@@ -10254,6 +10290,7 @@ const anthropicAuthPlugin = async (
                   routingModelId ?? '',
                   routingCandidates(snapshot.accounts),
                   {
+                    requestId: hostRequestId,
                     capacityWait: { maxInRequestMs },
                     signal: init?.signal ?? undefined,
                     warmCredentialId: routingWarmCredential(
@@ -10472,6 +10509,7 @@ const anthropicAuthPlugin = async (
                       response = await sendWithAccessToken(
                         input,
                         init,
+                        hostRequestId,
                         '',
                         refusalFallbackMode,
                         trace,
@@ -10952,6 +10990,7 @@ const anthropicAuthPlugin = async (
                         return sendWithAccessToken(
                           input,
                           init,
+                          hostRequestId,
                           scopedAttempt.accessToken,
                           refusalFallbackMode,
                           trace,
@@ -10969,6 +11008,7 @@ const anthropicAuthPlugin = async (
                       return sendWithAccessToken(
                         input,
                         init,
+                        hostRequestId,
                         selected.access ?? '',
                         refusalFallbackMode,
                         trace,
@@ -11556,6 +11596,7 @@ const anthropicAuthPlugin = async (
                     const response = await sendWithAccessToken(
                       input,
                       init,
+                      hostRequestId,
                       scopedAttempt.accessToken,
                       refusalFallbackMode,
                       trace,
@@ -12066,6 +12107,7 @@ const anthropicAuthPlugin = async (
                   await sendWithAccessToken(
                     input,
                     init,
+                    hostRequestId,
                     '',
                     refusalFallbackMode,
                     trace,
@@ -12081,6 +12123,7 @@ const anthropicAuthPlugin = async (
               const mainResponse = await sendWithAccessToken(
                 input,
                 init,
+                hostRequestId,
                 auth.access,
                 refusalFallbackMode,
                 trace,

@@ -169,7 +169,7 @@ test.each([
     )
 
     await expect(closeNativeTypeDeclarations(dist, producer)).rejects.toThrow(
-      `Expected published common-auth 0.59.0, got ${version}`,
+      `Expected published common-auth 0.60.0, got ${version}`,
     )
     expect(await readdir(dist)).not.toContain('internal-types')
   },
@@ -183,7 +183,7 @@ test('copies the complete published relative declaration graph including cycles 
     producer,
     'package.json',
     JSON.stringify({
-      version: '0.59.0',
+      version: '0.60.0',
       exports: { './store': { types: './dist/store/index.d.ts' } },
     }),
   )
@@ -319,9 +319,9 @@ test('packed Core types and Node runtime work in a fresh consumer without common
   const manifest = JSON.parse(
     await readFile(join(core, 'package.json'), 'utf8'),
   )
-  expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('0.59.0')
-  expect(manifest.dependencies['@cortexkit/claustrum-client']).toBe('0.21.0')
-  expect(manifest.dependencies['@cortexkit/subc-client']).toBe('^0.24')
+  expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('0.60.0')
+  expect(manifest.dependencies['@cortexkit/claustrum-client']).toBe('0.22.0')
+  expect(manifest.dependencies['@cortexkit/subc-client']).toBe('0.26.8')
   expect(manifest.dependencies['jsonc-parser']).toBe('^3.3.1')
   expect(manifest.dependencies['@cortexkit/private-files']).toBe('0.2.2')
   expect(manifest.dependencies['@cortexkit/common-auth']).toBeUndefined()
@@ -381,7 +381,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
       'utf8',
     ),
   )
-  expect(claustrumManifest.version).toBe('0.21.0')
+  expect(claustrumManifest.version).toBe('0.22.0')
   const subcManifests = allInstalled.filter((path) =>
     /(?:^|\/)@cortexkit\/subc-client\/package\.json$/.test(path),
   )
@@ -397,7 +397,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
     `Packed consumer subc-client copies: ${JSON.stringify(subcCopies)}`,
   )
   expect(subcCopies).toHaveLength(1)
-  expect(Bun.semver.satisfies(subcCopies[0]!.version, '^0.24')).toBe(true)
+  expect(subcCopies[0]!.version).toBe('0.26.8')
   const coreSubc = Bun.resolveSync('@cortexkit/subc-client', installed)
   const claustrumEntry = Bun.resolveSync(
     '@cortexkit/claustrum-client',

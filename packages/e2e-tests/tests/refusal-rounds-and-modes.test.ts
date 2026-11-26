@@ -134,6 +134,71 @@ const fromUpstream = (step: Step): Step => async (body, request) => {
   return response
 }
 
+type CapturedRouting = { sessionId: string; ask?: Body; report?: Body }
+
+async function readRouting(file: string): Promise<CapturedRouting[]> {
+  const capture = Bun.file(file)
+  if (!(await capture.exists())) return []
+  return (await capture.text()).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+}
+
+function billingStep(id: string, step: Step): Step {
+  return async (body, request) => {
+    const response = await step(body, request)
+    response?.headers.set('request-id', id)
+    return response
+  }
+}
+
+const billingRow = (entries: CapturedRouting[], id: string) => entries.find(
+  ({ report }) => report?.kind === 'billing' && report.provider_request_id === id,
+)
+
+async function waitForBilling(file: string, ...ids: string[]) {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const entries = await readRouting(file)
+    if (ids.every((id) => billingRow(entries, id))) return entries
+    await Bun.sleep(20)
+  }
+  throw new Error(`Missing billing reports for ${ids.join(', ')}: ${JSON.stringify(await readRouting(file))}`)
+}
+
+function fallbackRequestId(entry: CapturedRouting | undefined, entries: CapturedRouting[]) {
+  const id = (entry?.report?.fallback as Body | undefined)?.host_request_id
+  expect(id).toEqual(expect.any(String))
+  expect(entries.some(({ sessionId, ask }) => sessionId === entry?.sessionId && ask?.request_id === id)).toBe(true)
+  return id
+}
+
+const invalidTarget: Step = () => Response.json({ type: 'error', error: { type: 'invalid_request_error', message: 'Invalid target request' } }, { status: 400 })
+
+function serverFallbackStep(id: string, cause: 'refused_here' | 'round', category?: string): Step {
+  const usage = {
+    input_tokens: 67,
+    output_tokens: 19,
+    iterations: [
+      ...(cause === 'refused_here' ? [{ type: 'message', model: source, input_tokens: 67, output_tokens: 0 }] : []),
+      { type: 'fallback_message', model: target, input_tokens: 67, output_tokens: 19 },
+    ],
+  }
+  const events = [
+    { type: 'message_start', message: { id: `msg_${id}`, type: 'message', role: 'assistant', model: cause === 'refused_here' ? source : target, content: [], usage: { input_tokens: 67, output_tokens: 0 } } },
+    ...(cause === 'refused_here' ? [
+      { type: 'content_block_start', index: 0, content_block: { type: 'fallback', from: { model: source }, to: { model: target }, ...(category && { category }) } },
+      { type: 'content_block_stop', index: 0 },
+    ] : []),
+    { type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'The provider answered.' } },
+    { type: 'content_block_stop', index: 1 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage },
+    { type: 'message_stop' },
+  ]
+  return () => new Response(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''), {
+    headers: { 'content-type': 'text/event-stream', 'request-id': id },
+  })
+}
+
 function tool(body: Body, directory: string, id: string, open = false) {
   const name = (body.tools as Array<{ name: string }>).find((entry) =>
     /^(?:mcp_)?(?:bash|shell)$/i.test(entry.name),
@@ -184,7 +249,7 @@ for (const host of Object.keys(launch) as Host[]) {
         options: Pick<
           HostFixture,
           'mode' | 'model' | 'hybridCache' | 'overlap' | 'dump'
-        > & { viaRelay?: boolean } = {},
+        > & { viaRelay?: boolean; captureBilling?: boolean } = {},
       ) {
         test(name, async () => {
           const directory = await mkdtemp(join(root, 'case-'))
@@ -208,6 +273,7 @@ for (const host of Object.keys(launch) as Host[]) {
               shortTimeout: false,
               persistent: true,
               relay: relayAddress && { ...relayAddress, token: relayToken },
+              routingCapture: options.captureBilling ? join(directory, 'routing.jsonl') : undefined,
             })
             await exercise(session, mock, directory)
             expect(mock.queue).toHaveLength(0)
@@ -229,6 +295,166 @@ for (const host of Object.keys(launch) as Host[]) {
           }
         }, 120_000)
       }
+
+      for (const credited of [true, false]) {
+        scenario(`billing reports the ${credited ? 'credited' : 'uncredited'} answer and each round step`, async (session, mock, directory) => {
+          const file = join(directory, 'routing.jsonl')
+          const refused = 'req_bill_refused'
+          const answer = 'req_bill_answer'
+          const round = 'req_bill_round'
+          let signalAtRetry: Body[] = []
+          let signalAtRound: Body[] = []
+          const signals = async () => (await readRouting(file)).flatMap(({ report }) => report?.kind === 'fallback_attempt' ? [report] : [])
+          mock.queue.push(
+            billingStep(refused, reply([], { stop: 'refusal', credit: credited ? sentinel : null })),
+            billingStep(answer, async (body, request) => {
+              signalAtRetry = await signals()
+              return reply([block('Retry answered.')], { credited })(body, request)
+            }),
+            billingStep(round, async (body, request) => {
+              signalAtRound = await signals()
+              return reply([block('Round answered.')])(body, request)
+            }),
+          )
+          // The routing fixture never settles signal or billing reports, but the host still receives both replies.
+          expect(assistantSteps(host, (await session.prompt('Try fallback.')).stored).at(-1)?.finish).toBe(finishSuccess[host])
+          expect(assistantSteps(host, (await session.prompt('Continue the round.')).stored).at(-1)?.finish).toBe(finishSuccess[host])
+          const entries = await waitForBilling(file, refused, answer, round)
+          const refusedRow = billingRow(entries, refused)
+          const requestId = fallbackRequestId(refusedRow, entries)
+          const facts = { host_request_id: requestId, requested_model: source, category: 'cyber' }
+          expect(refusedRow?.report?.fallback).toEqual({ ...facts, role: 'refused', by: 'client' })
+          const answerRow = billingRow(entries, answer)?.report
+          expect(answerRow?.fallback).toEqual({ ...facts, role: 'answer', by: 'client', cause: 'refused_here', credited })
+          expect(answerRow?.attempt_id).not.toBe(refusedRow?.report?.attempt_id)
+          const roundRow = billingRow(entries, round)
+          const roundId = fallbackRequestId(roundRow, entries)
+          expect(roundId).not.toBe(requestId)
+          expect(roundRow?.report?.fallback).toEqual({ ...facts, host_request_id: roundId, role: 'answer', by: 'client', cause: 'round', round: { steps: 10, steps_left: 8 } })
+          const retrySignal = { kind: 'fallback_attempt', request_id: requestId, by: 'client', cause: 'refused_here' }
+          expect(signalAtRetry).toEqual([retrySignal])
+          expect(signalAtRound).toEqual([retrySignal, { kind: 'fallback_attempt', request_id: roundId, by: 'client', cause: 'round' }])
+          if (credited) {
+            const rejected = 'req_bill_round_400'
+            const resend = 'req_bill_source_resend'
+            mock.queue.push(billingStep(rejected, invalidTarget), billingStep(resend, reply([block('The requested model answered.')])) )
+            expect(assistantSteps(host, (await session.prompt('The round target will reject this request.')).stored).at(-1)?.finish).toBe(finishSuccess[host])
+            const reports = await waitForBilling(file, rejected, resend)
+            expect(billingRow(reports, rejected)?.report).toMatchObject({ status: 400, outcome: 'failed', model: target })
+            expect(billingRow(reports, resend)?.report).toMatchObject({ status: 200, outcome: 'completed', model: source })
+            expect(billingRow(reports, rejected)?.report).not.toHaveProperty('fallback')
+            expect(billingRow(reports, resend)?.report).not.toHaveProperty('fallback')
+            const lastSignals = await signals()
+            expect(lastSignals).toHaveLength(3)
+            const id = lastSignals.at(-1)?.request_id
+            expect(id).not.toBe(roundId)
+            expect(lastSignals.at(-1)).toEqual({ kind: 'fallback_attempt', request_id: id, by: 'client', cause: 'round' })
+            expect(reports.some(({ ask }) => ask?.request_id === id)).toBe(true)
+          }
+        }, { captureBilling: true })
+      }
+
+      scenario('billing reports only the acted-on refusal when no retry answers', async (session, mock, directory) => {
+        const file = join(directory, 'routing.jsonl')
+        const refused = 'req_bill_acted_on'
+        const failed = 'req_bill_failed'
+        mock.queue.push(billingStep(refused, reply([], { stop: 'refusal', credit: sentinel })), billingStep(failed, invalidTarget))
+        expect(assistantSteps(host, (await session.prompt('The retry will fail.')).stored).at(-1)?.finish).toBe(finishRefusal[host])
+        const entries = await waitForBilling(file, refused, failed)
+        const origin = billingRow(entries, refused)
+        const id = fallbackRequestId(origin, entries)
+        expect(origin?.report?.fallback).toEqual({ host_request_id: id, requested_model: source, category: 'cyber', role: 'refused', by: 'client' })
+        expect(billingRow(entries, failed)?.report).toMatchObject({ status: 400, outcome: 'failed', model: target })
+        expect(billingRow(entries, failed)?.report).not.toHaveProperty('fallback')
+        expect(entries.filter(({ report }) => report?.kind === 'fallback_attempt').map(({ report }) => report)).toEqual([
+          { kind: 'fallback_attempt', request_id: id, by: 'client', cause: 'refused_here' },
+        ])
+      }, { captureBilling: true })
+
+      scenario('billing reports no fallback for a refusal without a route or with fallback off, and ordinary bytes are unchanged', async (session, mock, directory) => {
+        const file = join(directory, 'routing.jsonl')
+        const noRoute = 'req_bill_no_route'
+        const disabled = 'req_bill_disabled'
+        const client = 'req_bill_ordinary_client'
+        const off = 'req_bill_ordinary_off'
+        mock.queue.push(
+          billingStep(client, reply([block('Ordinary answer.')])) ,
+          billingStep(noRoute, reply([], { stop: 'refusal', category: null, credit: sentinel })),
+          billingStep(disabled, reply([], { stop: 'refusal', credit: sentinel })),
+          billingStep(off, reply([block('Ordinary answer.')])) ,
+        )
+        await session.prompt('Ordinary client-mode request.')
+        await session.prompt('There is no route for this category.')
+        await session.policy!.settings({ refusal_fallback: 'off' })
+        // All three hosts reload the changed settings through a watcher.
+        await Bun.sleep(500)
+        await session.prompt('Do not act on this refusal.')
+        await session.prompt('Ordinary request with fallback off.')
+        const entries = await waitForBilling(file, client, noRoute, disabled, off)
+        expect(mock.models()).toEqual([source, source, source, source])
+        expect(entries.some(({ report }) => report?.kind === 'fallback_attempt')).toBe(false)
+        const assertOrdinaryBytes = (key: string, mode: 'client' | 'off') => {
+          const row = billingRow(entries, key)?.report
+          expect(row).not.toHaveProperty('fallback')
+          const { attempt_id, provider_response_id, provider_request_id, user_message_id, ...stable } = row!
+          expect(attempt_id).toEqual(expect.any(String))
+          expect(provider_response_id).toEqual(expect.any(String))
+          expect(provider_request_id).toBe(key)
+          if (user_message_id !== undefined) expect(user_message_id).toEqual(expect.any(String))
+          const credentialId = stable.credential_id
+          expect(credentialId).toEqual(expect.any(String))
+          expect(JSON.stringify(stable)).toBe(JSON.stringify({
+            kind: 'billing',
+            request_kind: 'primary',
+            credential_id: credentialId,
+            provider: 'anthropic',
+            model: source,
+            outcome: 'completed',
+            account_id: {
+              oc1: '11111111-1111-4111-8111-111111111111',
+              oc2: '11111111-2222-4333-8444-555555555555',
+              pi: '7c4e2a91-3b5d-4f60-8e17-a2c9d04b6f35',
+            }[host],
+            status: 200,
+            // Client dispatch already numbers the first attempt, even if it never retries.
+            ...(mode === 'client' && { attempt: 1 }),
+            charge_basis: 'subscription_included',
+            usage: { input: 11, output: 29, cache_read: 5, cache_write: 222 },
+            cache: { ttl_ms: 300_000, ...(host === 'oc2' && { warming: { on: false } }) },
+          }))
+          return credentialId
+        }
+        expect(billingRow(entries, noRoute)?.report).not.toHaveProperty('fallback')
+        expect(billingRow(entries, disabled)?.report).not.toHaveProperty('fallback')
+        expect(assertOrdinaryBytes(client, 'client')).toBe(assertOrdinaryBytes(off, 'off'))
+      }, { captureBilling: true })
+
+      scenario('billing reports the server handoff and sticky serving with no client signal', async (session, mock, directory) => {
+        const file = join(directory, 'routing.jsonl')
+        const cases = [
+          ['req_bill_provider', 'refused_here', 'bio'],
+          ['req_bill_provider_sticky', 'round', undefined],
+          ['req_bill_provider_uncategorized', 'refused_here', undefined],
+        ] as const
+        mock.queue.push(...cases.map(([id, cause, category]) => serverFallbackStep(id, cause, category)))
+        for (const [id] of cases) {
+          expect(assistantSteps(host, (await session.prompt(`Server fallback: ${id}`)).stored).at(-1)?.finish).toBe(finishSuccess[host])
+        }
+        const entries = await waitForBilling(file, ...cases.map(([id]) => id))
+        const ids = new Set()
+        for (const [key, cause, category] of cases) {
+          const row = billingRow(entries, key)
+          const id = fallbackRequestId(row, entries)
+          ids.add(id)
+          expect(row?.report?.fallback).toEqual({ host_request_id: id, requested_model: source, role: 'answer', by: 'provider', cause, ...(category && { category }) })
+          expect(row?.report?.usage_by_model).toEqual([
+            ...(cause === 'refused_here' ? [{ model_used: source, usage: { input: 67, output: 0 } }] : []),
+            { model_used: target, usage: { input: 67, output: 19 } },
+          ])
+        }
+        expect(ids.size).toBe(cases.length)
+        expect(entries.some(({ report }) => report?.kind === 'fallback_attempt')).toBe(false)
+      }, { mode: 'server', captureBilling: true })
 
       for (const state of [
         'valid target',
@@ -889,11 +1115,14 @@ for (const host of Object.keys(launch) as Host[]) {
       )
 
       scenario(
-        'a cold refusal that cannot retry directly starts a round on the relay',
-        async (session, mock) => {
+        'billing reports a cold refusal that defers to a round on the relay',
+        async (session, mock, directory) => {
+          const file = join(directory, 'routing.jsonl')
+          const refusalId = 'req_bill_relay_refusal'
+          const roundId = 'req_bill_relay_round'
           mock.queue.push(
-            fromUpstream(reply([], { stop: 'refusal', credit: sentinel })),
-            fromUpstream(reply([block('The next turn was served on the relay.')])),
+            billingStep(refusalId, reply([], { stop: 'refusal', credit: sentinel })),
+            billingStep(roundId, reply([block('The next turn was served on the relay.')])),
           )
           const refused = await session.prompt('Refuse before sending content.')
           expect(assistantSteps(host, refused.stored).at(-1)?.finish).toBe(
@@ -903,8 +1132,19 @@ for (const host of Object.keys(launch) as Host[]) {
           await session.prompt('Start the deferred round now.')
           expect(mock.models()).toEqual([source, target])
           expect(mock.primary[1]?.body).not.toHaveProperty('fallback_credit_token')
+          const entries = await waitForBilling(file, refusalId, roundId)
+          const origin = billingRow(entries, refusalId)
+          const answer = billingRow(entries, roundId)
+          const id = fallbackRequestId(origin, entries)
+          const nextId = fallbackRequestId(answer, entries)
+          const pair = { requested_model: source, category: 'cyber', by: 'client' }
+          expect(origin?.report?.fallback).toEqual({ ...pair, host_request_id: id, role: 'refused' })
+          expect(answer?.report?.fallback).toEqual({ ...pair, host_request_id: nextId, role: 'answer', cause: 'round', round: { steps: 10, steps_left: 9 } })
+          expect(entries.filter(({ report }) => report?.kind === 'fallback_attempt').map(({ report }) => report)).toEqual([
+            { kind: 'fallback_attempt', request_id: nextId, by: 'client', cause: 'round' },
+          ])
         },
-        { viaRelay: true },
+        { viaRelay: true, captureBilling: true },
       )
 
       scenario(

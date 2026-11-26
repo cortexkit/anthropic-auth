@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomUUID } from 'node:crypto'
 import {
   type CacheKeepRealTurn,
   clampHostRetryMs,
@@ -49,12 +50,16 @@ export async function installNativeAnthropic<Q, P>(
   const requestFinisher = new AsyncLocalStorage<{
     finish: () => void
     hostAttempt: number
+    hostRequestId: string
     discardQuotaStop?: () => void
     preserveCache?: () => boolean
     route?: string
     attemptId?: string
   }>()
-  const retryWait = new AsyncLocalStorage<{ terminalDelay?: number }>()
+  const retryWait = new AsyncLocalStorage<{
+    hostRequestId: string
+    terminalDelay?: number
+  }>()
   const retryScopeKey = (input: {
     sessionID: string
     agent: string
@@ -68,19 +73,25 @@ export async function installNativeAnthropic<Q, P>(
     ])
   const nextHostAttempts = new Map<
     string,
-    { sessionID: string; attempt: number }
+    { sessionID: string; attempt: number; hostRequestId: string }
   >()
+  const hostRequests = new Map<string, { sessionID: string; id: string }>()
   const forgetHostAttempts = (sessionID: string) => {
     for (const [key, next] of nextHostAttempts)
       if (next.sessionID === sessionID) nextHostAttempts.delete(key)
+    for (const [key, request] of hostRequests)
+      if (request.sessionID === sessionID) hostRequests.delete(key)
   }
   const attemptFinishers = new Map<string, () => void>()
   const responseCleanups = new WeakMap<Request, () => void>()
   const adapter: typeof native.adapter = {
     ...native.adapter,
     async chooseAccount(input) {
-      const choice = await native.adapter.chooseAccount(input)
       const retry = retryWait.getStore()
+      const choice = await native.adapter.chooseAccount(
+        input,
+        requestFinisher.getStore()?.hostRequestId ?? retry?.hostRequestId,
+      )
       if (retry && isTerminalPoolHold(choice))
         retry.terminalDelay = choice.hold.delayMs
       return choice
@@ -88,7 +99,11 @@ export async function installNativeAnthropic<Q, P>(
     rewriteRequest(input) {
       const request = requestFinisher.getStore()
       if (request) {
-        native.bindHostAttempt(input.attempt, request.hostAttempt)
+        native.bindHostAttempt(
+          input.attempt,
+          request.hostAttempt,
+          request.hostRequestId,
+        )
         const data = input.attempt.data
         if (data) {
           request.discardQuotaStop = () => native.discardQuotaStopMessage(data)
@@ -176,7 +191,10 @@ export async function installNativeAnthropic<Q, P>(
         }
         if (name === 'retry') {
           const previous = 'decision' in draft ? draft.decision : undefined
-          const wait: { terminalDelay?: number } = {}
+          const key = 'decision' in draft ? retryScopeKey(draft) : undefined
+          const wait: { hostRequestId: string; terminalDelay?: number } = {
+            hostRequestId: (key && hostRequests.get(key)?.id) || randomUUID(),
+          }
           const result = await retryWait.run(wait, () => callback(draft))
           if ('decision' in draft) {
             const key = retryScopeKey(draft)
@@ -191,6 +209,7 @@ export async function installNativeAnthropic<Q, P>(
               nextHostAttempts.set(key, {
                 sessionID: draft.sessionID,
                 attempt: draft.attempt,
+                hostRequestId: wait.hostRequestId,
               })
               while (nextHostAttempts.size > 512) {
                 const first = nextHostAttempts.keys().next().value
@@ -219,6 +238,7 @@ export async function installNativeAnthropic<Q, P>(
         let completion: {
           finish: () => void
           hostAttempt: number
+          hostRequestId: string
           discardQuotaStop?: () => void
           preserveCache?: () => boolean
           route?: string
@@ -237,9 +257,18 @@ export async function installNativeAnthropic<Q, P>(
         // Retry hooks expose the host count; response hooks do not. Consume
         // it once for the next send, including retries unrelated to quota.
         const key = retryScopeKey(input)
-        const hostAttempt = nextHostAttempts.get(key)?.attempt ?? 1
+        const next = nextHostAttempts.get(key)
+        const hostAttempt = next?.attempt ?? 1
+        const hostRequestId = next?.hostRequestId ?? randomUUID()
         nextHostAttempts.delete(key)
-        completion = { finish, hostAttempt }
+        // Account selection and its eventual HTTP send share the same id;
+        // the retry hook keeps it when the host asks to send the request again.
+        hostRequests.set(key, { sessionID: input.sessionID, id: hostRequestId })
+        if (hostRequests.size > 512) {
+          const oldest = hostRequests.keys().next()
+          if (!oldest.done) hostRequests.delete(oldest.value)
+        }
+        completion = { finish, hostAttempt, hostRequestId }
         try {
           // common-auth scopes these hooks to Anthropic. Other providers never
           // reach this observer, so their turns cannot invalidate a warm target.

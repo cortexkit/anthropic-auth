@@ -2,6 +2,10 @@ import { expect, test } from 'bun:test'
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import {
+  type AnthropicBillingReport,
+  observeAnthropicBillingResponse,
+} from '../billing.ts'
 import { hasValidRequestBodySignature, signRequestBody } from '../cch.ts'
 import { dispatchRefusalFallback } from '../refusal-fallback-dispatch.ts'
 import {
@@ -97,6 +101,41 @@ function fixture(
   }
   return { events, engine, input, plan, send, begin }
 }
+
+test('a routed JSON answer reports the live round without spending a step', async () => {
+  const { begin, engine, input, send, events } = fixture()
+  begin()
+  const routed = engine.planRouted({ ...input, kind: 'title' })
+  expect(routed.kind).toBe('routed')
+  const { handle } = send(routed)
+  const report = Promise.withResolvers<AnthropicBillingReport>()
+  const response = observeAnthropicBillingResponse(
+    {
+      sessionId: input.sessionId,
+      credentialId: binding.credentialId,
+      model: opus,
+      requestKind: 'title',
+      refusalBilling: engine.billingForRound(handle, 'title-request'),
+      onReport: report.resolve,
+    },
+    Response.json({
+      type: 'message',
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 2, output_tokens: 4 },
+    }),
+  )
+  await response.text()
+  expect((await report.promise).fallback).toEqual({
+    hostRequestId: 'title-request',
+    requestedModel: fable,
+    role: 'answer',
+    by: 'client',
+    category: 'cyber',
+    cause: 'round',
+    round: { steps: 10, steps_left: 9 },
+  })
+  expect(events.map(({ stepsLeft }) => stepsLeft)).toEqual([9, 9])
+})
 
 test.each([
   ['first refusal after 3 clean responses', false, 3, 0, 'retry', 10],
