@@ -1,11 +1,13 @@
+import { randomUUID } from 'node:crypto'
 import { readFileSync, statSync, watch } from 'node:fs'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import {
   clearTimeout as nativeClearTimeout,
   setTimeout as nativeSetTimeout,
 } from 'node:timers'
+import { logger } from '@cortexkit/anthropic-auth-core'
 import { applyEdits, modify, type ParseError, parse } from 'jsonc-parser'
 
 export const TUI_PREFS_FILE_ENV = 'OPENCODE_TUI_PREFERENCES_FILE'
@@ -230,6 +232,17 @@ const TEMPLATE = `// Shared preferences for opencode TUI plugins.
 `
 
 type JsonValue = string | number | boolean | null
+const MAX_WRITE_RETRIES = 3
+
+async function readPreferenceSnapshot(file: string): Promise<Buffer | null> {
+  try {
+    return await readFile(file)
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT')
+      return null
+    throw error
+  }
+}
 
 async function writePreference(
   pluginKey: string,
@@ -238,20 +251,32 @@ async function writePreference(
 ): Promise<void> {
   const file = getTuiPreferencesFile()
   await mkdir(dirname(file), { recursive: true })
-  let text: string
+  let snapshot = await readPreferenceSnapshot(file)
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`
   try {
-    text = await readFile(file, 'utf8')
-  } catch {
-    text = ''
+    for (let attempt = 0; attempt <= MAX_WRITE_RETRIES; attempt++) {
+      const text = snapshot?.toString('utf8') ?? ''
+      const source = text.trim() === '' ? TEMPLATE : text
+      const edits = modify(source, [pluginKey, ...path], value, {
+        formattingOptions: { insertSpaces: true, tabSize: 2 },
+      })
+      await writeFile(tmp, applyEdits(source, edits), 'utf8')
+      // Comparing just before rename narrows the race against other writers,
+      // but it cannot stop a writer from changing the file after the comparison.
+      const current = await readPreferenceSnapshot(file)
+      if (current === null ? snapshot === null : snapshot?.equals(current)) {
+        await rename(tmp, file)
+        return
+      }
+      snapshot = current
+    }
+    logger.warn(
+      'sidebar',
+      'TUI preference update skipped after repeated concurrent writes',
+    )
+  } finally {
+    await rm(tmp, { force: true }).catch(() => {})
   }
-  if (text.trim() === '') text = TEMPLATE
-  const edits = modify(text, [pluginKey, ...path], value, {
-    formattingOptions: { insertSpaces: true, tabSize: 2 },
-  })
-  const next = applyEdits(text, edits)
-  const tmp = `${file}.${process.pid}.tmp`
-  await writeFile(tmp, next, 'utf8')
-  await rename(tmp, file)
 }
 
 let writeChain: Promise<void> = Promise.resolve()
