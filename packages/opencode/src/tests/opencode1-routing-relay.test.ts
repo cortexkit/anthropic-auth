@@ -1855,4 +1855,43 @@ describe('OC1 shared routing relay', () => {
       ])
     })
   }
+
+  test('Fable 5.2 429 with only a 7d_oi rejection reports its weekly pool on OpenCode 1', async () => {
+    let calls = 0
+    const f = await fixture('fable-without-poll', () =>
+      ++calls === 1
+        ? new Response('limited', {
+            status: 429,
+            headers: {
+              'anthropic-ratelimit-unified-status': 'rejected',
+              'anthropic-ratelimit-unified-7d-status': 'allowed',
+              'anthropic-ratelimit-unified-7d-utilization': '0.55',
+              'anthropic-ratelimit-unified-7d_oi-status': 'rejected',
+              'anthropic-ratelimit-unified-7d_oi-utilization': '1.0',
+              'anthropic-ratelimit-unified-7d_oi-reset': '1796184000',
+            },
+          })
+        : new Response('ok'),
+    )
+    const reports: Array<{ outcome: string; [key: string]: unknown }> = []
+    globals[key] = () => ({
+      accountFor: async () => null,
+      report: (report: (typeof reports)[number]) => reports.push(report),
+    })
+    const response = await f.send({
+      model: 'claude-fable-5-2',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 10,
+    })
+    await response.body?.cancel()
+    expect(reports.filter((report) => report.outcome === 'exhausted')).toEqual([
+      {
+        account_id: syntheticMainAccountUuid,
+        outcome: 'exhausted',
+        window: '7d',
+        pool: 'fable',
+        resets_at: 1_796_184_000_000,
+      },
+    ])
+  })
 })
