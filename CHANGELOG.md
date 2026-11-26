@@ -10,6 +10,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Requests back to the requested model drop the fallback model's reasoning wherever it follows the requested model's own reasoning in the same turn, which Anthropic would refuse. This holds after a restart too.
 - OpenCode and Pi show the requested model, the serving model and the steps left in a round. Pi prices fallback replies at the serving model's rates. Billing reports carry the refused attempt and its retry as separate rows.
 - Fallback credits never appear in logs, request dumps or saved keep-warm templates.
+- Closing the vault connection on OpenCode and Pi now waits for an account-list refresh already in progress, so it can no longer write a lock file after the plugin has shut down.
 - Vault accounts: a profile or quota check that retries after a sign-in error no longer sends a vault credential the plugin already knows has been replaced (#900).
 - OpenCode: saving the sidebar's collapsed state no longer overwrites preference changes saved in the meantime, and leaves the preferences file untouched when it can't be read (#902).
 - Legacy import from 1.x: when the configuration and state files hold different logins for a fallback account and both record a refresh time, the more recently refreshed login is kept (#903).

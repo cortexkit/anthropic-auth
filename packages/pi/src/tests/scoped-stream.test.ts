@@ -1,5 +1,6 @@
 import { expect, test as registerTest, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
+import * as fs from 'node:fs/promises'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -2198,6 +2199,59 @@ for (const outcome of [
     expect(isRetryableAssistantError(result)).toBe(false)
   })
 }
+
+test('Pi close drains an in-flight stale roster lock eviction', async () => {
+  const f = await fixture()
+  const lock = `${nativeVaultPaths(await resolveNativePoolPaths(f.path)).roster}.claustrum-roster.lock`
+  await writeFile(lock, JSON.stringify({ ownerId: 'expired', expiresAt: 0 }))
+  const entered = lifetimes.gate()
+  const release = lifetimes.gate()
+  const markerWrite = lifetimes.gate()
+  const read = fs.readFile
+  const open = fs.open
+  let closeReturned = false
+  let markerAfterClose: string | undefined
+  const reads = spyOn(fs, 'readFile').mockImplementation((async (
+    ...args: Parameters<typeof read>
+  ) => {
+    if (String(args[0]) === lock) {
+      entered.open()
+      await release.wait
+    }
+    return read(...args)
+  }) as typeof read)
+  const writes = spyOn(fs, 'open').mockImplementation(async (...args) => {
+    if (String(args[0]) === `${lock}.evicting/owner.json`) {
+      if (closeReturned) markerAfterClose = String(args[0])
+      markerWrite.open()
+      throw Object.assign(new Error('probe ends after marker create attempt'), {
+        code: 'EPERM',
+      })
+    }
+    return open(...args)
+  })
+  deferCleanup(() => reads.mockRestore())
+  deferCleanup(() => writes.mockRestore())
+  const polled = new PiNativeRuntime(f.path, {
+    connect: f.connect,
+    vaultPoll: { intervalMs: 20 },
+  })
+  deferCleanup(() => polled.close())
+  await polled.service()
+  await entered.wait
+  const closing = (async () => {
+    await polled.close()
+    await closePiNativeRuntime(f.path)
+    closeReturned = true
+  })()
+  // This event-loop checkpoint is not a deadline: a close that does not await
+  // its work finishes here; a close that does await remains blocked on the read.
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  release.open()
+  await markerWrite.wait
+  await closing
+  expect(markerAfterClose).toBeUndefined()
+})
 
 test('Pi background vault poll adopts a main re-login while a fallback serves, with no request-time discovery', async () => {
   const f = await fixture('main-first')

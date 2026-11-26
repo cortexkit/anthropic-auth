@@ -1492,11 +1492,19 @@ export function createNativeVaultRuntime(
         closeCustody()
         return store.close()
       }
+      const drainRoster = async () => {
+        while (refreshing) await Promise.allSettled([refreshing])
+      }
       // Metadata writes recheck active custody before renaming. Leave custody
       // active until those writes finish, but close idle custody synchronously.
-      closing = quotaObservations.hasPendingPublications()
-        ? quotaObservations.close().finally(finish)
-        : Promise.resolve(finish())
+      // Abort rejects a refresh's waiter immediately, but cannot interrupt the
+      // discovery lock acquisition performed by common-auth. Join that work so
+      // its stale-lock eviction cannot write after this close has returned.
+      closing = (
+        quotaObservations.hasPendingPublications()
+          ? quotaObservations.close().finally(finish)
+          : Promise.resolve(finish())
+      ).finally(drainRoster)
       return closing
     },
   }
