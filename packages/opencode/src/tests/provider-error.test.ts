@@ -2149,7 +2149,8 @@ test('OC1 API lastUsed storage failure is detached, drained and warns without ch
       const file = await original(path, flags, mode)
       if (
         typeof path === 'string' &&
-        basename(path).includes('.native-runtime.') &&
+        (basename(path).includes('.native-runtime-metadata.') ||
+          basename(path).includes('.native-runtime.')) &&
         path.endsWith('.partial')
       ) {
         const write = file.writeFile.bind(file)

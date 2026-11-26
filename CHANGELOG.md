@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- A request that needs a fallback account no longer waits for a background quota save to finish writing to disk. On a slow disk that wait could take several seconds.
 - Vault accounts: a profile or quota check that retries after a sign-in error no longer sends a vault credential the plugin already knows has been replaced (#900).
 - OpenCode: saving the sidebar's collapsed state no longer overwrites preference changes saved in the meantime, and leaves the preferences file untouched when it can't be read (#902).
 - Legacy import from 1.x: when the configuration and state files hold different logins for a fallback account and both record a refresh time, the more recently refreshed login is kept (#903).

@@ -268,20 +268,22 @@ for (const enroll of [false, true]) {
       const warm = await f.runtime.authorizeLocal('main')
       if (warm.status !== 'usable') throw new Error('Invalid healthy fixture')
       let armed = false
-      const update = writer.updateNativeRuntime
-      const writerSpy = spyOn(writer, 'updateNativeRuntime').mockImplementation(
-        (path, storageId, change, hooks) =>
-          update(path, storageId, change, {
-            ...hooks,
-            beforeRename: async () => {
-              armed = true
-              try {
-                await hooks?.beforeRename?.()
-              } finally {
-                armed = false
-              }
-            },
-          }),
+      const update = writer.updateNativeRuntimeMetadata
+      const writerSpy = spyOn(
+        writer,
+        'updateNativeRuntimeMetadata',
+      ).mockImplementation((path, storageId, change, hooks) =>
+        update(path, storageId, change, {
+          ...hooks,
+          beforeRename: async () => {
+            armed = true
+            try {
+              await hooks?.beforeRename?.()
+            } finally {
+              armed = false
+            }
+          },
+        }),
       )
       deferCleanup(() => writerSpy.mockRestore())
       const held = holdRead((path) => armed && path === f.paths.config)
@@ -415,16 +417,18 @@ for (const enroll of [false, true]) {
       release = gate()
     let armed = false,
       reached = false
-    const update = writer.updateNativeRuntime
-    const updateSpy = spyOn(writer, 'updateNativeRuntime').mockImplementation(
-      (path, storageId, change, hooks) =>
-        update(path, storageId, change, {
-          ...hooks,
-          beforeRename: async () => {
-            await hooks?.beforeRename?.()
-            armed = true
-          },
-        }),
+    const update = writer.updateNativeRuntimeMetadata
+    const updateSpy = spyOn(
+      writer,
+      'updateNativeRuntimeMetadata',
+    ).mockImplementation((path, storageId, change, hooks) =>
+      update(path, storageId, change, {
+        ...hooks,
+        beforeRename: async () => {
+          await hooks?.beforeRename?.()
+          armed = true
+        },
+      }),
     )
     deferCleanup(() => updateSpy.mockRestore())
     type Lease = Parameters<Parameters<typeof locks.withLock>[2]>[0]

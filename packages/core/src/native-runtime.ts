@@ -31,6 +31,11 @@ import type {
   NativeRefreshObservation,
   NativeRefreshSubject,
 } from './native-refresh-coordinator.ts'
+import {
+  canonicalRuntimeMetadataPath,
+  runtimeMetadataStagePrefix,
+  sweepNativeRuntimeMetadataStages,
+} from './native-runtime-metadata-staging.ts'
 import { assertHostAuthorityStable } from './native-vault-host.ts'
 import {
   createWindowsOwnerOnly,
@@ -594,16 +599,15 @@ function freezeRuntime(value: unknown): void {
   Object.freeze(value)
 }
 
-/** Read snapshots are deeply frozen; writer callbacks receive a mutable clone. */
-export async function readNativeRuntime(
+async function readNativeRuntimeFile<T>(
   path: string,
-  storageId: string,
-  ownership: OwnerOnlyOptions = {},
-): Promise<NativeRuntimeRead> {
+  ownership: OwnerOnlyOptions,
+  read: (bytes: Buffer, cacheIdentity?: string) => T,
+  cachedState?: (identity: string) => T | undefined,
+): Promise<T | undefined> {
   const noFollow = constants.O_NOFOLLOW ?? 0
   try {
     checkPath(path)
-    if (!digest(storageId)) throw new NativeRuntimeError('invalid-runtime')
     for (let attempt = 0; attempt < 2; attempt++) {
       const info = await lstat(path, { bigint: true })
       if (
@@ -619,10 +623,9 @@ export async function readNativeRuntime(
       )
         throw new NativeRuntimeError('unsafe-runtime')
       const identity = runtimeFileIdentity(info)
-      const cached = runtimeCache.get(path)
       // Recheck ownership (including Windows ACLs) before trusting any cached bytes.
-      if (cached?.storageId === storageId && cached.identity === identity)
-        return { status: 'ready', state: cached.state }
+      const cached = cachedState?.(identity)
+      if (cached !== undefined) return cached
       const file = await open(path, constants.O_RDONLY | noFollow)
       try {
         const opened = await file.stat({ bigint: true })
@@ -646,33 +649,22 @@ export async function readNativeRuntime(
           if (attempt === 0) continue
           throw new NativeRuntimeError('unsafe-runtime')
         }
-        let contents: string
+        let bytes: Buffer
         try {
-          contents = new TextDecoder('utf-8', { fatal: true }).decode(
+          bytes =
             (await readWindowsOwnerOnly(path, ownership)) ??
-              (await file.readFile()),
-          )
+            (await file.readFile())
         } catch (error) {
           if (error instanceof TypeError)
             throw new NativeRuntimeError('invalid-runtime')
           throw error
         }
-        const state = decodeNativeRuntime(
-          parseJsonRedacted(contents),
-          storageId,
-        )
-        freezeRuntime(state)
         // A replacement between lstat and open is safe to read, but its bytes
         // must not be cached under the preceding file's identity.
-        if (runtimeFileIdentity(opened) === identity) {
-          runtimeCache.delete(path)
-          runtimeCache.set(path, { storageId, identity, state })
-          if (runtimeCache.size > runtimeCacheLimit) {
-            const oldest = runtimeCache.keys().next().value
-            if (oldest !== undefined) runtimeCache.delete(oldest)
-          }
-        }
-        return { status: 'ready', state }
+        return read(
+          bytes,
+          runtimeFileIdentity(opened) === identity ? identity : undefined,
+        )
       } finally {
         await file.close()
       }
@@ -680,12 +672,68 @@ export async function readNativeRuntime(
     throw new NativeRuntimeError('unsafe-runtime')
   } catch (error) {
     runtimeCache.delete(path)
-    if (missing(error)) return { status: 'missing' }
+    if (missing(error)) return undefined
     if (error instanceof NativeRuntimeError) throw error
     if (error instanceof SyntaxError)
       throw new NativeRuntimeError('invalid-runtime')
     throw new NativeRuntimeError('runtime-io')
   }
+}
+
+function decodeNativeRuntimeBytes(bytes: Buffer, storageId: string) {
+  let contents: string
+  try {
+    contents = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  } catch (error) {
+    if (error instanceof TypeError)
+      throw new NativeRuntimeError('invalid-runtime')
+    throw error
+  }
+  try {
+    return decodeNativeRuntime(parseJsonRedacted(contents), storageId)
+  } catch (error) {
+    if (error instanceof SyntaxError)
+      throw new NativeRuntimeError('invalid-runtime')
+    throw error
+  }
+}
+
+/** Read snapshots are deeply frozen; writer callbacks receive a mutable clone. */
+export async function readNativeRuntime(
+  path: string,
+  storageId: string,
+  ownership: OwnerOnlyOptions = {},
+): Promise<NativeRuntimeRead> {
+  try {
+    checkPath(path)
+    if (!digest(storageId)) throw new NativeRuntimeError('invalid-runtime')
+  } catch (error) {
+    runtimeCache.delete(path)
+    throw error
+  }
+  const state = await readNativeRuntimeFile(
+    path,
+    ownership,
+    (bytes, identity) => {
+      const state = decodeNativeRuntimeBytes(bytes, storageId)
+      freezeRuntime(state)
+      if (identity !== undefined) {
+        runtimeCache.delete(path)
+        runtimeCache.set(path, { storageId, identity, state })
+        if (runtimeCache.size > runtimeCacheLimit) {
+          const oldest = runtimeCache.keys().next().value
+          if (oldest !== undefined) runtimeCache.delete(oldest)
+        }
+      }
+      return state
+    },
+    (identity) => {
+      const cached = runtimeCache.get(path)
+      if (cached?.storageId === storageId && cached.identity === identity)
+        return cached.state
+    },
+  )
+  return state ? { status: 'ready', state } : { status: 'missing' }
 }
 
 export interface NativeRuntimeWriteHooks {
@@ -841,6 +889,142 @@ export async function updateNativeRuntime(
   hooks: NativeRuntimeWriteHooks = {},
 ): Promise<NativeRuntimeState> {
   return writeNativeRuntime(path, storageId, change, hooks)
+}
+
+/** Merge advisory metadata again if its base changes. Credential writers stage under the lock. */
+export async function updateNativeRuntimeMetadata(
+  path: string,
+  storageId: string,
+  change: (current: NativeRuntimeState) => NativeRuntimeState,
+  hooks: NativeRuntimeWriteHooks = {},
+): Promise<void> {
+  checkPath(path)
+  if (!digest(storageId)) throw new NativeRuntimeError('invalid-runtime')
+  const publication = capturePublicationOptions(hooks.publication)
+  const commitRename = (from: string, to: string): Promise<void> => {
+    try {
+      assertHostAuthorityStable()
+      hooks.beforeCommit?.()
+    } catch {
+      throw new NativeRuntimeError('publication-refused')
+    }
+    return (publication.rename ?? rename)(from, to)
+  }
+  try {
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+    const target = await canonicalRuntimeMetadataPath(
+      path,
+      () => new NativeRuntimeError('unsafe-runtime'),
+    )
+    const dir = dirname(target)
+    const prefix = runtimeMetadataStagePrefix(target)
+    await sweepNativeRuntimeMetadataStages(dir, prefix)
+    const readBytes = () => readNativeRuntimeFile(target, {}, (bytes) => bytes)
+    for (let attempt = 0; attempt <= 2; attempt++) {
+      const base = await readBytes()
+      if (base === undefined)
+        throw new NativeRuntimeError('publication-refused')
+      const current = decodeNativeRuntimeBytes(base, storageId)
+      const next = decodeNativeRuntime(
+        change(structuredClone(current)),
+        storageId,
+      )
+      assertTransitions(current, next)
+      const bytes = `${JSON.stringify(next, null, 2)}\n`
+      const stage = join(
+        dir,
+        `${prefix}${process.pid}.${attempt}.${randomUUID()}.partial`,
+      )
+      let ownsStage = false
+      try {
+        const nativeCreated = await createWindowsOwnerOnly(stage, bytes)
+        ownsStage = nativeCreated
+        const file = await open(
+          stage,
+          nativeCreated ? constants.O_RDWR : 'wx',
+          0o600,
+        )
+        ownsStage = true
+        try {
+          if (!nativeCreated) await file.writeFile(bytes, 'utf8')
+          await file.sync()
+        } finally {
+          await file.close()
+        }
+        const published = await withLock(
+          target,
+          {
+            name: 'native-runtime',
+            ttlMs: 10_000,
+            timeoutMs: 15_000,
+            renew: true,
+            onLockEvent: hooks.onLockEvent,
+            signal: hooks.signal,
+          },
+          async (lock) => {
+            const latest = await readBytes()
+            // Never recreate a runtime file that disappeared before we got the lock.
+            if (latest === undefined)
+              throw new NativeRuntimeError('publication-refused')
+            // The byte check catches any writer that changed the file since our
+            // read. Credential, validation and metadata writers all take this
+            // lock. The one-time move of the state files to a new folder does
+            // not; it is safe because no process opens a writer on the new
+            // folder until that move has committed (state-layout-move.ts).
+            if (!latest.equals(base)) return false
+            const fence = async () => {
+              try {
+                await hooks.beforeRename?.()
+                await lock.assertOwned()
+                await hooks.beforePublish?.()
+                if (hooks.beforePublish) await lock.assertOwned()
+              } catch {
+                throw new NativeRuntimeError('publication-refused')
+              }
+              return 'publish' as const
+            }
+            await fence()
+            await renameWithWindowsSharingRetry(
+              stage,
+              target,
+              { ...publication, rename: commitRename },
+              fence,
+            )
+            ownsStage = false
+            try {
+              await hooks.afterRename?.()
+            } catch {
+              throw new NativeRuntimeError('publication-refused')
+            }
+            return true
+          },
+        )
+        if (published) return
+      } finally {
+        if (ownsStage) await rm(stage, { force: true })
+      }
+    }
+    await writeNativeRuntime(
+      target,
+      storageId,
+      async (current) => {
+        // Falling back after contention still must not recreate a removed file.
+        try {
+          await lstat(target)
+        } catch (error) {
+          if (missing(error))
+            throw new NativeRuntimeError('publication-refused')
+          throw error
+        }
+        return change(current)
+      },
+      hooks,
+    )
+  } catch (error) {
+    if (hooks.signal?.aborted && error === hooks.signal.reason) throw error
+    if (error instanceof NativeRuntimeError) throw error
+    throw new NativeRuntimeError('runtime-io')
+  }
 }
 
 /**

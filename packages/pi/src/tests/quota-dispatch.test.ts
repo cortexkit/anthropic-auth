@@ -2,13 +2,21 @@ import { expect, spyOn } from 'bun:test'
 import * as filesystem from 'node:fs/promises'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, basename } from 'node:path'
 import { resolveNativePoolPaths } from '@cortexkit/anthropic-auth-core'
 import type { Api, Context, Model } from '@earendil-works/pi-ai'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import { streamCortexKitAnthropic } from '../stream.ts'
 import { saveNativePiFixture } from './native-fixture.ts'
+
+// Quota metadata stages beside the runtime file as
+// "<runtime>.native-runtime-metadata.*"; other runtime writes use
+// "<runtime>.native-runtime.*". Compare names, since the metadata writer
+// resolves the folder's canonical path first.
+function isRuntimeStage(path: string, runtime: string) {
+  return basename(path).startsWith(`${basename(runtime)}.native-runtime`)
+}
 
 const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
 
@@ -170,7 +178,7 @@ test('Pi serves a pending poll reading without waiting for runtime sync and clos
   const openSpy = spyOn(filesystem, 'open').mockImplementation(
     async (path, flags, mode) => {
       const file = await realOpen(path, flags, mode)
-      if (String(path).startsWith(`${paths.runtime}.native-runtime.`)) {
+      if (isRuntimeStage(String(path), paths.runtime)) {
         const sync = file.sync.bind(file)
         file.sync = async () => {
           const staged = JSON.parse(await readFile(path, 'utf8'))
