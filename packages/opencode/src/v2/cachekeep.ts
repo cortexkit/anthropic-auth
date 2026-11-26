@@ -599,7 +599,9 @@ export function createNativeCacheKeep(
     owner.persistence.realTurn(input.sessionID, false)
     try {
       for (const turn of realTurns) if (!turn.active) realTurns.delete(turn)
-      const turn = manager.beginRealTurn(input.sessionID)
+      const turn = manager.beginRealTurn(input.sessionID, {
+        deferWarmExclusion: owner.rounds.hasRound(input.sessionID),
+      })
       realTurns.add(turn)
       return turn
     } catch {}

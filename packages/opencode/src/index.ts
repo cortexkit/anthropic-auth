@@ -7922,7 +7922,7 @@ const anthropicAuthPlugin = async (
                   targetAllowed,
                   sentBodyText: () =>
                     typeof body === 'string' ? body : undefined,
-                  onRoundActivity() {
+                  onRoundActivity(_cacheTtlMs, requestedModel) {
                     if (
                       cacheRequest &&
                       payer.accountIdentity &&
@@ -7934,6 +7934,7 @@ const anthropicAuthPlugin = async (
                           url: requestUrl,
                           accountId: oauthAccountId,
                           accountIdentity: payer.accountIdentity,
+                          requestedModel,
                         },
                       )
                   },
@@ -8413,7 +8414,7 @@ const anthropicAuthPlugin = async (
               if (roundMarked) return
               if (roundPlan?.request && !rounds.markSent(roundPlan.request))
                 throw replan
-              if (primary && roundPlan?.request)
+              if (primary && roundPlan?.kind === 'source' && roundPlan.request)
                 roundTurn = cacheKeepManager.beginRealTurn(primary.sessionId)
               if (
                 primary &&
@@ -8734,6 +8735,13 @@ const anthropicAuthPlugin = async (
                     response,
                     {
                       ...options,
+                      send(request) {
+                        if (primary && !roundTurn)
+                          roundTurn = cacheKeepManager.beginRealTurn(
+                            primary.sessionId,
+                          )
+                        return options.send(request)
+                      },
                       isCurrentPrimary: () => isCurrentPrimary(payer),
                       onResendFailure: (model) => {
                         const billing = resendBilling(model)

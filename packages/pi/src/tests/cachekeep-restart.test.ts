@@ -111,6 +111,12 @@ test('Pi round activity renews the warm budget and an idle end advances backoff'
   })
 }, 20_000)
 
+test('Pi does not abort an in-flight requested-model warm when a round step starts', async () => {
+  await withProcesses(async (spawn) => {
+    expect(await spawn('round-concurrent').result).toEqual({ live: 5, warm: 1 })
+  })
+}, 20_000)
+
 test('Pi stops warming when the OAuth account changes mid-round', async () => {
   await withProcesses(async (spawn) => {
     expect(await spawn('round-account').result).toEqual({ live: 4, warm: 1 })

@@ -122,9 +122,9 @@ test('an idle round ends only past the last accepted primary step lifetime and a
   expect(events.at(-1)).toMatchObject({ kind: 'step_served', stepsLeft: 19 })
 })
 
-test.each(['count', 'idle'] as const)(
+test.each(['count', 'idle', 'off', 'restart'] as const)(
   'the %s return restores the ordinary kept prefix marker without replacing the tail marker',
-  (end) => {
+  async (end) => {
     let now = 1
     const cache = { ...binding, accountIdentity: 'original' }
     const route = { ...oauth, cache }
@@ -138,7 +138,10 @@ test.each(['count', 'idle'] as const)(
       loadStorage: async () => storage,
       now: () => now,
     })
-    const { begin, plan, send, events } = fixture({ now: () => now, cacheKeep })
+    const directory = await mkdtemp(join(tmpdir(), 'refusal-return-'))
+    const thinkingStore = new RecoveryThinkingStore({ directory })
+    const options = { now: () => now, cacheKeep, thinkingStore }
+    const { begin, plan, send, events } = fixture(options)
     const control = { type: 'ephemeral' }
     const first = {
       role: 'user',
@@ -165,20 +168,56 @@ test.each(['count', 'idle'] as const)(
         oauth: route,
         bodyText: JSON.stringify({ ...body, messages: [prompt, tail] }),
       }
-      begin('retry', plan(extended))
-      if (end === 'count') {
-        for (let step = 0; step < 9; step++)
-          send(plan(extended)).lifecycle?.onCompleted?.(completion)
-      } else now += 300_001
-      const returned = plan(extended)
+      let returned: RefusalFallbackRoundPlan
+      let expectedMessages: unknown[] = [first, tail]
+      if (end === 'restart') {
+        const initial = plan(extended)
+        const { lifecycle } = send(initial)
+        lifecycle?.onRefusal?.(refusal)
+        lifecycle?.onRetryThinkingDigest?.(
+          recoveryThinkingDigest('thinking', targetThought.signature),
+        )
+        lifecycle?.onRetryCompleted?.(completion, {
+          model: opus,
+          folded: false,
+        })
+        lifecycle?.onRetryFinished?.()
+        await thinkingStore.flush()
+        const restarted = fixture({
+          ...options,
+          thinkingStore: new RecoveryThinkingStore({ directory }),
+        })
+        await restarted.engine.loadThinking('s')
+        returned = restarted.plan({
+          oauth: route,
+          bodyText: replay(
+            prompt,
+            assistant(sourceThought, targetThought),
+            tail,
+          ),
+        })
+        expectedMessages = [first, assistant(sourceThought), tail]
+        expect(restarted.events).toEqual([])
+      } else {
+        begin('retry', plan(extended))
+        if (end === 'count') {
+          for (let step = 0; step < 9; step++)
+            send(plan(extended)).lifecycle?.onCompleted?.(completion)
+        } else if (end === 'idle') now += 300_001
+        returned = plan({ ...extended, mode: end === 'off' ? 'off' : 'client' })
+        expect(events.at(-1)).toMatchObject({
+          kind: 'round_ended',
+          reason: end === 'off' ? 'mode' : end,
+        })
+      }
       expect(returned).toMatchObject({
         kind: 'source',
         sourceCacheMarkerRestored: true,
       })
-      expect(JSON.parse(returned.bodyText).messages).toEqual([first, tail])
-      expect(events.at(-1)).toMatchObject({ kind: 'round_ended', reason: end })
+      expect(JSON.parse(returned.bodyText).messages).toEqual(expectedMessages)
     } finally {
       cacheKeep.stop()
+      await rm(directory, { recursive: true, force: true })
     }
   },
 )
@@ -226,6 +265,20 @@ test('a deferred round expires by the refused request lifetime before any fallba
     reason: 'idle',
     stepsLeft: 10,
   })
+})
+
+test('a delayed defer starts the idle clock at the refusal, not after authorization', () => {
+  let now = 0
+  const { plan, send, events } = fixture({ now: () => now })
+  const { lifecycle } = send(plan())
+  lifecycle?.onRefusal?.(refusal)
+  now = 20_000
+  lifecycle?.onDeferredRefusal?.(refusal)
+  now = 300_000
+  expect(plan().kind).toBe('round')
+  now++
+  expect(plan().kind).toBe('source')
+  expect(events.at(-1)).toMatchObject({ kind: 'round_ended', reason: 'idle' })
 })
 
 test.each([

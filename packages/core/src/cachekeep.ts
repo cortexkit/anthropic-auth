@@ -665,6 +665,10 @@ export function isCacheKeepWarmWait(
 
 export interface CacheKeepRealTurn {
   readonly active: boolean
+  /** Exclude warms once a tentative turn is about to send to the kept model. */
+  excludeWarms(): void
+  /** Keep ownership, but allow warms while the turn uses another model. */
+  allowWarms(): void
   track(
     input: Parameters<CacheKeepManager['track']>[0],
   ): ReturnType<CacheKeepManager['track']>
@@ -888,9 +892,14 @@ export class CacheKeepManager {
   }
 
   /** A request owns its busy lease; an older completion cannot retire a newer turn. */
-  beginRealTurn(sessionId: string): CacheKeepRealTurn {
+  beginRealTurn(
+    sessionId: string,
+    { deferWarmExclusion = false } = {},
+  ): CacheKeepRealTurn {
     let active = true
-    let busy = true
+    let busy = false
+    let everExcludedWarms = !deferWarmExclusion
+    let leaseExpired = false
     let tracked = false
     const lifetime = this.lifetime
     const id = ++this.nextRealTurn
@@ -935,7 +944,6 @@ export class CacheKeepManager {
       if (!busy) return
       busy = false
       turns.leases.delete(record)
-      clearTimer()
     }
     const release = (silent = false) => {
       if (!active) return
@@ -946,6 +954,7 @@ export class CacheKeepManager {
       try {
         if (
           !silent &&
+          everExcludedWarms &&
           lifetime === this.lifetime &&
           turns.latest === id &&
           currentTime() < expiresAt + CACHE_KEEP_TTL_MS
@@ -977,8 +986,10 @@ export class CacheKeepManager {
           release(true)
           return
         }
-        if (!busy) return
+        if (leaseExpired) return
+        leaseExpired = true
         releaseBusy()
+        clearTimer()
         const remaining = expiresAt + CACHE_KEEP_TTL_MS - currentTime()
         if (remaining <= 0) release(true)
         else {
@@ -994,7 +1005,24 @@ export class CacheKeepManager {
         }
       },
     }
-    turns.leases.add(record)
+    const excludeWarms = () => {
+      if (
+        !active ||
+        busy ||
+        leaseExpired ||
+        lifetime !== this.lifetime ||
+        currentTime() >= expiresAt
+      )
+        return
+      busy = true
+      everExcludedWarms = true
+      turns.leases.add(record)
+      for (const [controller, session] of this.warmControllers)
+        if (session === sessionId) controller.abort()
+      try {
+        this.scheduleDueTimer()
+      } catch {}
+    }
     try {
       timer = (this.options.setTimeoutImpl ?? setTimeout)(
         record.expire,
@@ -1002,9 +1030,7 @@ export class CacheKeepManager {
       )
       timer.unref?.()
       this.turnTimers.add(timer)
-      for (const [controller, session] of this.warmControllers)
-        if (session === sessionId) controller.abort()
-      this.scheduleDueTimer()
+      if (!deferWarmExclusion) excludeWarms()
     } catch {}
     const thisManager = this
     return {
@@ -1012,13 +1038,21 @@ export class CacheKeepManager {
         try {
           return (
             active &&
-            busy &&
+            !leaseExpired &&
             lifetime === thisManager.lifetime &&
             (thisManager.options.now?.() ?? Date.now()) < expiresAt
           )
         } catch {
           return false
         }
+      },
+      excludeWarms,
+      allowWarms: () => {
+        if (!busy) return
+        releaseBusy()
+        try {
+          this.scheduleDueTimer()
+        } catch {}
       },
       track: (input) => {
         if (turns.latest !== id) {
@@ -1194,7 +1228,12 @@ export class CacheKeepManager {
   /** A fallback step spends on a different cache, so it only renews the budget. */
   recordRoundActivity(
     sessionId: string,
-    route: { url: string; accountId: string; accountIdentity: string },
+    route: {
+      url: string
+      accountId: string
+      accountIdentity: string
+      requestedModel: string
+    },
   ): void {
     const target = this.targets.get(sessionId)
     if (!target) return
@@ -1214,29 +1253,36 @@ export class CacheKeepManager {
       this.scheduleDueTimer()
       return
     }
+    let model: unknown
+    try {
+      model = JSON.parse(target.bodyText)?.model
+    } catch {}
+    if (model !== route.requestedModel) {
+      this.untrack(sessionId)
+      return
+    }
     const state = target.policyState
     if (!state || now >= target.cacheExpiresAt) return
-    // A warm interrupted by this turn must not charge the newly reset budget.
+    // Keep the replay target so an in-flight warm can extend its lifetime.
+    // Replace only the budget so an earlier reservation cannot charge it.
     const policyState = {
       ...state,
       warmsSinceLastRealRequest: 0,
       warmCostSoFar: 0,
       pendingWarmCost: undefined,
     }
-    const renewed = { ...target, policyState }
     if (this.restoringPolicies.has(state))
       this.restoringPolicies.add(policyState)
-    if (this.restoredTargets.has(target)) this.restoredTargets.add(renewed)
-    this.lastRoundActivityAt.set(renewed, now)
-    this.targets.set(sessionId, renewed)
-    const decision = this.policyDecision(renewed, now)
+    target.policyState = policyState
+    this.lastRoundActivityAt.set(target, now)
+    const decision = this.policyDecision(target, now)
     if (decision?.action === 'stop') {
-      this.removeTarget(renewed, decision.reason, now)
+      this.removeTarget(target, decision.reason, now)
       this.publishTrackedSessions()
       this.scheduleDueTimer()
       return
     }
-    this.options.onTargetChanged?.(renewed)
+    this.options.onTargetChanged?.(target)
     this.scheduleDueTimer()
   }
 

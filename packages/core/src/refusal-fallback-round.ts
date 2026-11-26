@@ -242,7 +242,10 @@ export type RefusalFallbackRoundLifecycleOptions = {
   /** The final physical body, including after message-thread recovery. */
   sentBodyText?: () => string | undefined
   /** An accepted fallback step renews the warm budget, not the replay prefix. */
-  onRoundActivity?: (cacheTtlMs: number) => void | Promise<void>
+  onRoundActivity?: (
+    cacheTtlMs: number,
+    requestedModel: string,
+  ) => void | Promise<void>
 }
 
 /** Process-local client round state. The host owns routing, headers, threads and transport. */
@@ -268,6 +271,15 @@ export class RefusalFallbackRoundEngine {
     return this.#thinking.loadSession(sessionId)
   }
 
+  /** The next primary may be a fallback step; planning still checks its route and prefix. */
+  hasRound(sessionId: string): boolean {
+    const session = this.#sessions.get(sessionId)
+    return (
+      session !== undefined &&
+      [...session.families.values()].some((family) => family.round)
+    )
+  }
+
   forgetSession(sessionId: string): void {
     this.#sessions.delete(sessionId)
     this.#sessionLifetimes.delete(sessionId)
@@ -284,6 +296,7 @@ export class RefusalFallbackRoundEngine {
     input: RefusalFallbackRoundInput,
     familyId?: ClaudeRefusalRecoveryFamily,
     round?: symbol,
+    onStrippedThinking?: () => void,
   ): string {
     const text =
       input.filterBody?.(
@@ -294,9 +307,9 @@ export class RefusalFallbackRoundEngine {
     const digests = this.#thinking.peek(input.sessionId, familyId)
     if (!digests?.size) return text
     const body = parse(text)
-    return body && stripRecoveryRoundThinking(body, digests, round)
-      ? update(text, 'messages', body.messages)
-      : text
+    if (!body || !stripRecoveryRoundThinking(body, digests, round)) return text
+    onStrippedThinking?.()
+    return update(text, 'messages', body.messages)
   }
 
   #emit(
@@ -412,29 +425,41 @@ export class RefusalFallbackRoundEngine {
         if (target !== 'source') this.#end(existing, round, target)
       }
     }
-    let bodyText = this.#filter(input, familyId)
-    if (input.mode !== 'client' || !oauth) return { kind: 'source', bodyText }
-    const parsed = parse(bodyText)
-    const returning = session?.returning
+    let returning = session?.returning
+    let bodyText = this.#filter(input, familyId, undefined, () => {
+      // After restart the live round is gone, but recorded fallback thinking
+      // after source thinking still identifies a return to the requested model.
+      if (!session) returning = Symbol()
+    })
+    if (input.mode === 'server' || !oauth) return { kind: 'source', bodyText }
+    const parsed = returning && !input.compacted ? parse(bodyText) : undefined
     const sourceCacheMarkerRestored = Boolean(
-      returning &&
-        !input.compacted &&
-        parsed &&
-        this.#restoreReturnMarker(sessionId, parsed, oauth.cache),
+      parsed && this.#restoreReturnMarker(sessionId, parsed, oauth.cache),
     )
     if (sourceCacheMarkerRestored) bodyText = JSON.stringify(parsed)
+    const source = {
+      kind: 'source' as const,
+      bodyText,
+      ...(sourceCacheMarkerRestored && {
+        sourceCacheMarkerRestored: true as const,
+      }),
+    }
+    if (input.mode !== 'client') return source
     if (!session) {
       const lifetime = this.#sessionLifetimes.get(sessionId) ?? {}
       this.#sessionLifetimes.set(sessionId, lifetime)
-      session = { model: requestedModel, lifetime, families: new Map() }
+      session = {
+        model: requestedModel,
+        lifetime,
+        families: new Map(),
+        returning,
+      }
       this.#sessions.set(sessionId, session)
     }
     const family = existing ?? { clean: 0, level: 0, recent: false }
     session.families.set(familyId, family)
     return {
-      kind: 'source',
-      bodyText,
-      ...(sourceCacheMarkerRestored && { sourceCacheMarkerRestored: true }),
+      ...source,
       request: this.#handle({
         kind: 'source',
         sessionId,
@@ -716,7 +741,9 @@ export class RefusalFallbackRoundEngine {
       requestCacheLifetimeMs(sentBodyText?.() ?? request.templateBodyText)
     const recordRoundActivity = (cacheTtlMs: number) => {
       try {
-        void Promise.resolve(onRoundActivity?.(cacheTtlMs)).then(
+        void Promise.resolve(
+          onRoundActivity?.(cacheTtlMs, request.session.model),
+        ).then(
           () => publication?.resolve(),
           () => publication?.resolve(),
         )
@@ -733,9 +760,16 @@ export class RefusalFallbackRoundEngine {
       this.#thinking.record(request.sessionId, request.familyId, digest, round)
     }
     let releaseRetryThinking: (() => void) | undefined
+    let refusalClock: Round['idleClock'] | undefined
     if (onCacheKeepTemplate) request.publishTemplate = publish
     const startOnNextRequest = (refusal: RefusalFallbackCompletedRefusal) => {
-      if (request.phase !== 'refusal' || !refusal.category || !fresh()) return
+      if (
+        request.phase !== 'refusal' ||
+        !refusal.category ||
+        !refusalClock ||
+        !fresh()
+      )
+        return
       request.phase = 'finished'
       const body = parse(request.baseBodyText)
       if (!body) return
@@ -763,7 +797,7 @@ export class RefusalFallbackRoundEngine {
               projectReply,
               !refusal.releasedTool,
             ),
-            idleClock: clockFrom(wireCacheTtl()),
+            idleClock: refusalClock,
           },
           false,
         )
@@ -814,6 +848,7 @@ export class RefusalFallbackRoundEngine {
         },
         onRefusal: (refusal) => {
           if (request.phase !== 'sent' || !fresh()) return
+          refusalClock = clockFrom(wireCacheTtl())
           request.session.returning = undefined
           request.phase = 'refusal'
           request.family.clean = 0

@@ -25,6 +25,7 @@ import {
   createDumpResponseObserver,
   createProviderErrorRedactor,
   createProviderErrorResponseScope,
+  currentCacheKeepRealTurn,
   DEFAULT_REFUSAL_FALLBACK_MODE,
   type DumpHandle,
   type DumpTag,
@@ -2139,11 +2140,14 @@ export function createNativeAnthropicAdapter<Q, P>(
           ensureLive,
         )
       }
+      const realTurn = currentCacheKeepRealTurn()
       if (roundPlan?.request) roundCacheSends.add(data)
       if (billing) billingSends.set(data, billing)
       if (data.route === 'oauth' && messages && cleaned !== undefined)
         notifyFinal(prepared.headers, attempt.attemptId, cleaned)
       if (primary && messages) {
+        if (roundPlan?.kind === 'round') realTurn?.allowWarms()
+        else realTurn?.excludeWarms()
         markPrimary(input.sessionID, primaryMarker)
       }
       if (!send.oauth || !messages || body === undefined) return prepared
@@ -2536,6 +2540,10 @@ export function createNativeAnthropicAdapter<Q, P>(
         physical.target400 = (response) =>
           rounds.handleTarget400(handle, response, {
             ...fallback,
+            send(request) {
+              realTurn?.excludeWarms()
+              return fallback.send(request)
+            },
             isCurrentPrimary: () => isCurrent(true),
             onResendFailure: (model) => {
               const input = resendBilling(model)

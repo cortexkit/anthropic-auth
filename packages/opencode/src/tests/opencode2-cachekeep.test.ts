@@ -2046,7 +2046,9 @@ test('OpenCode 2 saves pending recovery thinking before server disposal returns'
   )
 })
 
-async function exerciseRoundKeepWarm(end: 'restart' | 'idle' | 'account') {
+async function exerciseRoundKeepWarm(
+  end: 'restart' | 'idle' | 'account' | 'concurrent',
+) {
   const f = await fixture()
   await f.setQuota('first')
   await f.store.updateSettings((settings) => ({
@@ -2102,8 +2104,14 @@ async function exerciseRoundKeepWarm(end: 'restart' | 'idle' | 'account') {
       { headers: { 'content-type': 'text/event-stream' } },
     )
   }
+  const warmStarted = Promise.withResolvers<AbortSignal>()
+  const warmRelease = Promise.withResolvers<void>()
   const send = async (request: Request) => {
     const body = (await request.json()) as { model: string; max_tokens: number }
+    if (end === 'concurrent' && body.max_tokens === 0) {
+      warmStarted.resolve(request.signal)
+      await warmRelease.promise
+    }
     return body.max_tokens === 0
       ? Response.json({
           id: 'msg_warm',
@@ -2151,6 +2159,26 @@ async function exerciseRoundKeepWarm(end: 'restart' | 'idle' | 'account') {
   const answer = await joined.text()
   expect(answer).not.toContain(credit)
   expect(answer).toContain('answer')
+  if (end === 'concurrent') {
+    f.due()
+    const warming = f.timers.fire()
+    try {
+      const signal = await Promise.race([
+        warmStarted.promise,
+        warming.then(() => undefined),
+      ])
+      expect(signal).toBeDefined()
+      const step = await prepare(append(refused, 'round while warming'))
+      expect(await step.request.clone().json()).toMatchObject({ model: target })
+      expect(signal?.aborted).toBe(false)
+      await f.respond(step, reply(target))
+      expect(signal?.aborted).toBe(false)
+    } finally {
+      warmRelease.resolve()
+      await warming
+    }
+    return
+  }
   const round = await prepare(append(refused, 'new primary on round'))
   const roundBody = await round.request.clone().text()
   expect(JSON.parse(roundBody)).toMatchObject({
@@ -2293,6 +2321,8 @@ test('OpenCode 2 round activity renews the warm budget and an idle end advances 
   exerciseRoundKeepWarm('idle'))
 test('OpenCode 2 stops warming the requested-model prefix if the account disappears mid-round', () =>
   exerciseRoundKeepWarm('account'))
+test('OpenCode 2 does not abort an in-flight requested-model warm when a round step starts', () =>
+  exerciseRoundKeepWarm('concurrent'))
 
 const CACHE_KEEP_SLOT = Symbol.for(
   'cortexkit.anthropic-auth.opencode2.cachekeep.v3',

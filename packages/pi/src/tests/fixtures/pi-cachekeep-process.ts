@@ -36,7 +36,9 @@ const roundSource = 'claude-fable-5-2'
 const roundTarget = 'claude-opus-4-8'
 const roundIdle = phase === 'round-idle'
 const roundAccount = phase === 'round-account'
-const roundSeed = phase === 'round-seed' || roundIdle || roundAccount
+const roundConcurrent = phase === 'round-concurrent'
+const roundSeed =
+  phase === 'round-seed' || roundIdle || roundAccount || roundConcurrent
 const roundFixture = roundSeed || phase === 'round-resume'
 const thinkingSeed = phase === 'thinking-seed'
 const thinkingFixture = thinkingSeed || phase === 'thinking-resume'
@@ -44,6 +46,8 @@ const shouldSend =
   roundSeed || ['seed', 'locked', 'takeover'].includes(phase ?? '')
 const sessionId = 'pi-restart-session-S'
 const requestedTemplateReady = Promise.withResolvers<void>()
+const warmStarted = Promise.withResolvers<AbortSignal | undefined>()
+const warmRelease = Promise.withResolvers<void>()
 let roundManager: CacheKeepManager | undefined
 if (roundSeed) {
   const track = CacheKeepManager.prototype.track
@@ -195,6 +199,10 @@ globalThis.fetch = Object.assign(
               'Pi dispatched the requested-model warm before saving its reservation',
             )
         }
+      }
+      if (roundConcurrent) {
+        warmStarted.resolve(init?.signal ?? undefined)
+        await warmRelease.promise
       }
       return Response.json({ usage: { cache_read_input_tokens: 100 } })
     }
@@ -507,7 +515,6 @@ try {
     if (!record)
       throw new Error('Pi lost the requested-model warm during the round')
     now = record.nextPrewarmAt + 1000
-    await roundManager.tick()
     const manager = roundManager
     const nextStep = async (prompt: string) => {
       if (!lastRound || !provider || !model)
@@ -524,6 +531,27 @@ try {
       lastRound.messages.push(result)
       await emit('agent_settled', { type: 'agent_settled' })
     }
+    const warming = manager.tick()
+    if (roundConcurrent) {
+      try {
+        const signal = await Promise.race([
+          warmStarted.promise,
+          warming.then(() => undefined),
+        ])
+        if (!signal)
+          throw new Error('Pi did not start the requested-model warm')
+        await nextStep('round while warming')
+        deepStrictEqual(messages.at(-1)?.model, roundTarget)
+        deepStrictEqual(
+          signal.aborted,
+          false,
+          'Pi aborted the requested-model warm',
+        )
+      } finally {
+        warmRelease.resolve()
+        await warming
+      }
+    } else await warming
     if (roundIdle) {
       const before = manager.trackedRequest(sessionId)
       const state = manager.trackedPolicyState(sessionId)

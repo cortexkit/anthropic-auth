@@ -422,7 +422,7 @@ export class PiCacheKeep {
     return starting
   }
 
-  realTurn(sessionId: string) {
+  realTurn(sessionId: string, deferWarmExclusion = false) {
     this.realTurns.add(sessionId)
     const session = this.sessions.get(sessionId)
     if (session && !this.stopping) {
@@ -435,7 +435,7 @@ export class PiCacheKeep {
     try {
       const previous = this.turnStarts.get(sessionId)
       if (previous && !previous.claimed) this.finishTurn(previous.turn)
-      const turn = this.manager.beginRealTurn(sessionId)
+      const turn = this.manager.beginRealTurn(sessionId, { deferWarmExclusion })
       this.turnStarts.set(sessionId, { turn, claimed: false })
       return turn
     } catch {
@@ -443,13 +443,13 @@ export class PiCacheKeep {
     }
   }
 
-  requestTurn(sessionId: string) {
+  requestTurn(sessionId: string, deferWarmExclusion = false) {
     const pending = this.turnStarts.get(sessionId)
     if (pending && !pending.claimed && pending.turn.active) {
       pending.claimed = true
       return pending.turn
     }
-    const turn = this.realTurn(sessionId)
+    const turn = this.realTurn(sessionId, deferWarmExclusion)
     const entry = this.turnStarts.get(sessionId)
     if (entry) entry.claimed = true
     return turn

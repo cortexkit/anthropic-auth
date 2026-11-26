@@ -606,7 +606,7 @@ export async function setupAnthropicAuth(
       rounds: cacheKeep.rounds,
       takeRoundThreadReset: cacheKeep.roundNotices.takeThreadReset,
       roundPolicy: (input) => {
-        const { accountId, baseUrl, sessionID } = input
+        const { accountId, baseUrl, modelID, sessionID } = input
         const cacheRoute = () => {
           const account = runtime
             .peek?.()
@@ -635,7 +635,11 @@ export async function setupAnthropicAuth(
           cacheRoute: cacheRoute(),
           onRoundActivity() {
             const route = cacheRoute()
-            if (route) cacheKeep.recordRoundActivity(sessionID, route)
+            if (route)
+              cacheKeep.recordRoundActivity(sessionID, {
+                ...route,
+                requestedModel: modelID,
+              })
           },
         }
       },

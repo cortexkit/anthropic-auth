@@ -297,8 +297,9 @@ export function beginPiPrimaryTurn(
   sessionId?: string,
 ): void {
   if (!sessionId) return
-  const lease = piCacheKeep.realTurn(sessionId)
-  if (refusalRounds.has(sessionId)) piCacheKeep.preserveTurn(lease)
+  const deferWarmExclusion = rounds.hasRound(sessionId)
+  const lease = piCacheKeep.realTurn(sessionId, deferWarmExclusion)
+  if (deferWarmExclusion) piCacheKeep.preserveTurn(lease)
   const previous = primarySessions.get(sessionId)
   const session =
     previous?.storagePath === storagePath
@@ -1202,10 +1203,13 @@ async function sendAnthropicRequest(
         options.requestOrigin,
       ) &&
       options.streamOptions?.sessionId
-    )
+    ) {
+      const sessionId = options.streamOptions.sessionId
+      const deferWarmExclusion = rounds.hasRound(sessionId)
       turn = deps.cacheKeep
-        ? deps.cacheKeep.beginRealTurn(options.streamOptions.sessionId)
-        : piCacheKeep.requestTurn(options.streamOptions.sessionId)
+        ? deps.cacheKeep.beginRealTurn(sessionId, { deferWarmExclusion })
+        : piCacheKeep.requestTurn(sessionId, deferWarmExclusion)
+    }
   } catch {}
   try {
     return await withCacheKeepRealTurn(turn, async () => {
@@ -1920,6 +1924,10 @@ async function sendAnthropicRequestAttempt(
     )
       throw replanPiRound
     if (roundRequest && !roundEngine.markSent(roundRequest)) throw replanPiRound
+    if (primaryRequest) {
+      if (roundPlan?.kind === 'round') realTurn?.allowWarms()
+      else realTurn?.excludeWarms()
+    }
     roundMarked = true
     if (primaryRequest && realSession) {
       delete primary.compacted
@@ -1996,6 +2004,7 @@ async function sendAnthropicRequestAttempt(
             url: input.toString(),
             accountId: routeId,
             accountIdentity: verifiedUuid,
+            requestedModel,
           })
       },
       async onCacheKeepTemplate(template, isCurrent) {
@@ -2092,6 +2101,8 @@ async function sendAnthropicRequestAttempt(
       requirePiOAuthOrigin(url, currentGateway)
       signal.throwIfAborted()
       assertHostAuthorityStable()
+      if (refusalRetry) realTurn?.allowWarms()
+      else realTurn?.excludeWarms()
       if (!refusalRetry && relayedOrigin) {
         const config = relayConfig
         if (!config || !candidate) throw new Error('Relay is unavailable')
@@ -4115,7 +4126,10 @@ export function streamCortexKitAnthropic(
       !piForkHeadSession(options) &&
       !piRoundSideRequest(options, getPiAccountStoragePath(), requestOrigin)
     )
-      turn = piCacheKeep.requestTurn(options.sessionId)
+      turn = piCacheKeep.requestTurn(
+        options.sessionId,
+        rounds.hasRound(options.sessionId),
+      )
   } catch {}
 
   void withCacheKeepRealTurn(turn, async () => {

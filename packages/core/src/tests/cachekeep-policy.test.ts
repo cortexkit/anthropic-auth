@@ -542,6 +542,7 @@ test('accepted round activity resets the warm budget and idle clock without touc
     url: f.input.url,
     accountId: 'first',
     accountIdentity: 'login',
+    requestedModel: 'claude-opus-5-5',
   }
   f.track({
     oauthAccountId: route.accountId,
@@ -551,7 +552,7 @@ test('accepted round activity resets the warm budget and idle clock without touc
   await f.manager.tick()
   expect(f.sends).toBe(1)
   expect(f.target.policyState?.warmsSinceLastRealRequest).toBe(1)
-  const original = f.target
+  const original = structuredClone(f.target)
   f.advance(1_800_000)
   f.manager.recordRoundActivity(f.input.sessionId, route)
   expect(f.target).toMatchObject({
@@ -612,6 +613,65 @@ test('a late warm cannot advance the newer target after a real request replaces 
     hasWarmed: false,
     lastRealRequestAt: f.now,
   })
+})
+
+test('an in-flight warm advances the kept prefix when a fallback step completes', async () => {
+  const started = Promise.withResolvers<true>()
+  const response = Promise.withResolvers<Response>()
+  const f = plannedFixture({
+    fetchImpl: Object.assign(
+      async () => {
+        started.resolve(true)
+        return response.promise
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  const route = {
+    url: f.input.url,
+    accountId: 'first',
+    accountIdentity: 'login',
+    requestedModel: 'claude-opus-5-5',
+  }
+  f.track({
+    oauthAccountId: route.accountId,
+    oauthAccountIdentity: route.accountIdentity,
+  })
+  f.advance(270_000)
+  const warming = f.manager.tick()
+  try {
+    expect(await Promise.race([started.promise, warming])).toBe(true)
+    f.manager.recordRoundActivity(f.input.sessionId, route)
+  } finally {
+    response.resolve(Response.json({}))
+    await warming
+  }
+  expect(f.target).toMatchObject({
+    lastTouchAt: f.now,
+    lastTouchKind: 'warm',
+    cacheExpiresAt: f.now + 300_000,
+    nextPrewarmAt: f.now + 150_000,
+    policyState: { warmsSinceLastRealRequest: 0, warmCostSoFar: 0 },
+  })
+})
+
+test('round activity retires the kept prefix after a requested model switch', async () => {
+  const f = plannedFixture()
+  const route = {
+    url: f.input.url,
+    accountId: 'first',
+    accountIdentity: 'login',
+    requestedModel: 'claude-fable-5-2',
+  }
+  f.track({
+    oauthAccountId: route.accountId,
+    oauthAccountIdentity: route.accountIdentity,
+  })
+  f.manager.recordRoundActivity(f.input.sessionId, route)
+  f.advance(270_000)
+  await f.manager.tick()
+  expect(f.manager.trackedRequest(f.input.sessionId)).toBeUndefined()
+  expect(f.sends).toBe(0)
 })
 
 test('planned timeout is clipped to expiry minus safety and authorization cannot consume the margin', async () => {
