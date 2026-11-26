@@ -213,7 +213,6 @@ import {
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
   RecoveryThinkingStore,
-  type RefusalFallbackCacheRoute,
   type RefusalFallbackDispatchOptions,
   type RefusalFallbackMode,
   RefusalFallbackRoundEngine,
@@ -3757,11 +3756,10 @@ const anthropicAuthPlugin = async (
     CacheKeepManager['trackedSessions']
   > = []
   const cacheKeepScopedAttempts = new Map<number, NativeOAuthAuthorization>()
-  const warmRoutes = new Map<string, RefusalFallbackCacheRoute>()
+  const roundAccounts = new Map<string, string>()
   const recoveryThinking = new RecoveryThinkingStore()
   const roundNotices = createRefusalRoundNotices()
   const currentWarmGateway = () => nativeAccounts.getClaudeGateway?.()
-  const sourceWarmFetch = fetchOAuthModel(currentWarmGateway)
   const cacheWarmFetch = fetchOAuthModel(currentWarmGateway, requestGzipLatch)
   const cacheKeepManager: CacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
@@ -3769,8 +3767,7 @@ const anthropicAuthPlugin = async (
     resolveSettings: (storage, model) =>
       nativeAccounts.resolveSettings?.(storage, model) ?? storage,
     now: runtimeNow,
-    peekRoutingAccount: (target, { sessionId, modelId }) => {
-      if (target.sourceWarm) modelId = parseRequestModel(target.bodyText)
+    peekRoutingAccount: (_target, { sessionId, modelId }) => {
       const snapshot = nativeAccounts.peek?.()
       return peekRoutingAccount({
         snapshot,
@@ -3783,26 +3780,7 @@ const anthropicAuthPlugin = async (
     },
     // Prewarms carry an OAuth bearer: recheck the destination, no redirects.
     // A keep-warm is a model request, so it follows the current gateway.
-    fetchForTarget: (target) => {
-      if (!target.sourceWarm) return cacheWarmFetch
-      // The mode can change during credential checks or warm reservation.
-      // Send source warms without gzip so a compression retry cannot skip this check.
-      return Object.assign(
-        async (...args: Parameters<typeof fetch>) => {
-          if (readRefusalFallbackMode() !== 'client') {
-            cacheKeepManager.untrack(target.id, 'policy-refused')
-            throw new CacheKeepWarmRefusal('stopped')
-          }
-          const gateway = currentWarmGateway()
-          return gateway &&
-            target.hostMetadata?.sourceBaseUrl &&
-            target.url !== target.hostMetadata.sourceBaseUrl
-            ? fetchOAuthPhysical(gateway)(...args)
-            : sourceWarmFetch(...args)
-        },
-        { preconnect: sourceWarmFetch.preconnect },
-      )
-    },
+    fetchForTarget: () => cacheWarmFetch,
     billingRequest: (target, attempt) => {
       const payer = cacheKeepScopedAttempts.get(attempt.id)
       if (!payer) return
@@ -3831,9 +3809,7 @@ const anthropicAuthPlugin = async (
     },
     onResponse: async ({ target, bodyText, status, receivedAt, attempt }) => {
       const authorization = cacheKeepScopedAttempts.get(attempt.id)
-      // A recovery source warm protects another model, not the active fallback's cache.
       if (
-        !target.sourceWarm &&
         status >= 200 &&
         status < 300 &&
         !attempt.signal?.aborted &&
@@ -3904,23 +3880,9 @@ const anthropicAuthPlugin = async (
       await cacheKeepRestart.stagger(target, attempt.signal)
       if (!cacheKeepRestart.active() || !isTargetCurrent())
         throw new CacheKeepWarmRefusal('stopped')
-      if (target.sourceWarm) {
-        const host = await latestHostGetAuth?.()
-        if (
-          !isCustodyTombstoneOAuth(host, 'anthropic') &&
-          !isRealHostLogin(host)
-        ) {
-          forgetRoundAccount(target.oauthAccountId ?? 'main')
-          throw new CacheKeepWarmRefusal('stopped')
-        }
-      }
       // A remembered URL gets the same destination rule as a live request;
       // refuse it before any credential is authorized for the prewarm.
-      const baseUrl =
-        typeof target.hostMetadata?.sourceBaseUrl === 'string'
-          ? target.hostMetadata.sourceBaseUrl
-          : target.url
-      if (!isAllowedOAuthDestination(target.url, modelGateway(baseUrl)))
+      if (!isAllowedOAuthDestination(target.url, modelGateway(target.url)))
         return undefined
       const accountId = target.oauthAccountId ?? 'main'
       let modelId: string | undefined
@@ -3937,9 +3899,7 @@ const anthropicAuthPlugin = async (
       )
       if (
         (target.oauthAccountIdentity &&
-          (target.sourceWarm
-            ? credential.credentialId
-            : credential.accountIdentity) !== target.oauthAccountIdentity) ||
+          credential.accountIdentity !== target.oauthAccountIdentity) ||
         (target.hostMetadata?.restartCredential !== undefined &&
           cacheKeepCredential(credential) !==
             target.hostMetadata.restartCredential)
@@ -3947,43 +3907,28 @@ const anthropicAuthPlugin = async (
         throw new NativeAccountRefusal('credential-changed')
       const accessToken = credential.accessToken
       cacheKeepScopedAttempts.set(attempt.id, credential)
-      if (target.sourceWarm || target.hostMetadata?.preserveSourceHeaders) {
-        if (target.sourceWarm) {
-          const gateway = modelGateway(baseUrl)
-          if (gateway) applyClaudeGatewayHeaders(headers, gateway)
-        }
-      } else
-        try {
-          const parsedBody = JSON.parse(target.bodyText) as Record<
-            string,
-            unknown
-          >
-          const identity = nativeWireIdentity(credential.accountIdentity)
-          const refusalSourceModel = target.hostMetadata?.refusalSourceModel
-          headers.delete('anthropic-beta')
-          setOAuthHeaders(headers, accessToken, {
-            body:
-              typeof refusalSourceModel === 'string'
-                ? { ...parsedBody, model: refusalSourceModel }
-                : parsedBody,
-            identity,
-            refusalFallbackMode:
-              typeof refusalSourceModel === 'string'
-                ? 'client'
-                : attempt.refusalFallbackMode,
-          })
-          if (typeof refusalSourceModel !== 'string') {
-            headers.set(
-              'anthropic-beta',
-              mergeAnthropicBetas(headers.get('anthropic-beta'), [
-                CACHE_KEEP_EXTENDED_TTL_BETA,
-              ]),
-            )
-            if (parsedBody.speed === 'fast') addFastModeBetaHeader(headers)
-          }
-        } catch {
-          setOAuthHeaders(headers, accessToken)
-        }
+      try {
+        const parsedBody = JSON.parse(target.bodyText) as Record<
+          string,
+          unknown
+        >
+        const identity = nativeWireIdentity(credential.accountIdentity)
+        headers.delete('anthropic-beta')
+        setOAuthHeaders(headers, accessToken, {
+          body: parsedBody,
+          identity,
+          refusalFallbackMode: attempt.refusalFallbackMode,
+        })
+        headers.set(
+          'anthropic-beta',
+          mergeAnthropicBetas(headers.get('anthropic-beta'), [
+            CACHE_KEEP_EXTENDED_TTL_BETA,
+          ]),
+        )
+        if (parsedBody.speed === 'fast') addFastModeBetaHeader(headers)
+      } catch {
+        setOAuthHeaders(headers, accessToken)
+      }
       const betas = headers.get('anthropic-beta')?.split(',') ?? []
       headers.set(
         'anthropic-beta',
@@ -4011,14 +3956,6 @@ const anthropicAuthPlugin = async (
       headers.set('authorization', `Bearer ${finalCredential.accessToken}`)
       cacheKeepScopedAttempts.set(attempt.id, finalCredential)
       return headers
-    },
-    validatePrewarm: ({ target }) => {
-      if (!target.sourceWarm) return { ok: true as const }
-      if (readRefusalFallbackMode() !== 'client') {
-        cacheKeepManager.untrack(target.id, 'policy-refused')
-        return { ok: false, reason: 'refusal-fallback-mode-changed' }
-      }
-      return { ok: true as const }
     },
   })
   const cacheKeepRestart = adoptCacheKeepRestart(accountStoragePath, {
@@ -4048,8 +3985,8 @@ const anthropicAuthPlugin = async (
   )
   function forgetRoundAccount(accountId: string) {
     rounds.forgetAccount(accountId)
-    for (const [sessionId, route] of warmRoutes)
-      if (route.accountId === accountId) warmRoutes.delete(sessionId)
+    for (const [sessionId, account] of roundAccounts)
+      if (account === accountId) roundAccounts.delete(sessionId)
   }
 
   // Prime sends a minimal Haiku request after the account's quota reset to
@@ -6359,7 +6296,7 @@ const anthropicAuthPlugin = async (
 
       if (value.type === 'session.deleted') {
         rounds.forgetSession(sessionId)
-        warmRoutes.delete(sessionId)
+        roundAccounts.delete(sessionId)
         roundNotices.forget(sessionId)
         pendingRoundDesktopNotices.delete(sessionId)
         desktopNoticeIdle.delete(sessionId)
@@ -6492,7 +6429,7 @@ const anthropicAuthPlugin = async (
         latestHostGetAuth = hostGetAuth
         const activation = await hostGetAuth()
         if (activation.type !== 'oauth') {
-          for (const { accountId } of warmRoutes.values())
+          for (const accountId of roundAccounts.values())
             forgetRoundAccount(accountId)
         }
         // Stock API-key authentication is not owned by the OAuth vault path.
@@ -7246,7 +7183,7 @@ const anthropicAuthPlugin = async (
             const primary = request?.kind === 'primary' ? request : undefined
             if (primary?.model && typeof body === 'string') {
               await rounds.loadThinking(primary.sessionId)
-              warmRoutes.delete(primary.sessionId)
+              roundAccounts.delete(primary.sessionId)
               body = rounds.plan({
                 sessionId: primary.sessionId,
                 requestedModel: remapModelId(primary.model),
@@ -7697,6 +7634,9 @@ const anthropicAuthPlugin = async (
             )
             let roundPlan: RefusalFallbackRoundPlan | undefined
             let lifecycleForPlan: ReturnType<typeof rounds.lifecycle>
+            let roundTurn:
+              | ReturnType<CacheKeepManager['beginRealTurn']>
+              | undefined
             let roundMarked = false
             const replan = new Error('Refusal round changed before dispatch')
             const acceptedCacheAttempts = new WeakSet<object>()
@@ -7913,7 +7853,7 @@ const anthropicAuthPlugin = async (
             }
             const trackRoundTemplate = (
               payer: NativeOAuthAuthorization,
-              bodyText: string | null,
+              bodyText: string,
               usage:
                 | Parameters<CacheKeepManager['recordAcceptedUsage']>[2]
                 | undefined,
@@ -7927,15 +7867,9 @@ const anthropicAuthPlugin = async (
                 !cacheKeepRestart.active()
               )
                 return
-              if (bodyText === null) {
-                cacheKeepManager.releaseTarget(cacheRequest.sessionId)
-                return
-              }
               const storeTemplate = (template: string) => {
                 if (!isCurrent() || !cacheKeepRestart.active()) return
                 const acceptedAt = runtimeNow()
-                const sourceModel = parseRequestModel(sourceBodyText)
-                const servingModel = parseRequestModel(template)
                 const tracked = cacheKeepManager.track({
                   sessionId: cacheRequest.sessionId,
                   url: requestUrl,
@@ -7948,14 +7882,6 @@ const anthropicAuthPlugin = async (
                   oauthAccountIdentity: payer.accountIdentity,
                   hostMetadata: {
                     restartCredential: cacheKeepCredential(payer),
-                    ...(servingModel !== modelForIdentity && {
-                      preserveSourceHeaders: true,
-                    }),
-                    ...(sourceModel &&
-                      servingModel &&
-                      servingModel !== sourceModel && {
-                        refusalSourceModel: sourceModel,
-                      }),
                   },
                   isSubagent: subagentRequest,
                   acceptedAt,
@@ -7994,15 +7920,30 @@ const anthropicAuthPlugin = async (
                 rounds.lifecycle(handle, {
                   isFresh: () => isFresh(payer),
                   targetAllowed,
+                  sentBodyText: () =>
+                    typeof body === 'string' ? body : undefined,
+                  onRoundActivity() {
+                    if (
+                      cacheRequest &&
+                      payer.accountIdentity &&
+                      isCurrentCacheRequest(payer)
+                    )
+                      cacheKeepManager.recordRoundActivity(
+                        cacheRequest.sessionId,
+                        {
+                          url: requestUrl,
+                          accountId: oauthAccountId,
+                          accountIdentity: payer.accountIdentity,
+                        },
+                      )
+                  },
                   onCacheKeepTemplate: keepCompletedReply
                     ? (template, isCurrent) =>
                         trackRoundTemplate(
                           payer,
-                          template?.bodyText ?? null,
-                          template?.usage,
+                          template.bodyText,
+                          template.usage,
                           () => isCurrent() && isCurrentCacheRequest(payer),
-                          roundPlan?.kind === 'source' &&
-                            template?.servingModel !== modelForIdentity,
                         )
                     : undefined,
                 })
@@ -8398,7 +8339,6 @@ const anthropicAuthPlugin = async (
               ) {
                 await rounds.loadThinking(relayAffinity)
                 const credentialId = requestAuthority.credentialId
-                const url = finalUrl(gateway)
                 const input: RefusalFallbackRoundInput = {
                   sessionId: relayAffinity,
                   requestedModel: model,
@@ -8411,58 +8351,14 @@ const anthropicAuthPlugin = async (
                           accountId: oauthAccountId,
                           credentialId,
                           targetAllowed,
-                          ...(primary &&
-                            wireSettings.cacheEnabled && {
-                              sourceWarm: {
-                                url,
-                                headers: new Headers(requestHeaders),
-                                restartIdentity:
-                                  cacheKeepCredential(requestAuthority),
-                                cacheMode: wireSettings.cacheMode,
-                                loadStorage: () =>
-                                  loadAccounts(accountStoragePath, model),
-                                currentRoute: () => {
-                                  const route = warmRoutes.get(relayAffinity)
-                                  const snapshot = nativeAccounts.peek?.()
-                                  const account = snapshot?.accounts.find(
-                                    (row) => row.id === oauthAccountId,
-                                  )
-                                  if (
-                                    !route ||
-                                    account?.type !== 'oauth' ||
-                                    !nativeAccountCanServe(account) ||
-                                    account.accountIdentity !==
-                                      requestAuthority.accountIdentity ||
-                                    (account.binding
-                                      ? localMessageThreadCredential(
-                                          account.binding,
-                                        )
-                                      : account.credentialId) !==
-                                      credentialId ||
-                                    requestWireSettings(
-                                      snapshot?.policyStorage,
-                                      model,
-                                    ).cacheMode !== wireSettings.cacheMode ||
-                                    !requestWireSettings(
-                                      snapshot?.policyStorage,
-                                      model,
-                                    ).cacheEnabled
-                                  )
-                                    return
-                                  return {
-                                    ...route,
-                                    mode: readRefusalFallbackMode(),
-                                    url: finalUrl(currentGateway()),
-                                  }
-                                },
-                                hostMetadata: {
-                                  restartCredential:
-                                    cacheKeepCredential(requestAuthority),
-                                  sourceBaseUrl: requestUrl,
-                                },
-                                isSubagent: subagentRequest,
-                              },
-                            }),
+                          cache: requestAuthority.accountIdentity
+                            ? {
+                                url: requestUrl,
+                                accountId: oauthAccountId,
+                                accountIdentity:
+                                  requestAuthority.accountIdentity,
+                              }
+                            : undefined,
                         }
                       : undefined,
                 }
@@ -8517,6 +8413,8 @@ const anthropicAuthPlugin = async (
               if (roundMarked) return
               if (roundPlan?.request && !rounds.markSent(roundPlan.request))
                 throw replan
+              if (primary && roundPlan?.request)
+                roundTurn = cacheKeepManager.beginRealTurn(primary.sessionId)
               if (
                 primary &&
                 modelForIdentity &&
@@ -8526,18 +8424,11 @@ const anthropicAuthPlugin = async (
                   primary.sessionId,
                 )?.primary
                 if (newest === undefined || newest <= primary.sequence) {
-                  warmRoutes.delete(primary.sessionId)
-                  warmRoutes.set(primary.sessionId, {
-                    accountId: oauthAccountId,
-                    credentialId: requestAuthority.credentialId,
-                    requestedModel:
-                      parseRequestModel(sourceBodyText) ?? modelForIdentity,
-                    mode: refusalFallbackMode,
-                    url: finalUrl(gateway),
-                  })
-                  if (warmRoutes.size > 128) {
-                    const oldest = warmRoutes.keys().next()
-                    if (!oldest.done) warmRoutes.delete(oldest.value)
+                  roundAccounts.delete(primary.sessionId)
+                  roundAccounts.set(primary.sessionId, oauthAccountId)
+                  if (roundAccounts.size > 128) {
+                    const oldest = roundAccounts.keys().next()
+                    if (!oldest.done) roundAccounts.delete(oldest.value)
                   }
                 }
               }
@@ -9010,7 +8901,7 @@ const anthropicAuthPlugin = async (
                 })
               }
               return response
-            })
+            }).finally(() => roundTurn?.pause())
           }
 
           function getFallbackQuota(account: {

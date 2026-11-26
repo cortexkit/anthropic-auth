@@ -780,9 +780,7 @@ test.each([false, true])(
         category: 'cyber',
         stepsLeft: 9,
       })
-      expect(templates).toHaveLength(1)
-      expect(templates[0]).not.toContain(PRIVATE_CREDIT)
-      expect(await core.hasValidRequestBodySignature(templates[0]!)).toBe(true)
+      expect(templates).toEqual([])
 
       const title = await prepare([{ role: 'user', content: 'make a title' }], {
         ...primary,
@@ -1134,8 +1132,7 @@ test.each(['answer', 'reject', 'gateway moved', 'new primary'] as const)(
         expect(text).toContain('the retry answered')
         expect(text).toContain('"input_tokens":25')
         expect(text).not.toContain('"stop_reason":"refusal"')
-        expect(completed).toHaveLength(1)
-        expect(completed[0]).not.toContain(PRIVATE_CREDIT)
+        expect(completed).toEqual([])
       } else {
         expect(text).toContain('"stop_reason":"refusal"')
         expect(text).not.toContain('the retry answered')

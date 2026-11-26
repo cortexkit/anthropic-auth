@@ -34,30 +34,28 @@ import {
 const phase = process.argv[2]
 const roundSource = 'claude-fable-5-2'
 const roundTarget = 'claude-opus-4-8'
-const roundSeed = phase === 'round-seed'
+const roundIdle = phase === 'round-idle'
+const roundAccount = phase === 'round-account'
+const roundSeed = phase === 'round-seed' || roundIdle || roundAccount
 const roundFixture = roundSeed || phase === 'round-resume'
 const thinkingSeed = phase === 'thinking-seed'
 const thinkingFixture = thinkingSeed || phase === 'thinking-resume'
 const shouldSend =
   roundSeed || ['seed', 'locked', 'takeover'].includes(phase ?? '')
 const sessionId = 'pi-restart-session-S'
-const roundTemplateReady = Promise.withResolvers<void>()
-const sourceWarmReady = Promise.withResolvers<void>()
+const requestedTemplateReady = Promise.withResolvers<void>()
 let roundManager: CacheKeepManager | undefined
 if (roundSeed) {
   const track = CacheKeepManager.prototype.track
   CacheKeepManager.prototype.track = function (input) {
     const result = track.call(this, input)
-    if (result.tracked && input.sourceWarm) sourceWarmReady.resolve()
     if (
       result.tracked &&
       input.sessionId === sessionId &&
-      input.bodyText.includes('later round step')
+      JSON.parse(input.bodyText).model === roundSource
     ) {
       roundManager = this
-      roundTemplateReady.resolve()
-      if (this.trackedRequest(`source-warm:${sessionId}:fable-5-2`))
-        sourceWarmReady.resolve()
+      requestedTemplateReady.resolve()
     }
     return result
   }
@@ -142,6 +140,7 @@ function partialReplyFrames(lane: 'source' | 'target') {
 }
 
 let refuseRoundSource = false
+let lastRound: Context | undefined
 const probeFailures: string[] = []
 const originalFetch = globalThis.fetch
 globalThis.fetch = Object.assign(
@@ -149,7 +148,14 @@ globalThis.fetch = Object.assign(
     const url = input instanceof Request ? input.url : String(input)
     if (url.includes('/api/claude_cli/bootstrap'))
       return Response.json({
-        oauth_account: { account_uuid: fixtureAccountIdentity('main') },
+        oauth_account: {
+          account_uuid: fixtureAccountIdentity(
+            new Headers(init?.headers).get('authorization') ===
+              'Bearer sk-ant-oat01-replacement-access'
+              ? 'replacement'
+              : 'main',
+          ),
+        },
       })
     if (!url.includes('/v1/messages'))
       throw new Error(`Unexpected fixture request: ${new URL(url).pathname}`)
@@ -467,6 +473,7 @@ try {
       : stream.result())
     if (result.stopReason === 'error') throw new Error(result.errorMessage)
     if (roundSeed) {
+      await requestedTemplateReady.promise
       refuseRoundSource = true
       context.messages.push(result, {
         role: 'user',
@@ -488,17 +495,80 @@ try {
         .result()
       if (round.stopReason !== 'stop' || messages.at(-1)?.model !== roundTarget)
         throw new Error('Pi did not serve the round step on the target')
-      await Promise.all([roundTemplateReady.promise, sourceWarmReady.promise])
+      lastRound = context
+      lastRound.messages.push(round)
     }
     await events.get('agent_settled')?.({ type: 'agent_settled' }, ctx)
   }
   if (roundSeed && roundManager) {
-    // The two prefixes can have different lifetimes. Tick when each one is
-    // due instead of moving both by the assumed one-hour cache lifetime.
-    const due = roundManager.trackedSessions().map((row) => row.nextPrewarmAt)
-    for (const next of [...new Set(due)].sort((a, b) => a - b)) {
-      now = next + 1000
-      await roundManager.tick()
+    const record = roundManager
+      .trackedSessions()
+      .find((row) => row.id === sessionId)
+    if (!record)
+      throw new Error('Pi lost the requested-model warm during the round')
+    now = record.nextPrewarmAt + 1000
+    await roundManager.tick()
+    const manager = roundManager
+    const nextStep = async (prompt: string) => {
+      if (!lastRound || !provider || !model)
+        throw new Error('Missing Pi round history')
+      await emit('turn_start', {
+        type: 'turn_start',
+        turnIndex: lastRound.messages.length,
+      })
+      lastRound.messages.push({ role: 'user', content: prompt, timestamp: now })
+      const result = await provider
+        .streamSimple(model, lastRound, { sessionId })
+        .result()
+      if (result.stopReason === 'error') throw new Error(result.errorMessage)
+      lastRound.messages.push(result)
+      await emit('agent_settled', { type: 'agent_settled' })
+    }
+    if (roundIdle) {
+      const before = manager.trackedRequest(sessionId)
+      const state = manager.trackedPolicyState(sessionId)
+      deepStrictEqual(state?.warmsSinceLastRealRequest, 1)
+      now += 60_000
+      await nextStep('shorter than the round step lifetime')
+      deepStrictEqual(messages.at(-1)?.model, roundTarget)
+      deepStrictEqual(manager.trackedRequest(sessionId), before)
+      const renewed = manager.trackedPolicyState(sessionId)
+      deepStrictEqual(renewed?.warmsSinceLastRealRequest, 0)
+      deepStrictEqual(renewed?.warmCostSoFar, 0)
+      deepStrictEqual(renewed?.lastRealRequestAt, state?.lastRealRequestAt)
+      now += 54 * 60_000
+      await manager.tick()
+      now += 6 * 60_000 + 1
+      await nextStep('longer than the round step lifetime')
+      deepStrictEqual(messages.at(-1)?.model, roundSource)
+      const returned = messages.at(-1)?.messages as
+        | { content: { text?: string; cache_control?: unknown }[] }[]
+        | undefined
+      deepStrictEqual(
+        returned?.[0]?.content.find((block) => block.text === 'hello')
+          ?.cache_control,
+        { type: 'ephemeral', ttl: '1h' },
+      )
+      refuseRoundSource = true
+      await nextStep('refuse again after an idle end')
+      const { piRefusalRoundStatus } = await import('../../stream.ts')
+      if (!piRefusalRoundStatus(sessionId)?.includes('(cyber; 19 steps left)'))
+        throw new Error('Pi did not start a longer round after an idle end')
+    } else if (roundAccount) {
+      const runtime = await getPiNativeRuntime(storagePath).service()
+      await runtime.loginOAuth({
+        routeId: 'main',
+        replace: true,
+        accountIdentity: fixtureAccountIdentity('replacement'),
+        credential: {
+          access: 'sk-ant-oat01-replacement-access',
+          refresh: 'synthetic-replacement-refresh',
+          expires: now + 86_400_000,
+        },
+      })
+      now += 55 * 60_000
+      await manager.tick()
+      deepStrictEqual(manager.trackedRequest(sessionId), undefined)
     }
   }
   if ((!shouldSend && !thinkingFixture) || phase === 'takeover') {
@@ -545,14 +615,19 @@ if (roundSeed) {
   )
   const expected = `${createHash('sha256').update(sessionId).digest('hex')}.json.gz`
   const saved = files.filter((file) => file.endsWith('.json.gz'))
-  if (JSON.stringify(saved) !== JSON.stringify([expected]))
-    throw new Error(`Source warm leaked into Pi restart persistence: ${saved}`)
   if (
-    !messages.some(
-      (body) => body.model === roundSource && body.max_tokens === 0,
-    )
+    !roundIdle &&
+    !roundAccount &&
+    JSON.stringify(saved) !== JSON.stringify([expected])
   )
-    throw new Error('Pi did not warm the source during the round')
+    throw new Error(
+      `Pi did not save a single ordinary session record: ${saved}`,
+    )
+  deepStrictEqual(
+    messages.filter((body) => body.max_tokens === 0).map((body) => body.model),
+    roundIdle ? [roundSource, roundSource] : [roundSource],
+    'Pi must warm only the requested model during the round',
+  )
 }
 if (probeFailures.length) throw new Error(probeFailures.join('\n'))
 console.log(

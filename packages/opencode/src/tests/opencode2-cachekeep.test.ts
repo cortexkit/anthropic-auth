@@ -2046,7 +2046,7 @@ test('OpenCode 2 saves pending recovery thinking before server disposal returns'
   )
 })
 
-test('OpenCode 2 keeps separate live warm targets and restores the requested-model prefix', async () => {
+async function exerciseRoundKeepWarm(end: 'restart' | 'idle' | 'account') {
   const f = await fixture()
   await f.setQuota('first')
   await f.store.updateSettings((settings) => ({
@@ -2170,11 +2170,10 @@ test('OpenCode 2 keeps separate live warm targets and restores the requested-mod
       remaining: 8,
     }),
   )
-  const sourceWarmID = `source-warm:${sessionID}:fable-5-2`
-  expect(owner.manager.trackedRequest(sourceWarmID)?.bodyText).toContain(
+  expect(owner.manager.trackedRequest(sessionID)?.bodyText).toContain(
     'clean source prefix only',
   )
-  expect(owner.manager.trackedRequest(sourceWarmID)?.bodyText).not.toContain(
+  expect(owner.manager.trackedRequest(sessionID)?.bodyText).not.toContain(
     'refused suffix',
   )
   f.due()
@@ -2191,10 +2190,57 @@ test('OpenCode 2 keeps separate live warm targets and restores the requested-mod
   }
   expect(warmByModel.get(source)?.wire).toContain('clean source prefix only')
   expect(warmByModel.get(source)?.wire).not.toContain('refused suffix')
-  expect(warmByModel.get(target)?.wire).toContain('new primary on round')
-  expect(warmByModel.get(target)?.headers.get('anthropic-beta')).toBe(
-    round.request.headers.get('anthropic-beta'),
-  )
+  expect([...warmByModel.keys()]).toEqual([source])
+  if (end === 'account') {
+    const before = f.sent.length
+    await f.store.remove('first')
+    f.due()
+    await f.timers.fire()
+    expect(f.sent).toHaveLength(before)
+    expect(owner.manager.trackedRequest(sessionID)).toBeUndefined()
+    return
+  }
+  if (end === 'idle') {
+    const before = owner.manager.trackedRequest(sessionID)
+    const state = owner.manager.trackedPolicyState(sessionID)
+    expect(state?.warmsSinceLastRealRequest).toBe(1)
+    f.advance(60_000)
+    const lastStep = append(
+      append(refused, 'new primary on round'),
+      'short gap',
+    )
+    const short = await prepare(lastStep)
+    expect(await short.request.clone().json()).toMatchObject({ model: target })
+    await f.respond(short, reply(target))
+    expect(owner.manager.trackedRequest(sessionID)?.bodyText).toBe(
+      before?.bodyText,
+    )
+    expect(owner.manager.trackedPolicyState(sessionID)).toMatchObject({
+      warmsSinceLastRealRequest: 0,
+      warmCostSoFar: 0,
+      lastRealRequestAt: state?.lastRealRequestAt,
+    })
+    f.advance(54 * 60_000)
+    await f.timers.fire()
+    f.advance(6 * 60_000 + 1)
+    const returned = append(lastStep, 'idle gap past one hour')
+    const long = await prepare(returned)
+    const wire = JSON.parse(await long.request.clone().text())
+    expect(wire.model).toBe(source)
+    expect(wire.messages[0].content).toContainEqual(
+      expect.objectContaining({
+        text: 'clean source prefix only',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      }),
+    )
+    await f.respond(long, reply(source))
+    const nextRefusal = await prepare(append(returned, 'refuse again'))
+    await (await f.respond(nextRefusal, reply(source, true), false)).text()
+    expect(owner.roundNotices.snapshot()).toContainEqual(
+      expect.objectContaining({ sessionId: sessionID, remaining: 19 }),
+    )
+    return
+  }
   await owner.persistence.drain()
   const saved = await readdir(f.disk)
   expect(saved.filter((name) => name.endsWith('.json.gz'))).toHaveLength(1)
@@ -2239,7 +2285,14 @@ test('OpenCode 2 keeps separate live warm targets and restores the requested-mod
   expect(record.nextPrewarmAt).toBeGreaterThan(
     record.policyState.lastRealRequestAt + 60 * 60_000,
   )
-})
+}
+
+test('OpenCode 2 only warms the requested-model prefix during a round and after restart', () =>
+  exerciseRoundKeepWarm('restart'))
+test('OpenCode 2 round activity renews the warm budget and an idle end advances backoff', () =>
+  exerciseRoundKeepWarm('idle'))
+test('OpenCode 2 stops warming the requested-model prefix if the account disappears mid-round', () =>
+  exerciseRoundKeepWarm('account'))
 
 const CACHE_KEEP_SLOT = Symbol.for(
   'cortexkit.anthropic-auth.opencode2.cachekeep.v3',
@@ -2872,8 +2925,6 @@ test.each([
   'unreadable',
   'unfinished-write',
   'invalid',
-  'unknown-refusal-source',
-  'unsupported-refusal-source',
   ...(process.platform === 'win32' ? [] : ['unsafe-file']),
 ])(
   'OpenCode 2 deletes a %s restart record without sending it',
@@ -2890,10 +2941,6 @@ test.each([
       saved.oauthAccountIdentity = 'someone-else'
     if (change === 'format') saved.v = 99
     if (change === 'invalid') saved.bodyText = '{not JSON'
-    if (change === 'unknown-refusal-source')
-      saved.refusalSourceModel = 'unknown-claude-model'
-    if (change === 'unsupported-refusal-source')
-      saved.refusalSourceModel = 'claude-sonnet-4-6'
     await writeFile(
       path,
       change === 'unreadable' ? 'not gzip' : gzipSync(JSON.stringify(saved)),
@@ -2913,9 +2960,7 @@ test.each([
     )
     expect(drops).toHaveLength(1)
     expect(drops[0]).toContain('DEBUG [cachekeep]')
-    expect(drops[0]).toContain(
-      `"reason":"${change.includes('refusal-') ? 'invalid' : change}"`,
-    )
+    expect(drops[0]).toContain(`"reason":"${change}"`)
     expect(drops[0]).toContain(`"file":"${droppedName}"`)
     expect(drops[0]).not.toContain(saved.id)
     expect(drops[0]).not.toContain(saved.bodyText)

@@ -116,7 +116,7 @@ function fixture(
 }
 
 test.each(['disabled', 'thread', 'body-budget'] as const)(
-  'a refused real-turn %s replacement ends every session-owned target',
+  'a refused real-turn %s replacement ends the previous target',
   async (reason) => {
     const f = fixture(null)
     Object.assign(f.input.storage, {
@@ -124,14 +124,6 @@ test.each(['disabled', 'thread', 'body-budget'] as const)(
       claudeCache: { enabled: true, mode: 'hybrid' },
     })
     expect(f.track({ cacheMode: 'hybrid' }).tracked).toBe(true)
-    expect(
-      f.track({
-        sessionId: 'source-prefix',
-        ownerSessionId: f.input.sessionId,
-        sourceWarm: true,
-        cacheMode: 'hybrid',
-      }).tracked,
-    ).toBe(true)
     f.targets.get(f.input.sessionId)!.policyState!.hasWarmed = true
     const bodyText =
       reason === 'body-budget'
@@ -1147,7 +1139,6 @@ test.each([
   ['retries-exhausted', 'deadline-missed'],
   ['expired', 'deadline-missed'],
   ['idle', 'cost-cap'],
-  ['source-warm-idle-cap', 'cost-cap'],
   ...[
     'budget',
     'count',

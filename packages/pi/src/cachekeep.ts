@@ -7,11 +7,11 @@ import {
   CacheKeepStore,
   type CacheKeepStoreOptions,
   type CacheKeepTarget,
-  cacheKeepRestartTarget,
   currentCacheKeepRealTurn,
   type HolderLiveness,
   isCacheKeepSubagentsEnabled,
   logger,
+  NativeAccountRefusal,
   type NativeAccountSnapshot,
   type NativeAccountView,
   nativeAccountCanServe,
@@ -41,8 +41,6 @@ function accountKey(account: NativeAccountView) {
     account.binding?.credentialEpoch,
   ])
 }
-
-export { accountKey as piCacheKeepAccountKey }
 
 /** One Pi process owns only the sessions its lifecycle actually opened. */
 export class PiCacheKeep {
@@ -86,17 +84,13 @@ export class PiCacheKeep {
     this.schedule = schedule
     this.cancel = managerOptions.clearIntervalImpl ?? clearInterval
     const persisted = (target: Readonly<CacheKeepTarget>) => {
-      const entry = cacheKeepRestartTarget(target)
-      const identity = target.sourceWarm
-        ? entry?.oauthAccountIdentity
-        : target.hostMetadata?.accountIdentity
-      return entry && typeof identity === 'string'
-        ? { ...entry, oauthAccountIdentity: identity }
+      const identity = target.hostMetadata?.accountIdentity
+      return typeof identity === 'string'
+        ? { ...target, oauthAccountIdentity: identity }
         : undefined
     }
     const persistWarm = async (target: Readonly<CacheKeepTarget>) => {
       const entry = persisted(target)
-      if (!cacheKeepRestartTarget(target)) return true
       const session = entry && this.sessions.get(entry.id)
       if (this.stopping || !session || !entry) return 'not-owner' as const
       return session.store.reserveWarm(entry)
@@ -104,8 +98,6 @@ export class PiCacheKeep {
     this.manager = new CacheKeepManager({
       ...managerOptions,
       peekRoutingAccount: (target, route) => {
-        // Core checks the source route, not the live template's target model.
-        if (target.sourceWarm) return undefined
         const session = this.sessions.get(route.sessionId)
         const routing = this.options.routing?.(
           session?.storagePath ?? target.accountStoragePath ?? '',
@@ -131,9 +123,7 @@ export class PiCacheKeep {
           : Promise.resolve(false),
       onTargetRemoved: (id, target) => {
         this.restored.delete(id)
-        const entry = cacheKeepRestartTarget(target)
-        if (entry)
-          this.sessions.get(entry.id)?.store.removed(persisted(target) ?? entry)
+        this.sessions.get(id)?.store.removed(persisted(target) ?? target)
         managerOptions.onTargetRemoved?.(id, target)
       },
       prepareHeaders: async (headers, target, attempt, isTargetCurrent) => {
@@ -158,9 +148,14 @@ export class PiCacheKeep {
           const account = snapshot.accounts.find(
             (row) => accountKey(row) === identity,
           )
-          if (!account || !nativeAccountCanServe(account)) return undefined
-        } else if (!target.sourceWarm && this.manager.trackedRequest(target.id))
-          return undefined
+          if (!account)
+            throw new NativeAccountRefusal(
+              snapshot.accounts.some((row) => row.id === target.oauthAccountId)
+                ? 'credential-changed'
+                : 'account-unavailable',
+            )
+          if (!nativeAccountCanServe(account)) return undefined
+        } else if (this.manager.trackedRequest(target.id)) return undefined
         return managerOptions.prepareHeaders
           ? managerOptions.prepareHeaders(
               headers,
@@ -209,7 +204,6 @@ export class PiCacheKeep {
     this.starts.delete(sessionId)
     this.restored.delete(sessionId)
     this.manager.releaseTarget(sessionId)
-    this.manager.releaseSourceWarm(sessionId)
   }
 
   private claim(
@@ -378,7 +372,6 @@ export class PiCacheKeep {
           if (!account) return 'foreign-identity'
           if (account.type !== 'oauth' || !nativeAccountCanServe(account))
             return 'account-gone'
-          if (entry.refusalSourceModel !== undefined) return 'invalid'
           if (
             entry.isSubagent &&
             !entry.policyState?.planned &&

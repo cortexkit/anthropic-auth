@@ -6,7 +6,6 @@ import {
   CacheKeepStore,
   type CacheKeepTarget,
   CacheKeepWarmRefusal,
-  cacheKeepRestartTarget,
   isCacheKeepSubagentsEnabled,
   localMessageThreadCredential,
   logger,
@@ -108,7 +107,6 @@ function restore(shared: Shared): Promise<void> {
         const account = accounts.get(entry.oauthAccountIdentity)
         if (!account) return 'account-gone'
         // Older round records contain only the serving model's prefix.
-        if (entry.refusalSourceModel !== undefined) return 'invalid'
         if (
           entry.isSubagent &&
           !entry.policyState?.planned &&
@@ -179,7 +177,6 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
         shared.owners.delete(hash)
         shared.restored.delete(hash)
         owner?.manager.releaseTarget(id)
-        owner?.manager.releaseSourceWarm?.(id)
       },
     }),
     leases: new Set<Lease>(),
@@ -195,9 +192,8 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
   const active = () => shared.leases.has(lease)
   const persisted = (target: Readonly<CacheKeepTarget>) => {
     const credential = target.hostMetadata?.restartCredential
-    const entry = cacheKeepRestartTarget(target)
-    return entry && typeof credential === 'string'
-      ? { ...entry, oauthAccountIdentity: credential }
+    return typeof credential === 'string'
+      ? { ...target, oauthAccountIdentity: credential }
       : undefined
   }
   const reserve = (target: Readonly<CacheKeepTarget>) => {
@@ -220,23 +216,16 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
         shared.owners.set(hash, lease)
         shared.restored.delete(hash)
         previous?.manager.releaseTarget(entry.id)
-        previous?.manager.releaseSourceWarm?.(entry.id)
       }
-      shared.store.changed(
-        entry,
-        (!target.sourceWarm || target.lastTouchKind === undefined) &&
-          !lease.manager.isRestoredTarget(target),
-      )
+      shared.store.changed(entry, !lease.manager.isRestoredTarget(target))
     },
     removed(target: Readonly<CacheKeepTarget>) {
-      const entry = cacheKeepRestartTarget(target)
-      if (!entry) return
-      const hash = sessionHash(entry.id)
+      const hash = sessionHash(target.id)
       if (shared.owners.get(hash) !== lease) return
       shared.owners.delete(hash)
       shared.restored.delete(hash)
       shared.store.removed(
-        persisted(target) ?? { ...entry, oauthAccountIdentity: undefined },
+        persisted(target) ?? { ...target, oauthAccountIdentity: undefined },
       )
     },
     forget(id: string, deleted = false, acceptedAt?: number) {

@@ -98,10 +98,22 @@ test(
   20_000,
 )
 
-test('Pi signs both live round warms and restores only the requested-model prefix', async () => {
+test('Pi signs only the requested-model warm during a round and after restart', async () => {
   await withProcesses(async (spawn) => {
-    expect(await spawn('round-seed').result).toEqual({ live: 4, warm: 2 })
+    expect(await spawn('round-seed').result).toEqual({ live: 4, warm: 1 })
     expect(await spawn('round-resume').result).toEqual({ live: 0, warm: 1 })
+  })
+}, 20_000)
+
+test('Pi round activity renews the warm budget and an idle end advances backoff', async () => {
+  await withProcesses(async (spawn) => {
+    expect(await spawn('round-idle').result).toEqual({ live: 8, warm: 2 })
+  })
+}, 20_000)
+
+test('Pi stops warming when the OAuth account changes mid-round', async () => {
+  await withProcesses(async (spawn) => {
+    expect(await spawn('round-account').result).toEqual({ live: 4, warm: 1 })
   })
 }, 20_000)
 

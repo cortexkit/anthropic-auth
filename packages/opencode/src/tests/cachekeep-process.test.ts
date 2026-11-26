@@ -261,11 +261,8 @@ test.each(['opencode1', 'opencode2'] as const)(
     }),
 )
 
-test('OpenCode 1 replaces an older in-process lease without releaseSourceWarm', () =>
+test('OpenCode 1 replaces an older in-process lease on a new accepted turn', () =>
   withRestoredOwner('opencode1', async ({ owner, start, saved }) => {
-    Object.defineProperty(owner.manager, 'releaseSourceWarm', {
-      value: undefined,
-    })
     const successor = await start()
     expect(await successor.prepare('New plugin turn')).toEqual({
       tracked: true,

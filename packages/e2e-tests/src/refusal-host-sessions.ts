@@ -1,11 +1,12 @@
 import { Database } from 'bun:sqlite'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { Readable } from 'node:stream'
 import { pathToFileURL } from 'node:url'
 import {
   ACCOUNT_STATE_FILE_NAME,
+  cacheKeepStoreDirectory,
   createNativeAccountRuntime,
   getStickyRoutingStatePath,
   type ProviderAccountUuid,
@@ -500,6 +501,25 @@ import auth from ${JSON.stringify(pathToFileURL(extension).href)};
   )
   const policy = fixturePolicy(paths, 'pi', env.ANTHROPIC_AUTH_SETTINGS_FILE)
   if (fixture.relay) await policy.relay(fixture.relay)
+  const waitForTrackedPrefix = async () => {
+    const store = cacheKeepStoreDirectory(
+      paths.storageId,
+      requireHostEnv(env, 'XDG_DATA_HOME'),
+      'pi',
+    )
+    const deadline = Date.now() + 5_000
+    while (Date.now() < deadline) {
+      const files = await readdir(store).catch(
+        (error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return []
+          throw error
+        },
+      )
+      if (files.some((file) => file.endsWith('.json.gz'))) return
+      await Bun.sleep(20)
+    }
+    throw new Error('Pi did not save the accepted keep-warm prefix')
+  }
   const args = (mode: 'json' | 'rpc') => [
     ...locked,
     executable,
@@ -613,6 +633,7 @@ import auth from ${JSON.stringify(pathToFileURL(extension).href)};
       await writeFile(edit, JSON.stringify([from, to]))
     },
     prompt: (text) => rpc.prompt(text),
+    waitForTrackedPrefix,
     close: () => rpc.close(),
     async restart() {
       await rpc.close()

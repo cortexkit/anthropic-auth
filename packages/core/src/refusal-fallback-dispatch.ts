@@ -21,6 +21,7 @@ import {
   selectRefusalFallbackTarget,
 } from './refusal-fallback-targets.ts'
 import { classifyGzipRejection } from './request-gzip.ts'
+import { requestCacheLifetimeMs } from './session-cache-policy.ts'
 
 export type RefusalFallbackBinding = Readonly<{
   accountId: string
@@ -57,7 +58,7 @@ export type RefusalFallbackDispatchLifecycle = RefusalFallbackLifecycle & {
   cacheKeepTemplateSettled?: Promise<void>
   onRetryCompleted?: (
     completion: RefusalFallbackCompletion,
-    target: Readonly<{ model: string; folded: boolean; bodyText?: string }>,
+    target: Readonly<{ model: string; folded: boolean; cacheTtlMs?: number }>,
   ) => void
   onRetryThinkingDigest?: (digest: string) => void
   onRetryFinished?: () => void
@@ -117,7 +118,6 @@ export type RefusalFallbackDispatchOptions = {
     response: Response,
     attempt: RefusalFallbackPhysicalAttempt,
     /** For retries only: signed, full, pre-thread, with no credit or prefill. */
-    reusableBodyText?: string,
   ) => Response
   signal?: AbortSignal
   maxPendingBytes?: number
@@ -294,10 +294,6 @@ export function dispatchRefusalFallback(
       retryBody = replace(retryBody, ['max_tokens'], choice.maxTokens)
       retryBody = replace(retryBody, ['fallbacks'], undefined)
       retryBody = replace(retryBody, ['fallback_credit_token'], undefined)
-      const reusableBodyText =
-        options.observePhysicalResponse || options.lifecycle?.onRetryCompleted
-          ? await signRequestBody(replace(retryBody, ['thread'], undefined))
-          : undefined
       if (thread === 'continue')
         retryBody = replace(retryBody, ['thread'], { type: 'create' })
       if (token) {
@@ -370,8 +366,7 @@ export function dispatchRefusalFallback(
       }
       const sse = eventStream(guarded)
       const observed =
-        options.observePhysicalResponse?.(guarded, attempt, reusableBodyText) ??
-        guarded
+        options.observePhysicalResponse?.(guarded, attempt) ?? guarded
       const billed = observeAnthropicBillingResponse(billing, observed, sse)
       if (billed.ok && sse && billed.body)
         return {
@@ -386,7 +381,7 @@ export function dispatchRefusalFallback(
               options.lifecycle?.onRetryCompleted?.(completion, {
                 model: attempt.model,
                 folded,
-                bodyText: reusableBodyText,
+                cacheTtlMs: requestCacheLifetimeMs(retryBody),
               }),
           }),
         }

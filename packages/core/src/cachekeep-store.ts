@@ -97,7 +97,6 @@ export type SavedCacheKeepTarget = Pick<
   v: typeof RECORD_FORMAT_VERSION
   pluginVersion: string
   /** Legacy round record: the saved body contains only the serving prefix. */
-  refusalSourceModel?: string
 }
 
 type DropReason =
@@ -480,20 +479,6 @@ export class CacheKeepClaim {
       setTimeout(() => void this.releaseEventually(), 1000).unref?.()
     }
   }
-}
-
-/** The source slot and the ordinary target share one durable session record. */
-export function cacheKeepRestartTarget(
-  target: Readonly<CacheKeepTarget>,
-): Readonly<CacheKeepTarget> | undefined {
-  if (typeof target.hostMetadata?.refusalSourceModel === 'string')
-    return undefined
-  if (!target.sourceWarm) return target
-  const id = target.policyState?.ownerSessionId
-  const oauthAccountIdentity = target.sourceWarmRestartIdentity
-  return id && oauthAccountIdentity
-    ? { ...target, id, oauthAccountIdentity }
-    : undefined
 }
 
 function record(

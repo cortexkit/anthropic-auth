@@ -1,5 +1,4 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { createHash } from 'node:crypto'
 import {
   type CacheKeepDecision,
   decideCacheKeep,
@@ -32,7 +31,6 @@ import {
 import { claudeGatewaySecretValues } from './gateway.ts'
 import { logger } from './logger.ts'
 import { getClaudeModelCatalogue } from './model-capabilities.ts'
-import { CLAUDE_OPUS_5_5_PRICING } from './models.ts'
 import {
   NativeAccountRefusal,
   type NativeAccountRefusalReason,
@@ -359,7 +357,6 @@ function hasExplicitCacheControl(value: unknown): boolean {
 export async function buildCacheKeepPrewarmBody(
   bodyText: string,
   options: {
-    stripServerFallback?: boolean
     refusalFallbackMode?: RefusalFallbackMode
   } = {},
 ): Promise<{ ok: true; bodyText: string } | { ok: false; reason: string }> {
@@ -384,11 +381,7 @@ export async function buildCacheKeepPrewarmBody(
   }
 
   const warm = structuredClone(body) as Record<string, unknown>
-  // A source warm must not opt into server-side routing. An ordinary server-mode
-  // prewarm retains the opt-in so it warms whichever model served the live turns.
-  const mode = options.stripServerFallback
-    ? 'client'
-    : (options.refusalFallbackMode ?? 'server')
+  const mode = options.refusalFallbackMode ?? 'server'
   if (mode === 'server') stripServerFallbackUsageMarkers(warm)
   sanitizeClaudeCodeRequestBody(warm, mode)
   delete warm.thread
@@ -449,17 +442,6 @@ export type CacheKeepTarget = {
   accountStoragePath?: string
   isSubagent: boolean
   policyState?: CacheKeepPolicyState
-  /**
-   * A recovery-round warm for the original (source) model, tracked under a
-   * key that cannot collide with the session's live target. It follows the
-   * same send, auth, retry and logging path; the caller stops it through
-   * untrack() when its prefix becomes unusable and replaces it on source return.
-   */
-  sourceWarm?: boolean
-  /** In-process validity check for a kept source prefix; never serialized. */
-  sourceWarmCurrent?: (bodyText: string) => boolean
-  /** Identity that lets this warm persist the accepted source prefix. */
-  sourceWarmRestartIdentity?: string
 } & Pick<CacheKeepTrackedSession, 'ttlMs' | 'lastTouchAt' | 'lastTouchKind'>
 
 type AcceptedCacheUsage = {
@@ -521,8 +503,6 @@ function stopReason(reason: string): CacheKeepStopReason {
       return 'retries-exhausted'
     case 'cachekeep-hybrid-inactive':
       return 'disabled'
-    case 'source-warm-idle-cap':
-      return 'cost-cap'
     case 'routing-moved':
       return 'routing-moved'
     default:
@@ -544,7 +524,6 @@ function reportStopReason(reason: string): CacheWarmStopReason {
     case 'expired':
       return 'deadline-missed'
     case 'idle':
-    case 'source-warm-idle-cap':
       // The idle bound for unpriced automatic warming acts as its cost limit.
       return 'cost-cap'
     default:
@@ -554,84 +533,6 @@ function reportStopReason(reason: string): CacheWarmStopReason {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-const BILLING_HEADER_BLOCK_PREFIX = 'x-anthropic-billing-header:'
-
-function isBillingHeaderBlock(block: unknown): boolean {
-  return (
-    isRecord(block) &&
-    block.type === 'text' &&
-    typeof block.text === 'string' &&
-    block.text.startsWith(BILLING_HEADER_BLOCK_PREFIX)
-  )
-}
-
-function normalizePrefixValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(normalizePrefixValue)
-  if (!isRecord(value)) return value
-  const normalized: Record<string, unknown> = {}
-  for (const key of Object.keys(value).sort()) {
-    normalized[key] = normalizePrefixValue(value[key])
-  }
-  return normalized
-}
-
-/**
- * Fingerprint of the cacheable prefix of a request body: tools, system
- * blocks, and messages up to the last cache breakpoint. The billing header
- * block is excluded because its signature is re-signed on every send, and
- * everything past the last breakpoint (output limits, stream flags,
- * thinking config) never affects the stored cache entry. Two bodies with
- * the same fingerprint warm the same cache entry.
- */
-export function cacheWarmCacheablePrefixFingerprint(
-  bodyText: string,
-): string | undefined {
-  let body: unknown
-  try {
-    body = JSON.parse(bodyText)
-  } catch {
-    return undefined
-  }
-  if (!isRecord(body)) return undefined
-  const messages = Array.isArray(body.messages) ? body.messages : []
-  let lastBreakpoint = -1
-  messages.forEach((message, index) => {
-    if (hasExplicitCacheControl(message)) lastBreakpoint = index
-  })
-  const system = Array.isArray(body.system)
-    ? body.system.filter((block) => !isBillingHeaderBlock(block))
-    : (body.system ?? null)
-  const prefix = normalizePrefixValue({
-    tools: body.tools ?? null,
-    system,
-    messages: messages.slice(0, lastBreakpoint + 1),
-  })
-  return createHash('sha256').update(JSON.stringify(prefix)).digest('hex')
-}
-
-/**
- * How many warms one idle recovery round may send before stopping: each
- * warm pays a cache read, and the idle warms stay worth it while the reads
- * sent since the last user turn cost less than one 1-hour rewrite, so the
- * round stops after floor((1-hour write rate - read rate) / read rate)
- * warms. Rates come from the source model's own catalogue pricing; models
- * without catalogue facts (Opus 5) use the nearest sibling with 1-hour
- * pricing.
- */
-export function cacheKeepSourceWarmIdleCap(modelId: string): number {
-  let pricing: { cacheRead: number; cacheWrite1h: number }
-  try {
-    pricing = getClaudeModelCatalogue(modelId).pricing
-  } catch {
-    pricing = CLAUDE_OPUS_5_5_PRICING
-  }
-  if (!Number.isFinite(pricing.cacheRead) || pricing.cacheRead <= 0) return 1
-  return Math.max(
-    1,
-    Math.floor((pricing.cacheWrite1h - pricing.cacheRead) / pricing.cacheRead),
-  )
 }
 
 export type CacheKeepPrewarmAttempt = {
@@ -817,6 +718,7 @@ export class CacheKeepManager {
   private readonly reportedStops = new WeakSet<CacheKeepPolicyState>()
   private readonly restoredTargets = new WeakSet<object>()
   private readonly restoringPolicies = new WeakSet<CacheKeepPolicyState>()
+  private readonly lastRoundActivityAt = new WeakMap<CacheKeepTarget, number>()
   private readonly sessionWarms = new Map<
     string,
     Promise<CacheKeepPrewarmResult>
@@ -1266,50 +1168,6 @@ export class CacheKeepManager {
     this.scheduleDueTimer()
   }
 
-  /** Move an already accepted source prefix to the round's separate warm slot. */
-  moveToSourceWarm(
-    sessionId: string,
-    id: string,
-    matches: (target: Readonly<CacheKeepTarget>) => boolean,
-    warm: Pick<
-      CacheKeepTarget,
-      | 'headers'
-      | 'oauthAccountId'
-      | 'oauthAccountIdentity'
-      | 'hostMetadata'
-      | 'accountStoragePath'
-      | 'sourceWarmCurrent'
-      | 'sourceWarmRestartIdentity'
-    >,
-  ): boolean {
-    const previous = this.targets.get(sessionId)
-    if (!previous || this.targets.has(id) || !matches(previous)) return false
-    const target = {
-      ...previous,
-      ...warm,
-      id,
-      sourceWarm: true,
-      hostMetadata: { ...previous.hostMetadata, ...warm.hostMetadata },
-      sourceWarmRestartIdentity:
-        warm.sourceWarmRestartIdentity ?? previous.oauthAccountIdentity,
-    }
-    // Stop any send using the old target. A distinct policy object also
-    // prevents a late completion from updating the moved target.
-    if (target.policyState) target.policyState = { ...target.policyState }
-    this.releaseTarget(sessionId)
-    this.targets.set(id, target)
-    this.options.onTargetChanged?.(target)
-    this.publishTrackedSessions()
-    this.scheduleDueTimer()
-    return true
-  }
-
-  releaseSourceWarm(sessionId: string) {
-    for (const target of this.targets.values())
-      if (target.sourceWarm && target.policyState?.ownerSessionId === sessionId)
-        this.releaseTarget(target.id)
-  }
-
   trackedCount(): number {
     return this.targets.size
   }
@@ -1319,14 +1177,6 @@ export class CacheKeepManager {
     return current
       ? current.policyState === target.policyState
       : this.immediateTargets.get(target.id) === target
-  }
-
-  private isCurrentSourceWarm(target: CacheKeepTarget): boolean {
-    try {
-      return target.sourceWarmCurrent?.(target.bodyText) ?? true
-    } catch {
-      return false
-    }
   }
 
   isRestoredTarget(target: Readonly<CacheKeepTarget>): boolean {
@@ -1339,6 +1189,55 @@ export class CacheKeepManager {
    */
   trackedPolicyState(id: string): Readonly<CacheKeepPolicyState> | undefined {
     return this.targets.get(id)?.policyState
+  }
+
+  /** A fallback step spends on a different cache, so it only renews the budget. */
+  recordRoundActivity(
+    sessionId: string,
+    route: { url: string; accountId: string; accountIdentity: string },
+  ): void {
+    const target = this.targets.get(sessionId)
+    if (!target) return
+    const now = this.options.now?.() ?? Date.now()
+    if (
+      target.oauthAccountId !== route.accountId ||
+      target.oauthAccountIdentity !== route.accountIdentity
+    ) {
+      this.removeTarget(target, 'account-changed', now)
+      this.publishTrackedSessions()
+      this.scheduleDueTimer()
+      return
+    }
+    if (target.url !== route.url) {
+      this.removeTarget(target, 'routing-moved', now)
+      this.publishTrackedSessions()
+      this.scheduleDueTimer()
+      return
+    }
+    const state = target.policyState
+    if (!state || now >= target.cacheExpiresAt) return
+    // A warm interrupted by this turn must not charge the newly reset budget.
+    const policyState = {
+      ...state,
+      warmsSinceLastRealRequest: 0,
+      warmCostSoFar: 0,
+      pendingWarmCost: undefined,
+    }
+    const renewed = { ...target, policyState }
+    if (this.restoringPolicies.has(state))
+      this.restoringPolicies.add(policyState)
+    if (this.restoredTargets.has(target)) this.restoredTargets.add(renewed)
+    this.lastRoundActivityAt.set(renewed, now)
+    this.targets.set(sessionId, renewed)
+    const decision = this.policyDecision(renewed, now)
+    if (decision?.action === 'stop') {
+      this.removeTarget(renewed, decision.reason, now)
+      this.publishTrackedSessions()
+      this.scheduleDueTimer()
+      return
+    }
+    this.options.onTargetChanged?.(renewed)
+    this.scheduleDueTimer()
   }
 
   hasPlannedTarget(id: string): boolean {
@@ -1485,10 +1384,12 @@ export class CacheKeepManager {
         : { mode }
     if (!plan) return { action: 'stop', reason: 'unsupported' }
     const costs = this.costs(target, ownReservation)
+    const lastRealRequestAt =
+      this.lastRoundActivityAt.get(target) ?? state.lastRealRequestAt
     if (
       mode === 'auto' &&
       !costs &&
-      state.lastRealRequestAt <
+      lastRealRequestAt <
         now -
           (target.isSubagent
             ? PLANNED_UNPRICED_SUBAGENT_IDLE_MS
@@ -1543,11 +1444,6 @@ export class CacheKeepManager {
     const current = this.targets.get(target.id)
     if (!current || !this.isCurrentTarget(target))
       throw new CacheKeepWarmRefusal('stopped')
-    const checkSourceWarm = () => {
-      if (!this.isCurrentSourceWarm(current))
-        throw new CacheKeepWarmRefusal('routing-moved')
-    }
-    checkSourceWarm()
     const state = current.policyState
     if (this.realTurnBusy(state?.ownerSessionId ?? target.id))
       throw new CacheKeepWarmWait()
@@ -1563,7 +1459,6 @@ export class CacheKeepManager {
           )
         : loaded
     if (!this.isCurrentTarget(target)) throw new CacheKeepWarmRefusal('stopped')
-    checkSourceWarm()
     if (this.realTurnBusy(state?.ownerSessionId ?? target.id))
       throw new CacheKeepWarmWait()
     const now = this.options.now?.() ?? Date.now()
@@ -1627,7 +1522,6 @@ export class CacheKeepManager {
     }
     if (state) this.admittedWarmCosts.set(state, admittedCost)
     if (!this.isCurrentTarget(target)) throw new CacheKeepWarmRefusal('stopped')
-    checkSourceWarm()
     const fresh = this.realTurnBusy(state?.ownerSessionId ?? target.id)
       ? { action: 'wait' as const, until: 0 }
       : this.policyDecision(current, this.options.now?.() ?? Date.now(), true)
@@ -1757,9 +1651,6 @@ export class CacheKeepManager {
     for (const target of [...this.targets.values()])
       if (
         target !== keep &&
-        // Keep the requested model's warm target when the fallback model
-        // finishes a turn. sourceWarmCurrent controls its separate lifetime.
-        !target.sourceWarmCurrent &&
         (target.id === sessionId ||
           target.policyState?.ownerSessionId === sessionId)
       )
@@ -1771,15 +1662,8 @@ export class CacheKeepManager {
   private reportStop(target: CacheKeepTarget, reason: string, at: number) {
     if (this.targets.get(target.id) !== target) return
     const state = target.policyState
-    // Source warms use a synthetic id, not the session's own.
-    if (!target.sourceWarm)
-      this.setWarmingRecord(target.id, {
-        stopReason: reportStopReason(reason),
-      })
-    // Source warms are a different model's prefix, not evidence about the
-    // active session cache. The shared report has no target-attribution field.
+    this.setWarmingRecord(target.id, { stopReason: reportStopReason(reason) })
     if (
-      target.sourceWarm ||
       !state ||
       (!state.hasWarmed && !this.restoredTargets.has(target)) ||
       this.reportedStops.has(state)
@@ -1851,11 +1735,6 @@ export class CacheKeepManager {
     hostMetadata?: Readonly<Record<string, unknown>>
     accountStoragePath?: string
     isSubagent?: boolean
-    sourceWarm?: boolean
-    sourceWarmCurrent?: CacheKeepTarget['sourceWarmCurrent']
-    sourceWarmRestartIdentity?: string
-    /** Source targets use a synthetic id but belong to a real host session. */
-    ownerSessionId?: string
     acceptedAt?: number
     acceptedUsage?: AcceptedCacheUsage
     ttlMs?: number
@@ -1889,7 +1768,7 @@ export class CacheKeepManager {
     // request, and most requests are excluded before the body matters.
     let bodyBytes: number | undefined
     const refuse = (reason: string, reasonCode: string) => {
-      if (input.sessionId && !input.retained && !input.sourceWarm)
+      if (input.sessionId && !input.retained)
         this.finishSessionTargets(input.sessionId)
       // Only a body that cannot fit in the budget warrants a warning;
       // normal eligibility exclusions remain short debug diagnostics.
@@ -1926,9 +1805,7 @@ export class CacheKeepManager {
       previous = undefined
     }
     const ownerSessionId =
-      input.ownerSessionId ??
-      input.retained?.policyState?.ownerSessionId ??
-      input.sessionId
+      input.retained?.policyState?.ownerSessionId ?? input.sessionId
     const freshPolicy = readSessionCachePolicy(ownerSessionId, true)
     const restoredPlan = input.retained?.policyState?.planned === true
     const policy =
@@ -1960,7 +1837,7 @@ export class CacheKeepManager {
     // A plan or setting that keeps warming off is recorded for billing, unless
     // this call stops a live target: then that stop is the session's record.
     const keptOff = () => {
-      if (!previous && !input.sourceWarm) this.recordWarmingOff(sessionId)
+      if (!previous) this.recordWarmingOff(sessionId)
     }
     if (policy?.ttl === 'none' || policy?.keep_warm === 'off') {
       if (policy.keep_warm === 'off') keptOff()
@@ -1998,29 +1875,11 @@ export class CacheKeepManager {
     }
     const window = getCacheKeepWindow(input.storage)
     const appliedTtlMs = requestCacheLifetimeMs(input.bodyText)
-    const replayTtlMs = planned || input.sourceWarm ? appliedTtlMs : input.ttlMs
+    const replayTtlMs = planned ? appliedTtlMs : input.ttlMs
     if (planned && appliedTtlMs === 0) return retire('unsupported')
     if (!planned && !isCacheKeepActiveNow(input.storage, new Date(now))) {
       return refuse('outside configured schedule', 'outside-schedule')
     }
-    if (
-      input.sourceWarm &&
-      previous?.sourceWarm &&
-      previous.bodyText === input.bodyText &&
-      previous.oauthAccountIdentity === input.oauthAccountIdentity &&
-      previous.policyState?.lastRealRequestAt === acceptedAt
-    ) {
-      const decision = this.policyDecision(previous, now)
-      if (decision?.action === 'stop') return retire(decision.reason)
-      if (decision?.action === 'wait')
-        previous.nextPrewarmAt = Math.max(
-          previous.nextPrewarmAt,
-          decision.until,
-        )
-      this.scheduleDueTimer()
-      return { tracked: true }
-    }
-
     const today = cacheKeepPeriodKey(input.storage, window, new Date(now))
     this.pruneTargets(now, today)
     previous = this.targets.get(input.sessionId)
@@ -2046,19 +1905,17 @@ export class CacheKeepManager {
             lastTouchAt: input.retained.lastTouchAt,
             lastTouchKind: input.retained.lastTouchKind,
           }
-        : input.sourceWarm
-          ? { ttlMs: replayTtlMs }
-          : {
-              ttlMs: input.ttlMs ?? CACHE_KEEP_TTL_MS,
-              lastTouchAt: acceptedAt,
-              lastTouchKind: 'response' as const,
-            }),
+        : {
+            ttlMs: input.ttlMs ?? CACHE_KEEP_TTL_MS,
+            lastTouchAt: acceptedAt,
+            lastTouchKind: 'response' as const,
+          }),
       cacheExpiresAt:
         input.retained?.cacheExpiresAt ??
         acceptedAt + (replayTtlMs ?? CACHE_KEEP_TTL_MS),
       nextPrewarmAt:
         input.retained?.nextPrewarmAt ??
-        (planned || input.sourceWarm
+        (planned
           ? acceptedAt +
             (replayTtlMs ?? CACHE_KEEP_TTL_MS) -
             replayPrewarmLeadMs(replayTtlMs ?? CACHE_KEEP_TTL_MS, planned)
@@ -2097,14 +1954,6 @@ export class CacheKeepManager {
               ? false
               : (previous?.policyState?.hasWarmed ?? false),
           },
-      ...(input.sourceWarm === true && { sourceWarm: true }),
-      ...(input.sourceWarmRestartIdentity && {
-        sourceWarmRestartIdentity: input.sourceWarmRestartIdentity,
-      }),
-      ...(input.sourceWarm &&
-        input.sourceWarmCurrent && {
-          sourceWarmCurrent: input.sourceWarmCurrent,
-        }),
     })
     const target = this.targets.get(input.sessionId)
     if (!target)
@@ -2246,14 +2095,6 @@ export class CacheKeepManager {
       // An earlier prewarm's await can let a real request replace or retire
       // this target; only the current one is decided and sent.
       if (this.targets.get(target.id) !== target) return
-      if (!this.isCurrentSourceWarm(target)) {
-        this.removeTarget(
-          target,
-          'routing-moved',
-          this.options.now?.() ?? Date.now(),
-        )
-        return
-      }
       if (this.realTurnBusy(target.policyState?.ownerSessionId ?? target.id))
         return
       const attemptAt = this.options.now?.() ?? Date.now()
@@ -2354,7 +2195,7 @@ export class CacheKeepManager {
   private lastPrewarmStart(target: CacheKeepTarget) {
     return (
       target.cacheExpiresAt -
-      (target.policyState?.planned || target.sourceWarm
+      (target.policyState?.planned
         ? 0
         : (this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS)) -
       CACHE_KEEP_EXPIRY_SAFETY_MS
@@ -2465,7 +2306,7 @@ export class CacheKeepManager {
       CACHE_KEEP_EXPIRY_SAFETY_MS
     const timeout = Math.min(
       this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS,
-      target.policyState?.planned || target.sourceWarm ? remaining : Infinity,
+      target.policyState?.planned ? remaining : Infinity,
     )
     if (timeout <= 0)
       return { ok: false, refused: true, reason: 'retry-window-ended' }
@@ -2497,12 +2338,6 @@ export class CacheKeepManager {
       // One-off diagnostic probes are not idle sessions following a real turn.
       if (!this.targets.has(target.id)) return
       const sessionId = target.policyState?.ownerSessionId ?? target.id
-      if (
-        target.sourceWarm &&
-        this.stoppedSessions.get(sessionId)?.warmStopped?.reason ===
-          'routing-moved'
-      )
-        throw new CacheKeepWarmRefusal('routing-moved')
       const body = this.targets.get(sessionId)?.bodyText ?? target.bodyText
       let modelId: string | undefined
       try {
@@ -2534,7 +2369,6 @@ export class CacheKeepManager {
       const preparedTarget = { ...target, bodyText }
       attempt.refusalFallbackMode = this.options.refusalFallbackMode?.()
       const prewarm = await buildCacheKeepPrewarmBody(bodyText, {
-        stripServerFallback: target.sourceWarm === true,
         refusalFallbackMode: attempt.refusalFallbackMode,
       })
       ensureActive()
@@ -2602,7 +2436,7 @@ export class CacheKeepManager {
       // fallback-beta bodies also need credit redaction before billing.
       const send = async (attemptHeaders: Headers): Promise<Response> => {
         ensureActive()
-        if (!this.isCurrentTarget(target) || !this.isCurrentSourceWarm(target))
+        if (!this.isCurrentTarget(target))
           throw new CacheKeepWarmRefusal('stopped')
         checkRouting()
         if (this.targets.has(target.id) || target.policyState) {
@@ -2617,12 +2451,8 @@ export class CacheKeepManager {
         try {
           const dispatch = async () => {
             ensureActive()
-            if (
-              target.sourceWarmCurrent &&
-              (!this.isCurrentTarget(target) ||
-                !this.isCurrentSourceWarm(target))
-            )
-              throw new CacheKeepWarmRefusal('routing-moved')
+            if (!this.isCurrentTarget(target))
+              throw new CacheKeepWarmRefusal('stopped')
             const raw = await fetchImpl(target.url, {
               method: 'POST',
               headers: attemptHeaders,
@@ -2888,28 +2718,25 @@ export class CacheKeepManager {
         Math.max(0, (state.pendingWarmCost ?? 0) - cost) || undefined
       this.admittedWarmCosts.delete(state)
       this.reportedStops.delete(state)
-      if (!target.sourceWarm)
-        reportSessionCacheTouch(state.ownerSessionId, {
-          at: acceptedAt,
-          ttlMs: result.ttlMs ?? requestCacheLifetimeMs(target.bodyText),
-          source: 'warm',
-        })
+      reportSessionCacheTouch(state.ownerSessionId, {
+        at: acceptedAt,
+        ttlMs: result.ttlMs ?? requestCacheLifetimeMs(target.bodyText),
+        source: 'warm',
+      })
     }
-    target.ttlMs =
-      state?.planned || target.sourceWarm ? target.ttlMs : CACHE_KEEP_TTL_MS
+    target.ttlMs = state?.planned ? target.ttlMs : CACHE_KEEP_TTL_MS
     target.lastTouchAt = acceptedAt
     target.lastTouchKind = 'warm'
     target.cacheExpiresAt = acceptedAt + (target.ttlMs ?? CACHE_KEEP_TTL_MS)
-    target.nextPrewarmAt =
-      state?.planned || target.sourceWarm
-        ? target.cacheExpiresAt -
-          replayPrewarmLeadMs(
-            target.ttlMs ?? CACHE_KEEP_TTL_MS,
-            state?.planned === true,
-          )
-        : (readSessionCachePolicy(state?.ownerSessionId ?? target.id, true)?.ttl
-            ? acceptedAt + CACHE_KEEP_TTL_MS
-            : target.cacheExpiresAt) - CACHE_KEEP_PREWARM_LEAD_MS
+    target.nextPrewarmAt = state?.planned
+      ? target.cacheExpiresAt -
+        replayPrewarmLeadMs(
+          target.ttlMs ?? CACHE_KEEP_TTL_MS,
+          state?.planned === true,
+        )
+      : (readSessionCachePolicy(state?.ownerSessionId ?? target.id, true)?.ttl
+          ? acceptedAt + CACHE_KEEP_TTL_MS
+          : target.cacheExpiresAt) - CACHE_KEEP_PREWARM_LEAD_MS
     target.consecutiveFailures = 0
     logger.debug('cachekeep', 'prewarm succeeded', {
       session: target.id,

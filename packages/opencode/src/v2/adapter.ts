@@ -58,7 +58,6 @@ import {
   type RefusalFallbackMode,
   type RefusalFallbackRoundEngine,
   type RefusalFallbackRoundInput,
-  type RefusalFallbackSourceWarmInput,
   type RefusalFallbackStreamOptions,
   type RequestGzipLatch,
   relayProxyApplies,
@@ -555,31 +554,23 @@ export interface NativeAnthropicAdapterDeps<Q, P> {
   readonly roundPolicy?: (
     input: NativeAnthropicAttemptContext<P> & {
       baseUrl: string
-      url: string
-      headers: Headers
-      mode: RefusalFallbackMode
-      credentialId?: string
     },
   ) => {
     targetAllowed: (model: string) => boolean
-    sourceWarm?: RefusalFallbackSourceWarmInput
-    onPrimarySent?: () => void
+    cacheRoute?: NonNullable<RefusalFallbackRoundInput['oauth']>['cache']
+    onRoundActivity?: () => void
   }
   readonly onRoundCacheTemplate?: (
     input: NativeAnthropicAttemptContext<P> & {
       url: string
       headers: Headers
       signal: AbortSignal
-      template: RefusalFallbackCacheKeepTemplate | null
-      refusalSourceModel?: string
-      alreadySigned: boolean
+      template: RefusalFallbackCacheKeepTemplate
       isCurrent: () => boolean
     },
   ) => void | Promise<void>
   /** A warm replays the source-shaped headers that its live request used. */
   readonly cacheKeepHeaders?: Headers
-  /** Requested model for rebuilding OAuth betas when a saved keep-warm body names a fallback model. */
-  readonly cacheKeepRefusalSourceModel?: string
   readonly log?: NativeAnthropicAdapterLogger
   /** Maximum number of authorized sends waiting for their request rewrite. */
   readonly maxPendingSends?: number
@@ -1523,22 +1514,12 @@ export function createNativeAnthropicAdapter<Q, P>(
           headers.delete('content-encoding')
           headers.set('authorization', `Bearer ${accessToken}`)
         } else {
-          const refusalSourceModel =
-            attempt.agent === 'cachekeep'
-              ? deps.cacheKeepRefusalSourceModel
-              : undefined
           setOAuthHeaders(headers, accessToken, {
-            body:
-              refusalSourceModel && finalBody
-                ? { ...finalBody, model: refusalSourceModel }
-                : finalBody,
-            refusalFallbackMode: refusalSourceModel
-              ? 'client'
-              : refusalFallbackMode,
+            body: finalBody,
+            refusalFallbackMode,
             ...(identity ? { identity } : {}),
             requestClass:
-              !refusalSourceModel &&
-              (attempt.kind !== 'primary' || isAuxiliaryAgent(attempt.agent))
+              attempt.kind !== 'primary' || isAuxiliaryAgent(attempt.agent)
                 ? 'auxiliary'
                 : 'main',
           })
@@ -1584,7 +1565,6 @@ export function createNativeAnthropicAdapter<Q, P>(
         ? model.model
         : remapModelId(input.modelID)
     const mode = refusalFallbackMode ?? DEFAULT_REFUSAL_FALLBACK_MODE
-    const destination = gatewayUrl?.toString() ?? url
     const isBackground =
       isBackgroundDumpScope(attempt) ||
       correlation[LANE_START_REQUEST_HEADER] === '1'
@@ -1596,10 +1576,6 @@ export function createNativeAnthropicAdapter<Q, P>(
         ...contextOf(attempt, data),
         modelID: requestedModel,
         baseUrl: url,
-        url: destination,
-        headers: sourceHeaders,
-        mode,
-        credentialId: send.oauth?.credentialId,
       })
     const targetAllowed = (model: string) =>
       policy ? policy.targetAllowed(model) : true
@@ -1622,8 +1598,7 @@ export function createNativeAnthropicAdapter<Q, P>(
                       accountId: input.accountId,
                       credentialId: send.oauth.credentialId,
                       targetAllowed,
-                      sourceWarm:
-                        primary && policy ? policy.sourceWarm : undefined,
+                      cache: primary && policy ? policy.cacheRoute : undefined,
                     }
                   : undefined,
             }
@@ -1631,6 +1606,8 @@ export function createNativeAnthropicAdapter<Q, P>(
           })()
         : undefined
     if (roundPlan) body = roundPlan.bodyText
+    let recoveredRoundBody: string | undefined
+    let bindRoundBilling: ((input: AnthropicBillingRequest) => void) | undefined
     if (primary && messages && deps.takeRoundThreadReset?.(input.sessionID))
       messageThreads.forget(input.sessionID, 'response_fallback')
     // The body may have changed length; let the runtime compute it.
@@ -1816,6 +1793,8 @@ export function createNativeAnthropicAdapter<Q, P>(
                   }),
               })
               if (billingSend) {
+                if (roundPlan?.kind === 'round')
+                  bindRoundBilling?.(billingSend.input)
                 billingSend.received = true
                 if (fromUpstream(received.headers, data))
                   received = observeAnthropicBillingResponse(
@@ -1824,6 +1803,7 @@ export function createNativeAnthropicAdapter<Q, P>(
                   )
               }
               if (received.ok && fromUpstream(received.headers, data)) {
+                recoveredRoundBody = createBody
                 if (clientSource) {
                   recoveredSource.set(received, {
                     headers:
@@ -2165,7 +2145,6 @@ export function createNativeAnthropicAdapter<Q, P>(
         notifyFinal(prepared.headers, attempt.attemptId, cleaned)
       if (primary && messages) {
         markPrimary(input.sessionID, primaryMarker)
-        if (policy) policy.onPrimarySent?.()
       }
       if (!send.oauth || !messages || body === undefined) return prepared
 
@@ -2237,6 +2216,8 @@ export function createNativeAnthropicAdapter<Q, P>(
         rounds?.lifecycle(handle, {
           isFresh,
           targetAllowed,
+          sentBodyText: () => recoveredRoundBody ?? body,
+          onRoundActivity: policy ? policy.onRoundActivity : undefined,
           onCacheKeepTemplate:
             deps.onRoundCacheTemplate &&
             ((template, isCurrent) =>
@@ -2246,13 +2227,6 @@ export function createNativeAnthropicAdapter<Q, P>(
                 headers: templateHeaders,
                 signal,
                 template,
-                ...(template &&
-                  template.servingModel !== requestedModel && {
-                    refusalSourceModel: requestedModel,
-                  }),
-                alreadySigned:
-                  roundPlan.kind === 'source' &&
-                  template?.servingModel !== requestedModel,
                 isCurrent,
               })),
         })
@@ -2260,10 +2234,12 @@ export function createNativeAnthropicAdapter<Q, P>(
         physical.join = { sourceModel, isFresh, signal, lifecycle }
       if (billing && lifecycle?.cacheKeepTemplateSettled) {
         const publication = lifecycle.cacheKeepTemplateSettled
-        const warming = billing.input.cacheWarming
-        billing.input.cacheWarmingAfter = () =>
-          isFresh() ? publication : undefined
-        billing.input.cacheWarming = () => (isFresh() ? warming?.() : undefined)
+        bindRoundBilling = (input) => {
+          const warming = input.cacheWarming
+          input.cacheWarmingAfter = () => (isFresh() ? publication : undefined)
+          input.cacheWarming = () => (isFresh() ? warming?.() : undefined)
+        }
+        bindRoundBilling(billing.input)
       }
       if (!handle && deferredCache && fullBodyText !== undefined)
         physical.observeCompletion = (response) =>
@@ -2527,7 +2503,7 @@ export function createNativeAnthropicAdapter<Q, P>(
             } catch {}
           }
         },
-        observePhysicalResponse(response, physicalAttempt, reusableBodyText) {
+        observePhysicalResponse(response, physicalAttempt) {
           if (!physicalAttempt.refusalRetry) return response
           if (!retry) return response
           const { scope, context, upstream } = retry
@@ -2541,9 +2517,7 @@ export function createNativeAnthropicAdapter<Q, P>(
                 reportRouting: false,
               })
           } catch {}
-          return !handle && reusableBodyText
-            ? complete(safe, reusableBodyText, context)
-            : safe
+          return safe
         },
       }
       if (clientSource) physical.fallback = fallback
@@ -2701,14 +2675,10 @@ export function createNativeAnthropicAdapter<Q, P>(
       const dispatchFallback = (fallback: RefusalFallbackDispatchOptions) =>
         dispatchRefusalFallback(response, {
           ...fallback,
-          observePhysicalResponse: (guarded, attempt, template) => {
+          observePhysicalResponse: (guarded, attempt) => {
             if (attempt.refusalRetry)
               return (
-                fallback.observePhysicalResponse?.(
-                  guarded,
-                  attempt,
-                  template,
-                ) ?? guarded
+                fallback.observePhysicalResponse?.(guarded, attempt) ?? guarded
               )
             let observed = scrubResponse(data, guarded)
             if (threaded) observed = threaded.thread.observe(observed)

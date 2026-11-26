@@ -536,16 +536,47 @@ test('legacy planned auto starts with zero admitted cost', async () => {
   })
 })
 
-test('source synchronization does not reset a per-target reserved count or lifetime', async () => {
-  const f = plannedFixture()
-  const acceptedAt = f.now
-  f.track({ sourceWarm: true, acceptedAt })
-  f.advance(270_000)
+test('accepted round activity resets the warm budget and idle clock without touching the prefix', async () => {
+  const f = plannedFixture({}, { ttl: 'long', keep_warm: 'auto' })
+  const route = {
+    url: f.input.url,
+    accountId: 'first',
+    accountIdentity: 'login',
+  }
+  f.track({
+    oauthAccountId: route.accountId,
+    oauthAccountIdentity: route.accountIdentity,
+  })
+  f.advance(3_570_000)
   await f.manager.tick()
-  const expiry = f.target.cacheExpiresAt
-  f.track({ sourceWarm: true, acceptedAt })
+  expect(f.sends).toBe(1)
   expect(f.target.policyState?.warmsSinceLastRealRequest).toBe(1)
-  expect(f.target.cacheExpiresAt).toBe(expiry)
+  const original = f.target
+  f.advance(1_800_000)
+  f.manager.recordRoundActivity(f.input.sessionId, route)
+  expect(f.target).toMatchObject({
+    bodyText: original.bodyText,
+    lastTouchAt: original.lastTouchAt,
+    cacheExpiresAt: original.cacheExpiresAt,
+    nextPrewarmAt: original.nextPrewarmAt,
+    policyState: {
+      lastRealRequestAt: original.policyState!.lastRealRequestAt,
+      warmsSinceLastRealRequest: 0,
+      warmCostSoFar: 0,
+    },
+  })
+  f.advance(1_770_000)
+  await f.manager.tick()
+  expect(f.sends).toBe(2)
+  f.manager.recordRoundActivity(f.input.sessionId, {
+    ...route,
+    accountId: 'second',
+  })
+  expect(f.manager.trackedRequest(f.input.sessionId)).toBeUndefined()
+  expect(f.manager.warming(f.input.sessionId)).toEqual({
+    on: false,
+    stopReason: 'unsupported',
+  })
 })
 
 test('a late warm cannot advance the newer target after a real request replaces it', async () => {
@@ -761,31 +792,6 @@ test('restoring an unresolved dispatch accounts for a successful warm before its
   expect(restored.sends).toBe(0)
 })
 
-test.each(['short', 'long'] as const)(
-  'ttl-only %s source preserves its captured lifetime without an active touch',
-  async (ttl) => {
-    const f = plannedFixture({}, { ttl })
-    f.input.storage.claudeCache = { enabled: true, mode: 'hybrid' }
-    f.input.storage.cacheKeep = { enabled: true, always: true }
-    const acceptedAt = f.now - 10_000
-    expect(
-      f.track({
-        sourceWarm: true,
-        ttlMs: undefined,
-        acceptedAt,
-        cacheMode: 'hybrid',
-      }).tracked,
-    ).toBe(true)
-    expect(f.target.ttlMs).toBe(ttl === 'short' ? 300_000 : 3_600_000)
-    expect(f.target.cacheExpiresAt).toBe(
-      acceptedAt + (ttl === 'short' ? 300_000 : 3_600_000),
-    )
-    f.advance(3_300_000)
-    await f.manager.tick()
-    expect(f.sends).toBe(ttl === 'short' ? 0 : 1)
-  },
-)
-
 test('a known failed warm clears its unresolved admitted cost durably without spending it', async () => {
   let settled: import('../cachekeep.ts').CacheKeepPolicyState | undefined
   const f = plannedFixture(
@@ -972,107 +978,3 @@ test('accepted JSON body and known usage persist together while duplicate observ
     { prefixTokens: 1_101, inputTokens: 91_101 },
   ])
 })
-
-test.each([
-  ['short', 300_000, 30_000],
-  ['long', 3_600_000, 300_000],
-] as const)(
-  'no-policy %s source schedules each warm from expiry, never admission',
-  async (ttl, lifetime, lead) => {
-    const f = plannedFixture({}, { ttl })
-    f.setPolicy(null)
-    f.input.storage.claudeCache = { enabled: true, mode: 'hybrid' }
-    f.input.storage.cacheKeep = { enabled: true, always: true }
-    expect(
-      f.track({ sourceWarm: true, ttlMs: undefined, cacheMode: 'hybrid' })
-        .tracked,
-    ).toBe(true)
-    expect(f.target.nextPrewarmAt).toBe(f.now + lifetime - lead)
-    await f.manager.tick()
-    expect(f.sends).toBe(0)
-    f.advance(lifetime - lead - 1)
-    await f.manager.tick()
-    expect(f.sends).toBe(0)
-    f.advance(1)
-    await f.manager.tick()
-    expect(f.sends).toBe(1)
-    expect(f.target.nextPrewarmAt).toBe(f.now + lifetime - lead)
-    await f.manager.tick()
-    expect(f.sends).toBe(1)
-  },
-)
-
-test.each([0, 17_000, 59_000])(
-  'registered timers warm a short source twice from interval phase %s',
-  async (phase) => {
-    let now = Date.parse('2026-05-18T10:00:00Z')
-    const scheduled = new Map<
-      object,
-      { at: number; every?: number; callback: () => unknown }
-    >()
-    const arm = (callback: () => unknown, ms: number, every?: number) => {
-      const id = { unref() {} }
-      scheduled.set(id, { at: now + ms, every, callback })
-      return id
-    }
-    const clear = (id: object) => {
-      scheduled.delete(id)
-    }
-    const f = plannedFixture(
-      {
-        now: () => now,
-        setIntervalImpl: ((callback: () => unknown, ms: number) =>
-          arm(callback, ms, ms)) as unknown as typeof setInterval,
-        clearIntervalImpl: clear as unknown as typeof clearInterval,
-        setTimeoutImpl: ((callback: () => unknown, ms: number) =>
-          arm(callback, ms)) as unknown as typeof setTimeout,
-        clearTimeoutImpl: clear as unknown as typeof clearTimeout,
-      },
-      { ttl: 'short' },
-    )
-    f.setPolicy(null)
-    f.input.storage.claudeCache = { enabled: true, mode: 'hybrid' }
-    f.input.storage.cacheKeep = { enabled: true, always: true }
-    const tick = spyOn(f.manager, 'tick')
-    const advanceTo = async (end: number) => {
-      for (;;) {
-        const next = [...scheduled]
-          .filter(([, timer]) => timer.at <= end)
-          .sort((a, b) => a[1].at - b[1].at)[0]
-        if (!next) break
-        const [id, timer] = next
-        now = timer.at
-        if (timer.every) timer.at += timer.every
-        else scheduled.delete(id)
-        await timer.callback()
-        // Intervals deliberately return void; join the pass they actually started.
-        await tick.mock.results.at(-1)?.value
-      }
-      now = end
-    }
-    try {
-      f.manager.start()
-      await advanceTo(now + phase)
-      const admittedAt = now
-      expect(
-        f.track({ sourceWarm: true, cacheMode: 'hybrid', acceptedAt: now })
-          .tracked,
-      ).toBe(true)
-      expect(f.sends).toBe(0)
-      await advanceTo(admittedAt + 269_999)
-      expect(f.sends).toBe(0)
-      await advanceTo(admittedAt + 270_000)
-      expect(f.sends).toBe(1)
-      expect(f.target.cacheExpiresAt).toBe(admittedAt + 570_000)
-      await advanceTo(admittedAt + 539_999)
-      expect(f.sends).toBe(1)
-      await advanceTo(admittedAt + 540_000)
-      expect(f.sends).toBe(2)
-      expect(f.target.cacheExpiresAt).toBe(admittedAt + 840_000)
-      await advanceTo(admittedAt + 600_000)
-      expect(f.sends).toBe(2)
-    } finally {
-      tick.mockRestore()
-    }
-  },
-)

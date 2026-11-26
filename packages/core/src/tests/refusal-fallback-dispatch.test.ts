@@ -158,15 +158,17 @@ test('credited retry changes only the permitted wire fields and bills both physi
   )
   const bodyText = await signRequestBody(raw)
   const { options, sends, reports } = await setup({ bodyText })
-  let reusable = ''
+  let completedRetry: unknown
   let observedRetry: unknown
   const committed: unknown[] = []
-  options.observePhysicalResponse = (response, attempt, body) => {
-    if (attempt.refusalRetry) {
-      reusable = body ?? ''
-      observedRetry = attempt
-    }
+  options.observePhysicalResponse = (response, attempt) => {
+    if (attempt.refusalRetry) observedRetry = attempt
     return response
+  }
+  options.lifecycle = {
+    onRetryCompleted(_completion, target) {
+      completedRetry = target
+    },
   }
   options.onRetryCommitted = ({ model, attempt }) => {
     committed.push({ model, attempt })
@@ -197,8 +199,11 @@ test('credited retry changes only the permitted wire fields and bills both physi
   expect(send.bodyText).toContain('"content": "\\u2603"')
   expect(await hasValidRequestBodySignature(bodyText)).toBe(true)
   expect(await hasValidRequestBodySignature(send.bodyText)).toBe(true)
-  expect(await hasValidRequestBodySignature(reusable)).toBe(true)
-  expect(JSON.parse(reusable)).not.toHaveProperty('fallback_credit_token')
+  expect(completedRetry).toEqual({
+    model: opus48,
+    folded: false,
+    cacheTtlMs: 0,
+  })
   await Bun.sleep(10)
   expect(reports).toHaveLength(2)
   expect(reports[0]).toMatchObject([

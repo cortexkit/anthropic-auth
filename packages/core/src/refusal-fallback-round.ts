@@ -20,6 +20,7 @@ import {
   refusalFallbackDeferredPrefix,
   refusalFallbackPrefix,
 } from './refusal-fallback-prefix.ts'
+import { restoreRefusalFallbackReturnMarker } from './refusal-fallback-return-marker.ts'
 import type {
   RefusalFallbackCompletedRefusal,
   RefusalFallbackCompletion,
@@ -35,11 +36,8 @@ import {
   RecoveryThinkingStore,
   stripRecoveryRoundThinking,
 } from './refusal-fallback-thinking.ts'
-import {
-  type RefusalFallbackCacheRoute,
-  RefusalFallbackSourceWarm,
-  type RefusalFallbackSourceWarmInput,
-} from './refusal-fallback-warm.ts'
+import { PROMPT_CACHE_DEFAULT_TTL_MS } from './session-cache-activity.ts'
+import { requestCacheLifetimeMs } from './session-cache-policy.ts'
 import type { RefusalFallbackMode } from './settings-definition.ts'
 
 declare const requestHandle: unique symbol
@@ -47,6 +45,7 @@ export type RefusalFallbackRoundRequest = { readonly [requestHandle]: true }
 
 export type RefusalFallbackRoundEnd =
   | 'count'
+  | 'idle'
   | 'compaction'
   | 'account'
   | 'route'
@@ -81,17 +80,18 @@ export type RefusalFallbackRoundInput = {
   /** The final route chosen for the source; omit for ineligible and non-OAuth routes. */
   oauth?: {
     accountId: string
-    /** Stable credential binding, not the rotating OAuth bearer. Required for source warming. */
+    /** Stable credential binding, not the rotating OAuth bearer. */
     credentialId?: string
     targetAllowed: (model: string) => boolean
-    sourceWarm?: RefusalFallbackSourceWarmInput
+    /** Route binding for the host's ordinary CacheKeep record. */
+    cache?: { url: string; accountId: string; accountIdentity: string }
   }
   /** Result of comparing the host's normalized history with the round checkpoint. */
   compacted?: boolean
   /**
    * Optional host adjustment before Core's thinking filter. Core removes recorded
    * target thinking after source thinking in every turn, preserving a nonempty
-   * message. Target routes exempt the live round's digests.
+   * message. Fallback requests keep the thinking recorded in the live round.
    */
   filterBody?: (
     bodyText: string,
@@ -124,6 +124,7 @@ type Round = Omit<RoundInfo, 'stepsLeft'> & {
   folded: boolean
   base?: RefusalFallbackEstimateBase
   checkpoint: RefusalFallbackPrefix | null
+  idleClock: { at: number; ttlMs: number }
   releaseThinking: () => void
 }
 
@@ -154,8 +155,7 @@ type Request = {
   sourceBodyText: string
   baseBodyText: string
   templateBodyText: string
-  cacheRoute?: RefusalFallbackCacheRoute
-  sourceWarm?: RefusalFallbackSourceWarmInput
+  cache?: NonNullable<RefusalFallbackRoundInput['oauth']>['cache']
   credentialId?: string
   identity: symbol
   folded: boolean
@@ -165,7 +165,6 @@ type Request = {
   handling400?: boolean
   publishTemplate?: (
     bodyText: string,
-    servingModel: string,
     usage?: RefusalFallbackCompletion['usage'],
   ) => void
 }
@@ -210,20 +209,6 @@ function earlyEnd(
   if (compacted) return 'compaction'
 }
 
-function cacheRoute(
-  input: RefusalFallbackRoundInput,
-): RefusalFallbackCacheRoute | undefined {
-  const { oauth, mode, requestedModel } = input
-  if (!oauth?.credentialId || !oauth.sourceWarm) return undefined
-  return {
-    accountId: oauth.accountId,
-    credentialId: oauth.credentialId,
-    url: oauth.sourceWarm.url,
-    mode,
-    requestedModel,
-  }
-}
-
 export type RefusalFallbackRoundEngineOptions = {
   thinkingStore?: RecoveryThinkingStore
   cacheKeep?: CacheKeepManager
@@ -232,7 +217,6 @@ export type RefusalFallbackRoundEngineOptions = {
 
 export type RefusalFallbackCacheKeepTemplate = Readonly<{
   bodyText: string
-  servingModel: string
   usage?: RefusalFallbackCompletion['usage']
 }>
 
@@ -248,15 +232,17 @@ export type RefusalFallbackRoundLifecycleOptions = {
     blocks: readonly Record<string, unknown>[],
   ) => readonly Record<string, unknown>[]
   /**
-   * Receives the body keep-warm should resend for this session (the accepted
-   * request before thread handling). The host computes its billing signature,
-   * then checks `isCurrent` before tracking it with CacheKeep. `null` removes
-   * only the session's current keep-warm body, not a separate source-model warm.
+   * Receives an accepted requested-model body before thread handling. The host
+   * signs it and checks `isCurrent` before tracking it with CacheKeep.
    */
   onCacheKeepTemplate?: (
-    template: RefusalFallbackCacheKeepTemplate | null,
+    template: RefusalFallbackCacheKeepTemplate,
     isCurrent: () => boolean,
   ) => void | Promise<void>
+  /** The final physical body, including after message-thread recovery. */
+  sentBodyText?: () => string | undefined
+  /** An accepted fallback step renews the warm budget, not the replay prefix. */
+  onRoundActivity?: (cacheTtlMs: number) => void | Promise<void>
 }
 
 /** Process-local client round state. The host owns routing, headers, threads and transport. */
@@ -266,7 +252,7 @@ export class RefusalFallbackRoundEngine {
   readonly #requests = new WeakMap<RefusalFallbackRoundRequest, Request>()
   readonly #thinking: RecoveryThinkingStore
   readonly #cacheKeep: CacheKeepManager | undefined
-  readonly #warm: RefusalFallbackSourceWarm | undefined
+  readonly #now: () => number
 
   constructor(
     private readonly observe?: (event: RefusalFallbackRoundEvent) => void,
@@ -275,11 +261,7 @@ export class RefusalFallbackRoundEngine {
     this.#thinking =
       options.thinkingStore ?? new RecoveryThinkingStore({ persist: false })
     this.#cacheKeep = options.cacheKeep
-    if (options.cacheKeep)
-      this.#warm = new RefusalFallbackSourceWarm(
-        options.cacheKeep,
-        options.now ?? Date.now,
-      )
+    this.#now = options.now ?? Date.now
   }
 
   loadThinking(sessionId: string): Promise<void> {
@@ -290,12 +272,10 @@ export class RefusalFallbackRoundEngine {
     this.#sessions.delete(sessionId)
     this.#sessionLifetimes.delete(sessionId)
     this.#thinking.forgetSession(sessionId)
-    this.#warm?.forgetSession(sessionId)
   }
 
   /** Call on sign-out or credential replacement, including with the same account UUID. */
   forgetAccount(accountId: string): void {
-    this.#warm?.forgetAccount(accountId)
     for (const session of this.#sessions.values())
       if (session.accountId === accountId) session.latest = undefined
   }
@@ -348,11 +328,31 @@ export class RefusalFallbackRoundEngine {
     round.releaseThinking()
     const session = this.#sessions.get(round.sessionId)
     if (session) session.returning = round.identity
-    const template = this.#cacheKeep?.trackedRequest(round.sessionId)
-    if (template && parse(template.bodyText)?.model === round.servingModel)
-      this.#cacheKeep?.releaseTarget(round.sessionId)
-    if (reason === 'compaction') this.#warm?.forgetSession(round.sessionId)
     this.#emit(round, 'round_ended', reason)
+  }
+
+  #restoreReturnMarker(
+    sessionId: string,
+    body: Record<string, unknown>,
+    cache: Request['cache'],
+  ): boolean {
+    if (!cache) return false
+    // If the host hasn't finished tracking the accepted prefix, return without a marker.
+    const target = this.#cacheKeep?.trackedRequest(sessionId)
+    if (
+      !target ||
+      target.cacheExpiresAt <= this.#now() ||
+      target.url !== cache.url ||
+      target.oauthAccountId !== cache.accountId ||
+      target.oauthAccountIdentity !== cache.accountIdentity
+    )
+      return false
+    const accepted = parse(target.bodyText)
+    return Boolean(
+      accepted &&
+        accepted.model === body.model &&
+        restoreRefusalFallbackReturnMarker(body, accepted),
+    )
   }
 
   #handle(
@@ -372,9 +372,6 @@ export class RefusalFallbackRoundEngine {
     const unchanged = { kind: 'source', bodyText: input.bodyText } as const
     if (input.kind !== 'primary') return unchanged
     const { requestedModel, sessionId, oauth } = input
-    const route = cacheRoute(input)
-    this.#warm?.checkPlan(sessionId, route)
-    if (input.compacted) this.#warm?.forgetSession(sessionId)
     let session = this.#sessions.get(sessionId)
     let endedForModel = false
     if (session && session.model !== requestedModel) {
@@ -396,7 +393,10 @@ export class RefusalFallbackRoundEngine {
     const existing = session?.families.get(familyId)
     const round = existing?.round
     if (session && existing && round) {
-      const reason = earlyEnd(round, input)
+      const { idleClock } = round
+      const reason =
+        earlyEnd(round, input) ??
+        (this.#now() - idleClock.at > idleClock.ttlMs ? 'idle' : undefined)
       if (reason) this.#end(existing, round, reason)
       else if (oauth) {
         const target = this.#planTarget(
@@ -417,10 +417,12 @@ export class RefusalFallbackRoundEngine {
     const parsed = parse(bodyText)
     const returning = session?.returning
     const sourceCacheMarkerRestored = Boolean(
-      returning && parsed && this.#warm?.restoreReturnMarker(sessionId, parsed),
+      returning &&
+        !input.compacted &&
+        parsed &&
+        this.#restoreReturnMarker(sessionId, parsed, oauth.cache),
     )
     if (sourceCacheMarkerRestored) bodyText = JSON.stringify(parsed)
-    this.#warm?.checkSourceHistory(sessionId, parsed)
     if (!session) {
       const lifetime = this.#sessionLifetimes.get(sessionId) ?? {}
       this.#sessionLifetimes.set(sessionId, lifetime)
@@ -441,8 +443,7 @@ export class RefusalFallbackRoundEngine {
         familyId,
         accountId: oauth.accountId,
         credentialId: oauth.credentialId,
-        cacheRoute: route,
-        sourceWarm: oauth.sourceWarm,
+        cache: oauth.cache,
         returning,
         sourceBodyText: bodyText,
         baseBodyText: bodyText,
@@ -551,8 +552,7 @@ export class RefusalFallbackRoundEngine {
         sessionId: input.sessionId,
         accountId: oauth.accountId,
         credentialId: oauth.credentialId,
-        cacheRoute: cacheRoute(input),
-        sourceWarm: oauth.sourceWarm,
+        cache: oauth.cache,
         sourceBodyText,
         baseBodyText,
         templateBodyText: bodyText,
@@ -599,7 +599,7 @@ export class RefusalFallbackRoundEngine {
     request: Request,
     category: string,
     target: { model: string; folded: boolean },
-    step: Pick<Round, 'base' | 'checkpoint'>,
+    step: Pick<Round, 'base' | 'checkpoint' | 'idleClock'>,
     retry: boolean,
   ) {
     const { family, session, sessionId, accountId } = request
@@ -623,15 +623,6 @@ export class RefusalFallbackRoundEngine {
     family.round = round
     this.#emit(round, 'round_started')
     if (retry) this.#emit(round, 'step_served')
-    const refused = this.#warm && parse(request.baseBodyText)
-    if (refused)
-      this.#warm?.register(
-        sessionId,
-        refused,
-        () =>
-          this.#sessions.get(sessionId) === session &&
-          (family.round === round || session.returning === round.identity),
-      )
   }
 
   #step(
@@ -664,38 +655,11 @@ export class RefusalFallbackRoundEngine {
     }
   }
 
-  #sourceCompleted(
-    request: Request,
-    bodyText: string,
-    completion: RefusalFallbackCompletion,
-  ) {
+  #sourceCompleted(request: Request) {
     if (++request.family.clean >= 10) {
       request.family.level = 0
       request.family.recent = false
     }
-    const usage = completion.usage
-    this.#warm?.completeSource(
-      request.sessionId,
-      request.familyId,
-      request.cacheRoute,
-      request.sourceWarm,
-      bodyText,
-      parse(bodyText),
-      usage && {
-        input_tokens:
-          typeof usage.input_tokens === 'number'
-            ? usage.input_tokens
-            : undefined,
-        cache_read_input_tokens:
-          typeof usage.cache_read_input_tokens === 'number'
-            ? usage.cache_read_input_tokens
-            : undefined,
-        cache_creation_input_tokens:
-          typeof usage.cache_creation_input_tokens === 'number'
-            ? usage.cache_creation_input_tokens
-            : undefined,
-      },
-    )
   }
 
   /** Pass to dispatch for source plans, or to the protected join for round plans. */
@@ -706,55 +670,58 @@ export class RefusalFallbackRoundEngine {
       targetAllowed,
       projectReply,
       onCacheKeepTemplate,
+      sentBodyText,
+      onRoundActivity,
     }: RefusalFallbackRoundLifecycleOptions,
   ): RefusalFallbackDispatchLifecycle | undefined {
     const request = this.#requests.get(handle)
     if (!request || request.kind === 'routed') return undefined
     const fresh = () => this.#isCurrentPrimary(request) && isFresh()
     const templateIsCurrent = () => this.#isNewestPrimary(request) && isFresh()
-    const publication = onCacheKeepTemplate && Promise.withResolvers<void>()
+    const publication =
+      (onCacheKeepTemplate || onRoundActivity) && Promise.withResolvers<void>()
     const publish = (
-      bodyText: string | null,
-      servingModel: string,
+      bodyText: string,
       usage?: RefusalFallbackCompletion['usage'],
     ) => {
-      if (!onCacheKeepTemplate || !publication) return
-      const liveRound =
-        servingModel !== request.session.model && bodyText !== null
-          ? request.family.round
-          : undefined
-      const current = () =>
-        templateIsCurrent() &&
-        (!liveRound || request.family.round === liveRound)
-      if (!current()) {
+      if (!publication) return
+      const current = () => templateIsCurrent() && !request.family.round
+      if (!onCacheKeepTemplate || !current()) {
         publication.resolve()
         return
       }
       try {
-        let pending: void | Promise<void>
-        if (bodyText === null) pending = onCacheKeepTemplate(null, current)
-        else {
-          const body = parse(bodyText)
-          if (!body || refusalBodyRecord(body.thread)?.type === 'continue') {
-            publication.resolve()
-            return
-          }
-          if (body.thread !== undefined)
-            bodyText = update(bodyText, 'thread', undefined)
-          if (body.fallback_credit_token !== undefined)
-            bodyText = update(bodyText, 'fallback_credit_token', undefined)
-          pending = onCacheKeepTemplate(
-            { bodyText, servingModel, usage },
-            current,
-          )
+        const body = parse(bodyText)
+        if (!body || refusalBodyRecord(body.thread)?.type === 'continue') {
+          publication.resolve()
+          return
         }
-        void Promise.resolve(pending).then(
-          publication.resolve,
-          publication.resolve,
-        )
+        if (body.thread !== undefined)
+          bodyText = update(bodyText, 'thread', undefined)
+        if (body.fallback_credit_token !== undefined)
+          bodyText = update(bodyText, 'fallback_credit_token', undefined)
+        void Promise.resolve(
+          onCacheKeepTemplate({ bodyText, usage }, current),
+        ).then(publication.resolve, publication.resolve)
       } catch {
         // Transport-side CacheKeep bookkeeping cannot interrupt the response.
         publication.resolve()
+      }
+    }
+    const clockFrom = (cacheTtlMs: number) => ({
+      at: this.#now(),
+      ttlMs: cacheTtlMs || PROMPT_CACHE_DEFAULT_TTL_MS,
+    })
+    const wireCacheTtl = () =>
+      requestCacheLifetimeMs(sentBodyText?.() ?? request.templateBodyText)
+    const recordRoundActivity = (cacheTtlMs: number) => {
+      try {
+        void Promise.resolve(onRoundActivity?.(cacheTtlMs)).then(
+          () => publication?.resolve(),
+          () => publication?.resolve(),
+        )
+      } catch {
+        publication?.resolve()
       }
     }
     const sessionStillExists = () =>
@@ -789,10 +756,18 @@ export class RefusalFallbackRoundEngine {
           request,
           refusal.category,
           { model: target.model, folded },
-          this.#step(request, refusal, projectReply, !refusal.releasedTool),
+          {
+            ...this.#step(
+              request,
+              refusal,
+              projectReply,
+              !refusal.releasedTool,
+            ),
+            idleClock: clockFrom(wireCacheTtl()),
+          },
           false,
         )
-        publish(null, target.model)
+        publication?.resolve()
       }
     }
     return {
@@ -810,23 +785,20 @@ export class RefusalFallbackRoundEngine {
         request.phase = 'finished'
         if (request.round) {
           const round = request.round
+          const cacheTtlMs = wireCacheTtl()
           Object.assign(round, this.#step(request, completion, projectReply))
+          round.idleClock = clockFrom(cacheTtlMs)
+          recordRoundActivity(cacheTtlMs)
           round.stepsLeft--
           this.#emit(round, 'step_served')
           if (round.stepsLeft === 0) {
             this.#end(request.family, round, 'count')
-            publication?.resolve()
-            return
           }
-        } else {
-          request.session.returning = undefined
-          this.#sourceCompleted(request, request.templateBodyText, completion)
+          return
         }
-        publish(
-          request.templateBodyText,
-          request.round?.servingModel ?? request.session.model,
-          completion.usage,
-        )
+        request.session.returning = undefined
+        this.#sourceCompleted(request)
+        publish(request.templateBodyText, completion.usage)
       },
       ...(request.kind === 'source' && {
         onRetryThinkingDigest: (digest) => {
@@ -854,15 +826,18 @@ export class RefusalFallbackRoundEngine {
           if (request.phase !== 'refusal' || !request.category || !fresh())
             return
           request.phase = 'finished'
+          const cacheTtlMs = target.cacheTtlMs ?? wireCacheTtl()
           this.#start(
             request,
             request.category,
             target,
-            this.#step(request, completion, projectReply),
+            {
+              ...this.#step(request, completion, projectReply),
+              idleClock: clockFrom(cacheTtlMs),
+            },
             true,
           )
-          if (target.bodyText)
-            publish(target.bodyText, target.model, completion.usage)
+          recordRoundActivity(cacheTtlMs)
         },
       }),
     }
@@ -903,7 +878,10 @@ export class RefusalFallbackRoundEngine {
     let sourceBodyText = request.sourceBodyText
     if (request.kind === 'round') {
       const body = parse(sourceBodyText)
-      if (body && this.#warm?.restoreReturnMarker(request.sessionId, body))
+      if (
+        body &&
+        this.#restoreReturnMarker(request.sessionId, body, request.cache)
+      )
         sourceBodyText = JSON.stringify(body)
     }
     return resendRefusalFallbackSource(
@@ -920,12 +898,8 @@ export class RefusalFallbackRoundEngine {
       request.kind === 'round'
         ? (completion, bodyText) => {
             if (!isNewest()) return
-            this.#sourceCompleted(request, bodyText, completion)
-            request.publishTemplate?.(
-              bodyText,
-              request.session.model,
-              completion.usage,
-            )
+            this.#sourceCompleted(request)
+            request.publishTemplate?.(bodyText, completion.usage)
           }
         : undefined,
       request.kind === 'round'

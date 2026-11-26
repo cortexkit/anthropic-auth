@@ -43,7 +43,7 @@ test('ordinary and source prewarms strip usage markers without changing outgoing
       { role: 'user', content: [{ type: 'text', text: 'continue' }] },
     ],
   }
-  for (const stripServerFallback of [true, false]) {
+  for (const refusalFallbackMode of ['client', 'off', 'server'] as const) {
     for (const signature of [
       `${SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX}{"iterations":[]}`,
       'forged-provider-signature',
@@ -56,10 +56,10 @@ test('ordinary and source prewarms strip usage markers without changing outgoing
         signature,
       })
       const expected = await buildCacheKeepPrewarmBody(JSON.stringify(body), {
-        stripServerFallback,
+        refusalFallbackMode,
       })
       const actual = await buildCacheKeepPrewarmBody(JSON.stringify(marked), {
-        stripServerFallback,
+        refusalFallbackMode,
       })
       expect(expected.ok).toBe(true)
       expect(actual).toEqual(expected)

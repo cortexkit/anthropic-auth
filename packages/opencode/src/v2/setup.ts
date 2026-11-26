@@ -2,12 +2,10 @@ import {
   acquireNativeAccountRuntime,
   assertUnmanagedInjectedPaths,
   authorize,
-  claudeGatewayModelUrl,
   connectVaultHost,
   createEmptyStorage,
   createNativeAccountRuntime,
   createNativeUi,
-  DEFAULT_REFUSAL_FALLBACK_MODE,
   decideOpenCodeStateLayoutOnce,
   disconnectNativeVaultForHost,
   exchange,
@@ -16,7 +14,6 @@ import {
   isDumpPersistentlyEnabled,
   isVaultHosted,
   legacySettingsProtection,
-  localMessageThreadCredential,
   logger,
   type NativeAccountRuntime,
   type NativeAccountRuntimeOptions,
@@ -24,14 +21,11 @@ import {
   type NativeHolderRegistration,
   type NativePoolPaths,
   type NativeUiOptions,
-  nativeAccountCanServe,
   nativeAccountPolicy,
   nativeVaultRuntimeKey,
   openCodeHolderKind,
   readNativeEnrollmentMode,
   readPeerLegacySettingsProtection,
-  readSessionCachePolicy,
-  readThreeWayBoolean,
   registerNativePoolHolder,
   resolveNativePoolPaths,
   setDumpEnabled,
@@ -57,9 +51,9 @@ import {
 } from './activation'
 import { stateRefusalFrom } from './adapter'
 import {
+  accountKey,
   createNativeCacheKeep,
   type NativeCacheKeepOptions,
-  sourceWarmRestartIdentity,
 } from './cachekeep'
 import { installNativeAnthropic } from './install'
 import { startNativeAnthropicLifecycle } from './lifecycle'
@@ -612,24 +606,25 @@ export async function setupAnthropicAuth(
       rounds: cacheKeep.rounds,
       takeRoundThreadReset: cacheKeep.roundNotices.takeThreadReset,
       roundPolicy: (input) => {
-        const { sessionID, modelID, accountId, credentialId } = input
-        const initial = runtime.peek?.()
-        const cache = initial?.policyStorage.claudeCache
-        const cacheMode = cache?.mode ?? 'explicit'
-        const cacheEnabled = (view: NativeAccountRuntime) =>
-          readSessionCachePolicy(sessionID, true)?.keep_warm !== undefined ||
-          readThreeWayBoolean(
-            view.peek?.()?.policyStorage.claudeCache?.enabled,
-            false,
+        const { accountId, baseUrl, sessionID } = input
+        const cacheRoute = () => {
+          const account = runtime
+            .peek?.()
+            ?.accounts.find((row) => row.id === accountId)
+          return (
+            account && {
+              url: baseUrl,
+              accountId,
+              accountIdentity: accountKey(account),
+            }
           )
-        const currentAccount = (view: NativeAccountRuntime) => {
-          const snapshot = view.peek?.()
-          const account = snapshot?.accounts.find((row) => row.id === accountId)
-          return { snapshot, account }
         }
         return {
           targetAllowed(model) {
-            const { snapshot, account } = currentAccount(runtime)
+            const snapshot = runtime.peek?.()
+            const account = snapshot?.accounts.find(
+              (row) => row.id === accountId,
+            )
             return Boolean(
               snapshot &&
                 account &&
@@ -637,92 +632,20 @@ export async function setupAnthropicAuth(
                   'allowed',
             )
           },
-          onPrimarySent() {
-            const routes = cacheKeep?.roundRoutes
-            if (!routes) return
-            routes.delete(sessionID)
-            if (input.route !== 'oauth' || !credentialId) return
-            routes.set(sessionID, {
-              accountId,
-              credentialId,
-              requestedModel: modelID,
-              mode: input.mode,
-              url: input.url,
-            })
-            if (routes.size > 128) {
-              const oldest = routes.keys().next()
-              if (!oldest.done) routes.delete(oldest.value)
-            }
+          cacheRoute: cacheRoute(),
+          onRoundActivity() {
+            const route = cacheRoute()
+            if (route) cacheKeep.recordRoundActivity(sessionID, route)
           },
-          ...(credentialId &&
-            cacheEnabled(runtime) && {
-              sourceWarm: {
-                url: input.url,
-                headers: input.headers,
-                cacheMode,
-                // A refusal can arrive before CacheKeep tracks the source model's accepted prefix.
-                restartIdentity: sourceWarmRestartIdentity(
-                  initial?.accounts.find((row) => row.id === accountId),
-                  credentialId,
-                ),
-                hostMetadata: { sourceBaseUrl: input.baseUrl },
-                isSubagent: subagent(sessionID),
-                loadStorage: async () => {
-                  const current = cacheKeep?.roundRuntime()
-                  return current
-                    ? (await current.read(modelID)).policyStorage
-                    : null
-                },
-                currentRoute: () => {
-                  const route = cacheKeep?.roundRoutes.get(sessionID)
-                  const current = cacheKeep?.roundRuntime()
-                  if (!current) return
-                  const { snapshot, account } = currentAccount(current)
-                  if (
-                    !route ||
-                    account?.type !== 'oauth' ||
-                    !nativeAccountCanServe(account) ||
-                    (account.binding
-                      ? localMessageThreadCredential(account.binding)
-                      : account.credentialId) !== credentialId ||
-                    !cacheEnabled(current) ||
-                    (snapshot?.policyStorage.claudeCache?.mode ??
-                      'explicit') !== cacheMode
-                  )
-                    return
-                  const gateway = current.getClaudeGateway?.()
-                  return {
-                    ...route,
-                    url:
-                      (gateway &&
-                        claudeGatewayModelUrl(
-                          input.baseUrl,
-                          gateway,
-                        )?.toString()) ||
-                      input.baseUrl,
-                    mode:
-                      current.getRefusalFallbackMode?.() ??
-                      snapshot?.refusalFallbackMode ??
-                      DEFAULT_REFUSAL_FALLBACK_MODE,
-                  }
-                },
-              },
-            }),
         }
       },
       onRoundCacheTemplate(input) {
-        const { template, isCurrent, headers, alreadySigned, ...scope } = input
+        const { template, isCurrent, headers, ...scope } = input
         if (!isCurrent() || !cacheKeep) return
-        if (!template) {
-          cacheKeep.retireRoundTemplate(scope.sessionID)
-          return
-        }
         const keeper = cacheKeep
         const acceptedAt = options.cacheKeep?.now?.() ?? Date.now()
         return (async () => {
-          const bodyText = alreadySigned
-            ? template.bodyText
-            : await signRequestBody(template.bodyText)
+          const bodyText = await signRequestBody(template.bodyText)
           if (!isCurrent()) return
           try {
             await keeper.track({

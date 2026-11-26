@@ -79,11 +79,9 @@ test('successful active warm reports its sent lifetime detached from the keeper'
 })
 
 function fixture({
-  source = false,
   fail = false,
   send,
 }: {
-  source?: boolean
   fail?: boolean
   send?: () => Promise<Response>
 } = {}) {
@@ -141,7 +139,6 @@ function fixture({
     storage,
     cacheMode: 'explicit',
     ttlMs: 3_600_000,
-    ...(source && { sourceWarm: true }),
   }
   expect(manager.track(input).tracked).toBe(true)
   return {
@@ -211,40 +208,6 @@ test('routing-moved refuses before send and reports one WARN, lifecycle reason a
   }
 })
 
-test('source-model warms peek the owner session and its current model before sending', async () => {
-  let sends = 0
-  const f = fixture({
-    send: async () => {
-      sends++
-      return Response.json({})
-    },
-  })
-  expect(
-    f.manager.track({
-      ...f.input,
-      sessionId: 'source-copy',
-      ownerSessionId: 'ses_report',
-      sourceWarm: true,
-      bodyText: f.input.bodyText.replace('claude-opus-5-5', 'claude-fable-5'),
-    }).tracked,
-  ).toBe(true)
-  await f.warm()
-  expect(sends).toBe(2)
-  expect(f.peeks).toContainEqual({
-    targetId: 'source-copy',
-    sessionId: 'ses_report',
-    modelId: 'claude-opus-5-5',
-  })
-  f.setRoutedAccount('B')
-  await f.warm()
-  expect(sends).toBe(2)
-  expect(
-    f.manager
-      .registrySessions()
-      .every((row) => row.warmStopped?.reason === 'routing-moved'),
-  ).toBe(true)
-})
-
 test.each([
   'off',
   'none',
@@ -295,16 +258,13 @@ test.each([
   },
 )
 
-test.each([{ source: true }, { fail: true }])(
-  'source and failed warms produce no active-cache report (%j)',
-  async (options) => {
-    const f = fixture(options)
-    await f.warm()
-    f.manager.untrack('ses_report')
-    await detached()
-    expect(f.reports).toEqual([])
-  },
-)
+test('failed warms produce no active-cache report', async () => {
+  const f = fixture({ fail: true })
+  await f.warm()
+  f.manager.untrack('ses_report')
+  await detached()
+  expect(f.reports).toEqual([])
+})
 
 test('a captured but never warmed session has no stopped report', async () => {
   const f = fixture()

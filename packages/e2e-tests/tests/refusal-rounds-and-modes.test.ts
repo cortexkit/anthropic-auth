@@ -1439,7 +1439,7 @@ for (const host of Object.keys(launch) as Host[]) {
       }
 
       scenario(
-        'ten target steps, then the first source request reads a kept prefix older than 20 blocks',
+        'ten target steps, then the requested model reads its ordinary kept prefix older than 20 blocks',
         async (session, mock) => {
           const prefix =
             'Kept source prefix: never replace this with the refused suffix.'
@@ -1451,6 +1451,8 @@ for (const host of Object.keys(launch) as Host[]) {
           const firstRead = 8_784
           mock.queue.push(reply([block('Accepted source answer.')]))
           await session.prompt(prefix)
+          // Pi saves the accepted prefix detached from the host's prompt.
+          await session.waitForTrackedPrefix?.()
           const cached = mark(mock.primary[0]!.body)
           expect(cached).toMatchObject({ type: 'ephemeral' })
           mock.queue.push(reply([], { stop: 'refusal', credit: sentinel }))

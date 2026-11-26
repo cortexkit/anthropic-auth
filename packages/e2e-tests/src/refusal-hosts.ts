@@ -203,6 +203,7 @@ export type HostSession = {
   newerPrimary?: ReturnType<typeof newerPrimaryControl>['send']
   readDiagnostics?: () => Promise<string>
   readDumps?: () => ReturnType<typeof readFixtureDumps>
+  waitForTrackedPrefix?: () => Promise<void>
 }
 
 export async function startOc1(fixture: HostFixture): Promise<HostSession> {

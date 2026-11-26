@@ -822,38 +822,6 @@ export function extractLatestHybridMessageCacheAnchor(
   }
 }
 
-/**
- * Fingerprints of every user message carrying a wire cache anchor, in
- * history order. A recovery-round source warm stays valid while the kept
- * request's earliest anchored message is still among them: compaction or a
- * history edit drops or rewrites that message, while later turns only append
- * after it. Membership (not position) is compared so an extra bridge anchor
- * on a longer history does not count as a prefix change.
- */
-export function hybridUserMessageCacheAnchorFingerprints(
-  bodyText: string,
-): string[] {
-  try {
-    const parsed = JSON.parse(bodyText) as Record<string, unknown>
-    if (!Array.isArray(parsed.messages)) return []
-    const fingerprints: string[] = []
-    for (const message of parsed.messages) {
-      if (
-        !isRecord(message) ||
-        message.role !== 'user' ||
-        !messageHasWireCacheAnchor(message)
-      ) {
-        continue
-      }
-      const fingerprint = cacheAnchorMessageFingerprint(message)
-      if (fingerprint) fingerprints.push(fingerprint)
-    }
-    return fingerprints
-  } catch {
-    return []
-  }
-}
-
 function updateCacheControlTtl(value: unknown, cache1hEnabled: boolean) {
   if (!isRecord(value)) return
   const cacheControl = getCacheControl(value) as CacheControl | null

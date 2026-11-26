@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { CacheKeepManager } from '../cachekeep.ts'
 import { hasValidRequestBodySignature, signRequestBody } from '../cch.ts'
 import { dispatchRefusalFallback } from '../refusal-fallback-dispatch.ts'
 import {
@@ -97,6 +98,135 @@ function fixture(
   }
   return { events, engine, input, plan, send, begin }
 }
+
+test('an idle round ends only past the last accepted primary step lifetime and advances backoff', () => {
+  const ttl = 5 * 60_000
+  let now = 0
+  const { begin, engine, events, input, plan, send } = fixture({
+    now: () => now,
+  })
+  begin()
+  now = ttl
+  const atBoundary = plan()
+  expect(atBoundary.kind).toBe('round')
+  send(atBoundary).lifecycle?.onCompleted?.(completion)
+  now += ttl
+  const title = engine.planRouted({ ...input, kind: 'title' })
+  expect(title.kind).toBe('routed')
+  expect(engine.markSent(title.request!)).toBe(true)
+  now += 1
+  const afterIdle = plan()
+  expect(afterIdle.kind).toBe('source')
+  expect(events.at(-1)).toMatchObject({ kind: 'round_ended', reason: 'idle' })
+  begin('retry', afterIdle)
+  expect(events.at(-1)).toMatchObject({ kind: 'step_served', stepsLeft: 19 })
+})
+
+test.each(['count', 'idle'] as const)(
+  'the %s return restores the ordinary kept prefix marker without replacing the tail marker',
+  (end) => {
+    let now = 1
+    const cache = { ...binding, accountIdentity: 'original' }
+    const route = { ...oauth, cache }
+    const storage = {
+      version: 1 as const,
+      accounts: [],
+      claudeCache: { enabled: true, mode: 'hybrid' as const },
+      cacheKeep: { enabled: true, always: true },
+    }
+    const cacheKeep = new CacheKeepManager({
+      loadStorage: async () => storage,
+      now: () => now,
+    })
+    const { begin, plan, send, events } = fixture({ now: () => now, cacheKeep })
+    const control = { type: 'ephemeral' }
+    const first = {
+      role: 'user',
+      content: [{ type: 'text', text: 'Hello', cache_control: control }],
+    }
+    const tail = {
+      role: 'user',
+      content: [{ type: 'text', text: 'more', cache_control: control }],
+    }
+    try {
+      expect(
+        cacheKeep.track({
+          sessionId: 's',
+          ...cache,
+          storage,
+          oauthAccountId: cache.accountId,
+          oauthAccountIdentity: cache.accountIdentity,
+          cacheMode: 'hybrid',
+          headers: new Headers(),
+          bodyText: JSON.stringify({ ...body, messages: [first] }),
+        }).tracked,
+      ).toBe(true)
+      const extended = {
+        oauth: route,
+        bodyText: JSON.stringify({ ...body, messages: [prompt, tail] }),
+      }
+      begin('retry', plan(extended))
+      if (end === 'count') {
+        for (let step = 0; step < 9; step++)
+          send(plan(extended)).lifecycle?.onCompleted?.(completion)
+      } else now += 300_001
+      const returned = plan(extended)
+      expect(returned).toMatchObject({
+        kind: 'source',
+        sourceCacheMarkerRestored: true,
+      })
+      expect(JSON.parse(returned.bodyText).messages).toEqual([first, tail])
+      expect(events.at(-1)).toMatchObject({ kind: 'round_ended', reason: end })
+    } finally {
+      cacheKeep.stop()
+    }
+  },
+)
+
+test.each([
+  ['1h', 3_600_000],
+  ['5m', 300_000],
+] as const)(
+  'round activity reads %s from the physical body after thread recovery',
+  (ttl, ms) => {
+    let now = 0
+    const { begin, plan, send } = fixture({ now: () => now })
+    begin()
+    const step = plan()
+    const wire = JSON.stringify({
+      ...body,
+      system: [
+        {
+          type: 'text',
+          text: 'actual',
+          cache_control: { type: 'ephemeral', ttl },
+        },
+      ],
+    })
+    send(step, { sentBodyText: () => wire }).lifecycle?.onCompleted?.(
+      completion,
+    )
+    now = ms
+    expect(plan().kind).toBe('round')
+    now += 1
+    expect(plan().kind).toBe('source')
+  },
+)
+
+test('a deferred round expires by the refused request lifetime before any fallback step', () => {
+  let now = 0
+  const { begin, plan, events } = fixture({ now: () => now })
+  begin('tool')
+  now = 299_999
+  expect(plan().kind).toBe('round')
+  now += 2
+  expect(plan().kind).toBe('source')
+  expect(events.at(-1)).toMatchObject({
+    kind: 'round_ended',
+    reason: 'idle',
+    stepsLeft: 10,
+  })
+})
 
 test.each([
   ['first refusal after 3 clean responses', false, 3, 0, 'retry', 10],
@@ -919,7 +1049,7 @@ test('dispatch with no round lifecycle preserves the joined wire bytes and physi
   expect(sent[0]).toBe(sent[1])
 })
 
-test('two rounds keep the retry prefix identical and a second refusal does not restore stripped thinking', async () => {
+test('two rounds do not publish a warm template and a second refusal does not restore stripped thinking', async () => {
   const thinkingStore = new RecoveryThinkingStore({ persist: false })
   const { plan, send, events } = fixture({ thinkingStore })
   const templates: Array<string | null> = []
@@ -947,13 +1077,7 @@ test('two rounds keep the retry prefix identical and a second refusal does not r
       capture: (text) => sends.push(text),
     },
   ).text()
-  const template = templates[0]!
-  expect(await hasValidRequestBodySignature(template)).toBe(true)
-  expect(JSON.parse(template)).toMatchObject({
-    model: opus,
-    messages: [prompt],
-  })
-  expect(template).not.toContain('one-use-credit')
+  expect(await hasValidRequestBodySignature(sends[0]!)).toBe(true)
   expect(JSON.parse(sends[0]!).messages).toEqual([
     prompt,
     assistant(sourceThought),
@@ -1026,7 +1150,7 @@ test('two rounds keep the retry prefix identical and a second refusal does not r
   expect(nextRound.bodyText).not.toContain('target signature')
   expect(nextRound.bodyText).not.toContain('target redacted data')
   expect(nextRound.bodyText).toContain('round two signature')
-  expect(templates).toHaveLength(2)
+  expect(templates).toBeEmpty()
   expect(
     events.some(
       (event) => event.kind === 'round_ended' && event.reason === 'compaction',

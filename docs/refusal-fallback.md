@@ -21,7 +21,7 @@ Set `refusal_fallback` in your [shared user settings file](settings-file.md), `a
 
 The mode does not enable OAuth fallback on paid API-key or custom provider routes. In `client` and `off`, eligible OAuth requests still advertise Anthropic's fallback beta but omit the `fallbacks` body field. Only `server` sends `fallbacks: "default"`.
 
-Running hosts that watch the shared file pick up edits without a restart. A mode change ends any live client round on the next primary request; the next keep-warm check stops warming the requested model's prefix before another warm is sent.
+Running hosts that watch the shared file pick up edits without a restart. A mode change ends any live client round on the next primary request. Keep-warm continues to follow the session's cache policy.
 
 ### Migrating from environment variables
 
@@ -50,9 +50,11 @@ A successful retry counts as the first response of a round. If the round starts 
 
 ### Returning to the requested model
 
-During a round, CacheKeep can also keep the requested model's last accepted prefix warm, when the refused request extends that prefix and keep-warm policy allows it. The first request back carries a cache marker at the kept prefix when it still matches, so Anthropic can read the cache again.
+During a round, keep-warm still targets only the requested model's last accepted prefix, if the session is being kept warm. Each accepted primary step resets the warm budget without replacing that prefix. The serving model's cache is refreshed by the round's requests, not by keep-warm.
 
-The serving model's keep-warm target is used only while the round is live. When the round ends, CacheKeep can continue warming the requested model's prefix until the first successful response back on that model, unless a change such as history compaction invalidates it. A restart ends the round, but the saved requested-model prefix and its keep-warm budget can be restored. The restored warm targets the model that will serve the next request.
+The next primary request returns to the requested model if the time since the last accepted round step exceeds the cache lifetime sent with that step: one hour or five minutes (five minutes if it had no cache marker). Before a deferred round serves its first step, the clock starts at the refusal that created it. Titles and compaction requests do not refresh that clock. An idle end advances the next round's length just like using all its steps.
+
+When the first request back extends the kept prefix, it carries a cache marker at that prefix so Anthropic can read the cache again. A restart also ends the round; the requested model's saved prefix and warm budget can be restored and warmed normally.
 
 On requests to the requested model, the plugin removes recorded fallback-model thinking wherever it follows that requested model's thinking in the same turn. It checks every turn, not only the latest one, and the record survives restarts. Pi and OpenCode 2 save the record on shutdown.
 

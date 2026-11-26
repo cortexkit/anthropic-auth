@@ -10,15 +10,12 @@ import {
   CacheKeepSessionRegistry,
   type CacheKeepTarget,
   CacheKeepWarmRefusal,
-  cacheKeepRestartTarget,
-  claudeGatewayModelUrl,
   currentCacheKeepRealTurn,
   getCacheKeepRegistryDirectories,
   isCacheKeepActiveNow,
   isCacheKeepHybridActive,
   isCacheKeepSubagentsEnabled,
   isCacheKeepWarmWait,
-  localMessageThreadCredential,
   logger,
   NativeAccountRefusal,
   type NativeAccountRefusalReason,
@@ -27,7 +24,6 @@ import {
   nativeAccountCanServe,
   nativeAccountRefusal,
   RecoveryThinkingStore,
-  type RefusalFallbackCacheRoute,
   RefusalFallbackRoundEngine,
   readSessionCachePolicy,
   requestCacheLifetimeMs,
@@ -62,7 +58,7 @@ export interface NativeCacheKeepOptions {
 
 // Token refreshes preserve this identity; replacing a local row or a vault
 // credential does not. Never warm a previous login's prefix on its replacement.
-function accountKey(account: NativeAccountView) {
+export function accountKey(account: NativeAccountView) {
   return JSON.stringify([
     account.source,
     account.accountIdentity,
@@ -71,19 +67,6 @@ function accountKey(account: NativeAccountView) {
     account.binding?.rowId,
     account.binding?.credentialEpoch,
   ])
-}
-
-export function sourceWarmRestartIdentity(
-  account: NativeAccountView | undefined,
-  credentialId: string,
-) {
-  if (
-    account &&
-    (account.binding
-      ? localMessageThreadCredential(account.binding)
-      : account.credentialId) === credentialId
-  )
-    return accountKey(account)
 }
 
 function missingAccountReason(
@@ -152,8 +135,6 @@ interface SharedCacheKeep {
   readonly rounds: RefusalFallbackRoundEngine
   readonly thinkingStore: RecoveryThinkingStore
   readonly roundNotices: ReturnType<typeof createRefusalRoundNotices>
-  readonly roundRoutes: Map<string, RefusalFallbackCacheRoute>
-  readonly roundRuntime: () => NativeAccountRuntime | undefined
   readonly registry: CacheKeepSessionRegistry
   readonly persistence: CacheKeepStore
   loading?: Promise<void>
@@ -256,15 +237,10 @@ function createSharedCacheKeep(
     onClaimLost(id) {
       restored.delete(id)
       manager.releaseTarget(id)
-      manager.releaseSourceWarm(id)
     },
   })
-  const reserveRestartWarm = (target: Readonly<CacheKeepTarget>) => {
-    const entry = cacheKeepRestartTarget(target)
-    return entry
-      ? persistence.reserveWarm(entry)
-      : Promise.resolve(true as const)
-  }
+  const reserveRestartWarm = (target: Readonly<CacheKeepTarget>) =>
+    persistence.reserveWarm(target)
   const registry = new CacheKeepSessionRegistry({
     ...getCacheKeepRegistryDirectories('opencode', options.registryDirectory),
     now: options.now,
@@ -308,19 +284,11 @@ function createSharedCacheKeep(
         : Promise.resolve(false),
     deferWarmReservation: true,
     responseTtlMs: (response) => warmResponseLifetimes.get(response),
-    onTargetChanged: (target) => {
-      const entry = cacheKeepRestartTarget(target)
-      if (entry)
-        shared.persistence.changed(
-          entry,
-          (!target.sourceWarm || target.lastTouchKind === undefined) &&
-            !manager.isRestoredTarget(target),
-        )
-    },
+    onTargetChanged: (target) =>
+      shared.persistence.changed(target, !manager.isRestoredTarget(target)),
     onTargetRemoved: (id, target) => {
       restored.delete(id)
-      const entry = cacheKeepRestartTarget(target)
-      if (entry) shared.persistence.removed(entry)
+      shared.persistence.removed(target)
     },
     onRealTurnsSettled: (id) => {
       const deferred = restoreAfterTurn.get(id)
@@ -422,8 +390,6 @@ function createSharedCacheKeep(
       now: options.now,
     }),
     roundNotices,
-    roundRoutes: new Map(),
-    roundRuntime: () => newestLease()?.runtime,
     registry,
     persistence,
     prepared,
@@ -518,7 +484,6 @@ function createSharedCacheKeep(
               )
             if (account.type !== 'oauth' || !nativeAccountCanServe(account))
               return 'account-gone'
-            if (entry.refusalSourceModel !== undefined) return 'invalid'
             if (
               entry.isSubagent &&
               !entry.policyState?.planned &&
@@ -712,11 +677,7 @@ export function createNativeCacheKeep(
     let dispatchStorage: CacheKeepPolicyStorage | undefined
     const body = JSON.parse(warmBodyText) as { model: string }
     const boundAccount = (account: NativeAccountView) =>
-      target.sourceWarm
-        ? (account.binding
-            ? localMessageThreadCredential(account.binding)
-            : account.credentialId) === target.oauthAccountIdentity
-        : accountKey(account) === target.oauthAccountIdentity
+      accountKey(account) === target.oauthAccountIdentity
     const scope: RequestScope = {
       providerID: 'anthropic',
       modelID: body.model,
@@ -728,14 +689,10 @@ export function createNativeCacheKeep(
       throw new NativeAccountRefusal(reason)
     }
     let actualWarmTtl = requestCacheLifetimeMs(warmBodyText)
-    const refusalSourceModel = target.hostMetadata?.refusalSourceModel
     const native = createNativeAnthropicAdapter({
       cacheKeepHeaders: target.headers['anthropic-beta']
         ? new Headers(target.headers)
         : undefined,
-      ...(typeof refusalSourceModel === 'string' && {
-        cacheKeepRefusalSourceModel: refusalSourceModel,
-      }),
       source: {
         ...source,
         quotaFromHeaders(headers, input) {
@@ -859,20 +816,15 @@ export function createNativeCacheKeep(
       dispatchStorage = snapshot.policyStorage
       const sessionId = target.policyState?.ownerSessionId ?? target.id
       const sessionBody = manager.trackedRequest(sessionId)?.bodyText
-      const modelId =
-        sessionBody && !target.sourceWarm
-          ? (JSON.parse(sessionBody) as { model?: string }).model
-          : body.model
+      const modelId = sessionBody
+        ? (JSON.parse(sessionBody) as { model?: string }).model
+        : body.model
       const routed = manager.trackedRequest(target.id)
         ? source.peekAccount?.(sessionId, modelId, snapshot)
         : undefined
       if (routed !== undefined && routed !== (target.oauthAccountId ?? 'main'))
         throw new CacheKeepWarmRefusal('routing-moved')
-      const accountId = snapshot.accounts.find(
-        (account) =>
-          boundAccount(account) &&
-          (!target.sourceWarm || account.id === target.oauthAccountId),
-      )?.id
+      const accountId = snapshot.accounts.find(boundAccount)?.id
       if (!accountId)
         throw new NativeAccountRefusal(
           snapshot.accounts.some(
@@ -901,23 +853,11 @@ export function createNativeCacheKeep(
         transport: 'http',
         data: authorized.attempt,
       }
-      const baseUrl =
-        target.sourceWarm &&
-        typeof target.hostMetadata?.sourceBaseUrl === 'string'
-          ? target.hostMetadata.sourceBaseUrl
-          : target.url
-      const gateway = runtime.getClaudeGateway?.()
-      if (
-        target.sourceWarm &&
-        ((gateway && claudeGatewayModelUrl(baseUrl, gateway)?.toString()) ||
-          baseUrl) !== target.url
-      )
-        throw new CacheKeepWarmRefusal('routing-moved')
       const request = await native.adapter.rewriteRequest?.({
         ...scope,
         accountId,
         attempt,
-        request: new Request(baseUrl, {
+        request: new Request(target.url, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: warmBodyText,
@@ -938,12 +878,6 @@ export function createNativeCacheKeep(
       const physical = await manager.reserveWarmDispatch(
         target,
         () => {
-          const tracked = manager.trackedRequest(target.id)
-          if (
-            target.sourceWarmCurrent &&
-            (!tracked || !target.sourceWarmCurrent(tracked.bodyText))
-          )
-            throw new CacheKeepWarmRefusal('routing-moved')
           stage = 'send'
           return (options.fetch ?? fetch)(request)
         },
@@ -976,12 +910,7 @@ export function createNativeCacheKeep(
           attempt,
         })
       const bytes = await response.arrayBuffer()
-      if (
-        response.ok &&
-        !signal.aborted &&
-        !target.sourceWarm &&
-        manager.isCurrentTarget(target)
-      )
+      if (response.ok && !signal.aborted && manager.isCurrentTarget(target))
         sessionCacheActivity.recordPrewarm(
           target.id,
           accountId,
@@ -1045,19 +974,12 @@ export function createNativeCacheKeep(
     ready,
     rounds: owner.rounds,
     roundNotices: owner.roundNotices,
-    roundRoutes: owner.roundRoutes,
-    roundRuntime: owner.roundRuntime,
     forgetRoundAccount(accountId: string) {
       owner.rounds.forgetAccount(accountId)
-      for (const [sessionID, route] of owner.roundRoutes)
-        if (route.accountId === accountId) owner.roundRoutes.delete(sessionID)
     },
-    retireRoundTemplate: (sessionID: string) =>
-      manager.releaseTarget(sessionID),
+    recordRoundActivity: manager.recordRoundActivity.bind(manager),
     beginRealTurn,
-    async track(
-      input: NativeCacheRequestPrepared & { refusalSourceModel?: string },
-    ) {
+    async track(input: NativeCacheRequestPrepared) {
       let turn =
         input.kind === 'primary' &&
         input.agent !== 'cachekeep' &&
@@ -1163,11 +1085,6 @@ export function createNativeCacheKeep(
         cacheMode: 'hybrid',
         oauthAccountId: input.accountId,
         oauthAccountIdentity: accountKey(account),
-        ...(input.refusalSourceModel !== undefined && {
-          hostMetadata: {
-            refusalSourceModel: input.refusalSourceModel,
-          },
-        }),
         isSubagent,
         ttlMs:
           requestCacheLifetimeMs(input.bodyText) ||
@@ -1274,7 +1191,6 @@ export function createNativeCacheKeep(
     sessionDeleted(sessionID: string) {
       owner.rounds.forgetSession(sessionID)
       owner.roundNotices.forget(sessionID)
-      owner.roundRoutes.delete(sessionID)
       // Local routing cleanup also runs on eviction and shutdown. Only the host
       // deletion event can invalidate a record belonging to another server.
       const current =

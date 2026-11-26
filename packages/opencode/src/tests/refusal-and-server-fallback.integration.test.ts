@@ -1,10 +1,9 @@
 import { describe, expect, mock, spyOn } from 'bun:test'
-import { readdir, readFile, writeFile } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { gunzipSync, gzipSync } from 'node:zlib'
+import { gunzipSync } from 'node:zlib'
 import {
   type AccountStorage,
-  CACHE_DIAGNOSTICS_BETA,
   cacheKeepStoreDirectory,
   hasValidRequestBodySignature,
   logger,
@@ -29,6 +28,7 @@ import {
 import {
   createFallbackStorage,
   getPlugin as getPluginWithCtx,
+  replacePoolMainLogin,
   syntheticMainHostAuth,
   updatePoolRelay,
   useTempAccountFile as useTempAccountFileWithCtx,
@@ -906,8 +906,10 @@ describe('auth.loader', () => {
   )
 
   const exerciseRoundWarm = async (
-    restart: 'valid' | 'unsupported' | 'legacy' | false,
+    restart: boolean,
     loseResend = false,
+    idle = false,
+    replaceAccount = false,
   ) => {
     await useTempAccountFile(
       createFallbackStorage({
@@ -943,10 +945,10 @@ describe('auth.loader', () => {
     const globals = globalThis as Record<symbol, unknown>
     const previousRouting = globals[routingKey]
     const reports: Record<string, unknown>[] = []
-    if (loseResend) {
+    if (loseResend || idle) {
       globals[routingKey] = () => ({
         report: (row: Record<string, unknown>) => {
-          if (row.kind === 'billing') reports.push(row)
+          reports.push(row)
         },
       })
       getBodyLifetime(testContext).deferCleanup(() => {
@@ -958,6 +960,16 @@ describe('auth.loader', () => {
       withNativeAdmission(
         (input: string | URL | Request, init?: RequestInit) => {
           const url = extractUrl(input)
+          if (
+            url.includes('/api/claude_cli/bootstrap') &&
+            new Headers(init?.headers).get('authorization') ===
+              'Bearer sk-ant-oat01-round-replacement'
+          )
+            return Response.json({
+              oauth_account: {
+                account_uuid: '00000000-0000-4000-8000-000000000099',
+              },
+            })
           if (!url.includes('/v1/messages')) return Response.json({})
           const text = String(init?.body)
           const body = JSON.parse(text)
@@ -1067,7 +1079,7 @@ describe('auth.loader', () => {
       target,
     ])
     const third = append(second, 'the next primary')
-    if (!restart) {
+    if (!restart && !idle && !replaceAccount) {
       // Probe the other instance's routing without accepting a newer source
       // prefix and transferring the shared session's warm ownership to it.
       rejectIndependent = true
@@ -1088,8 +1100,7 @@ describe('auth.loader', () => {
 
     const keeper = getPluginTestHandles(plugin).cacheKeepManager
     await Promise.resolve()
-    const warmId = `source-warm:${sessionId}:fable-5-2`
-    const kept = keeper.trackedRequest(warmId)
+    const kept = keeper.trackedRequest(sessionId)
     expect(kept?.bodyText).toContain('the clean cached prefix')
     expect(kept?.bodyText).not.toContain('the refused turn')
     now += 55 * 60_000
@@ -1101,6 +1112,86 @@ describe('auth.loader', () => {
     expect(warm?.body).not.toHaveProperty('thread')
     expect(warm?.body).not.toHaveProperty('fallbacks')
     expect(warm?.text).not.toContain(credit)
+    expect(sends.filter(({ body }) => body.max_tokens === 0)).toEqual([warm!])
+
+    if (replaceAccount) {
+      const before = sends.length
+      await replacePoolMainLogin(
+        testContext,
+        {
+          access: 'sk-ant-oat01-round-replacement',
+          refresh: 'round-replacement-refresh',
+          expires: now + 8 * 60 * 60_000,
+        },
+        {
+          sameAccount: false,
+          accountIdentity: '00000000-0000-4000-8000-000000000099',
+        },
+      )
+      now += 55 * 60_000
+      await keeper.tick()
+      expect(sends).toHaveLength(before)
+      expect(keeper.trackedRequest(sessionId)).toBeUndefined()
+      return
+    }
+
+    if (idle) {
+      const state = keeper.trackedPolicyState(sessionId)!
+      expect(state.warmsSinceLastRealRequest).toBe(1)
+      now += 60_000
+      const lastStep = append(third, 'shorter than a round step lifetime')
+      await request(host, lastStep)
+      expect(sends.at(-1)?.body.model).toBe(target)
+      expect(keeper.trackedRequest(sessionId)?.bodyText).toBe(kept?.bodyText)
+      expect(keeper.trackedPolicyState(sessionId)).toMatchObject({
+        warmsSinceLastRealRequest: 0,
+        warmCostSoFar: 0,
+        lastRealRequestAt: state.lastRealRequestAt,
+      })
+      await Bun.sleep(0)
+      expect(reports).toContainEqual(
+        expect.objectContaining({ kind: 'cache_touch', source: 'warm' }),
+      )
+      expect(
+        reports
+          .filter((row) => row.kind === 'billing' && row.model === target)
+          .at(-1),
+      ).toMatchObject({
+        cache: { warming: { on: true } },
+      })
+      const acceptedAt = now
+      now += 54 * 60_000
+      await keeper.tick()
+      expect(
+        sends
+          .filter(({ body }) => body.max_tokens === 0)
+          .map(({ body }) => body.model),
+      ).toEqual([source, source])
+      now = acceptedAt + 60 * 60_000 + 1
+      const returned = append(lastStep, 'longer than a round step lifetime')
+      await request(host, returned)
+      expect(sends.at(-1)?.body.model).toBe(source)
+      const wire = JSON.parse(sends.at(-1)!.text)
+      expect(wire.messages[0].content).toContainEqual(
+        expect.objectContaining({
+          text: 'the clean cached prefix',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        }),
+      )
+      const observed = spyOn(logger, 'info')
+      try {
+        refuse = true
+        await request(host, append(returned, 'the next refusal'))
+        expect(observed.mock.calls).toContainEqual([
+          'refusal-fallback',
+          'round_started',
+          expect.objectContaining({ stepsLeft: 19 }),
+        ])
+      } finally {
+        observed.mockRestore()
+      }
+      return
+    }
 
     if (restart) {
       const modelBetas = (headers: Headers) =>
@@ -1108,14 +1199,6 @@ describe('auth.loader', () => {
           .get('anthropic-beta')!
           .split(',')
           .filter((beta) => beta !== MESSAGE_THREADS_BETA)
-      const liveWarm = sends.find(
-        ({ body }) => body.max_tokens === 0 && body.model === target,
-      )
-      expect(modelBetas(liveWarm!.headers)).toEqual(
-        modelBetas(round.headers).filter(
-          (beta) => beta !== CACHE_DIAGNOSTICS_BETA,
-        ),
-      )
       await plugin.dispose()
       testContext.livePlugins.delete(plugin)
       await independent.dispose()
@@ -1131,24 +1214,6 @@ describe('auth.loader', () => {
       expect(entries).toHaveLength(1)
       const path = join(disk, entries[0]!)
       const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
-      if (restart !== 'valid') {
-        await writeFile(
-          path,
-          gzipSync(
-            JSON.stringify({
-              ...saved,
-              bodyText: JSON.stringify({
-                ...JSON.parse(saved.bodyText),
-                model: target,
-              }),
-              refusalSourceModel:
-                restart === 'legacy' ? source : 'claude-sonnet-4-6',
-            }),
-          ),
-        )
-      }
-      const debug = spyOn(logger, 'debug')
-      getBodyLifetime(testContext).deferCleanup(() => debug.mockRestore())
       const restarted = await getPlugin(undefined, undefined, {
         now: () => now,
       })
@@ -1159,22 +1224,6 @@ describe('auth.loader', () => {
       const before = sends.length
       await handles.cacheKeepManager.tick()
       const restored = sends.slice(before)
-      if (restart !== 'valid') {
-        expect(restored).toBeEmpty()
-        expect(await readdir(disk)).not.toContain(entries[0]!)
-        expect(
-          debug.mock.calls.filter(
-            ([, message]) => message === 'restart record dropped',
-          ),
-        ).toEqual([
-          [
-            'cachekeep',
-            'restart record dropped',
-            { file: entries[0], reason: 'invalid' },
-          ],
-        ])
-        return
-      }
       expect(restored).toHaveLength(1)
       expect(restored[0]!.body).toMatchObject({
         model: source,
@@ -1208,13 +1257,13 @@ describe('auth.loader', () => {
         reports.filter(
           (row) =>
             row.model === source &&
+            row.kind === 'billing' &&
             row.status === undefined &&
             row.outcome === 'failed',
         ),
       ).toHaveLength(1)
       return
     }
-    expect(keeper.trackedRequest(warmId)).toBeUndefined()
     await request(host, append(third, 'source after the round'))
     expect(sends.at(-1)?.body).toMatchObject({
       model: source,
@@ -1236,9 +1285,9 @@ describe('auth.loader', () => {
   test('OpenCode 1 bills a round source resend that loses its socket before headers', () =>
     exerciseRoundWarm(false, true))
   test('OpenCode 1 restart warms the last accepted requested-model prefix', () =>
-    exerciseRoundWarm('valid'))
-  test('OpenCode 1 restart drops an unsupported refusal source without sending it', () =>
-    exerciseRoundWarm('unsupported'))
-  test('OpenCode 1 accepts the legacy record layout but does not replay its serving-model body', () =>
-    exerciseRoundWarm('legacy'))
+    exerciseRoundWarm(true))
+  test('OpenCode 1 round activity renews the warm budget and an idle end advances backoff', () =>
+    exerciseRoundWarm(false, false, true))
+  test('OpenCode 1 stops warming when the OAuth account changes mid-round', () =>
+    exerciseRoundWarm(false, false, false, true))
 })

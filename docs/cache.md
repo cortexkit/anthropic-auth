@@ -44,7 +44,7 @@ OpenCode 1, OpenCode 2 and Pi report `cache_touch` after each accepted ordinary 
 
 `cache_warm_stopped` contains `{kind:'cache_warm_stopped', at, reason}` and is emitted only for a session that actually warmed. Reasons are exactly `cost-cap`, `count-cap`, `outside-hours`, `session-ended`, `unsupported`, `evicted`, `stopped`, `account-changed`, `expired` and `idle`. `count-cap`, not `idle`, describes the 24-attempt stop. `idle` is reserved for legacy/unpriced-auto idle limits. A policy refusal is `unsupported`; a disappeared/invalid previously applied runner plan is `session-ended`.
 
-During a [client fallback round](refusal-fallback.md#returning-to-the-requested-model), the requested model's saved prefix can be warmed separately so it remains available when the session switches back. These source warms remain separate cache targets, with their own 24-attempt bound where applicable. Explicit cache-policy `off` and `none` stop them too. Source warms do not move the active session's cache clock or emit its touch/stop reports: the shared report has no target/model attribution, so a source warm cannot establish the active model's cache lifetime. Prime remains separate and has no session cache reports.
+During a [client fallback round](refusal-fallback.md#returning-to-the-requested-model), keep-warm still targets only the requested model's saved prefix. Those warms report touches and stops under the ordinary rules. Accepted round steps reset the warm budget without replacing the saved prefix. Prime remains separate and has no session cache reports.
 
 ## Prime and lane start
 

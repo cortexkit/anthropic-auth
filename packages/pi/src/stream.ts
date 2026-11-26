@@ -97,7 +97,6 @@ import {
   type ProviderAccountUuid,
   type ProviderErrorResponseScope,
   parseSseFrame,
-  peekRoutingAccount,
   prepareMessageThreadRequest,
   protectFallbackCreditResponse,
   QuotaManager,
@@ -112,7 +111,6 @@ import {
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
   RecoveryThinkingStore,
-  type RefusalFallbackCacheRoute,
   type RefusalFallbackDispatchOptions,
   type RefusalFallbackMode,
   RefusalFallbackRoundEngine,
@@ -170,7 +168,7 @@ import {
   type ThinkingContent,
   type ToolCall,
 } from '@earendil-works/pi-ai'
-import { PiCacheKeep, piCacheKeepAccountKey } from './cachekeep.ts'
+import { PiCacheKeep } from './cachekeep.ts'
 import {
   buildAnthropicRequest,
   fromClaudeCodeToolName,
@@ -217,7 +215,14 @@ const replanPiRound = Symbol('replan Pi refusal round')
 const refusalRounds = new Map<string, RefusalFallbackRoundEvent>()
 const roundRoutes = new Map<
   string,
-  RefusalFallbackCacheRoute & { storagePath: string; routeId: string }
+  {
+    accountId: string
+    credentialId: string
+    requestedModel: string
+    url: string
+    storagePath: string
+    routeId: string
+  }
 >()
 const roundNotices = new Map<string, (message?: string) => void>()
 
@@ -686,16 +691,7 @@ const piCacheKeep = new PiCacheKeep(
         () => piClaudeGatewayFromMemory(storagePath),
         getRequestGzipLatch(getRequestGzipLatchPath(storagePath)),
       )
-      const base = target.hostMetadata?.sourceWarmBaseUrl
-      return target.sourceWarm && typeof base === 'string'
-        ? Object.assign(
-            (_: Parameters<typeof fetch>[0], init?: RequestInit) =>
-              fetch(base, init),
-            {
-              preconnect: fetch.preconnect,
-            },
-          )
-        : fetch
+      return fetch
     },
     loadStorage: async () => (await getPiNativeRuntime().view()).policyStorage,
     resolveSettings: resolvePiSettingsFromMemory,
@@ -709,11 +705,7 @@ const piCacheKeep = new PiCacheKeep(
         target.accountStoragePath ?? getPiAccountStoragePath(),
       )
       requirePiOAuthOrigin(target.url, runtime.claudeGateway())
-      const warmRoute = target.hostMetadata?.sourceWarmRouteId
-      const id =
-        typeof warmRoute === 'string'
-          ? warmRoute
-          : (target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID)
+      const id = target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID
       const current = await runtime.view()
       const body = JSON.parse(target.bodyText) as Record<string, unknown>
       const served = await runtime.authorize(
@@ -724,10 +716,7 @@ const piCacheKeep = new PiCacheKeep(
       )
       if (
         !target.oauthAccountIdentity ||
-        (target.sourceWarm
-          ? served.accountIdentity !== target.oauthAccountId ||
-            piBillingPayer(served).credentialId !== target.oauthAccountIdentity
-          : served.accountIdentity !== target.oauthAccountIdentity)
+        served.accountIdentity !== target.oauthAccountIdentity
       )
         throw new NativeAccountRefusal('credential-changed')
       const identity = getClaudeCodeIdentityForVerifiedAccount(
@@ -738,10 +727,7 @@ const piCacheKeep = new PiCacheKeep(
       )
       headers.delete('anthropic-beta')
       applyPiOAuthRequestHeaders(headers, piAttemptAccessToken(served), {
-        body:
-          typeof target.hostMetadata?.refusalSourceModel === 'string'
-            ? { ...body, model: target.hostMetadata.refusalSourceModel }
-            : body,
+        body,
         identity,
         leadingBetas: [CACHE_KEEP_EXTENDED_TTL_BETA],
         refusalFallbackMode:
@@ -767,9 +753,7 @@ const piCacheKeep = new PiCacheKeep(
       const retryBody = JSON.parse(target.bodyText) as Record<string, unknown>
       const rotated = await entry.runtime
         .retry(
-          typeof target.hostMetadata?.sourceWarmRouteId === 'string'
-            ? target.hostMetadata.sourceWarmRouteId
-            : (target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID),
+          target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID,
           entry.served,
           attempt.signal,
           typeof retryBody.model === 'string' ? retryBody.model : undefined,
@@ -795,7 +779,6 @@ const piCacheKeep = new PiCacheKeep(
         status >= 200 &&
         status < 300 &&
         !attempt.signal?.aborted &&
-        !target.sourceWarm &&
         cacheKeepManager.isCurrentTarget(target)
       )
         sessionCacheActivity.recordPrewarm(
@@ -1581,12 +1564,26 @@ async function sendAnthropicRequestAttempt(
   }
   const cacheAccepted = new Set<PiNativeAttempt>()
   const cacheTracking = new Map<PiNativeAttempt, 'pending' | 'settled'>()
+  const recordCacheAcceptance = (appliedTtl: number, at: number) => {
+    const localTtl =
+      readSessionCachePolicy(relayAffinity, true)?.ttl !== undefined
+        ? appliedTtl
+        : cacheTtlMs || PROMPT_CACHE_DEFAULT_TTL_MS
+    if (relayAffinity) {
+      sessionCacheActivity.record(relayAffinity, routeId, localTtl)
+      reportSessionCacheTouch(relayAffinity, {
+        at,
+        ttlMs: appliedTtl,
+        source: 'response',
+      })
+    }
+    return localTtl
+  }
   const trackAcceptedRequest = async (
     attempt: PiNativeAttempt,
     sentBody = wireBodyText,
     template = bodyText,
     isFresh = () => true,
-    refusalSourceModel?: string,
     finalUsage?: Record<string, number>,
     prepare?: (bodyText: string) => Promise<string>,
   ) => {
@@ -1607,18 +1604,7 @@ async function sendAnthropicRequestAttempt(
       sessionCacheActivity.record(forkHead, routeId, appliedTtl)
       return
     }
-    const localTtl =
-      readSessionCachePolicy(relayAffinity, true)?.ttl !== undefined
-        ? appliedTtl
-        : cacheTtlMs || PROMPT_CACHE_DEFAULT_TTL_MS
-    if (relayAffinity) {
-      sessionCacheActivity.record(relayAffinity, routeId, localTtl)
-      reportSessionCacheTouch(relayAffinity, {
-        at,
-        ttlMs: appliedTtl,
-        source: 'response',
-      })
-    }
+    const localTtl = recordCacheAcceptance(appliedTtl, at)
     const target: Parameters<CacheKeepManager['track']>[0] = {
       sessionId: relayAffinity,
       url: input.toString(),
@@ -1630,7 +1616,6 @@ async function sendAnthropicRequestAttempt(
       oauthAccountId: routeId,
       oauthAccountIdentity: verifiedUuid,
       accountStoragePath: options.storagePath,
-      ...(refusalSourceModel && { hostMetadata: { refusalSourceModel } }),
     }
     const activeTurn = realTurn?.active ? realTurn : undefined
     let usageBody = cleanTemplate
@@ -1887,55 +1872,11 @@ async function sendAnthropicRequestAttempt(
               accountId: verifiedUuid,
               credentialId: boundCredential,
               targetAllowed,
-              ...(primaryRequest &&
-                requestCacheLifetimeMs(sourceBodyText) > 0 && {
-                  sourceWarm: {
-                    url: originUrl,
-                    headers: new Headers(headers),
-                    loadStorage: async () =>
-                      (await native.view(undefined, requestedModel))
-                        .policyStorage,
-                    cacheMode: isCacheKeepHybridActive(storage)
-                      ? 'hybrid'
-                      : 'disabled',
-                    restartIdentity:
-                      selected?.accountIdentity === verifiedUuid
-                        ? piCacheKeepAccountKey(selected)
-                        : undefined,
-                    accountStoragePath: options.storagePath,
-                    hostMetadata: {
-                      sourceWarmRouteId: routeId,
-                      sourceWarmBaseUrl: input.toString(),
-                    },
-                    currentRoute: () => {
-                      const route = roundRoutes.get(realSession)
-                      const view = native.peek?.()
-                      const current = currentMode()
-                      if (
-                        !route ||
-                        !view ||
-                        !current ||
-                        !accountMatches(route) ||
-                        route.routeId !== routeId ||
-                        route.storagePath !== options.storagePath
-                      )
-                        return undefined
-                      const routed = peekRoutingAccount({
-                        snapshot: view,
-                        router: view.routingPath
-                          ? stickyRouters.get(view.routingPath)
-                          : undefined,
-                        sessionId: realSession,
-                        modelId: requestedModel,
-                        affinityModelId: requestedModel,
-                      })
-                      if (routed !== undefined && routed !== routeId)
-                        return undefined
-                      const url = resolvedUrl()
-                      return url ? { ...route, url, mode: current } : undefined
-                    },
-                  },
-                }),
+              cache: {
+                url: input.toString(),
+                accountId: routeId,
+                accountIdentity: verifiedUuid,
+              },
             }
           : undefined,
     }
@@ -1986,7 +1927,6 @@ async function sendAnthropicRequestAttempt(
         roundRoutes.set(realSession, {
           ...piBillingPayer(attempt),
           requestedModel,
-          mode,
           url: originUrl,
           storagePath: options.storagePath,
           routeId,
@@ -2048,15 +1988,18 @@ async function sendAnthropicRequestAttempt(
               }
             : block,
         ),
+      sentBodyText: () => wireBodyText,
+      onRoundActivity(cacheTtlMs) {
+        recordCacheAcceptance(cacheTtlMs, Date.now())
+        if (relayAffinity && verifiedUuid)
+          keep.recordRoundActivity(relayAffinity, {
+            url: input.toString(),
+            accountId: routeId,
+            accountIdentity: verifiedUuid,
+          })
+      },
       async onCacheKeepTemplate(template, isCurrent) {
         if (!isCurrent() || !realSession) return
-        if (!template) {
-          keep.releaseTarget(realSession)
-          return
-        }
-        const model = template.servingModel
-        const signedRetry =
-          roundPlan?.kind === 'source' && model !== requestedModel
         const usage = Object.fromEntries(
           Object.entries(template.usage ?? {}).filter(
             (entry): entry is [string, number] => typeof entry[1] === 'number',
@@ -2067,9 +2010,8 @@ async function sendAnthropicRequestAttempt(
           template.bodyText,
           template.bodyText,
           isCurrent,
-          model === requestedModel ? undefined : requestedModel,
           usage,
-          signedRetry ? async (text) => text : signRequestBody,
+          signRequestBody,
         )
       },
     })
@@ -2314,7 +2256,6 @@ async function sendAnthropicRequestAttempt(
                   sentBody,
                   bodyText,
                   fresh,
-                  undefined,
                   usage,
                 )
             },
