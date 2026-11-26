@@ -215,6 +215,7 @@ test('credited retry changes only the permitted wire fields and bills both physi
       model: opus48,
       attempt: 2,
       usage: { input: 21, output: 7, cacheRead: 7 },
+      outcome: 'completed',
     },
     { refusalRetry: true, paysCacheWrite: false },
   ])

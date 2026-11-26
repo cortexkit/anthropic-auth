@@ -294,6 +294,80 @@ test('billing marks a cut-off stream partial without pricing unread output as ze
   expect(reports[0]?.usage).not.toHaveProperty('output')
 })
 
+test.each(['EOF', 'read error', 'cancel'] as const)(
+  'billing keeps usage without message_stop but reports a cut on %s',
+  async (ending) => {
+    const reports = capture()
+    let warmingReads = 0
+    const tracked: AnthropicBillingRequest = {
+      ...request,
+      cache: { ttlMs: 300_000 },
+      cacheWarming: () => {
+        warmingReads++
+        return { on: true }
+      },
+    }
+    const bytes = new TextEncoder().encode(
+      frame(start) +
+        frame({ type: 'message_delta', usage: { output_tokens: 7 } }),
+    )
+    const error = new Error('connection reset')
+    let sentUsage = false
+    const upstream = new Response(
+      new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            if (!sentUsage) {
+              sentUsage = true
+              controller.enqueue(bytes)
+            } else if (ending === 'read error') {
+              controller.error(error)
+            } else {
+              controller.close()
+            }
+          },
+        },
+        { highWaterMark: 0 },
+      ),
+      { headers: { 'content-type': 'text/event-stream' } },
+    )
+    const sent = await withAnthropicBilling(tracked, async () => upstream)
+    if (!sent.body) throw new Error('Expected a streamed response')
+    const reader = sent.body.getReader()
+    expect(await reader.read()).toEqual({ done: false, value: bytes })
+    if (ending === 'cancel') await reader.cancel()
+    else if (ending === 'read error')
+      await expect(reader.read()).rejects.toBe(error)
+    else expect((await reader.read()).done).toBe(true)
+    await Bun.sleep(10)
+    expect({ reports, warmingReads }).toEqual({
+      reports: [
+        expect.objectContaining({
+          outcome: 'cut',
+          usage: { input: 12, output: 7 },
+          cache: { ttl_ms: 300_000 },
+        }),
+      ],
+      warmingReads: 0,
+    })
+  },
+)
+
+test('billing treats message_stop as completion without final usage', async () => {
+  const reports = capture()
+  const sent = await withAnthropicBilling(request, async () =>
+    response([start, { type: 'message_stop' }]),
+  )
+  await sent.text()
+  await Bun.sleep(10)
+  expect(reports).toHaveLength(1)
+  expect(reports[0]).toMatchObject({
+    outcome: 'completed',
+    usage: { input: 12 },
+  })
+  expect(reports[0]?.usage).not.toHaveProperty('output')
+})
+
 test('billing reports cancellation once and handles split UTF-8 stream frames', async () => {
   const reports = capture()
   const bytes = new TextEncoder().encode(
@@ -519,7 +593,7 @@ test('oversized non-usage stream lines cannot hide a later usage frame', async (
   await Bun.sleep(10)
   expect(reports).toHaveLength(1)
   expect(reports[0]).toMatchObject({
-    outcome: 'completed',
+    outcome: 'cut',
     usage: { input: 12, output: 8 },
   })
 })

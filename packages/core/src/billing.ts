@@ -199,9 +199,10 @@ export function createAnthropicBillingObserver(
     if (sent) return
     sent = true
     const measured = anthropicBillingUsage(rawUsage)
-    // message_start's zero output is not a measurement of a cut-off answer.
+    // message_start's zero output is not a measurement of final output.
     if (!finalUsage) delete measured.usage.output
-    const outcome = failed ? 'failed' : !finalUsage ? 'cut' : 'completed'
+    const completed = sse ? stopped : finalUsage
+    const outcome = failed ? 'failed' : completed ? 'completed' : 'cut'
     const publish = (readWarming: boolean) => {
       let cache = failed ? undefined : base.cache
       if (readWarming && !cache?.warming && input.cacheWarming) {
