@@ -280,7 +280,12 @@ ${newer?.source ?? ''}
     await server.exited
   }
   try {
+    // The first healthy answer can come before OpenCode 2 has finished
+    // starting: the login command's own health check then still gets a 503
+    // for a moment. Wait until health has stayed up for a second, as the main
+    // e2e runner does, and retry the login only for that 503.
     const deadline = Date.now() + 10_000
+    let healthySince = 0
     while (true) {
       if (Date.now() >= deadline || server.exitCode !== null)
         throw new Error('OC2 did not become ready')
@@ -290,24 +295,36 @@ ${newer?.source ?? ''}
         },
         signal: AbortSignal.timeout(300),
       }).catch(() => undefined)
-      if (health?.ok) break
+      if (health?.ok) {
+        healthySince ||= Date.now()
+        if (Date.now() - healthySince >= 1_000) break
+      } else {
+        healthySince = 0
+      }
       await Bun.sleep(100)
     }
-    await mustRun(
-      [
-        ...locked,
-        'auth',
-        'login',
-        'anthropic',
-        '--method',
-        methodID,
-        '--server',
-        hostUrl,
-      ],
-      project,
-      env,
-      12_000,
-    )
+    const login = [
+      ...locked,
+      'auth',
+      'login',
+      'anthropic',
+      '--method',
+      methodID,
+      '--server',
+      hostUrl,
+    ]
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await mustRun(login, project, env, 12_000)
+        break
+      } catch (error) {
+        const starting = String(error).includes(
+          'did not provide a compatible V2 health response: UnexpectedStatus: 503',
+        )
+        if (!starting || attempt >= 3) throw error
+        await Bun.sleep(500)
+      }
+    }
     let id: string | undefined
     const readDiagnostics = () =>
       readFile(
