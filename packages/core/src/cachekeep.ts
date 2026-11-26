@@ -1211,7 +1211,8 @@ export class CacheKeepManager {
       this.retainStopped(target, reason, now)
       this.targets.delete(id)
     }
-    this.abortSessionWarms(id)
+    for (const [controller, { targetId }] of this.warmControllers)
+      if (targetId === id) controller.abort()
     if (!target) return false
     this.options.onTargetRemoved?.(id, target)
     this.publishTrackedSessions()

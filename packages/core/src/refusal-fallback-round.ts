@@ -86,6 +86,8 @@ export type RefusalFallbackRoundInput = {
     /** Route binding for the host's ordinary CacheKeep record. */
     cache?: { url: string; accountId: string; accountIdentity: string }
   }
+  /** The host's transport route changed without necessarily changing its cache binding. */
+  routeChanged?: boolean
   /** Result of comparing the host's normalized history with the round checkpoint. */
   compacted?: boolean
   /**
@@ -197,10 +199,10 @@ function fitFailure(
 
 function earlyEnd(
   round: Round,
-  { mode, oauth, compacted }: RefusalFallbackRoundInput,
+  { mode, oauth, routeChanged, compacted }: RefusalFallbackRoundInput,
 ): RefusalFallbackRoundEnd | undefined {
   if (mode !== round.mode) return 'mode'
-  if (!oauth) return 'route'
+  if (!oauth || routeChanged) return 'route'
   if (
     oauth.accountId !== round.accountId ||
     oauth.credentialId !== round.credentialId
@@ -617,7 +619,6 @@ export class RefusalFallbackRoundEngine {
     if (request.kind !== 'routed') {
       request.session.latest = request.identity
       request.session.accountId = request.accountId
-      if (request.kind === 'source') request.session.returning = undefined
       if (request.round && request.folded) request.round.folded = true
     }
     return true
@@ -851,6 +852,7 @@ export class RefusalFallbackRoundEngine {
           }
           return
         }
+        request.session.returning = undefined
         this.#sourceCompleted(request)
         publish(request.templateBodyText, completion.usage)
       },
@@ -869,6 +871,7 @@ export class RefusalFallbackRoundEngine {
         onRefusal: (refusal) => {
           if (request.phase !== 'sent' || !fresh()) return
           refusalClock = clockFrom(wireCacheTtl())
+          request.session.returning = undefined
           request.phase = 'refusal'
           request.family.clean = 0
           request.category = refusal.category

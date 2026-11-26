@@ -1869,6 +1869,10 @@ async function sendAnthropicRequestAttempt(
       mode,
       bodyText: sourceBodyText,
       compacted: primaryRequest && primary.compacted,
+      routeChanged:
+        primaryRequest &&
+        route?.requestedModel === requestedModel &&
+        route.url !== originUrl,
       oauth:
         !options.apiAccount && verifiedUuid && boundCredential
           ? {
@@ -1883,12 +1887,6 @@ async function sendAnthropicRequestAttempt(
             }
           : undefined,
     }
-    if (
-      primaryRequest &&
-      route?.requestedModel === requestedModel &&
-      route.url !== originUrl
-    )
-      roundEngine.plan({ ...planInput, oauth: undefined })
     roundPlan = primaryRequest
       ? roundEngine.plan(planInput)
       : roundEngine.planRouted(planInput)
@@ -1898,9 +1896,14 @@ async function sendAnthropicRequestAttempt(
     if (roundPlan.kind !== 'source') physicalModel = roundPlan.servingModel
   }
   if (primaryRequest && realSession && roundPlan) {
-    // A source plan can start a new round as its reply is read. Use the
-    // resulting round state, not the tentative lease's state at turn start.
-    piCacheKeep.preserveTurn(realTurn, () => roundEngine.hasRound(realSession))
+    // A fallback step preserves the requested model's CacheKeep target even
+    // when it ends the round. A source reply may still start a new round.
+    piCacheKeep.preserveTurn(
+      realTurn,
+      roundPlan.kind === 'round'
+        ? undefined
+        : () => roundEngine.hasRound(realSession),
+    )
     if (options.apiAccount) piCacheKeep.finishTurn(realTurn)
   } else if (
     roundPlan?.request ||

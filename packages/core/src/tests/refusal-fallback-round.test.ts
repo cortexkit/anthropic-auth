@@ -125,6 +125,8 @@ test('an idle round ends only past the last accepted primary step lifetime and a
 test.each([
   'count',
   'idle',
+  'interrupted return then completion',
+  'interrupted return then refusal',
   'off',
   'restart',
   'restart in off mode',
@@ -232,15 +234,28 @@ test.each([
         expect(restarted.events).toEqual([])
       } else {
         begin('retry', plan(extended))
+        const interrupted = end.startsWith('interrupted return')
         if (end === 'count') {
           for (let step = 0; step < 9; step++)
             send(plan(extended)).lifecycle?.onCompleted?.(completion)
-        } else if (end === 'idle') now += 300_001
+        } else if (end === 'idle' || interrupted) now += 300_001
         returned = plan({ ...extended, mode: end === 'off' ? 'off' : 'client' })
         expect(events.at(-1)).toMatchObject({
           kind: 'round_ended',
-          reason: end === 'off' ? 'mode' : end,
+          reason: end === 'off' ? 'mode' : interrupted ? 'idle' : end,
         })
+        if (interrupted) {
+          expect(returned).toHaveProperty('sourceCacheMarkerRestored', true)
+          // The first fetch failed before either stream lifecycle callback ran.
+          send(returned)
+          returned = plan(extended)
+          expect(returned).toHaveProperty('sourceCacheMarkerRestored', true)
+          const { lifecycle } = send(returned)
+          if (end === 'interrupted return then completion')
+            lifecycle?.onCompleted?.(completion)
+          else lifecycle?.onRefusal?.(refusal)
+          expect(plan(extended)).not.toHaveProperty('sourceCacheMarkerRestored')
+        }
         if (end === 'off')
           expect(plan({ ...extended, mode: 'off' })).not.toHaveProperty(
             'sourceCacheMarkerRestored',

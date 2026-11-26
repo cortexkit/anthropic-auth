@@ -37,6 +37,8 @@ import {
   parseSse,
   piRefusalRoundStatus,
   primaryResponseAllowsApiFallback,
+  startPiCacheKeepSession,
+  stopPiCacheKeep,
   streamCortexKitAnthropic,
 } from '../stream.ts'
 import { normalizeContext } from '../transcript.ts'
@@ -442,6 +444,29 @@ function sseFixture(frames: Record<string, unknown>[], lineEnding = '\n') {
   )
 }
 
+function isolatePiCacheKeep(directory: string) {
+  const env = {
+    XDG_DATA_HOME: join(directory, 'cache-data'),
+    PI_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR: join(directory, 'cache-registry'),
+  }
+  const previous = Object.keys(env).map(
+    (key) => [key, process.env[key]] as const,
+  )
+  Object.assign(process.env, env)
+  // Shutdown drains pending writes but keeps restart records. Both the store
+  // and the registry must stay in the fixture directory that teardown deletes.
+  return async () => {
+    try {
+      await stopPiCacheKeep()
+    } finally {
+      for (const [key, value] of previous) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  }
+}
+
 test.each(['API key', 'source authorization failure'] as const)(
   'Pi retires the kept target when planning ends a round before tracking: %s',
   async (scenario) => {
@@ -522,7 +547,9 @@ test.each(['API key', 'source authorization failure'] as const)(
       return trackedSessions.call(this)
     })
     const authorizeSpy = spyOn(native, 'authorize')
+    const cleanCacheKeep = isolatePiCacheKeep(tempDir)
     try {
+      await startPiCacheKeepSession(storagePath, sessionId)
       await getPiTrackedCacheKeepSessions()
       const manager = captured[0]!
       capture.mockRestore()
@@ -601,9 +628,146 @@ test.each(['API key', 'source authorization failure'] as const)(
       readSpy.mockRestore()
       endPiPrimaryTurn(storagePath, sessionId, true)
       forgetPiMessageThread(sessionId)
+      captured[0]?.untrack(sessionId)
+      sessionCacheActivity.forget(sessionId)
+      await cleanCacheKeep()
     }
   },
 )
+
+test('Pi restores the kept prefix on a gateway-to-direct round return', async () => {
+  tempDir = await mkdtemp(join(tmpdir(), 'pi-round-gateway-'))
+  const storagePath = join(tempDir, 'accounts.json')
+  process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+  await saveNativePiFixture({ version: 1, accounts: [] }, storagePath)
+  const native = getPiNativeRuntime(storagePath)
+  const runtime = await native.service()
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    quota: { enabled: false },
+    claudeCache: { enabled: true, mode: 'hybrid' },
+    cacheKeep: { enabled: true, always: true },
+  }))
+  const read = runtime.read.bind(runtime)
+  const readSpy = spyOn(runtime, 'read').mockImplementation(
+    async (...args) => ({
+      ...(await read(...args)),
+      refusalFallbackMode: 'client',
+    }),
+  )
+  const gatewayOrigin = 'https://gateway.example.test'
+  const gatewaySpy = spyOn(runtime, 'getClaudeGateway').mockReturnValue({
+    origin: gatewayOrigin,
+    pathPrefix: '',
+    headers: [],
+  })
+  const sessionId = 'pi-round-gateway-return'
+  const source = serverFallbackSource
+  const target = 'claude-opus-4-8'
+  const prefix = 'Keep this user prefix through the route change.'
+  const sent: {
+    url: string
+    model: string
+    messages: {
+      content: { text?: string; cache_control?: unknown }[]
+    }[]
+  }[] = []
+  const marker = (request: (typeof sent)[number]) =>
+    request.messages[0]?.content.find((block) => block.text === prefix)
+      ?.cache_control
+  globalThis.fetch = Object.assign(
+    async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const text =
+        init?.body instanceof Uint8Array
+          ? gunzipSync(init.body).toString()
+          : String(init?.body)
+      const { model, messages } = JSON.parse(text)
+      sent.push({ url: String(input), model, messages })
+      return sseFixture([
+        {
+          type: 'message_start',
+          message: { model, usage: { input_tokens: 20 } },
+        },
+        {
+          type: 'message_delta',
+          delta:
+            sent.length === 2
+              ? {
+                  stop_reason: 'refusal',
+                  stop_details: {
+                    type: 'refusal',
+                    category: 'cyber',
+                    fallback_credit_token: 'test-credit',
+                  },
+                }
+              : { stop_reason: 'end_turn' },
+        },
+        { type: 'message_stop' },
+      ])
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  const prompt = async (...messages: string[]) => {
+    beginPiPrimaryTurn(storagePath, sessionId)
+    try {
+      const reply = await streamCortexKitAnthropic(
+        source,
+        {
+          ...anthropicContext,
+          messages: messages.map((content) => ({
+            role: 'user',
+            content,
+            timestamp: 0,
+          })),
+        },
+        { sessionId },
+        undefined,
+        undefined,
+        'agent-loop',
+      ).result()
+      expect(reply.stopReason).toBe('stop')
+    } finally {
+      endPiPrimaryTurn(storagePath, sessionId)
+    }
+  }
+  const cleanCacheKeep = isolatePiCacheKeep(tempDir)
+  try {
+    await startPiCacheKeepSession(storagePath, sessionId)
+    await prompt(prefix)
+    expect(marker(sent[0]!)).toEqual({ type: 'ephemeral', ttl: '1h' })
+    const deadline = Date.now() + 1_000
+    let tracked = false
+    do {
+      tracked = (await getPiTrackedCacheKeepSessions()).some(
+        ({ id }) => id === sessionId,
+      )
+      if (!tracked) await Bun.sleep(10)
+    } while (!tracked && Date.now() < deadline)
+    expect(tracked).toBe(true)
+    await prompt(prefix, 'Start a round.')
+    expect(piRefusalRoundStatus(sessionId)).toContain(target)
+    expect(marker(sent[1]!)).toBeUndefined()
+    gatewaySpy.mockReturnValue(undefined)
+    await prompt(prefix, 'Start a round.', 'Return through the direct route.')
+    expect(sent.map(({ model }) => model)).toEqual([
+      source.id,
+      source.id,
+      target,
+      source.id,
+    ])
+    expect(sent[1]?.url).toStartWith(gatewayOrigin)
+    expect(sent[3]?.url).toStartWith(source.baseUrl)
+    expect(piRefusalRoundStatus(sessionId)).toBeUndefined()
+    expect(marker(sent[3]!)).toEqual(marker(sent[0]!))
+  } finally {
+    gatewaySpy.mockRestore()
+    readSpy.mockRestore()
+    endPiPrimaryTurn(storagePath, sessionId, true)
+    forgetPiMessageThread(sessionId)
+    sessionCacheActivity.forget(sessionId)
+    await cleanCacheKeep()
+  }
+})
 
 async function piServerFallbackFixture(mode: 'server' | 'off') {
   tempDir = await mkdtemp(join(tmpdir(), 'pi-server-fallback-'))

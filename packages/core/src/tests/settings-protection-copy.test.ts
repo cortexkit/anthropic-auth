@@ -185,9 +185,9 @@ test('release A: rebuilding a missing beside copy preserves the peer floor', asy
   expect(copy.pi).toEqual(pi)
 })
 
-test.skipIf(process.platform === 'win32')(
-  'a state folder made writable by others after preparation prevents rebuilding the beside copy',
-  async () => {
+test.skipIf(process.platform === 'win32').each(['read', 'seed'] as const)(
+  'a state folder made writable by others after preparation refuses a %s from state',
+  async (operation) => {
     const f = await fixture()
     // Prepare with the state directory the fixture created already in place.
     const { records } = await settingsTestPaths(f.file)
@@ -206,12 +206,14 @@ test.skipIf(process.platform === 'win32')(
       }),
     )
 
-    await expect(
-      writeSettingsProtectionCopy(records, 'opencode', {
-        readAt: 2,
-        values: complete,
-      }),
-    ).rejects.toBeInstanceOf(UnknownSettingsStateCopyError)
+    const copy =
+      operation === 'read'
+        ? readSettingsProtectionCopy(records, 'pi')
+        : writeSettingsProtectionCopy(records, 'opencode', {
+            readAt: 2,
+            values: complete,
+          })
+    await expect(copy).rejects.toBeInstanceOf(UnknownSettingsStateCopyError)
     expect(await Bun.file(beside.applied).exists()).toBe(false)
   },
 )

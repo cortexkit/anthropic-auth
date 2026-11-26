@@ -152,7 +152,9 @@ async function readStateCopy<T>(
 ): Promise<T | typeof missingCopy> {
   try {
     if (records.stateUnavailable) throw records.stateUnavailable
-    return records.state ? await read(records.state.applied) : missingCopy
+    if (!records.state) return missingCopy
+    await checkSettingsRecordStateFolder(records)
+    return await read(records.state.applied)
   } catch (cause) {
     throw new UnknownSettingsStateCopyError(cause)
   }
@@ -202,7 +204,6 @@ function protectionEntry(copy: Record<string, unknown>, host: SettingsHost) {
 
 function readStateSeed(records: SettingsRecordPaths) {
   return readStateCopy(records, async (path) => {
-    await checkSettingsRecordStateFolder(records)
     const copy = await readCopy(path)
     if (copy !== missingCopy) {
       protectionEntry(copy, 'opencode')

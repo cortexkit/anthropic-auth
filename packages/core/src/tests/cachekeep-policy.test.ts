@@ -778,6 +778,45 @@ test('untracking a session aborts its in-flight warm', async () => {
   }
 })
 
+test('untracking a parent target leaves its tracked sub-agent warm running', async () => {
+  const started = Promise.withResolvers<AbortSignal>()
+  const response = Promise.withResolvers<Response>()
+  const f = plannedFixture({
+    fetchImpl: Object.assign(
+      async (_url: unknown, init?: RequestInit) => {
+        started.resolve(init!.signal!)
+        return response.promise
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  expect(f.track().tracked).toBe(true)
+  const { cacheExpiresAt, nextPrewarmAt, ttlMs, policyState } = f.target
+  const childId = 'ses_planned_child'
+  const input = { ...f.input, sessionId: childId, isSubagent: true }
+  expect(
+    f.track({
+      ...input,
+      retained: { cacheExpiresAt, nextPrewarmAt, ttlMs, policyState },
+    }).tracked,
+  ).toBe(true)
+  f.advance(150_000)
+  const warming = f.manager.prewarmNow(input)
+  try {
+    const signal = await Promise.race([started.promise, warming])
+    expect(signal).toBeInstanceOf(AbortSignal)
+    if (!(signal instanceof AbortSignal))
+      throw new Error(JSON.stringify(signal))
+    expect(signal.aborted).toBe(false)
+    expect(f.manager.untrack(f.input.sessionId)).toBe(true)
+    expect(f.manager.trackedRequest(childId)).toBeDefined()
+    expect(signal.aborted).toBe(false)
+  } finally {
+    response.resolve(Response.json({}))
+    await warming
+  }
+})
+
 test('planned timeout is clipped to expiry minus safety and authorization cannot consume the margin', async () => {
   const deadlines: number[] = []
   const timeout = spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {
