@@ -163,7 +163,7 @@ Modes are `main-first` (default), `fallback-first` and `sticky-balanced` (`routi
   - **Durability:** each attempt's count and admitted cost are written owner-only before the warm is sent, so a restart cannot reset the cap. An unusable restart folder keeps every bound in memory instead.
   - **Reports:** an accepted response or a successful warm of the tracked cache sends a detached `cache_touch` with the applied lifetime, and a warmed session's retirement sends `cache_warm_stopped` with a shared reason. Neither can delay a request. During a fallback round, warms of the requested model's kept prefix follow these same reporting rules.
 - **Activity:** `session-cache-activity.ts` records when each session's cache was last refreshed by an accepted response or a successful prewarm. The sticky hold rule uses it.
-- **Prime:** an opt-in five-hour window starter. On OpenCode 1, OpenCode 2 and Pi it sends one `max_tokens: 1` Haiku request per account when the window's reset has passed. On OpenCode 1 and 2 its scheduler starts with the plugin and follows `prime_enabled` changes without a restart. A marker keyed by the verified Claude account makes sure only one process fires per reset, even across separate account files and hosts.
+- **Prime:** an opt-in five-hour window starter. On OpenCode 1, OpenCode 2 and Pi it sends one `max_tokens: 1` Haiku request per account when the window's reset has passed. On OpenCode 1 and 2 its scheduler starts with the plugin and follows `prime_enabled` changes without a restart. A marker keyed by the verified Claude account in the [per-user data folder](docs/cache.md#prime-and-lane-start) makes sure only one process using that folder fires per reset, even across separate account files and hosts.
 
 ## Message threads
 
@@ -220,7 +220,7 @@ OpenCode 2 watches its config folder, so OpenCode's machine-written state moves 
 - **Parse failures:** request bodies that can't be parsed pass through unchanged. Structural history errors and effort-plan mismatches refuse locally with a non-retryable 400, before cache shaping, signing, dumping or sending.
 - **Stream errors:** a transient `api_error` inside a 200 SSE stream becomes a connection-reset error, so the host retries it instead of storing it.
 - **Redaction:** logs, sidebar state, RPC and menus never carry tokens, raw provider bodies or prompt text. Errors use fixed messages and a fixed set of error codes.
-- **Dumps:** request `.body.json` files contain the outgoing request body and can contain prompts and tool content. Response `.response.json` files keep an allowlisted summary without response text. `OPENCODE_ANTHROPIC_AUTH_DUMP_DIR` overrides the default `opencode-anthropic-auth-dumps` folder in the temp directory.
+- **Dumps:** request `.body.json` files contain the outgoing request body and can contain prompts and tool content. Response `.response.json` files keep an allowlisted summary without response text. `OPENCODE_ANTHROPIC_AUTH_DUMP_DIR` overrides the [default per-user folder](docs/transports.md#diagnostics-and-dumps), `<data>/cortexkit/anthropic-auth/dumps/`.
 - **Logging:** the log goes to `opencode-anthropic-auth.log` in the temp folder, or to `OPENCODE_ANTHROPIC_AUTH_LOG_FILE`.
 
 ## Testing and gates

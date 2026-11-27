@@ -1,12 +1,9 @@
 import { constants } from 'node:fs'
 import { lstat, open, readdir } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { basename, join, resolve } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
+import { basename, dirname, join, resolve } from 'node:path'
 
-import {
-  getDefaultCacheKeepRegistryDirectory,
-  getLegacyCacheKeepRegistryDirectory,
-} from './cachekeep-registry.ts'
+import { getDefaultCacheKeepRegistryDirectory } from './cachekeep-registry.ts'
 import {
   HOLDER_FILE_NAME,
   type HolderLiveness,
@@ -157,6 +154,10 @@ export interface PreNArtifactLocations {
   readonly cacheKeepDirs: readonly string[]
 }
 
+function getLegacyCacheKeepRegistryDirectory(scope: 'opencode' | 'pi') {
+  return join(tmpdir(), 'opencode-anthropic-auth', 'cachekeep-sessions', scope)
+}
+
 /** The artifact folders this process can find for `env`. */
 export function defaultPreNArtifactLocations(
   env: NodeJS.ProcessEnv = process.env,
@@ -176,7 +177,7 @@ export function defaultPreNArtifactLocations(
         [
           getDefaultCacheKeepRegistryDirectory('opencode', env),
           getDefaultCacheKeepRegistryDirectory('pi', env),
-          // Remove in the release after the next one: fence older temp records too.
+          // Older publishers may register only in the system temp folder.
           getLegacyCacheKeepRegistryDirectory('opencode'),
           getLegacyCacheKeepRegistryDirectory('pi'),
           env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR?.trim(),
@@ -199,6 +200,34 @@ async function listDir(
     blockers.push({ kind: 'artifact-scan', path: dir, reason: reasonOf(error) })
     return []
   }
+}
+
+async function isLocalLegacyRegistry(
+  dir: string,
+  uid: number,
+  blockers: FenceBlocker[],
+): Promise<boolean> {
+  // Inspect from the shared temp root down: another account's private parent
+  // can make the scope directory inaccessible even to lstat.
+  for (const path of [dirname(dirname(dir)), dirname(dir), dir]) {
+    try {
+      const stat = await lstat(path)
+      if (stat.uid !== uid) return false
+      if (!stat.isDirectory()) {
+        blockers.push({
+          kind: 'artifact-scan',
+          path,
+          reason: 'not a directory',
+        })
+        return false
+      }
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT')
+        blockers.push({ kind: 'artifact-scan', path, reason: reasonOf(error) })
+      return false
+    }
+  }
+  return true
 }
 
 /** A stamped artifact was written by a version that registers as a holder. */
@@ -380,7 +409,20 @@ export async function preNArtifactBlockers(
         blockers.push({ kind: 'pre-n-artifact', artifact: path, pid })
     }
   }
+  // Windows already isolates the temp folder by account.
+  const uid = process.platform === 'win32' ? undefined : process.getuid?.()
+  const legacyRegistries = new Set([
+    resolve(getLegacyCacheKeepRegistryDirectory('opencode')),
+    resolve(getLegacyCacheKeepRegistryDirectory('pi')),
+  ])
   for (const dir of locations.cacheKeepDirs) {
+    const absolute = resolve(dir)
+    if (
+      uid !== undefined &&
+      legacyRegistries.has(absolute) &&
+      !(await isLocalLegacyRegistry(absolute, uid, blockers))
+    )
+      continue
     for (const name of await listDir(dir, blockers)) {
       const match = /^(\d+)-.+\.json$/.exec(name)
       if (!match) continue

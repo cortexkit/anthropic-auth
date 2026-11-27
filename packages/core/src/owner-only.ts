@@ -203,9 +203,9 @@ export async function ensurePrivateDirectory(
   path: string,
   options: {
     base?: string
+    createBase?: boolean
     create?: boolean
     area: string
-    ownerOnly?: OwnerOnlyOptions
   },
 ): Promise<boolean> {
   const absolute = resolve(path)
@@ -216,6 +216,10 @@ export async function ensurePrivateDirectory(
   try {
     if (!parts[0] || parts[0] === '..' || isAbsolute(parts.join(sep)))
       throw new Error('Private folder is outside its base')
+    // The configured data home can be absent on a fresh install. Windows
+    // creates missing ancestors through the native ACL backend below.
+    if (create && options.createBase && process.platform !== 'win32')
+      await mkdir(base, { recursive: true, mode: 0o700 })
     for (const part of parts) {
       directory = join(directory, part)
       let metadata = await lstat(directory).catch((error) => {
@@ -225,13 +229,7 @@ export async function ensurePrivateDirectory(
       if (!metadata && !create) return false
       if (metadata && !metadata.isDirectory())
         throw new Error('Not a directory')
-      if (
-        await ensureWindowsOwnerOnlyDirectory(
-          directory,
-          options.ownerOnly,
-          create,
-        )
-      )
+      if (await ensureWindowsOwnerOnlyDirectory(directory, undefined, create))
         continue
       if (!metadata) {
         try {

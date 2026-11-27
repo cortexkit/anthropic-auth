@@ -8,11 +8,11 @@ import {
   unlink,
   writeFile,
 } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
 import { fallbackCreditRequestDumpView } from './fallback-credit.ts'
 import { isClaudeGatewaySecretHeader } from './gateway.ts'
+import { getHostDataHome } from './host-paths.ts'
 import { parseJsonRedacted } from './json.ts'
 import { isSecretKey, logger, relayLog } from './logger.ts'
 import { createWindowsOwnerOnly, ensurePrivateDirectory } from './owner-only.ts'
@@ -35,7 +35,7 @@ const DUMP_USAGE =
 const DUMP_DIR_ENV = 'OPENCODE_ANTHROPIC_AUTH_DUMP_DIR'
 const DUMP_MAX_BYTES_ENV = 'OPENCODE_ANTHROPIC_AUTH_DUMP_MAX_BYTES'
 const defaultDumpDirectory = () =>
-  join(tmpdir(), 'opencode-anthropic-auth-dumps')
+  join(getHostDataHome(), 'cortexkit', 'anthropic-auth', 'dumps')
 const DEFAULT_DUMP_MAX_BYTES = 512 * 1024 * 1024
 const DUMP_SWEEP_INTERVAL_MS = 5 * 60 * 1000
 const DUMP_SWEEP_NEWNESS_FLOOR_MS = 60 * 1000
@@ -163,7 +163,8 @@ export async function writeDumpFile(path: string, contents: string) {
 
 function ensureDefaultDumpDirectory(directory: string, create: boolean) {
   return ensurePrivateDirectory(directory, {
-    base: tmpdir(),
+    base: getHostDataHome(),
+    createBase: true,
     create,
     area: 'dump',
   })

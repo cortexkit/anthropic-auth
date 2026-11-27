@@ -49,7 +49,7 @@ A legacy sidecar is an old migration-source file. The native account files store
 | `OPENCODE_TUI_PREFERENCES_FILE` | Full path override for the optional shared `tui-preferences.jsonc` |
 | `PI_CODING_AGENT_DIR`, `PI_AGENT_DIR` | Pi extension default storage directory, in that precedence order |
 | `XDG_CONFIG_HOME` | Base for the default OpenCode config directory and, when absolute, the shared settings file at `cortexkit/anthropic-auth.jsonc` on every OS |
-| `XDG_DATA_HOME` | Base for OpenCode's data directory used to resolve OpenCode 1 `auth.json` during setup, and for the [CacheKeep session registry and restart store](cachekeep-registry.md#location-and-permissions) |
+| `XDG_DATA_HOME` | Base for OpenCode's data directory used to resolve OpenCode 1 `auth.json` during setup, and for the [CacheKeep session registry and restart store](cachekeep-registry.md#location-and-permissions), [Prime markers](cache.md#prime-and-lane-start) and [default request dumps](transports.md#diagnostics-and-dumps) |
 | `XDG_STATE_HOME` | Base for default enrollment files, `cortexkit/anthropic-auth/<host>-enrollment.json`; otherwise `~/.local/state` (`%USERPROFILE%\.local\state` on Windows) |
 
 A completed import records its routing destination in the journal; serving uses that recorded path rather than retroactively relocating it when an override changes. See [local storage](accounts-and-routing.md#local-storage). Pi SDK login-path resolution uses `PI_CODING_AGENT_DIR` (including home expansion), not the extension-only `PI_AGENT_DIR` fallback; the two are not interchangeable for host auth.

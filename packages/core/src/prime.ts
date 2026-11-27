@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto'
 import * as fs from 'node:fs'
 import { lstat, open, readdir, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { canonicalFilePathSync } from '@cortexkit/common-auth/fs'
 
@@ -17,6 +16,7 @@ import {
   type PrimeUsageCounters,
   quotaSnapshotOmitsFiveHour,
 } from './accounts.ts'
+import { getHostDataHome } from './host-paths.ts'
 import { logger } from './logger.ts'
 import {
   CLAUDE_HAIKU_4_5_MODEL_ID,
@@ -425,7 +425,7 @@ type AccountEvaluation = {
 }
 
 function defaultMarkerDir(): string {
-  return join(tmpdir(), 'opencode-anthropic-auth', 'prime')
+  return join(getHostDataHome(), 'cortexkit', 'anthropic-auth', 'prime')
 }
 
 export function primeStorageFingerprint(storagePath: string): string {
@@ -738,7 +738,9 @@ export class PrimeManager {
     }
     if (
       !(await ensurePrivateDirectory(this.markerRoot(), {
-        base: this.options.markerDir === undefined ? tmpdir() : undefined,
+        base:
+          this.options.markerDir === undefined ? getHostDataHome() : undefined,
+        createBase: this.options.markerDir === undefined,
         area: 'prime',
       })) ||
       this.stopped

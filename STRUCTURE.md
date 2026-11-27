@@ -47,6 +47,7 @@ docs/           public user and contributor documentation
 - **Cache:** `cache1h.ts`, `session-cache-policy.ts` (per-session policy from Thalamus), `cachekeep.ts` (one requested-model warm target per session, including during client fallback), `cachekeep-store.ts` (restart store), `cachekeep-registry.ts` (session list) and `prime.ts`.
 - **State layout:** `state-layout-*.ts`, `holder-registry.ts`, `layout-fence.ts`, `relocation-guard.ts` and `state-home-serving-guard.ts`.
 - **Shared plumbing:** `logger.ts`, `logging.ts`, `dump.ts`, `json.ts` (redacting JSON parse), `sse.ts`, `owner-only.ts`, `publication-rename.ts`, `network-errors.ts` and `provider-error.ts`.
+- **User data folders:** the [CacheKeep session list](docs/cachekeep-registry.md#location-and-permissions), [Prime markers](docs/cache.md#prime-and-lane-start) and [default request dumps](docs/transports.md#diagnostics-and-dumps) use `<data>/cortexkit/anthropic-auth/`.
 - `tests/`: Core unit tests. `test-lifetime.ts` holds the body-owned cleanup helper.
 - `../scripts/`: the Core build and the declaration-closure guard for bundled common-auth types (`check-native-type-closure.ts`).
 

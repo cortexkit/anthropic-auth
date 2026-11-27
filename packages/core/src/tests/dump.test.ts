@@ -96,19 +96,24 @@ test('request dumps return response handles only when enabled', async () => {
 })
 
 test.skipIf(process.platform === 'win32')(
-  'default dump folder is private and all new dump files have mode 0600',
+  'default dumps land in the private data folder, are pruned there, and have mode 0600',
   async () => {
     const base = await mkdtemp(join(tmpdir(), 'private-dumps-'))
     dumpDirs.push(base)
-    const original = process.env.TMPDIR
+    const originalTmp = process.env.TMPDIR
+    const originalData = process.env.XDG_DATA_HOME
+    const data = join(base, 'data')
     process.env.TMPDIR = base
+    process.env.XDG_DATA_HOME = data
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
     setDumpEnabled(true)
     try {
-      const dumpDir = join(base, 'opencode-anthropic-auth-dumps')
-      // Point the override at this test's copy of the default folder too, so the
-      // test can't write to the runner's real temp folder.
-      process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+      const dumpDir = join(data, 'cortexkit', 'anthropic-auth', 'dumps')
+      const oldDir = join(base, 'opencode-anthropic-auth-dumps')
+      const oldDump = join(oldDir, dumpArtifactName(1))
+      await mkdir(oldDir)
+      await writeFile(oldDump, 'untouched')
+      expect(getDumpDirectory()).toBe(dumpDir)
       const dump = () =>
         dumpDirectRequest({
           affinity: 'ses-private',
@@ -117,13 +122,19 @@ test.skipIf(process.platform === 'win32')(
         })
       const handle = await dump()
       expect(handle).not.toBeNull()
-      expect(getDumpDirectory()).toBe(dumpDir)
       expect((await lstat(dumpDir)).mode & 0o777).toBe(0o700)
       await dumpResponseArtifact(handle, { status: 200, message: {} })
       const entries = await readdir(dumpDir)
       expect(entries.length).toBeGreaterThanOrEqual(3)
       for (const name of entries)
         expect((await lstat(join(dumpDir, name))).mode & 0o777).toBe(0o600)
+      await sweepDumpDirectory({
+        maxBytes: 1,
+        minAgeMs: 0,
+        now: Date.now() + 1_000,
+      })
+      expect(await readdir(dumpDir)).toEqual([])
+      expect(await readFile(oldDump, 'utf8')).toBe('untouched')
       await chmod(dumpDir, 0o755)
       expect(await dump()).not.toBeNull()
       expect((await lstat(dumpDir)).mode & 0o777).toBe(0o700)
@@ -136,8 +147,10 @@ test.skipIf(process.platform === 'win32')(
       await dumpResponseArtifact(handle, { status: 200, message: {} })
       expect(await readdir(target)).toEqual([])
     } finally {
-      if (original === undefined) delete process.env.TMPDIR
-      else process.env.TMPDIR = original
+      if (originalTmp === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = originalTmp
+      if (originalData === undefined) delete process.env.XDG_DATA_HOME
+      else process.env.XDG_DATA_HOME = originalData
     }
   },
 )

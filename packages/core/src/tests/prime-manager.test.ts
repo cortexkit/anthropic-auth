@@ -82,7 +82,7 @@ async function tempMarkerRoot(): Promise<string> {
 
 function manager(input: {
   storagePath: string
-  markerDir: string
+  markerDir?: string
   now: () => number
   loadStorage: () => Promise<AccountStorage>
   refreshQuota: () => Promise<OAuthQuotaSnapshot>
@@ -117,6 +117,69 @@ function manager(input: {
 }
 
 describe('PrimeManager storage namespaces', () => {
+  test.skipIf(process.platform === 'win32')(
+    'the default Prime root writes and sweeps only in the user data folder',
+    async () => {
+      const root = await tempMarkerRoot()
+      const data = join(root, 'data')
+      const storagePath = join(root, 'accounts.json')
+      const lineage = tokenFingerprint(TEST_LINEAGE)
+      const accountDir = primeAccountMarkerDir(
+        join(data, 'cortexkit', 'anthropic-auth', 'prime'),
+        storagePath,
+        lineage,
+      )
+      const legacyDir = primeAccountMarkerDir(
+        join(root, 'opencode-anthropic-auth', 'prime'),
+        storagePath,
+        lineage,
+      )
+      const now = Date.now()
+      const staleName = 'main-1'
+      const stale = new Date(now - PRIME_MARKER_MAX_AGE_MS - 1_000)
+      const oldTmp = process.env.TMPDIR
+      const oldData = process.env.XDG_DATA_HOME
+      process.env.TMPDIR = root
+      process.env.XDG_DATA_HOME = data
+      try {
+        await mkdir(legacyDir, { recursive: true, mode: 0o700 })
+        await writeFile(join(legacyDir, staleName), '')
+        await utimes(join(legacyDir, staleName), stale, stale)
+        const legacyClaim = join(legacyDir, 'main-bootstrap')
+        await writeFile(legacyClaim, '')
+        await utimes(legacyClaim, new Date(now), new Date(now))
+
+        let sends = 0
+        const prime = manager({
+          storagePath,
+          now: () => now,
+          loadStorage: async () => storage(),
+          refreshQuota: async () => ({}),
+          sendPrime: async () => {
+            sends++
+          },
+        })
+        await prime.tick()
+        expect(await readdir(accountDir)).toEqual(['main-bootstrap'])
+        expect(sends).toBe(1)
+        expect((await lstat(accountDir)).mode & 0o777).toBe(0o700)
+        await writeFile(join(accountDir, staleName), '')
+        await utimes(join(accountDir, staleName), stale, stale)
+        await prime.tick()
+        expect(await readdir(accountDir)).toEqual(['main-bootstrap'])
+        expect((await readdir(legacyDir)).sort()).toEqual([
+          staleName,
+          'main-bootstrap',
+        ])
+      } finally {
+        if (oldTmp === undefined) delete process.env.TMPDIR
+        else process.env.TMPDIR = oldTmp
+        if (oldData === undefined) delete process.env.XDG_DATA_HOME
+        else process.env.XDG_DATA_HOME = oldData
+      }
+    },
+  )
+
   test('Ultra skips priming a stored or newly polled account with no five-hour limit', async () => {
     const now = Date.now()
     const quota: OAuthQuotaSnapshot = {
