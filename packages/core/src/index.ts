@@ -168,6 +168,7 @@ export type {
   NativeLocalFailurePolicyInput,
 } from './native-local-credential-service.ts'
 export { createNativeLocalCredentialService } from './native-local-credential-service.ts'
+export { createNativeLocalNoRouteError } from './native-local-refusal.ts'
 export type { NativeLocalExternalPolicy } from './native-local-runtime-readers.ts'
 export type { NativeLockEvent } from './native-lock-observer.ts'
 export { withNativeLock } from './native-lock-observer.ts'

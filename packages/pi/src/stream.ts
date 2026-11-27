@@ -30,6 +30,7 @@ import {
   copyStreamResponseTiming,
   createAnthropicStreamCompletion,
   createDumpResponseObserver,
+  createNativeLocalNoRouteError,
   createNativeVaultNoRouteResponse,
   createProviderErrorResponseScope,
   createQuotaRefusalResponse,
@@ -54,7 +55,6 @@ import {
   getCacheDiagnosticsBetas,
   getCacheKeepRegistryDirectories,
   getClaudeCodeIdentityForVerifiedAccount,
-  getFallbackReauthLabels,
   getMaxSameAccountWait,
   getQuotaCheckIntervalMs,
   getRequestGzipLatch,
@@ -3708,9 +3708,21 @@ async function executeWithFallback(options: {
           sessionId,
           waitForReset: getWaitForReset(storage) && !advice,
         })
+      const reauth = createNativeLocalNoRouteError({
+        snapshot: {
+          ...snapshot,
+          accounts: snapshot.accounts.map((account) => ({
+            ...account,
+            quota:
+              routes.allRoutes.find((route) => route.id === account.id)
+                ?.quota ?? account.quota,
+          })),
+        },
+        modelId: options.model.id,
+        sticky: true,
+      })
+      if (reauth) return reauth.response()
       return createStickyNoRouteResponse({
-        mainRefreshError: storage?.refresh?.mainLastRefreshError,
-        fallbackReauthLabels: getFallbackReauthLabels(storage),
         routeQuotas: routes.allRoutes.flatMap((route) =>
           route.quota ? [route.quota] : [],
         ),
@@ -4015,6 +4027,11 @@ async function executeWithFallback(options: {
         sessionId: options.streamOptions?.sessionId,
         waitForReset: getWaitForReset(storage) && !advice,
       })
+    const reauth = createNativeLocalNoRouteError({
+      snapshot,
+      modelId: options.model.id,
+    })
+    if (reauth) return reauth.response()
     return createStickyNoRouteResponse({
       routeQuotas: (storage?.accounts ?? [])
         .filter(isOAuthAccount)
@@ -4057,6 +4074,11 @@ async function executeWithFallback(options: {
         options.streamOptions?.signal,
         options.model.id,
       )
+      const reauth = createNativeLocalNoRouteError({
+        snapshot: current,
+        modelId: options.model.id,
+      })
+      if (reauth) return reauth.response()
       return createQuotaRefusalResponse(
         'Killswitch blocked all OAuth routes',
         quotaRefusalTiming({

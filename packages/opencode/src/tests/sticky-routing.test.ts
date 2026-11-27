@@ -109,12 +109,7 @@ describe('sticky-balanced session routing', () => {
       fable: 0,
     })
     const response = createStickyNoRouteResponse({
-      mainRefreshError: {
-        message: 'invalid_grant',
-        checkedAt: NOW,
-        status: 400,
-        permanent: true,
-      },
+      mainRequiresReauth: true,
       routeQuotas: [exhausted.quota],
       modelId: 'claude-fable-5',
       now: NOW,
@@ -154,7 +149,7 @@ describe('sticky-balanced session routing', () => {
       error: {
         type: 'authentication_error',
         message:
-          'No OAuth account is currently routable for Fable. Fallback Claude OAuth accounts require re-login: ufuk2, yiyi.',
+          'Fallback Claude OAuth accounts require re-login: ufuk2, yiyi. No OAuth account is currently routable for Fable.',
       },
     })
   })

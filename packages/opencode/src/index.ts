@@ -55,6 +55,7 @@ import {
   createDumpResponseObserver,
   createEmptyStorage,
   createNativeAccountRuntime,
+  createNativeLocalNoRouteError,
   createNativeUsagePublisher,
   createNativeVaultNoRouteResponse,
   createProviderErrorResponseScope,
@@ -101,7 +102,6 @@ import {
   getClaudeCodeIdentityForVerifiedAccount,
   getClaudeModelCatalogue,
   getClaustrumMode,
-  getFallbackReauthLabels,
   getHostClaustrumEnrollmentPaths,
   getKillswitchConfig,
   getMaxSameAccountWait,
@@ -1890,6 +1890,7 @@ const anthropicAuthPlugin = async (
       readonly tokenRefreshFailed = false,
       readonly failure?: NativeRefreshFailure,
       readonly validationRetryAt?: number,
+      readonly localAuthDecline?: 'invalid-grant',
     ) {
       super(
         validationRetryAt !== undefined
@@ -2033,6 +2034,10 @@ const anthropicAuthPlugin = async (
             authorization.failure.kind === 'provider',
           authorization.status === 'failed' ? authorization.failure : undefined,
           nativeValidationRetryAt(authorization),
+          authorization.status === 'refused' &&
+            authorization.reason === 'invalid-grant'
+            ? authorization.reason
+            : undefined,
         )
       }
       result = {
@@ -10591,6 +10596,12 @@ const anthropicAuthPlugin = async (
                 scopedModelId?: string,
               ) {
                 const current = await nativeAccounts.read()
+                const reauth = createNativeLocalNoRouteError({
+                  snapshot: current,
+                  modelId: scopedModelId ?? credentialModelId,
+                  otherReasons: [reason],
+                })
+                if (reauth) return reauth.response()
                 return reportHostWait(
                   createQuotaRefusalResponse(
                     reason,
@@ -10809,6 +10820,14 @@ const anthropicAuthPlugin = async (
                   )
                     throw auth.credentialFailure
                   if (!resolution && incompleteQuotaPool) {
+                    if (!stickyRoutes.allRoutes.length) {
+                      const reauth = createNativeLocalNoRouteError({
+                        snapshot,
+                        modelId: routingModelId,
+                        sticky: true,
+                      })
+                      if (reauth) return reauth.response()
+                    }
                     if (auth.modelDenied) return modelDeniedResponse()
                     throw new Error(
                       'Sticky-balanced routing is waiting for current OAuth quota snapshots',
@@ -10841,12 +10860,22 @@ const anthropicAuthPlugin = async (
                         'account_free',
                       )
                     }
+                    const reauth = createNativeLocalNoRouteError({
+                      snapshot: {
+                        ...snapshot,
+                        accounts: snapshot.accounts.map((account) => ({
+                          ...account,
+                          quota:
+                            stickyRoutes.allRoutes.find(
+                              (route) => route.id === account.id,
+                            )?.quota ?? account.quota,
+                        })),
+                      },
+                      modelId: routingModelId,
+                      sticky: true,
+                    })
+                    if (reauth) return reauth.response()
                     const response = createStickyNoRouteResponse({
-                      mainRefreshError:
-                        stickyRoutes.storage?.refresh?.mainLastRefreshError,
-                      fallbackReauthLabels: getFallbackReauthLabels(
-                        stickyRoutes.storage,
-                      ),
                       routeQuotas: stickyRoutes.allRoutes.flatMap((route) =>
                         route.quota ? [route.quota] : [],
                       ),
@@ -11448,6 +11477,17 @@ const anthropicAuthPlugin = async (
                     NativeCredentialUnavailableError
                 )
                   throw new NativeVaultNoAccountError()
+                if (
+                  mainSharedCredentialError instanceof
+                    NativeCredentialUnavailableError &&
+                  mainSharedCredentialError.localAuthDecline
+                ) {
+                  const reauth = createNativeLocalNoRouteError({
+                    snapshot: await nativeAccounts.read(credentialModelId),
+                    modelId: credentialModelId,
+                  })
+                  if (reauth) return reauth.response()
+                }
                 throw mainSharedCredentialError
               }
 
@@ -11537,6 +11577,25 @@ const anthropicAuthPlugin = async (
                       throw new NativeVaultNoAccountError()
                     throw error
                   }
+                }
+                if (auth.credentialFailure?.localAuthDecline) {
+                  const reauth = createNativeLocalNoRouteError({
+                    snapshot: await nativeAccounts.read(credentialModelId),
+                    modelId: credentialModelId,
+                  })
+                  if (reauth) return reauth.response()
+                  throw auth.credentialFailure
+                }
+                const current = nativeAccounts.peek?.()
+                if (
+                  current &&
+                  !current.accounts.some((account) => account.id === 'main')
+                ) {
+                  const reauth = createNativeLocalNoRouteError({
+                    snapshot: current,
+                    modelId: credentialModelId,
+                  })
+                  if (reauth) return reauth.response()
                 }
                 // Report an OAuth exchange failure rather than immediately
                 // masking it with its backoff. A failed account check needs

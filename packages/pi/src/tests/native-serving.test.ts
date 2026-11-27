@@ -18,6 +18,11 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import type { Api, Context, Model } from '@earendil-works/pi-ai'
 import { isRetryableAssistantError } from '@earendil-works/pi-ai/compat'
+import {
+  localAuthFixtureQuota,
+  localAuthRefusalScenarios,
+  seedLocalAuthRefusal,
+} from '../../../core/src/tests/local-auth-refusal-fixture.ts'
 import { TestLifetime } from '../../../core/src/tests/test-lifetime.ts'
 import {
   closePiNativeRuntime,
@@ -83,6 +88,102 @@ afterEach(async () => {
   delete process.env.PI_ANTHROPIC_AUTH_FILE
   await rm(directory, { recursive: true, force: true })
 })
+
+for (const mode of ['main-first', 'sticky-balanced'] as const) {
+  test.each(localAuthRefusalScenarios)(
+    `#916 Pi ${mode}: %s`,
+    async (scenario) => {
+      const alternateAccess = 'sk-ant-oat01-pi-refusal-alternate'
+      const alternate =
+        scenario === 'live alternate' || scenario === 'quota-blocked alternate'
+      await saveNativePiFixture(
+        {
+          version: 1,
+          routing: { mode },
+          quota: {
+            enabled: alternate,
+            minimumRemaining: { five_hour: 10, seven_day: 10 },
+          },
+          accounts: alternate
+            ? [
+                {
+                  type: 'oauth',
+                  id: 'alternate',
+                  access: alternateAccess,
+                  refresh: 'pi-alternate-refresh',
+                  expires: Date.now() + 3_600_000,
+                  quota: localAuthFixtureQuota(
+                    scenario === 'live alternate' ? 70 : 5,
+                  ),
+                },
+                {
+                  type: 'api',
+                  id: 'paid',
+                  apiKey: 'unused',
+                  baseURL: 'https://paid.invalid',
+                  enabled: false,
+                },
+              ]
+            : [
+                {
+                  type: 'api',
+                  id: 'paid',
+                  apiKey: 'unused',
+                  baseURL: 'https://paid.invalid',
+                  enabled: false,
+                },
+              ],
+        },
+        storagePath,
+      )
+      const waiting =
+        scenario === 'validation wait' || scenario === 'stale record'
+      await seedLocalAuthRefusal(
+        await resolveNativePoolPaths(storagePath),
+        waiting
+          ? scenario === 'stale record'
+            ? 'stale'
+            : 'validation'
+          : 'dead',
+      )
+      const outbound: [string, string | null][] = []
+      globalThis.fetch = Object.assign(
+        async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          const path = new URL(String(input)).pathname
+          outbound.push([path, new Headers(init?.headers).get('authorization')])
+          if (path === '/v1/messages') return success()
+          throw new Error(`Unexpected provider request: ${path}`)
+        },
+        { preconnect: originalFetch.preconnect },
+      )
+      const result = await streamCortexKitAnthropic(model, context, {
+        sessionId: 'pi-refusal',
+      }).result()
+      if (scenario === 'live alternate') {
+        expect(result.stopReason).toBe('stop')
+        expect(outbound).toEqual([
+          ['/v1/messages', `Bearer ${alternateAccess}`],
+        ])
+      } else {
+        expect(result.stopReason).toBe('error')
+        if (waiting) {
+          expect(result.errorMessage).toStartWith(
+            mode === 'sticky-balanced'
+              ? 'Sticky-balanced routing is waiting for current OAuth quota snapshots'
+              : "Claude couldn't confirm which account this login belongs to",
+          )
+        } else {
+          expect(result.errorMessage).toContain('HTTP 401')
+          expect(result.errorMessage).toContain(
+            '"type":"authentication_error","message":"Main Claude OAuth account requires re-login',
+          )
+          if (alternate) expect(result.errorMessage).toContain('quota floor')
+        }
+        expect(outbound).toEqual([])
+      }
+    },
+  )
+}
 
 test('a failed post-refresh Claude lookup in Pi recovers on the scheduled check', async () => {
   await saveNativePiFixture(
