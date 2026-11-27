@@ -80,7 +80,7 @@
     "@cortexkit/anthropic-auth-core": "2.17.1",
     "@cortexkit/claustrum-client": "0.21.0",
     "@cortexkit/private-files": "0.2.2",
-    "@cortexkit/subc-client": "^0.24",
+    "@cortexkit/subc-client": "^0.26",
     "@opentui/core": "0.9.7",
     "@opentui/solid": "0.9.7",
     "jsonc-parser": "^3.3.1",
