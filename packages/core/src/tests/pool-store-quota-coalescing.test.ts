@@ -190,17 +190,11 @@ for (const lane of lanes) {
             ? [poll, header]
             : [header, poll])
             await store.recordQuota('a', epoch1('acct-a'), reading)
-          const keepsPollFields =
-            lane.name === 'library' || order === 'poll, then newer header'
           const expected: Facts = {
             five_hour: { usedPercent: 12, checkedAt: 2_000 },
             seven_day: { usedPercent: 41, checkedAt: 2_000 },
-            ...(keepsPollFields
-              ? {
-                  fable: { usedPercent: 51, checkedAt: 1_000 },
-                  extraUsagePercent: 19.225,
-                }
-              : {}),
+            fable: { usedPercent: 51, checkedAt: 1_000 },
+            extraUsagePercent: 19.225,
           }
           expect(await facts(store, lane, 'a')).toEqual(expected)
           await closeStore(store)
@@ -210,7 +204,7 @@ for (const lane of lanes) {
     }
 
     coalescing(
-      'an older poll arriving after a newer header on disk never replaces the newer windows',
+      'the first poll adds scoped limits and credits without replacing newer header windows on disk',
       async () => {
         const paths = await fixture()
         await seed(paths, lane, [['a', 'acct-a']])
@@ -227,6 +221,8 @@ for (const lane of lanes) {
           (value) => value.five_hour?.checkedAt === 2_000,
         )
         expect(header.five_hour).toEqual({ usedPercent: 12, checkedAt: 2_000 })
+        expect(header.fable).toBeUndefined()
+        expect(header.extraUsagePercent).toBeUndefined()
         await store.recordQuota(
           'a',
           epoch1('acct-a'),
@@ -241,16 +237,10 @@ for (const lane of lanes) {
         const expected: Facts = {
           five_hour: { usedPercent: 12, checkedAt: 2_000 },
           seven_day: { usedPercent: 41, checkedAt: 2_000 },
-          ...(lane.name === 'library'
-            ? {
-                fable: { usedPercent: 51, checkedAt: 1_000 },
-                extraUsagePercent: 19.225,
-              }
-            : {}),
+          fable: { usedPercent: 51, checkedAt: 1_000 },
+          extraUsagePercent: 19.225,
         }
         expect(await facts(store, lane, 'a')).toEqual(expected)
-        // Native snapshots can stay unchanged, so join the drain rather than
-        // waiting for a poll-only field that the legacy merge does not retain.
         await closeStore(store)
         expect(await onDisk(paths, lane, 'a')).toEqual(expected)
       },
