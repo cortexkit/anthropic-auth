@@ -12,6 +12,7 @@ import {
   MessageThreadTailStore,
 } from './message-thread-tail-store.ts'
 import type { NativeLocalPoolBinding } from './pool-binding.ts'
+import { raceWithSignal } from './request-abort.ts'
 import { isServerFallbackUsageMarker } from './server-fallback-usage.ts'
 import { createSseFramer, decodeSseFrame, parseSseFrame } from './sse.ts'
 import { copyStreamResponseTiming } from './stream-completion.ts'
@@ -1438,12 +1439,13 @@ async function readThreadError(response: Response): Promise<Body | undefined> {
   if (response.status !== 400 && response.status !== 404) return undefined
   const reader = response.clone().body?.getReader()
   if (!reader) return undefined
+  const signal = AbortSignal.timeout(5_000)
   let text = ''
   let remaining = 16_384
   const decoder = new TextDecoder()
   try {
     while (remaining > 0) {
-      const chunk = await reader.read()
+      const chunk = await raceWithSignal(signal, () => reader.read())
       if (chunk.done) break
       remaining -= chunk.value.byteLength
       if (remaining < 0) return undefined

@@ -1839,6 +1839,77 @@ test.each([
   }
 })
 
+test.each([
+  [400, 'invalid_request_error', 'thread_fingerprint_mismatch'],
+  [404, 'not_found_error', 'thread_not_found'],
+] as const)(
+  'thread recovery returns the original %i response when its body stalls',
+  async (status, type, code) => {
+    const tracker = new MessageThreadTracker()
+    const full = advance(
+      anchor(tracker, {
+        ...input(),
+        account: `stalled-error-${status}`,
+        betas: ['base', MESSAGE_THREADS_BETA],
+      }),
+    )
+    const request = await prepareMessageThreadRequest(tracker, {
+      ...full,
+      bodyText: JSON.stringify(full.body),
+      headers: new Headers({ 'anthropic-beta': 'base' }),
+    })
+    expect(JSON.parse(request.bodyText).thread.type).toBe('continue')
+    const text = JSON.stringify({
+      error: { type, details: { error_code: code } },
+    })
+    let bodyController!: ReadableStreamDefaultController<Uint8Array>
+    const original = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          bodyController = controller
+          controller.enqueue(new TextEncoder().encode(text))
+        },
+      }),
+      { status },
+    )
+    const copy = original.clone()
+    const reader = copy.body!.getReader()
+    const stalled = Promise.withResolvers<void>()
+    const read = reader.read.bind(reader)
+    let reads = 0
+    spyOn(reader, 'read').mockImplementation(() => {
+      if (++reads === 2) stalled.resolve()
+      return read()
+    })
+    spyOn(copy.body!, 'getReader').mockReturnValue(reader)
+    spyOn(original, 'clone').mockReturnValue(copy)
+    const cancel = spyOn(reader, 'cancel')
+    const deadline = new AbortController()
+    const timeout = spyOn(AbortSignal, 'timeout').mockReturnValue(
+      deadline.signal,
+    )
+    let sends = 0
+    try {
+      const pending = request.recover(original, async () => {
+        sends++
+        return new Response('unexpected resend')
+      })
+      await stalled.promise
+      expect(timeout.mock.calls).toEqual([[5_000]])
+      deadline.abort(
+        new DOMException('thread error read timed out', 'TimeoutError'),
+      )
+      expect(await pending).toBe(original)
+      expect(sends).toBe(0)
+      expect(cancel).toHaveBeenCalledTimes(1)
+    } finally {
+      timeout.mockRestore()
+      bodyController.close()
+    }
+    expect(await original.text()).toBe(text)
+  },
+)
+
 test.each(['accepted', 'downstream rejected'])(
   'audit recovered create: %s resend has a fresh lifecycle',
   async (outcome) => {
