@@ -1046,9 +1046,8 @@ export class StickySessionRouter {
         state.assignments[key] = assignment
         changed = true
       }
-      // Imported pins must not replace newer destination choices. Ordinary
-      // routing handles expired pins and accounts that no longer exist.
-      if (changed) await this.writeState(state, () => lock.assertOwned(), false)
+      // Imported pins fill missing entries and share the destination's limits.
+      if (changed) await this.writeState(state, () => lock.assertOwned())
     } finally {
       await lock.release()
     }
@@ -1082,10 +1081,9 @@ export class StickySessionRouter {
   private async writeState(
     state: StickyRouteState,
     beforeRename: () => Promise<void>,
-    prune = true,
   ) {
     await this.options.relocationGuard?.assertNotRelocated()
-    if (prune) this.prune(state)
+    this.prune(state)
     state.updatedAt = this.now()
     const tempPath = `${this.options.path}.${randomUUID()}.tmp`
     try {
@@ -1107,18 +1105,14 @@ export class StickySessionRouter {
   ) {
     let ownershipLost = false
     try {
-      await this.writeState(
-        state,
-        async () => {
-          try {
-            await assertOwned()
-          } catch (error) {
-            ownershipLost = true
-            throw error
-          }
-        },
-        false,
-      )
+      await this.writeState(state, async () => {
+        try {
+          await assertOwned()
+        } catch (error) {
+          ownershipLost = true
+          throw error
+        }
+      })
       return true
     } catch {
       // A failed publication keeps its session change pending for a later retry.
@@ -1175,9 +1169,8 @@ export class StickySessionRouter {
           }
         }
         state.vaultLegacySeed = 'complete'
-        // Imported pins fill only missing assignments, leaving existing ones
-        // unchanged. Publish the marker and additions in one owned rename.
-        await this.writeState(state, () => lock.assertOwned(), false)
+        // Publish the import marker and the pruned assignments together.
+        await this.writeState(state, () => lock.assertOwned())
         this.seedFinalized = true
       } finally {
         await lock.release()

@@ -1,4 +1,5 @@
 import { expect } from 'bun:test'
+import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   mkdir,
@@ -47,8 +48,15 @@ async function fixture() {
     await Promise.all(routers.map((router) => router.drain()))
     await rm(directory, { recursive: true, force: true })
   })
-  const router = (onLockEvent?: (event: NativeLockEvent) => void) => {
-    const value = new StickySessionRouter({ path, onLockEvent })
+  const router = (
+    onLockEvent?: (event: NativeLockEvent) => void,
+    localRecoveryPath?: string,
+  ) => {
+    const value = new StickySessionRouter({
+      path,
+      onLockEvent,
+      localRecoveryPath,
+    })
     routers.push(value)
     return value
   }
@@ -183,6 +191,119 @@ lifetimes.test(
   10_000,
 )
 
+lifetimes.test(
+  'sticky routing assignment prunes the locked state without losing a live peer pin',
+  async () => {
+    const f = await fixture()
+    const contended = lifetimes.gate()
+    const router = f.router((event) => {
+      if (event.detached && event.type === 'contended') contended.open()
+    })
+    const now = Date.now()
+    const pin = (lastSeenAt: number) => ({
+      accountId: 'main',
+      family: 'general',
+      affinityModelId: 'claude-sonnet-5',
+      assignedAt: lastSeenAt,
+      lastSeenAt,
+      initialInputBytes: 1,
+      quotaCheckedAt: 0,
+    })
+    const assignments = Object.fromEntries(
+      Array.from({ length: 4096 }, (_, index) => [
+        key(`live-${index}`),
+        pin(index < 2 ? now - 10_000 + index : now - 1_000),
+      ]),
+    )
+    assignments[key('expired')] = pin(now - 8 * 24 * 60 * 60_000)
+    await writeFile(
+      f.path,
+      JSON.stringify({ version: 1, updatedAt: now, assignments }),
+      { mode: 0o600 },
+    )
+    const held = await f.hold()
+    try {
+      expect((await router.resolve(input('fresh')))?.accountId).toBe('main')
+      await contended.wait
+      // Publish a late peer pin under the fixture's lease, after routing has read the file.
+      const peer = spawnSync(
+        process.execPath,
+        [
+          '-e',
+          `
+      const [path, key, assignment] = process.argv.slice(1);
+      const { readFileSync, writeFileSync } = require('node:fs');
+      const state = JSON.parse(readFileSync(path, 'utf8'));
+      state.assignments[key] = JSON.parse(assignment);
+      writeFileSync(path, JSON.stringify(state));
+    `,
+          f.path,
+          key('late-peer'),
+          JSON.stringify({ ...pin(now), accountId: 'other' }),
+        ],
+        { encoding: 'utf8' },
+      )
+      expect(peer.stderr).toBe('')
+      expect(peer.status).toBe(0)
+      await held.assertOwned()
+    } finally {
+      await held.release()
+    }
+    await router.drain()
+    const saved = JSON.parse(await readFile(f.path, 'utf8')).assignments
+    expect(Object.keys(saved)).toHaveLength(4096)
+    expect(saved[key('expired')]).toBeUndefined()
+    expect(saved[key('live-0')]).toBeUndefined()
+    expect(saved[key('live-1')]).toBeUndefined()
+    expect(saved[key('live-2')]).toEqual(assignments[key('live-2')])
+    expect(saved[key('late-peer')]).toEqual({ ...pin(now), accountId: 'other' })
+    expect(saved[key('fresh')].accountId).toBe('main')
+  },
+)
+
+lifetimes.test(
+  'sticky routing local recovery prunes expired imports and keeps live pins',
+  async () => {
+    const f = await fixture()
+    const legacy = join(f.directory, 'legacy-routing.json')
+    const now = Date.now()
+    const live = {
+      accountId: 'main',
+      family: 'general',
+      affinityModelId: 'claude-sonnet-5',
+      assignedAt: now,
+      lastSeenAt: now,
+      initialInputBytes: 1,
+      quotaCheckedAt: 0,
+    }
+    const expired = now - 8 * 24 * 60 * 60_000
+    await writeFile(
+      legacy,
+      JSON.stringify({
+        version: 1,
+        updatedAt: now,
+        assignments: {
+          [key('live')]: live,
+          [key('expired')]: {
+            ...live,
+            assignedAt: expired,
+            lastSeenAt: expired,
+          },
+        },
+      }),
+      { mode: 0o600 },
+    )
+    const router = f.router(undefined, legacy)
+    expect(
+      await router.resolve({ ...input('no-route'), candidates: [] }),
+    ).toBeNull()
+    await router.drain()
+    expect(JSON.parse(await readFile(f.path, 'utf8')).assignments).toEqual({
+      [key('live')]: live,
+    })
+  },
+)
+
 for (const operation of ['assign', 'clear', 'seed'] as const) {
   lifetimes.test(
     `sticky routing ${operation} publishes after a held bookkeeping lock is released`,
@@ -202,7 +323,11 @@ for (const operation of ['assign', 'clear', 'seed'] as const) {
         version: 1,
         updatedAt: Date.now(),
         assignments:
-          operation === 'clear' ? { [key('session')]: assignment } : {},
+          operation === 'clear'
+            ? { [key('session')]: assignment }
+            : operation === 'seed'
+              ? { [key('expired')]: { ...assignment, lastSeenAt: 1 } }
+              : {},
         ...(operation === 'seed' ? { vaultLegacySeed: 'pending' } : {}),
       }
       const bytes = JSON.stringify(state)
@@ -235,7 +360,10 @@ for (const operation of ['assign', 'clear', 'seed'] as const) {
       if (operation === 'assign')
         expect(published.assignments[key('session')].accountId).toBe('main')
       else if (operation === 'clear') expect(published.assignments).toEqual({})
-      else expect(published.vaultLegacySeed).toBe('complete')
+      else {
+        expect(published.vaultLegacySeed).toBe('complete')
+        expect(published.assignments).toEqual({})
+      }
     },
   )
 }
