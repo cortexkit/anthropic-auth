@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import {
   mkdir,
   mkdtemp,
@@ -126,6 +127,8 @@ afterEach(() => {
 })
 
 const UPSTREAM = 'https://api.anthropic.com/v1/messages'
+const wireDigest = (body: string) =>
+  createHash('sha256').update(body).digest('hex')
 const ACCOUNT_UUID =
   '6f1d1c2e-0000-4000-8000-00000000a11c' as ProviderAccountUuid
 const IDENTITY: ClaudeCodeIdentity = {
@@ -560,14 +563,40 @@ test.each(['client', 'off'] as const)(
       expect(final.headers.get('anthropic-beta')?.split(',')).toContain(
         SERVER_SIDE_FALLBACK_BETA,
       )
-      expect(await final.clone().text()).toBe(
-        await signRequestBody(JSON.stringify(clean)),
+      const text = await final.text()
+      expect(text).toBe(await signRequestBody(JSON.stringify(clean)))
+      // Pin the signed prewarm bytes, including the billing signature.
+      expect(wireDigest(text)).toBe(
+        '986899fcd40ef585fe4d31119a70125c1a44b4d9a30e0f8c0b7ac82a9da072c2',
       )
     } finally {
       native.dispose()
     }
   },
 )
+
+test('OpenCode 2 reuses the parsed payload for an unchanged keep-warm send', async () => {
+  const { source } = makeSource({})
+  const native = createNativeAnthropicAdapter({ source })
+  const payload = {
+    model: 'claude-sonnet-5',
+    max_tokens: 0,
+    messages: [{ role: 'user', content: 'keep-warm parse reuse' }],
+  }
+  const body = JSON.stringify(payload)
+  const parse = spyOn(JSON, 'parse')
+  try {
+    const { final } = await new Host(native.adapter).run(
+      scopeOf({ agent: 'cachekeep', modelID: payload.model }),
+      hostRequest(payload),
+    )
+    expect(await final.text()).toBe(body)
+    expect(parse.mock.calls.filter(([text]) => text === body)).toHaveLength(3)
+  } finally {
+    parse.mockRestore()
+    native.dispose()
+  }
+})
 
 test.each([
   ['server', 'claude-fable-5', true, 'tool_use'],
@@ -1081,6 +1110,7 @@ test.each([false, true])(
 
 test('OpenCode 2 joins a credited retry after a rejected continue recovers to a refusal', async () => {
   const sent: Record<string, unknown>[] = []
+  const sentDigests: string[] = []
   const reports: core.AnthropicBillingReport[] = []
   const { source } = makeSource({
     billingRequest: (input) => ({
@@ -1094,13 +1124,18 @@ test('OpenCode 2 joins a credited retry after a rejected continue recovers to a 
   const native = createNativeAnthropicAdapter({
     source,
     fetch: (async (_url, init) => {
-      const body = JSON.parse(String(init?.body))
+      const text = String(init?.body)
+      sentDigests.push(wireDigest(text))
+      const body = JSON.parse(text)
       sent.push(body)
       return fallbackReply(body.model, body.model === FALLBACK_SOURCE)
     }) as typeof fetch,
   })
   const host = new Host(native.adapter)
-  const scope = scopeOf({ modelID: FALLBACK_SOURCE })
+  const scope = scopeOf({
+    modelID: FALLBACK_SOURCE,
+    sessionID: 'ses_credited_recovery_wire',
+  })
   const messages = [{ role: 'user', content: 'first' }]
   const payload = { model: FALLBACK_SOURCE, stream: true, max_tokens: 100 }
   const prepare = (history: typeof messages) =>
@@ -1125,9 +1160,8 @@ test('OpenCode 2 joins a credited retry after a rejected continue recovers to a 
       { role: 'user', content: 'second' },
     ]
     const continued = await prepare(next)
-    expect(
-      JSON.parse(await continued.final.clone().text()).thread,
-    ).toMatchObject({ type: 'continue' })
+    const continuation = await continued.final.clone().text()
+    expect(JSON.parse(continuation).thread).toMatchObject({ type: 'continue' })
     const response = await expose(
       continued,
       Response.json(
@@ -1157,6 +1191,13 @@ test('OpenCode 2 joins a credited retry after a rejected continue recovers to a 
       messages: next,
       fallback_credit_token: PRIVATE_CREDIT,
     })
+    // Pin the signed bytes of the continuation, recovery create and credited
+    // retry. Parsed JSON checks would miss changes to property order.
+    expect([wireDigest(continuation), ...sentDigests]).toEqual([
+      'f9d508b2c5c08c4130ec429a1b7280a2a67ec8f8433d77ef06c5edf4239b7296',
+      '1cf02a9338da5602814d5730ec0ca78ea9a50091b66f5ab96d8b3e5c122d6bb9',
+      '43fb87cb79707bab6a68c18d70d3bdb532e6a18b75cb38a28480f48fe8cccf20',
+    ])
     await until(() => reports.length >= 4)
     expect(reports.map(({ model, status }) => [model, status])).toEqual([
       [FALLBACK_SOURCE, 200],

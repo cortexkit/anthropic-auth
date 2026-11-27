@@ -1522,6 +1522,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     headers.delete('x-relay-token')
 
     let refusalFallbackMode: RefusalFallbackMode | undefined
+    let headerPayload: { bodyText: string; payload: unknown } | undefined
     try {
       if (data.route === 'oauth' && send.oauth) {
         // The request URL comes from provider configuration, which a project
@@ -1599,6 +1600,8 @@ export function createNativeAnthropicAdapter<Q, P>(
           ) {
             body = JSON.stringify(finalBody)
             cacheKeepBodyChanged = true
+          } else {
+            headerPayload = { bodyText: body, payload: parsed }
           }
         }
         if (attempt.agent === 'cachekeep' && deps.cacheKeepHeaders) {
@@ -1651,7 +1654,10 @@ export function createNativeAnthropicAdapter<Q, P>(
     const sourceHeaders = new Headers(headers)
     const sourceBody = body
     const rounds = deps.rounds
-    const model = sourceBody && parseJson(sourceBody)
+    const model =
+      headerPayload && headerPayload.bodyText === sourceBody
+        ? headerPayload.payload
+        : sourceBody && parseJson(sourceBody)
     const requestedModel =
       isRecord(model) && typeof model.model === 'string'
         ? model.model
@@ -1864,7 +1870,7 @@ export function createNativeAnthropicAdapter<Q, P>(
             try {
               assertHostAuthorityStable()
               const cleanBody = await withoutFallbackCredit(createBody)
-              billingSend = observeFinalWire(cleanBody)
+              billingSend = observeFinalWire(cleanBody, parseJson(cleanBody))
               assertHostAuthorityStable()
               notifyFinal(retryHeaders, attempt.attemptId, cleanBody)
               let received = await (deps.fetch ?? globalThis.fetch)(url, init)
@@ -2215,7 +2221,15 @@ export function createNativeAnthropicAdapter<Q, P>(
       if (!data || !send) return prepared
       const cleaned =
         body === undefined ? undefined : await withoutFallbackCredit(body)
-      const billing = observeFinalWire(cleaned)
+      // Threading, signing and credit removal can change the observed text.
+      const billing = observeFinalWire(
+        cleaned,
+        messages && cleaned !== undefined
+          ? cleaned === fullBodyText
+            ? finalPayload
+            : parseJson(cleaned)
+          : undefined,
+      )
       ensureLive()
       request.signal.throwIfAborted()
       assertHostAuthorityStable()
@@ -2663,15 +2677,15 @@ export function createNativeAnthropicAdapter<Q, P>(
       return prepared
     }
 
-    function observeFinalWire(bodyText: string | undefined) {
+    function observeFinalWire(bodyText: string | undefined, payload: unknown) {
       let billingSend: BillingSend | undefined
-      const payload =
-        messages && bodyText !== undefined ? parseJson(bodyText) : undefined
       if (data && messages && bodyText !== undefined) {
         try {
           const metadata = source.billingRequest?.(contextOf(attempt, data))
           if (metadata) {
-            const ttlMs = requestShortestCacheLifetimeMs(bodyText)
+            const ttlMs = isRecord(payload)
+              ? requestShortestCacheLifetimeMs(payload)
+              : 0
             billingSend = {
               input: {
                 ...metadata,

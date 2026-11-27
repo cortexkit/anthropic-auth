@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { SessionCacheActivity } from '../session-cache-activity.ts'
 import {
   applySessionCacheTtl,
@@ -13,6 +13,26 @@ const previous = globals[key]
 afterEach(() => {
   if (previous === undefined) delete globals[key]
   else globals[key] = previous
+})
+
+test('only the most recent request cache lifetime string is memoized', () => {
+  const body = { cache_control: { type: 'ephemeral', ttl: '1h' } }
+  const long = JSON.stringify(body)
+  const short = '{"cache_control":{"type":"ephemeral"}}'
+  const parse = spyOn(JSON, 'parse')
+  try {
+    expect(requestCacheLifetimeMs(long)).toBe(3_600_000)
+    expect(requestCacheLifetimeMs(long)).toBe(3_600_000)
+    expect(requestCacheLifetimeMs(short)).toBe(300_000)
+    expect(requestCacheLifetimeMs(long)).toBe(3_600_000)
+    expect(requestCacheLifetimeMs(body)).toBe(3_600_000)
+    body.cache_control.ttl = '5m'
+    expect(requestCacheLifetimeMs(body)).toBe(300_000)
+    expect(requestCacheLifetimeMs(long)).toBe(3_600_000)
+    expect(parse.mock.calls.map(([text]) => text)).toEqual([long, short, long])
+  } finally {
+    parse.mockRestore()
+  }
 })
 
 test('policy is synchronous, fresh, session-local and OAuth-only', () => {
