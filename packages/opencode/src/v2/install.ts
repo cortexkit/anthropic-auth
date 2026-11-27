@@ -314,6 +314,7 @@ export async function installNativeAnthropic<Q, P>(
         try {
           for await (const event of events.subscribe({
             signal: abort.signal,
+            types: ['session.deleted', 'session.idle', 'session.status'],
           })) {
             if (event.type === 'session.deleted') {
               forgetSession(event.data.sessionID)

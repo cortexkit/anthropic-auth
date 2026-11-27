@@ -225,7 +225,10 @@ export async function registerNativeMenu(
   }
   const listener = (async () => {
     try {
-      for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
+      for await (const event of ctx.event.subscribe({
+        signal: abort.signal,
+        types: ['session.deleted'],
+      })) {
         if (event.type === 'session.deleted')
           capabilities.forgetSession(event.data.sessionID)
       }
