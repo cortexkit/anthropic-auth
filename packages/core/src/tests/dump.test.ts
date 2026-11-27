@@ -13,17 +13,19 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import {
   createDumpResponseObserver,
   dumpDirectRequest,
   dumpRelayRequest,
   dumpResponseArtifact,
+  getDumpDirectory,
   resetDumpState,
   setDumpEnabled,
   sweepDumpDirectory,
   writeDumpFile,
 } from '../dump'
+import { FALLBACK_CREDIT_PLACEHOLDER } from '../fallback-credit.ts'
 
 const dumpDirs: string[] = []
 const dumpLinks: string[] = []
@@ -91,6 +93,195 @@ test('request dumps return response handles only when enabled', async () => {
   expect(direct?.responsePath).toMatch(/\.response\.json$/)
   expect(relay?.responsePath).toMatch(/\.response\.json$/)
   expect(await lstat(direct!.responsePath).catch(() => null)).toBeNull()
+})
+
+test.skipIf(process.platform === 'win32')(
+  'default dumps land in the private data folder, are pruned there, and have mode 0600',
+  async () => {
+    const base = await mkdtemp(join(tmpdir(), 'private-dumps-'))
+    dumpDirs.push(base)
+    const originalTmp = process.env.TMPDIR
+    const originalData = process.env.XDG_DATA_HOME
+    const data = join(base, 'data')
+    process.env.TMPDIR = base
+    process.env.XDG_DATA_HOME = data
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    setDumpEnabled(true)
+    try {
+      const dumpDir = join(data, 'cortexkit', 'anthropic-auth', 'dumps')
+      const oldDir = join(base, 'opencode-anthropic-auth-dumps')
+      const oldDump = join(oldDir, dumpArtifactName(1))
+      await mkdir(oldDir)
+      await writeFile(oldDump, 'untouched')
+      expect(getDumpDirectory()).toBe(dumpDir)
+      const dump = () =>
+        dumpDirectRequest({
+          affinity: 'ses-private',
+          bodyText: '{}',
+          route: 'oauth',
+        })
+      const handle = await dump()
+      expect(handle).not.toBeNull()
+      expect((await lstat(dumpDir)).mode & 0o777).toBe(0o700)
+      await dumpResponseArtifact(handle, { status: 200, message: {} })
+      const entries = await readdir(dumpDir)
+      expect(entries.length).toBeGreaterThanOrEqual(3)
+      for (const name of entries)
+        expect((await lstat(join(dumpDir, name))).mode & 0o777).toBe(0o600)
+      await sweepDumpDirectory({
+        maxBytes: 1,
+        minAgeMs: 0,
+        now: Date.now() + 1_000,
+      })
+      expect(await readdir(dumpDir)).toEqual([])
+      expect(await readFile(oldDump, 'utf8')).toBe('untouched')
+      await chmod(dumpDir, 0o755)
+      expect(await dump()).not.toBeNull()
+      expect((await lstat(dumpDir)).mode & 0o777).toBe(0o755)
+
+      await rm(dumpDir, { recursive: true })
+      const target = join(base, 'target')
+      await mkdir(target)
+      await symlink(target, dumpDir, 'dir')
+      expect(await dump()).toBeNull()
+      await dumpResponseArtifact(handle, { status: 200, message: {} })
+      expect(await readdir(target)).toEqual([])
+    } finally {
+      if (originalTmp === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = originalTmp
+      if (originalData === undefined) delete process.env.XDG_DATA_HOME
+      else process.env.XDG_DATA_HOME = originalData
+    }
+  },
+)
+
+for (const mode of [0o775, 0o755]) {
+  test.skipIf(process.platform === 'win32')(
+    `default dumps write without changing a CortexKit parent at ${mode.toString(8)}`,
+    async () => {
+      const data = await mkdtemp(join(tmpdir(), 'shared-parent-dumps-'))
+      dumpDirs.push(data)
+      const shared = join(data, 'cortexkit')
+      await mkdir(shared)
+      await chmod(shared, mode)
+      const oldData = process.env.XDG_DATA_HOME
+      process.env.XDG_DATA_HOME = data
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      setDumpEnabled(true)
+      try {
+        const handle = await dumpDirectRequest({
+          affinity: 'ses-shared-parent',
+          bodyText: '{}',
+          route: 'oauth',
+        })
+        expect(handle).not.toBeNull()
+        const dumpDir = join(shared, 'anthropic-auth', 'dumps')
+        const bodyName = basename(handle!.responsePath).replace(
+          /\.response\.json$/,
+          '.body.json',
+        )
+        expect(await readFile(join(dumpDir, bodyName), 'utf8')).toBe('{}')
+        expect((await lstat(shared)).mode & 0o777).toBe(mode)
+      } finally {
+        if (oldData === undefined) delete process.env.XDG_DATA_HOME
+        else process.env.XDG_DATA_HOME = oldData
+      }
+    },
+  )
+}
+
+test('credited request dumps replace the token in bytes, relay envelopes, and failure text', async () => {
+  const dumpDir = await mkdtemp(join(tmpdir(), 'credited-request-dump-'))
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+  const sentinel = 'sentinel_dump_credit_42fca7'
+  const bodyText = JSON.stringify({
+    fallback_credit_token: sentinel,
+    messages: ['private content stays in opt-in dumps'],
+  })
+  const direct = await dumpDirectRequest({
+    bodyText,
+    error: `rejected: ${sentinel}`,
+  })
+  const relay = await dumpRelayRequest({
+    affinity: 'session',
+    transport: 'http',
+    protocol: 1,
+    mode: 'full_sync',
+    bodyText,
+    payload: { body: bodyText },
+    relayBytes: bodyText.length,
+  })
+  expect(direct).not.toBeNull()
+  expect(relay).not.toBeNull()
+  const all = (
+    await Promise.all(
+      (
+        await readdir(dumpDir)
+      ).map((file) => readFile(join(dumpDir, file), 'utf8')),
+    )
+  ).join('\n')
+  expect(all).not.toContain(sentinel)
+  expect(all).toContain(`rejected: ${FALLBACK_CREDIT_PLACEHOLDER}`)
+  expect(all).toContain(
+    `"fallback_credit_token":"${FALLBACK_CREDIT_PLACEHOLDER}"`,
+  )
+  expect(all).toContain('private content stays in opt-in dumps')
+})
+
+test('a credited direct retry masks the token in every request artifact', async () => {
+  const dumpDir = await mkdtemp(join(tmpdir(), 'credited-direct-retry-'))
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+  const credit = 'fixture_direct_retry_credit_0113'
+  const model = 'claude-sonnet-4-6'
+  const handle = await dumpDirectRequest({
+    affinity: 'session',
+    route: 'oauth',
+    status: 400,
+    bodyText: JSON.stringify({
+      model,
+      max_tokens: 512,
+      stream: true,
+      messages: [
+        { role: 'user', content: 'Continue the story.' },
+        { role: 'assistant', content: [{ type: 'text', text: 'Once upon' }] },
+      ],
+      thread: { type: 'create' },
+      fallback_credit_token: credit,
+    }),
+    error: `Retry rejected: ${credit}`,
+    url: 'https://api.anthropic.com/v1/messages',
+    method: 'POST',
+    headers: { 'x-fixture-credit-echo': credit },
+  })
+  if (!handle) throw new Error('Expected direct retry dump')
+  const files = (await readdir(dumpDir)).sort()
+  const prefix = basename(handle.responsePath, '.response.json')
+  expect(files).toEqual(
+    ['body', 'meta', 'request'].map((kind) => `${prefix}.${kind}.json`),
+  )
+  const artifact = (kind: string) =>
+    readFile(join(dumpDir, `${prefix}.${kind}.json`), 'utf8')
+  const [body, meta, request] = await Promise.all([
+    artifact('body'),
+    artifact('meta'),
+    artifact('request'),
+  ])
+  for (const artifact of [body, meta, request])
+    expect(artifact).not.toContain(credit)
+  expect(JSON.parse(body)).toMatchObject({
+    model,
+    fallback_credit_token: FALLBACK_CREDIT_PLACEHOLDER,
+  })
+  expect(JSON.parse(meta).error).toBe(
+    `Retry rejected: ${FALLBACK_CREDIT_PLACEHOLDER}`,
+  )
+  expect(JSON.parse(request).headers['x-fixture-credit-echo']).toBe(
+    FALLBACK_CREDIT_PLACEHOLDER,
+  )
 })
 
 test('seeds a direct-request diff from the latest same-session dump after restart', async () => {

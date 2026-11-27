@@ -18,6 +18,8 @@ import {
   settingsNotImportedText,
 } from './settings-authority.ts'
 import {
+  DEFAULT_REFUSAL_FALLBACK_MODE,
+  type RefusalFallbackMode,
   type SettingsKey,
   settingsCheckPendingText,
   settingsDefinition,
@@ -232,6 +234,16 @@ export function createNativeRuntimeSettings(
     return next
   }
 
+  /** Read the current effective user-file mode without I/O or legacy storage. */
+  function refusalFallbackMode(): RefusalFallbackMode {
+    if (mode() === 'separate') return DEFAULT_REFUSAL_FALLBACK_MODE
+    return (
+      fallback?.values.refusal_fallback ??
+      generation()?.protection[options.host].values.refusal_fallback ??
+      DEFAULT_REFUSAL_FALLBACK_MODE
+    )
+  }
+
   function recheck(refresh = true): Promise<void> {
     if (checking) return checking
     if (closed || !service || mode() === 'separate') return Promise.resolve()
@@ -241,7 +253,11 @@ export function createNativeRuntimeSettings(
       if (
         !userAuthority &&
         (await resolveSettingsMode(
-          { target: current.file, separate: mode() === 'separate' },
+          {
+            target: current.file,
+            records: current.records,
+            separate: mode() === 'separate',
+          },
           options.settingsAuthority?.options,
         )) !== 'user-file'
       )
@@ -380,6 +396,7 @@ export function createNativeRuntimeSettings(
               ? 'user-file'
               : 'legacy',
         file: service?.file ?? fallback?.file ?? file,
+        records: service?.records,
         diagnostic,
       })
     },
@@ -387,6 +404,7 @@ export function createNativeRuntimeSettings(
       diagnostic = next
     },
     gateway,
+    refusalFallbackMode,
     applyEffects,
     file: () => generation()?.file,
     async prepareAction() {
@@ -432,7 +450,11 @@ export function createNativeRuntimeSettings(
       if (userAuthority) return true
       return (
         (await resolveSettingsMode(
-          { target: service.file, separate: mode() === 'separate' },
+          {
+            target: service.file,
+            records: service.records,
+            separate: mode() === 'separate',
+          },
           options.settingsAuthority?.options,
         )) === 'user-file'
       )

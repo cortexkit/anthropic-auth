@@ -23,11 +23,14 @@ import {
   type NativeAccountView,
   nativeAccountCanServe,
   nativeAccountRefusal,
+  RecoveryThinkingStore,
+  RefusalFallbackRoundEngine,
   readSessionCachePolicy,
   requestCacheLifetimeMs,
   sessionCacheActivity,
 } from '@cortexkit/anthropic-auth-core'
 import type { Attempt, RequestScope } from '@cortexkit/common-auth/opencode2'
+import { createRefusalRoundNotices } from '../refusal-round-notices'
 import {
   createNativeAnthropicAdapter,
   type NativeAnthropicAttemptData,
@@ -55,7 +58,7 @@ export interface NativeCacheKeepOptions {
 
 // Token refreshes preserve this identity; replacing a local row or a vault
 // credential does not. Never warm a previous login's prefix on its replacement.
-function accountKey(account: NativeAccountView) {
+export function accountKey(account: NativeAccountView) {
   return JSON.stringify([
     account.source,
     account.accountIdentity,
@@ -107,6 +110,7 @@ type CacheKeepPolicyStorage = Awaited<
  */
 interface CacheKeepLease {
   readonly generation: number
+  readonly runtime: NativeAccountRuntime
   stopped: boolean
   readonly loadStorage: () => Promise<CacheKeepPolicyStorage>
   readonly send: (
@@ -128,6 +132,9 @@ interface CacheKeepLease {
  */
 interface SharedCacheKeep {
   readonly manager: CacheKeepManager
+  readonly rounds: RefusalFallbackRoundEngine
+  readonly thinkingStore: RecoveryThinkingStore
+  readonly roundNotices: ReturnType<typeof createRefusalRoundNotices>
   readonly registry: CacheKeepSessionRegistry
   readonly persistence: CacheKeepStore
   loading?: Promise<void>
@@ -232,6 +239,8 @@ function createSharedCacheKeep(
       manager.releaseTarget(id)
     },
   })
+  const reserveRestartWarm = (target: Readonly<CacheKeepTarget>) =>
+    persistence.reserveWarm(target)
   const registry = new CacheKeepSessionRegistry({
     ...getCacheKeepRegistryDirectories('opencode', options.registryDirectory),
     now: options.now,
@@ -268,10 +277,10 @@ function createSharedCacheKeep(
     clearIntervalImpl: options.clearIntervalImpl,
     setTimeoutImpl: options.setTimeoutImpl,
     clearTimeoutImpl: options.clearTimeoutImpl,
-    reserveWarm: (target) => shared.persistence.reserveWarm(target),
+    reserveWarm: reserveRestartWarm,
     settleWarm: (target) =>
       manager.isCurrentTarget(target)
-        ? shared.persistence.reserveWarm(target)
+        ? reserveRestartWarm(target)
         : Promise.resolve(false),
     deferWarmReservation: true,
     responseTtlMs: (response) => warmResponseLifetimes.get(response),
@@ -345,6 +354,8 @@ function createSharedCacheKeep(
   // If there is no usable restart store, keep the in-memory targets across
   // directory eviction. They cannot warm without a live lease.
   let expiry: ReturnType<typeof setTimeout> | undefined
+  const thinkingStore = new RecoveryThinkingStore()
+  const roundNotices = createRefusalRoundNotices()
   let retainedUntil = 0
   const stopExpiry = () => {
     if (expiry !== undefined) clearTimeout(expiry)
@@ -371,6 +382,14 @@ function createSharedCacheKeep(
   }
   const shared: SharedCacheKeep = {
     manager,
+    thinkingStore,
+    // A reload keeps the round engine with the manager that warms its sessions.
+    rounds: new RefusalFallbackRoundEngine(roundNotices.observe, {
+      thinkingStore,
+      cacheKeep: manager,
+      now: options.now,
+    }),
+    roundNotices,
     registry,
     persistence,
     prepared,
@@ -580,7 +599,9 @@ export function createNativeCacheKeep(
     owner.persistence.realTurn(input.sessionID, false)
     try {
       for (const turn of realTurns) if (!turn.active) realTurns.delete(turn)
-      const turn = manager.beginRealTurn(input.sessionID)
+      const turn = manager.beginRealTurn(input.sessionID, {
+        deferWarmExclusion: owner.rounds.hasRound(input.sessionID),
+      })
       realTurns.add(turn)
       return turn
     } catch {}
@@ -657,6 +678,8 @@ export function createNativeCacheKeep(
     const warmBodyText = await warm.text()
     let dispatchStorage: CacheKeepPolicyStorage | undefined
     const body = JSON.parse(warmBodyText) as { model: string }
+    const boundAccount = (account: NativeAccountView) =>
+      accountKey(account) === target.oauthAccountIdentity
     const scope: RequestScope = {
       providerID: 'anthropic',
       modelID: body.model,
@@ -669,6 +692,9 @@ export function createNativeCacheKeep(
     }
     let actualWarmTtl = requestCacheLifetimeMs(warmBodyText)
     const native = createNativeAnthropicAdapter({
+      cacheKeepHeaders: target.headers['anthropic-beta']
+        ? new Headers(target.headers)
+        : undefined,
       source: {
         ...source,
         quotaFromHeaders(headers, input) {
@@ -712,7 +738,7 @@ export function createNativeCacheKeep(
           const account = snapshot.accounts.find((row) => row.id === accountId)
           if (account?.type !== 'oauth' || !nativeAccountCanServe(account))
             throw new NativeAccountRefusal('account-unavailable')
-          if (accountKey(account) !== target.oauthAccountIdentity)
+          if (!boundAccount(account))
             throw new NativeAccountRefusal('credential-changed')
           if (
             !target.policyState?.planned &&
@@ -736,11 +762,11 @@ export function createNativeCacheKeep(
           )
           if (
             authorized?.provenance.kind === 'local' &&
-            accountKey({
+            !boundAccount({
               ...account,
               binding: authorized.provenance.subject.binding,
               accountIdentity: authorized.provenance.subject.binding.identity,
-            }) !== target.oauthAccountIdentity
+            })
           )
             throw new NativeAccountRefusal('credential-changed')
           if (
@@ -759,7 +785,7 @@ export function createNativeCacheKeep(
           )
           signal.throwIfAborted()
           if (!account) throw new NativeAccountRefusal('account-unavailable')
-          if (accountKey(account) !== target.oauthAccountIdentity)
+          if (!boundAccount(account))
             throw new NativeAccountRefusal('credential-changed')
           if (
             !target.policyState?.planned &&
@@ -800,9 +826,7 @@ export function createNativeCacheKeep(
         : undefined
       if (routed !== undefined && routed !== (target.oauthAccountId ?? 'main'))
         throw new CacheKeepWarmRefusal('routing-moved')
-      const accountId = snapshot.accounts.find(
-        (account) => accountKey(account) === target.oauthAccountIdentity,
-      )?.id
+      const accountId = snapshot.accounts.find(boundAccount)?.id
       if (!accountId)
         throw new NativeAccountRefusal(
           snapshot.accounts.some(
@@ -838,7 +862,7 @@ export function createNativeCacheKeep(
         request: new Request(target.url, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body),
+          body: warmBodyText,
           signal,
         }),
       })
@@ -888,12 +912,7 @@ export function createNativeCacheKeep(
           attempt,
         })
       const bytes = await response.arrayBuffer()
-      if (
-        response.ok &&
-        !signal.aborted &&
-        !target.sourceWarm &&
-        manager.isCurrentTarget(target)
-      )
+      if (response.ok && !signal.aborted && manager.isCurrentTarget(target))
         sessionCacheActivity.recordPrewarm(
           target.id,
           accountId,
@@ -933,6 +952,7 @@ export function createNativeCacheKeep(
     }
   }
   const lease: CacheKeepLease = {
+    runtime,
     generation: owner.nextGeneration++,
     stopped: false,
     loadStorage: async () => (await runtime.read()).policyStorage,
@@ -954,16 +974,24 @@ export function createNativeCacheKeep(
   let cleanup: Promise<void> | undefined
   return {
     ready,
+    rounds: owner.rounds,
+    roundNotices: owner.roundNotices,
+    forgetRoundAccount(accountId: string) {
+      owner.rounds.forgetAccount(accountId)
+    },
+    recordRoundActivity: manager.recordRoundActivity.bind(manager),
     beginRealTurn,
     async track(input: NativeCacheRequestPrepared) {
       let turn =
         input.kind === 'primary' &&
         input.agent !== 'cachekeep' &&
-        input.agent !== 'prime'
+        input.agent !== 'prime' &&
+        !input.isCurrent
           ? currentCacheKeepRealTurn()
           : undefined
       try {
-        turn ??= !lease.stopped ? beginRealTurn(input) : undefined
+        turn ??=
+          !lease.stopped && !input.isCurrent ? beginRealTurn(input) : undefined
       } catch {}
       // An accepted real request replaces the session's replay target; other
       // endings retire it. Background work never owns a real request's lease.
@@ -978,7 +1006,8 @@ export function createNativeCacheKeep(
           reason,
         })
       }
-      if (lease.stopped) return skipped('lease-stopped')
+      if (lease.stopped || input.isCurrent?.() === false)
+        return skipped('lease-stopped')
       if (input.route !== 'oauth') return skipped('not-oauth')
       if (input.agent === 'cachekeep' || input.agent === 'prime')
         return skipped('background-agent')
@@ -1044,12 +1073,15 @@ export function createNativeCacheKeep(
         account.credentialId !== input.provenance.credentialId
       )
         return skipped('vault-credential-changed')
-      if (pending.get(input.attemptId) !== entry)
+      if (
+        pending.get(input.attemptId) !== entry ||
+        input.isCurrent?.() === false
+      )
         return skipped('attempt-ended')
       entry.target = {
         sessionId: input.sessionID,
         url: input.url,
-        headers: new Headers(),
+        headers: new Headers(input.sourceHeaders),
         bodyText: input.bodyText,
         storage: snapshot.policyStorage,
         cacheMode: 'hybrid',
@@ -1159,6 +1191,8 @@ export function createNativeCacheKeep(
         if (entry.sessionID === sessionID) discardAttempt(attemptId)
     },
     sessionDeleted(sessionID: string) {
+      owner.rounds.forgetSession(sessionID)
+      owner.roundNotices.forget(sessionID)
       // Local routing cleanup also runs on eviction and shutdown. Only the host
       // deletion event can invalidate a record belonging to another server.
       const current =
@@ -1205,9 +1239,15 @@ export function createNativeCacheKeep(
           await Promise.all(lease.inflight)
           await owner.persistence.drain()
         } finally {
-          // Retained sessions are not being warmed, so withdraw them from the
-          // shared session list unless another instance adopted them already.
-          if (last && owner.leases.size === 0) await registry.dispose()
+          try {
+            // Retained sessions are not being warmed, so withdraw them from the
+            // shared session list unless another instance adopted them already.
+            if (last && owner.leases.size === 0) await registry.dispose()
+          } finally {
+            // The keeper can outlive a lease. Flush the thinking record within
+            // the store's shutdown grace instead of waiting for eviction.
+            await owner.thinkingStore.close()
+          }
         }
       })()
       return cleanup

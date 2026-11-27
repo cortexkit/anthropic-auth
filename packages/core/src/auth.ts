@@ -54,6 +54,25 @@ export class ClaudeOAuthRefreshError extends Error {
   }
 }
 
+export function isInvalidGrantResponse(
+  status: number | undefined,
+  body: string,
+): boolean {
+  if (status !== 400) return false
+  try {
+    const response = JSON.parse(body) as {
+      error?: string | { type?: unknown } | null
+    } | null
+    const error = response?.error
+    return (
+      error === 'invalid_grant' ||
+      (typeof error === 'object' && error?.type === 'invalid_grant')
+    )
+  } catch {
+    return /\binvalid_grant\b/.test(body)
+  }
+}
+
 export type ClaudeOAuthRefreshResult = {
   access: string
   refresh: string
@@ -193,41 +212,47 @@ async function exchangeCode(
   verifier: string,
   redirectUri: string,
 ): Promise<ExchangeResult> {
-  const result = await fetch(TOKEN_URL, {
-    method: 'POST',
-    redirect: 'error',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json, text/plain, */*',
-      'User-Agent': AXIOS_USER_AGENT,
-    },
-    body: JSON.stringify({
-      code: callback.code,
-      state: callback.state,
-      grant_type: 'authorization_code',
-      client_id: CLIENT_ID,
-      redirect_uri: redirectUri,
-      code_verifier: verifier,
-    }),
-  })
+  // Give sign-in more time than a background refresh: the code is single-use.
+  const signal = AbortSignal.timeout(60_000)
+  try {
+    const result = await raceWithSignal(signal, () =>
+      fetch(TOKEN_URL, {
+        signal,
+        method: 'POST',
+        redirect: 'error',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/plain, */*',
+          'User-Agent': AXIOS_USER_AGENT,
+        },
+        body: JSON.stringify({
+          code: callback.code,
+          state: callback.state,
+          grant_type: 'authorization_code',
+          client_id: CLIENT_ID,
+          redirect_uri: redirectUri,
+          code_verifier: verifier,
+        }),
+      }),
+    )
 
-  if (!result.ok) {
-    return {
-      type: 'failed',
+    if (!result.ok) return { type: 'failed' }
+
+    const json = (await raceWithSignal(signal, () => result.json())) as {
+      refresh_token: string
+      access_token: string
+      expires_in: number
     }
-  }
 
-  const json = (await result.json()) as {
-    refresh_token: string
-    access_token: string
-    expires_in: number
-  }
-
-  return {
-    type: 'success',
-    refresh: json.refresh_token,
-    access: json.access_token,
-    expires: Date.now() + json.expires_in * 1000,
+    return {
+      type: 'success',
+      refresh: json.refresh_token,
+      access: json.access_token,
+      expires: Date.now() + json.expires_in * 1000,
+    }
+  } catch (error) {
+    if (signal.aborted) return { type: 'failed' }
+    throw error
   }
 }
 

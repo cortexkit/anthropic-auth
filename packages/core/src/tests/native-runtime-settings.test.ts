@@ -34,6 +34,7 @@ import { settingsDefinition } from '../settings-definition.ts'
 import type { SettingsMode } from '../settings-mode.ts'
 import { openSettingsService } from '../settings-service.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
+import { settingsTestPaths } from './settings-record-paths-fixture.ts'
 
 const cleanup: (() => void | Promise<void>)[] = []
 afterEach(async () => {
@@ -51,6 +52,7 @@ async function fixture(values: Record<string, unknown> = {}) {
   let reads = 0
   const service = await openSettingsService({
     file,
+    records: (await settingsTestPaths(file)).records,
     dependencies: {
       readFile: async (path) => {
         reads++
@@ -120,6 +122,20 @@ test('request settings use their model and the next request sees a watch publica
   expect(f.reader.resolve(storage, 'claude-opus-5-5').claudeFast?.enabled).toBe(
     false,
   )
+})
+
+test('the runtime reads the current fallback mode for each request or warm without file I/O', async () => {
+  const f = await fixture({ refusal_fallback: 'server' })
+  const readsBefore = f.reads()
+  const sentMode = f.reader.refusalFallbackMode()
+  expect(sentMode).toBe('server')
+  expect(f.reads()).toBe(readsBefore)
+  await writeFile(f.file, '{"refusal_fallback":"off"}')
+  await f.service.refresh()
+  const readsAfter = f.reads()
+  expect(f.reader.refusalFallbackMode()).toBe('off')
+  expect(f.reads()).toBe(readsAfter)
+  expect(sentMode).toBe('server')
 })
 
 test('legacy, separate, and absent-service readers preserve the exact legacy record without defaults', async () => {
@@ -524,7 +540,10 @@ for (const firstToClose of [0, 1]) {
   test(`separate settings leases share one native runtime and survive closing acquisition ${firstToClose + 1}`, async () => {
     const f = await fixture(overrides)
     await f.reader.close()
-    const peerService = await openSettingsService({ file: f.file })
+    const peerService = await openSettingsService({
+      file: f.file,
+      records: (await settingsTestPaths(f.file)).records,
+    })
     if (!peerService) throw new Error('Expected peer settings lease')
     cleanup.push(() => peerService.dispose())
     expect(peerService).not.toBe(f.service)
@@ -587,9 +606,10 @@ test('a runtime that fails to construct releases the settings service it retaine
   const file = join(root, 'settings.jsonc')
   await writeFile(file, '{}')
   let opens = 0
-  const open = () =>
+  const open = async () =>
     openSettingsService({
       file,
+      records: (await settingsTestPaths(file)).records,
       dependencies: {
         open: (options) => {
           opens++

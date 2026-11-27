@@ -12,12 +12,18 @@ import {
   CLAUDE_CODE_IDENTITY,
   CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
+  createServerSideFallbackStreamRewriter,
+  extractBillingHeaderCCH,
   FAST_MODE_BETA,
   logger,
   MessageThreadTracker,
   OPENCODE_IDENTITY_PREFIX,
   PER_TURN_CONTROL_BETA,
   REQUIRED_BETAS,
+  SERVER_FALLBACK_MARKER_TEXT,
+  SERVER_FALLBACK_SIGNATURE_PREFIX,
+  SERVER_SIDE_FALLBACK_BETA,
+  type ServerSideFallbackOutcome,
   signRequestBody,
   THINKING_BINDING_CONTROLS_BETA,
   TRAILING_ASSISTANT_HISTORY_MESSAGE,
@@ -29,14 +35,6 @@ import {
   encodeOpenCodeEffortPlan,
   markOpenCodeEffortTransitions,
 } from '../effort-history'
-import { FableFallbackManager } from '../fable-fallback'
-import {
-  createServerSideFallbackStreamRewriter,
-  SERVER_FALLBACK_MARKER_TEXT,
-  SERVER_FALLBACK_SIGNATURE_PREFIX,
-  SERVER_SIDE_FALLBACK_BETA,
-  type ServerSideFallbackOutcome,
-} from '../server-fallback'
 import {
   addFastModeBetaHeader,
   CC_VERSION_SUFFIX_SESSION_LIMIT,
@@ -54,7 +52,6 @@ import {
   rewriteUrl,
   sanitizeSystemText,
   setOAuthHeaders,
-  sourceCacheAnchorMatchesWire,
   stripToolPrefix,
   type ToolNameMap,
 } from '../transform'
@@ -770,8 +767,11 @@ describe('setOAuthHeaders', () => {
     expect(body.tool_choice).toBeUndefined()
     const headers = new Headers()
     const previousHeaders = new Headers()
-    setOAuthHeaders(headers, 'token', { body })
-    setOAuthHeaders(previousHeaders, 'token', { body: previous })
+    setOAuthHeaders(headers, 'token', { body, refusalFallbackMode: 'server' })
+    setOAuthHeaders(previousHeaders, 'token', {
+      body: previous,
+      refusalFallbackMode: 'server',
+    })
     expect(headers.get('anthropic-beta')).toBe(
       previousHeaders.get('anthropic-beta'),
     )
@@ -813,10 +813,11 @@ describe('setOAuthHeaders', () => {
     }
   })
 
-  test('adds the server-side fallback beta only for opted-in bodies', () => {
+  test('adds the server-side fallback beta in server mode only for opted-in bodies', () => {
     const enabled = new Headers()
     setOAuthHeaders(enabled, 'token', {
       body: { model: 'claude-fable-5', fallbacks: 'default' },
+      refusalFallbackMode: 'server',
     })
     expect(enabled.get('anthropic-beta')?.split(',')).toContain(
       SERVER_SIDE_FALLBACK_BETA,
@@ -825,9 +826,66 @@ describe('setOAuthHeaders', () => {
     const disabled = new Headers()
     setOAuthHeaders(disabled, 'token', {
       body: { model: 'claude-fable-5' },
+      refusalFallbackMode: 'server',
     })
     expect(disabled.get('anthropic-beta')?.split(',')).not.toContain(
       SERVER_SIDE_FALLBACK_BETA,
+    )
+  })
+
+  test.each(['client', 'off'] as const)(
+    'OpenCode 1 in %s sends the fallback beta without a body opt-in',
+    async (refusalFallbackMode) => {
+      const raw = JSON.stringify({
+        model: 'claude-fable-5',
+        max_tokens: 32,
+        fallbacks: { caller: true },
+        messages: [
+          { role: 'user', content: 'first' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'unfinished' },
+              { type: 'text', text: 'answer' },
+            ],
+          },
+          { role: 'user', content: 'continue' },
+        ],
+      })
+      const client = await rewriteRequestBody(raw, { isOAuth: true })
+      const body = JSON.parse(client)
+      expect(body).not.toHaveProperty('fallbacks')
+      expect(body.messages[1].content).toEqual([
+        { type: 'text', text: 'answer' },
+      ])
+      const headers = setOAuthHeaders(new Headers(), 'token', {
+        body,
+        refusalFallbackMode,
+      })
+      expect(headers.get('anthropic-beta')?.split(',')).toContain(
+        SERVER_SIDE_FALLBACK_BETA,
+      )
+      expect(client).toBe(await signRequestBody(client))
+    },
+  )
+
+  test('ordinary client fallback request bytes differ from server only in fallbacks and cch', async () => {
+    const input = JSON.stringify({
+      model: 'claude-fable-5',
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'first prompt' }],
+    })
+    const server = await rewriteRequestBody(input, {
+      isOAuth: true,
+      serverSideFallbackEnabled: true,
+    })
+    const client = await rewriteRequestBody(input, { isOAuth: true })
+    const { fallbacks, ...ordinary } = JSON.parse(server)
+    expect(fallbacks).toBe('default')
+    expect(client).toBe(await signRequestBody(JSON.stringify(ordinary)))
+    expect(extractBillingHeaderCCH(client)).toBeTruthy()
+    expect(extractBillingHeaderCCH(client)).not.toBe(
+      extractBillingHeaderCCH(server),
     )
   })
 
@@ -1886,8 +1944,7 @@ describe('createStrippedStream', () => {
     expect(finishReasons).toEqual(['max_tokens'])
   })
 
-  test('preserves lane-start refusal handling', async () => {
-    let refusals = 0
+  test('leaves a lane-start refusal unchanged', async () => {
     const body = sse('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: 'refusal' },
@@ -1895,14 +1952,9 @@ describe('createStrippedStream', () => {
 
     const text = await createStrippedStream(new Response(body), {
       laneStart: true,
-      onContentFilter: () => {
-        refusals++
-        return false
-      },
     }).text()
 
     expect(text).toBe(body)
-    expect(refusals).toBe(1)
   })
 
   test('observes a split message_start envelope exactly once', async () => {
@@ -2141,8 +2193,8 @@ describe('createStrippedStream', () => {
     expect(outcomes).toHaveLength(1)
   })
 
-  test('drains an over-cap refusal terminal frame before disabling the tail', async () => {
-    const contentFilters: boolean[] = []
+  test('does not count an over-cap refusal as a successful finish', async () => {
+    const completed: string[] = []
     const perf: Array<Record<string, unknown>> = []
     const terminal = sse('message_delta', {
       type: 'message_delta',
@@ -2159,16 +2211,13 @@ describe('createStrippedStream', () => {
         }),
       ),
       {
-        onContentFilter: () => {
-          contentFilters.push(true)
-          return false
-        },
+        onComplete: (finishReason) => completed.push(finishReason),
         perf: (_stage, stats) => perf.push(stats ?? {}),
       },
     )
 
     expect(await response.text()).toBe(body)
-    expect(contentFilters).toEqual([true])
+    expect(completed).toEqual([])
     expect(perf.at(-1)).toMatchObject({
       sseFinishPending: 0,
       sseFinishDisabled: true,
@@ -2584,8 +2633,7 @@ describe('createStrippedStream', () => {
     expect(text).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
   })
 
-  test('preserves a completed fallback tool call instead of retrying its terminal refusal', async () => {
-    const filterContexts: boolean[] = []
+  test('rewrites a closed-call refusal only for an opted-in OpenCode 1 server send', async () => {
     const completions: string[] = []
     const outcomes: ServerSideFallbackOutcome[] = []
     const payload = [
@@ -2614,7 +2662,10 @@ describe('createStrippedStream', () => {
       sse('content_block_stop', { type: 'content_block_stop', index: 0 }),
       sse('message_delta', {
         type: 'message_delta',
-        delta: { stop_reason: 'refusal' },
+        delta: {
+          stop_reason: 'refusal',
+          stop_details: { type: 'refusal', category: 'test' },
+        },
         usage: {
           output_tokens: 1,
           iterations: [{ type: 'fallback_message', model: 'claude-opus-4-8' }],
@@ -2624,10 +2675,7 @@ describe('createStrippedStream', () => {
     ].join('')
     const response = createStrippedStream(new Response(payload), {
       serverSideFallbackModel: 'claude-fable-5',
-      onContentFilter: (context) => {
-        filterContexts.push(context?.completedToolUse === true)
-        return true
-      },
+      serverSideFallbackSent: true,
       onComplete: (finishReason) => completions.push(finishReason),
       onServerSideFallbackOutcome: (outcome) => outcomes.push(outcome),
     })
@@ -2636,7 +2684,7 @@ describe('createStrippedStream', () => {
 
     expect(text).toContain('"stop_reason":"tool_use"')
     expect(text).not.toContain('"stop_reason":"refusal"')
-    expect(filterContexts).toEqual([true])
+    expect(text).not.toContain('"stop_details"')
     expect(completions).toEqual(['tool_use'])
     expect(outcomes).toEqual([
       expect.objectContaining({
@@ -2645,17 +2693,22 @@ describe('createStrippedStream', () => {
         stopReason: 'refusal',
       }),
     ])
+
+    for (const options of [{}, { serverSideFallbackModel: 'claude-fable-5' }]) {
+      const unchanged = createStrippedStream(new Response(payload), options)
+      expect(await unchanged.text()).toBe(payload)
+    }
   })
 
-  test('turns Fable refusal finishes into retryable errors and signals once', async () => {
+  test('passes a split server refusal through without a stream retry or successful finish', async () => {
     const encoder = new TextEncoder()
     const chunks = [
       'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n',
       'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_',
       'reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
     ]
-    let filtered = 0
-    let completed = 0
+    const completions: string[] = []
     const stream = new ReadableStream({
       start(controller) {
         for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
@@ -2663,93 +2716,14 @@ describe('createStrippedStream', () => {
       },
     })
     const response = createStrippedStream(new Response(stream), {
-      onContentFilter: () => {
-        filtered++
-      },
-      onComplete: () => {
-        completed++
-      },
+      serverSideFallbackModel: 'claude-fable-5',
+      serverSideFallbackSent: true,
+      requireMessageStop: true,
+      onComplete: (finishReason) => completions.push(finishReason),
     })
-    const reader = response.body!.getReader()
-    expect((await reader.read()).done).toBe(false)
 
-    let caught: unknown
-    try {
-      while (!(await reader.read()).done) {}
-    } catch (error) {
-      caught = error
-    }
-
-    expect((caught as { code?: string }).code).toBe('ECONNRESET')
-    expect((caught as { providerErrorType?: string }).providerErrorType).toBe(
-      'refusal',
-    )
-    expect(filtered).toBe(1)
-    expect(completed).toBe(0)
-  })
-
-  test('refusal error message names Opus 5 when contentFilterModel is set', async () => {
-    const encoder = new TextEncoder()
-    const chunks = [
-      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_',
-      'reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
-    ]
-    const stream = new ReadableStream({
-      start(controller) {
-        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
-        controller.close()
-      },
-    })
-    const response = createStrippedStream(new Response(stream), {
-      onContentFilter: () => true,
-      contentFilterModel: 'claude-opus-5',
-    })
-    const reader = response.body!.getReader()
-    expect((await reader.read()).done).toBe(false)
-
-    let caught: unknown
-    try {
-      while (!(await reader.read()).done) {}
-    } catch (error) {
-      caught = error
-    }
-
-    expect((caught as { code?: string }).code).toBe('ECONNRESET')
-    expect((caught as { providerErrorType?: string }).providerErrorType).toBe(
-      'refusal',
-    )
-    expect((caught as Error).message).toContain('Opus 5')
-    expect((caught as Error).message).not.toContain('Fable')
-  })
-
-  test('refusal error message uses Fable when contentFilterModel not set', async () => {
-    const encoder = new TextEncoder()
-    const chunks = [
-      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_',
-      'reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
-    ]
-    const stream = new ReadableStream({
-      start(controller) {
-        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
-        controller.close()
-      },
-    })
-    const response = createStrippedStream(new Response(stream), {
-      onContentFilter: () => true,
-    })
-    const reader = response.body!.getReader()
-    expect((await reader.read()).done).toBe(false)
-
-    let caught: unknown
-    try {
-      while (!(await reader.read()).done) {}
-    } catch (error) {
-      caught = error
-    }
-
-    expect((caught as Error).message).toContain('Fable')
+    expect(await response.text()).toBe(chunks.join(''))
+    expect(completions).toEqual([])
   })
 
   test('signals successful Anthropic finishes exactly once', async () => {
@@ -2768,20 +2742,11 @@ describe('createStrippedStream', () => {
     expect(finishes).toEqual(['tool_use'])
   })
 
-  test('does not intercept refusals when no Fable callback is installed', async () => {
+  test('passes refusal bytes through when the request did not opt in', async () => {
     const payload =
       'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"}}\n\n'
     const response = createStrippedStream(new Response(payload))
-    await expect(response.text()).resolves.toContain('refusal')
-  })
-
-  test('preserves a refusal when Fable recovery declines a non-OAuth route', async () => {
-    const payload =
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"}}\n\n'
-    const response = createStrippedStream(new Response(payload), {
-      onContentFilter: () => false,
-    })
-    await expect(response.text()).resolves.toContain('refusal')
+    await expect(response.text()).resolves.toBe(payload)
   })
 
   test('does not mark non-transient Anthropic stream errors retryable', async () => {
@@ -4210,7 +4175,7 @@ describe('rewriteRequestBody', () => {
         [
           base,
           image,
-          { type: 'thinking', thinking: 'reasoning' },
+          { type: 'thinking', thinking: 'reasoning', signature: 'signed' },
           { type: 'text', text: 'live' },
         ],
       ],
@@ -4518,469 +4483,6 @@ describe('rewriteRequestBody', () => {
     })
   })
 
-  describe('source cache recovery return', () => {
-    const options = { cache1hEnabled: true, cache1hMode: 'hybrid' as const }
-    function sourceRequest() {
-      return {
-        model: 'claude-fable-5-2',
-        system: 'Stable system block',
-        tools: [{ name: 'read', input_schema: { type: 'object' } }],
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: 'permanent history' },
-              { type: 'text', text: 'volatile history' },
-            ],
-          },
-          {
-            role: 'assistant',
-            content: Array.from({ length: 707 }, (_, i) => ({
-              type: 'text',
-              text: `history ${i}`,
-            })),
-          },
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: 'source tail first block' },
-              { type: 'text', text: 'source tail second block' },
-              { type: 'text', text: 'source cached boundary' },
-            ],
-          },
-        ],
-      }
-    }
-    function returnRequest() {
-      const body = sourceRequest()
-      // Ten recovery responses add forty blocks beyond the 712-block source.
-      for (let i = 0; i < 10; i++) {
-        body.messages.push(
-          {
-            role: 'assistant',
-            content: [
-              { type: 'text', text: `Opus response ${i}` },
-              { type: 'text', text: 'detail' },
-            ],
-          },
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: `Opus follow-up ${i}` },
-              { type: 'text', text: 'continue' },
-            ],
-          },
-        )
-      }
-      return body
-    }
-    function markers(body: any) {
-      return [
-        ...(body.system ?? []),
-        ...body.messages.flatMap((message: any) =>
-          Array.isArray(message.content) ? message.content : [],
-        ),
-      ].filter((block: any) => block.cache_control)
-    }
-
-    test('Fable return reserves the slot and its accepted wire continues unchanged', async () => {
-      const rewrite = (payload: unknown) =>
-        rewriteRequestBody(JSON.stringify(payload), {
-          ...options,
-          deferSigning: true,
-        })
-      const history = returnRequest()
-      const source = await rewrite(sourceRequest())
-      const first = JSON.parse(
-        await rewrite({ ...history, messages: history.messages.slice(0, 5) }),
-      )
-      const tracker = new MessageThreadTracker(10, () => 0)
-      const input = {
-        body: first,
-        betas: [],
-        account: 'account',
-        credential: 'credential',
-        session: 'reserved-return',
-        cacheSlot: () => undefined,
-      }
-      tracker.prepare(input).complete({
-        messageId: 'msg_source',
-        stopped: true,
-        stopReason: 'end_turn',
-        reply: history.messages[5],
-      })
-      const middle = JSON.parse(
-        await rewrite({ ...history, messages: history.messages.slice(0, 7) }),
-      )
-      const continuation = tracker.prepare({ ...input, body: middle })
-      expect(continuation.decision.type).toBe('continue')
-      continuation.complete({
-        messageId: 'msg_middle',
-        stopped: true,
-        stopReason: 'end_turn',
-        reply: history.messages[7],
-      })
-      let slot: Parameters<MessageThreadTracker['prepare']>[0]['cacheSlot']
-      const returned = JSON.parse(
-        await rewriteRequestBody(JSON.stringify(history), {
-          ...options,
-          deferSigning: true,
-          sourceRecoveryBody: source,
-          onThreadCacheSlot: (value) => {
-            slot = value
-          },
-        }),
-      )
-      const log = spyOn(logger, 'debug')
-      const full = tracker.prepare({
-        ...input,
-        body: returned,
-        cacheSlot: slot,
-      })
-      const reason = log.mock.calls
-        .filter((call) => call[1] === 'message_thread_tail_marker')
-        .at(-1)?.[2]
-      log.mockRestore()
-      expect(reason).toMatchObject({ reason: 'slot_taken' })
-      expect(full.tailMarkerAdded).toBe(false)
-      expect(JSON.stringify(full.body)).toBe(
-        JSON.stringify({ ...returned, thread: { type: 'create' } }),
-      )
-      const reply = {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'source answer' }],
-      }
-      full.complete({
-        messageId: 'msg_return',
-        stopped: true,
-        stopReason: 'end_turn',
-        reply,
-      })
-      const following = JSON.parse(
-        await rewrite({
-          ...history,
-          messages: [
-            ...history.messages,
-            reply,
-            { role: 'user', content: [{ type: 'text', text: 'next' }] },
-          ],
-        }),
-      )
-      const next = tracker.prepare({ ...input, body: following })
-      expect(next.decision.type).toBe('continue')
-      expect(JSON.stringify(next.body.system)).toBe(
-        JSON.stringify(full.body.system),
-      )
-      expect(JSON.stringify(next.body.tools)).toBe(
-        JSON.stringify(full.body.tools),
-      )
-    })
-
-    test.each(['1h', '5m'] as const)(
-      'restores the source old-tail breakpoint beyond lookback with %s TTL for one accepted return',
-      async (ttl) => {
-        const key = Symbol.for('cortexkit.routing')
-        const globals = globalThis as Record<symbol, unknown>
-        const previous = globals[key]
-        globals[key] = () => ({
-          cache: () => ({ ttl: ttl === '5m' ? 'short' : 'long' }),
-        })
-        const ttlOptions = {
-          ...options,
-          sessionId: 'ses_return',
-          isOAuth: true,
-        }
-        try {
-          const sourceBody = await rewriteRequestBody(
-            JSON.stringify(sourceRequest()),
-            ttlOptions,
-          )
-          const manager = new FableFallbackManager()
-          const initial = manager.plan(
-            'ses_return',
-            JSON.stringify(sourceRequest()),
-          )!
-          manager.activate(initial, 'main', {
-            bodyText: sourceBody,
-            oauthAccountId: 'main',
-            sentAt: 0,
-            model: initial.requestedModel,
-            url: 'https://api.anthropic.com/v1/messages',
-            headers: {},
-          })
-          for (let i = 0; i < 10; i++)
-            manager.complete(
-              manager.plan('ses_return', JSON.stringify(returnRequest()))!,
-            )
-          const returning = manager.plan(
-            'ses_return',
-            JSON.stringify(returnRequest()),
-          )!
-          let threadSlot: Parameters<
-            MessageThreadTracker['prepare']
-          >[0]['cacheSlot']
-          const result = JSON.parse(
-            await rewriteRequestBody(returning.bodyText, {
-              ...ttlOptions,
-              sourceRecoveryBody: returning.sourceRecovery?.bodyText,
-              onThreadCacheSlot: (slot) => {
-                threadSlot = slot
-              },
-            }),
-          )
-          expect(threadSlot?.(result)).toBeUndefined()
-          expect(result.messages[2].content[2].cache_control).toEqual(
-            ttl === '1h'
-              ? { type: 'ephemeral', ttl: '1h' }
-              : { type: 'ephemeral' },
-          )
-          expect(result.messages[2].content[0].cache_control).toBeUndefined()
-          expect(markers(result)).toHaveLength(4)
-          expect(
-            result.system.every((block: any) => !block.cache_control),
-          ).toBe(true)
-          expect(
-            result.messages.at(-1).content.at(-1).cache_control,
-          ).toBeDefined()
-          expect(
-            markers(result).every(
-              (block: any) =>
-                block.cache_control.ttl === (ttl === '1h' ? '1h' : undefined),
-            ),
-          ).toBe(true)
-          manager.completeSource(returning)
-          const next = manager.plan(
-            'ses_return',
-            JSON.stringify(returnRequest()),
-          )!
-          expect(next.sourceRecovery).toBeUndefined()
-          const second = await rewriteRequestBody(next.bodyText, {
-            ...ttlOptions,
-            sourceRecoveryBody: next.sourceRecovery?.bodyText,
-          })
-          expect(second).toBe(
-            await rewriteRequestBody(next.bodyText, ttlOptions),
-          )
-          expect(
-            JSON.parse(second).messages[2].content[2].cache_control,
-          ).toBeUndefined()
-        } finally {
-          if (previous === undefined) delete globals[key]
-          else globals[key] = previous
-        }
-      },
-    )
-
-    test.each(['rewrite', 'compaction', 'tools', 'system'] as const)(
-      'skips the restored anchor after %s',
-      async (change) => {
-        const sourceBody = await rewriteRequestBody(
-          JSON.stringify(sourceRequest()),
-          options,
-        )
-        const body = returnRequest()
-        if (change === 'rewrite')
-          body.messages[1]!.content[400]!.text = 'edited history'
-        if (change === 'compaction') body.messages.splice(1, 1)
-        if (change === 'tools') body.tools[0]!.input_schema.type = 'string'
-        if (change === 'system') body.system = 'Replaced system'
-        const input = JSON.stringify(body)
-        expect(
-          await rewriteRequestBody(input, {
-            ...options,
-            sourceRecoveryBody: sourceBody,
-          }),
-        ).toBe(await rewriteRequestBody(input, options))
-      },
-    )
-
-    test.each(['short', 'long'] as const)(
-      'skips the restored anchor when the source %s TTL changes during recovery',
-      async (sourceTtl) => {
-        const key = Symbol.for('cortexkit.routing')
-        const globals = globalThis as Record<symbol, unknown>
-        const previous = globals[key]
-        let ttl: 'short' | 'long' = sourceTtl
-        globals[key] = () => ({ cache: () => ({ ttl }) })
-        const policyOptions = {
-          ...options,
-          sessionId: 'ses_changed_ttl',
-          isOAuth: true,
-        }
-        try {
-          const sourceBody = await rewriteRequestBody(
-            JSON.stringify(sourceRequest()),
-            policyOptions,
-          )
-          ttl = sourceTtl === 'short' ? 'long' : 'short'
-          const input = JSON.stringify(returnRequest())
-          const result = await rewriteRequestBody(input, {
-            ...policyOptions,
-            sourceRecoveryBody: sourceBody,
-          })
-          expect(result).toBe(await rewriteRequestBody(input, policyOptions))
-          expect(
-            JSON.parse(result).messages[2].content[2].cache_control,
-          ).toBeUndefined()
-          expect(markers(JSON.parse(result)).at(-1).cache_control).toEqual(
-            ttl === 'long'
-              ? { type: 'ephemeral', ttl: '1h' }
-              : { type: 'ephemeral' },
-          )
-        } finally {
-          if (previous === undefined) delete globals[key]
-          else globals[key] = previous
-        }
-      },
-    )
-
-    test('matches canonical history through the exact old block, not later content', async () => {
-      const sourceBody = await rewriteRequestBody(
-        JSON.stringify(sourceRequest()),
-        options,
-      )
-      const reorderedSource = JSON.stringify(
-        JSON.parse(sourceBody),
-        (_key, value) => {
-          if (!value || typeof value !== 'object' || Array.isArray(value))
-            return value
-          return Object.fromEntries(Object.entries(value).reverse())
-        },
-      )
-      const body = returnRequest()
-      body.messages[2]!.content.push({
-        type: 'text',
-        text: 'content added after the cached block',
-      })
-      const result = JSON.parse(
-        await rewriteRequestBody(JSON.stringify(body), {
-          ...options,
-          sourceRecoveryBody: reorderedSource,
-        }),
-      )
-      expect(result.messages[2].content[2].cache_control).toEqual({
-        type: 'ephemeral',
-        ttl: '1h',
-      })
-      expect(result.messages[2].content[3].cache_control).toBeUndefined()
-      expect(markers(result)).toHaveLength(4)
-    })
-
-    test('an accepted thread continuation retains its full source template and anchors the mapped tail', async () => {
-      const template = await rewriteRequestBody(
-        JSON.stringify(sourceRequest()),
-        options,
-      )
-      const wire = JSON.parse(template)
-      wire.thread = { type: 'continue', previous_message_id: 'msg_source' }
-      wire.messages = wire.messages.slice(2)
-      expect(sourceCacheAnchorMatchesWire(template, JSON.stringify(wire))).toBe(
-        true,
-      )
-      const kept = sourceCacheAnchorMatchesWire(template, JSON.stringify(wire))
-        ? template
-        : undefined
-      const result = JSON.parse(
-        await rewriteRequestBody(JSON.stringify(returnRequest()), {
-          ...options,
-          sourceRecoveryBody: kept,
-        }),
-      )
-      expect(result.messages[2].content[2].cache_control).toEqual({
-        type: 'ephemeral',
-        ttl: '1h',
-      })
-    })
-
-    test('keeps the restored block even when it precedes every normal message anchor', async () => {
-      const base = {
-        model: 'claude-fable-5-2',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: '<memory-mural>stable</memory-mural>' },
-            ],
-          },
-        ],
-      }
-      const template = await rewriteRequestBody(JSON.stringify(base), options)
-      const input = JSON.stringify({
-        ...base,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              ...base.messages[0]!.content,
-              {
-                type: 'image',
-                source: {
-                  type: 'base64',
-                  media_type: 'image/png',
-                  data: 'AA==',
-                },
-              },
-              { type: 'text', text: 'appended merged history' },
-            ],
-          },
-          { role: 'assistant', content: 'answer' },
-          { role: 'user', content: 'normal bridge boundary' },
-          {
-            role: 'assistant',
-            content: Array.from({ length: 24 }, (_, i) => ({
-              type: 'text',
-              text: `block ${i}`,
-            })),
-          },
-          { role: 'user', content: 'new tail' },
-        ],
-      })
-      const result = JSON.parse(
-        await rewriteRequestBody(input, {
-          ...options,
-          sourceRecoveryBody: template,
-        }),
-      )
-      expect(result.messages[0].content[0].cache_control).toBeDefined()
-      expect(result.messages.at(-1).content[0].cache_control).toBeDefined()
-      expect(markers(result)).toHaveLength(4)
-    })
-
-    test('an unmappable thread continuation tail cannot establish a return anchor', async () => {
-      const template = await rewriteRequestBody(
-        JSON.stringify(sourceRequest()),
-        options,
-      )
-      const wire = JSON.parse(template)
-      wire.thread = { type: 'continue', previous_message_id: 'msg_source' }
-      wire.messages = wire.messages.slice(2)
-      delete wire.messages[0].content[2].cache_control
-      wire.messages.push({
-        role: 'assistant',
-        content: [
-          {
-            type: 'text',
-            text: 'prefill',
-            cache_control: { type: 'ephemeral', ttl: '1h' },
-          },
-        ],
-      })
-      expect(sourceCacheAnchorMatchesWire(template, JSON.stringify(wire))).toBe(
-        false,
-      )
-      const kept = sourceCacheAnchorMatchesWire(template, JSON.stringify(wire))
-        ? template
-        : undefined
-      const input = JSON.stringify(returnRequest())
-      expect(
-        await rewriteRequestBody(input, {
-          ...options,
-          sourceRecoveryBody: kept,
-        }),
-      ).toBe(await rewriteRequestBody(input, options))
-    })
-  })
-
   test('hybrid standby anchors rely on normal lookback while still nearby', async () => {
     const messages = [
       { role: 'user', content: 'message 0' },
@@ -5172,6 +4674,24 @@ describe('rewriteRequestBody', () => {
     ).toBe(4)
   })
 
+  test('drops a trailing assistant containing only unsigned thinking', async () => {
+    // Anthropic rejects unsigned thinking, so it's dropped before signing.
+    const messages = [{ role: 'user', content: 'hello' }]
+    const body = JSON.stringify({
+      system: 'sys',
+      messages: [
+        ...messages,
+        {
+          role: 'assistant',
+          content: [{ type: 'thinking', thinking: 'plan', signature: '' }],
+        },
+      ],
+    })
+    expect(JSON.parse(await rewriteRequestBody(body)).messages).toEqual(
+      messages,
+    )
+  })
+
   test('refuses a meaningful assistant hidden behind empty trailers', async () => {
     const body = JSON.stringify({
       system: 'sys',
@@ -5224,13 +4744,6 @@ describe('rewriteRequestBody', () => {
       {
         role: 'assistant',
         content: [{ type: 'text', text: ' ' }, { type: 'opaque_block' }],
-      },
-    ],
-    [
-      'visible reasoning',
-      {
-        role: 'assistant',
-        content: [{ type: 'thinking', thinking: 'plan', signature: '' }],
       },
     ],
     [

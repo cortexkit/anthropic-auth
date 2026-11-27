@@ -32,6 +32,7 @@ import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import { writeSettingsProtectionCopy } from '../../../core/src/settings-protection-copy.ts'
 import { legacySettingsProtection } from '../../../core/src/settings-protection-legacy.ts'
+import { settingsTestPaths } from '../../../core/src/tests/settings-record-paths-fixture.ts'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import { createPiNativeCommands } from '../native-commands.ts'
 import { saveNativePiFixture } from './native-fixture.ts'
@@ -103,6 +104,8 @@ async function handleRefusal(code: SettingsRefusalCode) {
   // The probe writes as a host that uses the file.
   const service = await openSettingsService({
     file: probe,
+    records: (await settingsTestPaths(probe, { home, env: process.env }))
+      .records,
     host: 'pi',
     adopted: () => true,
   })
@@ -428,6 +431,8 @@ test('rung 3 refuses a recreating menu write with its fixed reason and no succes
   const before = await fs.readFile(paths.config, 'utf8')
   const service = await openSettingsService({
     file,
+    records: (await settingsTestPaths(file, { home, env: process.env }))
+      .records,
     host: 'pi',
     protection: { readLegacyProtection: async () => undefined },
   })
@@ -554,10 +559,14 @@ test('settings status names a missing file and its later recreation', async () =
   await writeFile()
   // OpenCode's applied copy is the record of the set it uses, which a
   // recreation by Pi carries for it.
-  await writeSettingsProtectionCopy(file, 'opencode', {
-    readAt: 1,
-    values: legacySettingsProtection({}, 'opencode'),
-  })
+  await writeSettingsProtectionCopy(
+    (await settingsTestPaths(file, { home, env: process.env })).records,
+    'opencode',
+    {
+      readAt: 1,
+      values: legacySettingsProtection({}, 'opencode'),
+    },
+  )
   const f = await controller()
   await fs.unlink(file)
   await f.confirmMissing()

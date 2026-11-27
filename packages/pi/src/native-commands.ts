@@ -41,6 +41,7 @@ import { getPiNativeRuntime } from './native.ts'
 import { getPiAccountStoragePath } from './paths.ts'
 import {
   clearPiStickyRoutingSession,
+  forgetPiRefusalRoute,
   getPiTrackedCacheKeepSessions,
 } from './stream.ts'
 import { fetchPiOAuth } from './transport.ts'
@@ -116,6 +117,7 @@ export function createPiNativeCommands(
         return { ok: true, text: `Native account ${request.action}d.` }
       case 'remove':
         await runtime.remove(request.values.id)
+        forgetPiRefusalRoute(storagePath, request.values.id)
         return { ok: true, text: 'Native account removed.' }
       case 'move-up':
       case 'move-down': {
@@ -174,6 +176,8 @@ export function createPiNativeCommands(
       }
       case 'enrollment-reset': {
         const result = await custody.reset()
+        if (!result.text.startsWith('Refused:'))
+          forgetPiRefusalRoute(storagePath)
         return { ok: !result.text.startsWith('Refused:'), text: result.text }
       }
       case 'add-oauth-start': {

@@ -15,17 +15,61 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import { gunzipSync } from 'node:zlib'
+import { gunzipSync, gzipSync } from 'node:zlib'
 import {
   CacheKeepClaim,
   CacheKeepStore,
   type CacheKeepStoreOptions,
   legacyCacheKeepStoreDirectory,
 } from '../cachekeep-store.ts'
+import { signRequestBody } from '../cch.ts'
 import { withNativeLock } from '../native-lock-observer.ts'
 
 const session = 'session'
 const key = createHash('sha256').update(session).digest('hex')
+
+test('restores and replaces a credited cache template with its signed credit-free body', async () => {
+  const { root, store, makeStore, target } = await storeFixture()
+  const restarted = makeStore()
+  const path = join(store.directory, `${key}.json.gz`)
+  const sentinel = 'sentinel_old_cache_credit_7894'
+  const payload = {
+    system: [
+      {
+        type: 'text',
+        text: 'x-anthropic-billing-header: cc_version=2.1.0; cc_entrypoint=cli; cch=00000;',
+      },
+    ],
+    messages: [{ role: 'user', content: 'cache prefix' }],
+  }
+  try {
+    store.changed(target)
+    await store.drain()
+    await store.releaseClaims(() => true)
+    const record = JSON.parse(gunzipSync(await readFile(path)).toString())
+    const credited = await signRequestBody(
+      JSON.stringify({ ...payload, fallback_credit_token: sentinel }),
+    )
+    await writeFile(
+      path,
+      gzipSync(JSON.stringify({ ...record, bodyText: credited })),
+    )
+    const bodies: string[] = []
+    await restarted.load(Date.now(), (entry) => {
+      bodies.push(entry.bodyText)
+      return true
+    })
+    const expected = await signRequestBody(JSON.stringify(payload))
+    expect(bodies).toEqual([expected])
+    const persisted = gunzipSync(await readFile(path)).toString()
+    expect(persisted).not.toContain(sentinel)
+    expect(JSON.parse(persisted).bodyText).toBe(expected)
+  } finally {
+    await restarted.releaseClaims(() => true)
+    await store.releaseClaims(() => true)
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
 function acceptedPolicy(time: number) {
   return {

@@ -1,5 +1,8 @@
 import { afterEach, beforeEach } from 'bun:test'
+import { writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import {
+  type RefusalFallbackMode,
   resetCache1hState,
   resetClaudeCodeIdentityCachesForTest,
   resetDumpState,
@@ -21,6 +24,22 @@ import {
   getBodyLifetime,
   type Opencode1TestContext,
 } from './opencode1-test-context.ts'
+
+export async function setUserRefusalFallbackMode(
+  ctx: Opencode1TestContext,
+  mode: RefusalFallbackMode,
+) {
+  if (!ctx.tempConfigDir)
+    throw new Error('Missing test configuration directory')
+  const path = join(ctx.tempConfigDir, 'refusal-settings.jsonc')
+  await writeFile(path, JSON.stringify({ refusal_fallback: mode }))
+  const previous = process.env.ANTHROPIC_AUTH_SETTINGS_FILE
+  process.env.ANTHROPIC_AUTH_SETTINGS_FILE = path
+  getBodyLifetime(ctx).deferCleanup(() => {
+    if (previous === undefined) delete process.env.ANTHROPIC_AUTH_SETTINGS_FILE
+    else process.env.ANTHROPIC_AUTH_SETTINGS_FILE = previous
+  })
+}
 
 /**
  * Opt-in setup hooks that reset caches, dump state, fast-mode state,
@@ -50,7 +69,6 @@ export function installLoaderSetup(ctx: Opencode1TestContext) {
     ctx.testSidebarWriteHooks.clear()
     ctx.sidebarWriteListeners.clear()
     process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-    process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = 'legacy'
     await useTempAccountFile(ctx, createFallbackStorage({ accounts: [] }))
   })
 
@@ -68,7 +86,6 @@ export function installLoaderSetup(ctx: Opencode1TestContext) {
         ctx.testSidebarWriteHooks.clear()
         ctx.sidebarWriteListeners.clear()
         delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
-        delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
         await drainSidebarWrites()
         restoreProcessTestFiles()
         ctx.tempConfigDir = undefined

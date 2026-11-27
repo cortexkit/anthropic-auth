@@ -29,9 +29,14 @@ import {
   settingsCheckPendingText,
   settingsDefinition,
 } from './settings-definition.ts'
-import type { SettingsHost } from './settings-paths.ts'
+import {
+  type SettingsHost,
+  type SettingsRecordPaths,
+  settingsRecordLocations,
+} from './settings-paths.ts'
 import {
   readSettingsProtectionCopy,
+  UnknownSettingsStateCopyError,
   writeSettingsProtectionCopy,
 } from './settings-protection-copy.ts'
 
@@ -41,6 +46,7 @@ export type SettingsValues = {
 
 export const SETTINGS_PROTECTION_KEYS = [
   'max_same_account_wait',
+  'refusal_fallback',
   'quota_minimum_remaining_five_hour',
   'quota_minimum_remaining_seven_day',
   'quota_minimum_remaining_scoped',
@@ -187,6 +193,7 @@ export interface SettingsGeneration {
 }
 
 export interface SettingsService {
+  readonly records: SettingsRecordPaths
   readonly file: string
   /** An independently disposable reference; settings stay live until all references are disposed. */
   retain(): SettingsService
@@ -223,6 +230,7 @@ export type SettingsChangeListener = (
 type CoreSettingsHandle = SettingsHandle<typeof settingsDefinition.settings>
 export interface SettingsServiceOptions {
   file: string
+  records: SettingsRecordPaths
   /** Acting host: enables persistence and startup recovery of only its own copy set. */
   host?: SettingsHost
   separateInstall?: boolean
@@ -378,6 +386,12 @@ export function planSettingsRecreation(
     if (setting === 'killswitch_account_floors') continue
     const own = writer.values[setting]
     const other = peer.values[setting]
+    // The file-level recreation check requires both hosts to agree on this
+    // shared setting; it cannot be written at a host override level.
+    if (setting === 'refusal_fallback') {
+      edits.push({ setting, value: own })
+      continue
+    }
     if (sameJson(own, other)) {
       edits.push({ setting, value: own })
       continue
@@ -470,7 +484,10 @@ export interface SettingsRecreationInput {
   none?: boolean
 }
 
-export type SettingsRecreationRefusalReason = 'own-unknown' | 'peer-unknown'
+export type SettingsRecreationRefusalReason =
+  | 'own-unknown'
+  | 'peer-unknown'
+  | 'refusal-fallback-conflict'
 
 /**
  * What a menu write or setup that finds the file missing does, as a pure
@@ -491,6 +508,8 @@ export function planSettingsFileRecreation(
   if (peer.none)
     return { edits: settingsRecreationForWriter(writer.values, writer.host) }
   if (peer.rung === 3) return { refused: 'peer-unknown' }
+  if (writer.values.refusal_fallback !== peer.values.refusal_fallback)
+    return { refused: 'refusal-fallback-conflict' }
   return { edits: planSettingsRecreation(writer, peer).edits }
 }
 
@@ -1404,11 +1423,12 @@ class SharedSettingsService {
 /**
  * Rungs 1-3 of the protection ladder, which need no open settings handle:
  * the applied copy (by default read from disk only for the acting host),
- * then the host's legacy store, then the strictest set. A source that can't
- * be read is skipped whole; keys are never mixed across sources.
+ * then the host's legacy store, then the strictest set. An unknown state
+ * fallback stops at the strictest set; a beside read error still skips rung 1.
+ * Keys are never mixed across sources.
  */
 export async function recoverSettingsProtection(
-  file: string,
+  records: SettingsRecordPaths | undefined,
   host: SettingsHost,
   recovery: SettingsProtectionRecovery = {},
   actingHost?: SettingsHost,
@@ -1417,8 +1437,8 @@ export async function recoverSettingsProtection(
     [
       1,
       recovery.readAppliedCopy ??
-        (actingHost === host
-          ? () => readSettingsProtectionCopy(file, host)
+        (records && actingHost === host
+          ? () => readSettingsProtectionCopy(records, host)
           : undefined),
     ],
     [2, recovery.readLegacyProtection],
@@ -1426,7 +1446,8 @@ export async function recoverSettingsProtection(
     try {
       const values = await read?.(host)
       if (values) return { values, rung }
-    } catch {
+    } catch (error) {
+      if (rung === 1 && error instanceof UnknownSettingsStateCopyError) break
       // Skip this source whole.
     }
   }
@@ -1461,7 +1482,7 @@ class SettingsProtectionLease {
   constructor(
     private readonly shared: SharedSettingsService,
     private readonly recovery: SettingsProtectionRecovery = {},
-    private readonly options?: SettingsServiceOptions,
+    private readonly options: SettingsServiceOptions,
   ) {}
 
   /** Whether the acting host uses the file; see `SettingsServiceOptions.adopted`. */
@@ -1533,7 +1554,7 @@ class SettingsProtectionLease {
   }
 
   private write(entry: NonNullable<SettingsProtectionLease['unsaved']>) {
-    const host = this.options?.host
+    const { host, records } = this.options
     if (!host || this.closed) return
     const { identity } = entry
     this.copied = identity
@@ -1545,7 +1566,7 @@ class SettingsProtectionLease {
     const task = Promise.resolve()
       .then(() =>
         write(
-          entry.file,
+          records,
           host,
           { readAt: entry.readAt, values: entry.values },
           this.options?.lockTimeoutMs,
@@ -1560,7 +1581,7 @@ class SettingsProtectionLease {
           logged.add(key)
           logger.warn(
             'settings',
-            `Could not save applied protection settings for ${host} at "${entry.file}.applied.json"; the previous copy is unchanged until a retry succeeds.`,
+            `Could not save applied protection settings for ${host} ${settingsRecordLocations(records)}; the save will be retried.`,
           )
         }
         // Not done: the next generation or a retry within a minute submits again.
@@ -1635,7 +1656,7 @@ class SettingsProtectionLease {
     const readCopy =
       this.recovery.readAppliedCopy ??
       ((peer: SettingsHost) =>
-        readSettingsProtectionCopy(this.shared.file, peer))
+        readSettingsProtectionCopy(this.options.records, peer))
     try {
       const values = await readCopy(host)
       if (values) return { values, rung: 1 }
@@ -1675,6 +1696,7 @@ class SettingsProtectionLease {
             {
               'own-unknown': `${host}'s protection settings could not be recovered`,
               'peer-unknown': `the protection settings of ${peer} are unknown`,
+              'refusal-fallback-conflict': `${host} and ${peer} last applied different refusal_fallback modes`,
             }[plan.refused]
           }.`
         : 'A menu write will recreate it.'
@@ -1706,7 +1728,7 @@ class SettingsProtectionLease {
           : previous
     }
     return recoverSettingsProtection(
-      this.shared.file,
+      this.options.records,
       host,
       this.recovery,
       this.options?.host,
@@ -1761,6 +1783,7 @@ function referenceCountedSettingsService(
     }
     return {
       file: service.file,
+      records: service.records,
       retain() {
         use()
         return reference()
@@ -1852,6 +1875,7 @@ export async function openSettingsService(
   }
   return referenceCountedSettingsService({
     file,
+    records: options.records,
     resolve(host, model) {
       use()
       const context = lease.snapshot().contexts[host]

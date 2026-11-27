@@ -3,10 +3,9 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   CLAUDE_MODEL_CAPABILITIES,
-  resolveClaudeModelCapabilities,
+  SERVER_SIDE_FALLBACK_BETA,
   selectClaudeCodeBetas,
 } from '@cortexkit/anthropic-auth-core'
-import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback'
 import { rewriteRequestBody } from '../transform'
 
 // Captured before adding Fable 5.2. Keep the recorded request bodies and apply
@@ -20,7 +19,11 @@ const snapshotPath = join(
 test('existing model request bodies stay byte-identical with only the expected capability and beta updates', async () => {
   const rendered: Record<string, unknown> = {}
   for (const row of CLAUDE_MODEL_CAPABILITIES) {
-    if (row.id === 'claude-fable-5-2' || row.id === 'claude-mythos-5-2')
+    if (
+      row.id === 'claude-fable-5-2' ||
+      row.id === 'claude-mythos-5-2' ||
+      row.id === 'claude-opus-4-8'
+    )
       continue
     const requests: Record<string, unknown> = {}
     for (const thinking of [
@@ -49,10 +52,13 @@ test('existing model request bodies stay byte-identical with only the expected c
         auxiliaryBetas: selectClaudeCodeBetas(body, [], 'auxiliary'),
       }
     }
-    rendered[row.id] = {
-      capabilities: resolveClaudeModelCapabilities(row.id),
-      requests,
-    }
+    // These two fields are fallback-only metadata added after the fixture.
+    const {
+      tokenLimits: _limits,
+      refusalFallbacks: _routes,
+      ...capabilities
+    } = row
+    rendered[row.id] = { capabilities, requests }
   }
   const recorded = JSON.parse(readFileSync(snapshotPath, 'utf8'))
   recorded['claude-mythos-5-1'].capabilities.efforts = {

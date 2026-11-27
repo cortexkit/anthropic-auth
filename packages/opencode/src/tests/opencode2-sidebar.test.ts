@@ -456,6 +456,36 @@ describe('OpenCode 2 sidebar RPC', () => {
     await registration.dispose()
   })
 
+  test('the menu subscribes only to session deletion and forgets the deleted session', async () => {
+    const forgotten: string[] = []
+    const filters: (readonly string[] | undefined)[] = []
+    const ctx = {
+      rpc: {
+        register: async () => ({
+          dispose: async () => {},
+          events: { emit: async () => {} },
+        }),
+      },
+      command: { transform: async () => ({ dispose: async () => {} }) },
+      event: {
+        subscribe: async function* (options?: { types?: readonly string[] }) {
+          filters.push(options?.types)
+          yield { type: 'session.deleted', data: { sessionID: 'ses_deleted' } }
+        },
+      },
+    }
+    const registration = await registerNativeMenu(
+      ctx as never,
+      {} as never,
+      {
+        forgetSession: (id: string) => void forgotten.push(id),
+      } as NativeMenuCapabilities,
+    )
+    await registration.dispose()
+    expect(filters).toEqual([['session.deleted']])
+    expect(forgotten).toEqual(['ses_deleted'])
+  })
+
   test('serves the last account state and logs once when the sidebar account read is busy', async () => {
     let handlers: Record<string, (input: { sessionId: string }) => unknown> = {}
     const ctx = {

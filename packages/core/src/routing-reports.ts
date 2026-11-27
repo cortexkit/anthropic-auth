@@ -8,8 +8,10 @@ import {
   quotaFieldSource,
 } from './accounts.ts'
 import { logger } from './logger.ts'
+import { resolveClaudeModelCapabilities } from './model-capabilities.ts'
 import {
   hasScopedQuotaExhaustionHeaders,
+  latestRejectedScopedQuotaWindow,
   quotaExhaustionFromHeaders,
 } from './quota-headers.ts'
 
@@ -20,6 +22,7 @@ export type RoutingReportSubject = {
 
 // Shared routing's pool-name alphabet; it drops a report whose pool falls outside it.
 const ROUTING_POOL_NAME = /^[a-z0-9._-]{1,64}$/
+const FABLE_POOL = 'fable'
 const QUOTA_STATUS = new Set([
   'accepted',
   'allowed',
@@ -57,6 +60,7 @@ export function reportRoutingResponse(
 ): void {
   const handedOff: Array<{ window: '5h' | '7d'; pool?: string }> = []
   let noReportReason = 'no_confirmed_window'
+  let unnamedScope: string | undefined
   const send = (
     report: Extract<ReportRoutingInput, { outcome: 'served' | 'exhausted' }>,
   ) => {
@@ -113,6 +117,30 @@ export function reportRoutingResponse(
       if (!scopedHeaders.length) {
         if (quota.five_hour || quota.seven_day || !upstreamHttp429 || !modelId)
           return
+        // With the general windows ruled out, a rejected scoped window
+        // explains the unified rejection even if its suffix isn't a model name.
+        const rejected =
+          headers.get('anthropic-ratelimit-unified-status') === 'rejected'
+            ? latestRejectedScopedQuotaWindow(headers)
+            : undefined
+        if (rejected) {
+          const family = resolveClaudeModelCapabilities(modelId)?.family
+          if (family !== FABLE_POOL) {
+            noReportReason = 'unnamed_scope_no_pool'
+            unnamedScope = rejected.id
+            return
+          }
+          send({
+            ...identity,
+            outcome: 'exhausted',
+            window: '7d',
+            pool: FABLE_POOL,
+            ...(rejected.resetsAt !== undefined && {
+              resetsAt: rejected.resetsAt,
+            }),
+          })
+          return
+        }
         if (hasScopedQuotaExhaustionHeaders(headers)) {
           noReportReason = 'different_confirmed_scope'
           return
@@ -168,7 +196,7 @@ export function reportRoutingResponse(
         const pool =
           storedPool ??
           (reading.id === '7d_fable' || reading.id === '7d-fable'
-            ? 'fable'
+            ? FABLE_POOL
             : undefined)
         if (!pool) {
           noReportReason = 'unknown_scoped_pool'
@@ -196,6 +224,7 @@ export function reportRoutingResponse(
         rateLimitHeaders: safeRateLimitHeaders(headers),
         exhaustedReports: handedOff,
         ...(!handedOff.length && { noReportReason }),
+        ...(unnamedScope && { scope: unnamedScope }),
       })
     })
     .catch(() => {})

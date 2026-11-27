@@ -78,6 +78,7 @@ test('all shared settings are flat, user-only and have exactly the allowed overr
       'routing_mode',
       'max_same_account_wait',
       'wait_for_reset',
+      'refusal_fallback',
       'fallback_on',
       'refresh_enabled',
       'refresh_interval_minutes',
@@ -132,6 +133,7 @@ test('all shared settings are flat, user-only and have exactly the allowed overr
       // List and record settings take no overrides, nor does the gateway:
       // one gateway with its headers serves both hosts.
       key === 'killswitch_account_floors' ||
+        key === 'refusal_fallback' ||
         key === 'gateway_headers' ||
         key === 'gateway_url'
         ? undefined
@@ -384,6 +386,7 @@ const defaultReaders = {
   thinking_binding_prefix_mismatch_behavior: getThinkingPrefixMismatchBehavior,
   turn_end_note_tools: readTurnEndTools,
   // File-only: without the settings no gateway is used.
+  refusal_fallback: () => 'client',
   gateway_url: () => '',
   gateway_headers: () => ({}),
 } satisfies Record<

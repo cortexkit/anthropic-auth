@@ -31,16 +31,22 @@ import {
   decideStickyQuotaFailure,
   formatLogLine,
   getLogLevel,
+  hasValidRequestBodySignature,
   logger,
+  MESSAGE_THREADS_BETA,
   NativeCustodyError,
   type NativeLockEvent,
+  RecoveryThinkingStore,
   RequestGzipLatch,
+  resolveClaudeModelCapabilities,
   resolveNativePoolPaths,
   runNativeMigration,
+  SERVER_SIDE_FALLBACK_BETA,
   StickyQuotaRetryCounter,
   StickySessionRouter,
   sessionCacheActivity,
   setLogLevel,
+  signRequestBody,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type Attempt,
@@ -72,6 +78,14 @@ import { createNativeMenuCapabilities } from '../v2/menu'
 import { setupAnthropicAuth } from '../v2/setup'
 import type { NativeSource } from '../v2/source'
 import * as sourceFactory from '../v2/source'
+import {
+  RECOVERY_FAMILY,
+  refusalThinkingReply,
+  SOURCE_MODEL,
+  TARGET_DIGEST,
+  TARGET_MODEL,
+  TARGET_SIGNATURE,
+} from './fixtures/refusal-thinking'
 
 const cleanups: Array<() => void | Promise<void>> = []
 let reportFailure: (() => void) | undefined
@@ -439,7 +453,11 @@ async function fixture(
       const draft = {
         sessionID: sessionID as SessionHooks['http.request']['sessionID'],
         agent,
-        model: { providerID: 'anthropic', id: 'claude-sonnet-4-6' },
+        model: {
+          providerID: 'anthropic',
+          id:
+            typeof extra.model === 'string' ? extra.model : 'claude-sonnet-4-6',
+        },
         kind: 'primary',
         request: new Request(url, {
           method: 'POST',
@@ -1408,6 +1426,7 @@ test('OpenCode 2 prewarm classifies a vault authorization refusal without creden
       resetRouting: async () => {},
       servedAccount: () => undefined,
       recordPrime: async () => false,
+      primeEvidence: async () => undefined,
       authorizeAccount: () => {
         const error = new NativeCustodyError('unavailable')
         error.message = 'SECRET vault credential'
@@ -1962,13 +1981,17 @@ test('OpenCode 2 restores a gzipped session after a server restart with the same
   expect(saved).not.toMatch(
     /authorization|x-api-key|sk-ant-oat01|refresh-first|placeholder/,
   )
+  const record = JSON.parse(saved)
+  expect(record).not.toHaveProperty('refusalSourceModel')
   // A fresh server has no process-wide registry, even though its files survive.
   forgetCacheKeepProcess(f.paths.storageId)
   const next = await f.start()
   f.due()
   await f.timers.fire()
   expect(next.sent).toHaveLength(1)
-  const warm = (await next.sent[0]!.json()) as Record<string, any>
+  const wire = await next.sent[0]!.text()
+  const warm = JSON.parse(wire) as Record<string, any>
+  expect(await hasValidRequestBodySignature(wire)).toBe(true)
   expect(warm.tools).toEqual(live.tools)
   expect(warm.system.slice(1)).toEqual(live.system.slice(1))
   expect(warm.messages).toEqual(live.messages)
@@ -1977,6 +2000,330 @@ test('OpenCode 2 restores a gzipped session after a server restart with the same
     'Bearer sk-ant-oat01-first',
   )
 })
+
+test('OpenCode 2 saves pending recovery thinking before server disposal returns', async () => {
+  const f = await fixture()
+  // Leave a session with a live cache so the shared keeper stays in memory
+  // after disposal. No eviction should be needed to save the thinking digest.
+  await f.live()
+  const owner = keeperFor(f.paths.storageId)
+  expect(owner.manager.trackedCount()).toBe(1)
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = Object.assign(
+    async (input: string | URL | Request, init?: RequestInit) => {
+      const request = new Request(input as Request, init)
+      if (new URL(request.url).pathname !== '/v1/messages')
+        return originalFetch(input, init)
+      const { model } = (await request.json()) as { model: string }
+      expect(model).toBe(TARGET_MODEL)
+      return refusalThinkingReply(model)
+    },
+    { preconnect: originalFetch.preconnect },
+  ) satisfies typeof fetch
+  cleanups.push(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  const sessionID = 'ses_oc2_thinking_shutdown'
+  const prepared = await f.prepare(
+    undefined,
+    { model: SOURCE_MODEL, max_tokens: 256, stream: true },
+    sessionID,
+  )
+  const joined = await f.respond(
+    prepared,
+    refusalThinkingReply(SOURCE_MODEL),
+    false,
+  )
+  expect(await joined.text()).toContain(TARGET_SIGNATURE)
+  await f.dispose()
+  expect(keeperFor(f.paths.storageId)).toBe(owner)
+
+  const restarted = new RecoveryThinkingStore()
+  await restarted.loadSession(sessionID)
+  expect(restarted.peek(sessionID, RECOVERY_FAMILY)?.has(TARGET_DIGEST)).toBe(
+    true,
+  )
+})
+
+async function exerciseRoundKeepWarm(
+  end: 'restart' | 'idle' | 'account' | 'concurrent',
+) {
+  const f = await fixture()
+  await f.setQuota('first')
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    dump: { enabled: true },
+  }))
+  const dumpDir = join(f.root, 'round-dumps')
+  const previousDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  cleanups.push(async () => {
+    if (previousDumpDir === undefined)
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    else process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = previousDumpDir
+  })
+  const source = 'claude-fable-5-2'
+  const target = 'claude-opus-5'
+  const sessionID = 'ses_oc2_round_warm'
+  const credit = 'credit-sentinel-oc2-warm'
+  const usage = { input_tokens: 20, cache_read_input_tokens: 300 }
+  const reply = (model: string, refused = false) => {
+    const frames = [
+      { type: 'message_start', message: { id: `msg_${model}`, model, usage } },
+      ...(!refused
+        ? [
+            {
+              type: 'content_block_start',
+              index: 0,
+              content_block: { type: 'text', text: 'answer' },
+            },
+            { type: 'content_block_stop', index: 0 },
+          ]
+        : []),
+      {
+        type: 'message_delta',
+        usage: { output_tokens: 2 },
+        delta: refused
+          ? {
+              stop_reason: 'refusal',
+              stop_details: {
+                type: 'refusal',
+                category: 'bio',
+                fallback_credit_token: credit,
+              },
+            }
+          : { stop_reason: 'end_turn' },
+      },
+      { type: 'message_stop' },
+    ]
+    return new Response(
+      frames
+        .map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`)
+        .join(''),
+      { headers: { 'content-type': 'text/event-stream' } },
+    )
+  }
+  const warmStarted = Promise.withResolvers<AbortSignal>()
+  const warmRelease = Promise.withResolvers<void>()
+  const send = async (request: Request) => {
+    const body = (await request.json()) as { model: string; max_tokens: number }
+    if (end === 'concurrent' && body.max_tokens === 0) {
+      warmStarted.resolve(request.signal)
+      await warmRelease.promise
+    }
+    return body.max_tokens === 0
+      ? Response.json({
+          id: 'msg_warm',
+          model: body.model,
+          usage,
+          content: [],
+          stop_reason: 'end_turn',
+        })
+      : reply(body.model)
+  }
+  f.setSend(send)
+  // The native adapter's extra physical sends use the host fetch. Warm sends
+  // use the fetch injected into the CacheKeep fixture above.
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    const request = new Request(input as Request, init)
+    if (new URL(request.url).pathname !== '/v1/messages')
+      return originalFetch(input, init)
+    f.sent.push(request.clone() as Request)
+    return send(request as Request)
+  }) as typeof fetch
+  cleanups.push(async () => {
+    globalThis.fetch = originalFetch
+  })
+  const prepare = (messages: Array<{ role: string; content: string }>) =>
+    f.prepare(
+      undefined,
+      { model: source, max_tokens: 256, stream: true, messages },
+      sessionID,
+    )
+  const first = [{ role: 'user', content: 'clean source prefix only' }]
+  const append = (history: typeof first, content: string) => [
+    ...history,
+    { role: 'assistant', content: 'answer' },
+    { role: 'user', content },
+  ]
+  const original = await prepare(first)
+  await f.respond(original, reply(source))
+  const refused = append(first, 'refused suffix')
+  const refusedSend = await prepare(refused)
+  const joined = await f.respond(refusedSend, reply(source, true), false)
+  const answer = await joined.text()
+  expect(answer).not.toContain(credit)
+  expect(answer).toContain('answer')
+  if (end === 'concurrent') {
+    f.due()
+    const warming = f.timers.fire()
+    try {
+      const signal = await Promise.race([
+        warmStarted.promise,
+        warming.then(() => undefined),
+      ])
+      expect(signal).toBeDefined()
+      const step = await prepare(append(refused, 'round while warming'))
+      expect(await step.request.clone().json()).toMatchObject({ model: target })
+      expect(signal?.aborted).toBe(false)
+      await f.respond(step, reply(target))
+      expect(signal?.aborted).toBe(false)
+    } finally {
+      warmRelease.resolve()
+      await warming
+    }
+    return
+  }
+  const round = await prepare(append(refused, 'new primary on round'))
+  const roundBody = await round.request.clone().text()
+  expect(JSON.parse(roundBody)).toMatchObject({
+    model: target,
+    thread: { type: 'create' },
+  })
+  expect(await hasValidRequestBodySignature(roundBody)).toBe(true)
+  await f.respond(round, reply(target))
+
+  const owner = keeperFor(f.paths.storageId)
+  expect(owner.roundNotices.snapshot()).toContainEqual(
+    expect.objectContaining({
+      sessionId: sessionID,
+      requestedModelId: source,
+      targetModelId: target,
+      category: 'bio',
+      remaining: 8,
+    }),
+  )
+  expect(owner.manager.trackedRequest(sessionID)?.bodyText).toContain(
+    'clean source prefix only',
+  )
+  expect(owner.manager.trackedRequest(sessionID)?.bodyText).not.toContain(
+    'refused suffix',
+  )
+  f.due()
+  await f.timers.fire()
+  const warmByModel = new Map<string, { wire: string; headers: Headers }>()
+  for (const request of f.sent) {
+    const wire = await request.text()
+    const body = JSON.parse(wire)
+    if (body.max_tokens !== 0) continue
+    expect(body).not.toHaveProperty('thread')
+    expect(wire).not.toContain(credit)
+    expect(await hasValidRequestBodySignature(wire)).toBe(true)
+    warmByModel.set(body.model, { wire, headers: request.headers })
+  }
+  expect(warmByModel.get(source)?.wire).toContain('clean source prefix only')
+  expect(warmByModel.get(source)?.wire).not.toContain('refused suffix')
+  expect([...warmByModel.keys()]).toEqual([source])
+  if (end === 'account') {
+    const before = f.sent.length
+    await f.store.remove('first')
+    f.due()
+    await f.timers.fire()
+    expect(f.sent).toHaveLength(before)
+    expect(owner.manager.trackedRequest(sessionID)).toBeUndefined()
+    return
+  }
+  if (end === 'idle') {
+    const before = owner.manager.trackedRequest(sessionID)
+    const state = owner.manager.trackedPolicyState(sessionID)
+    expect(state?.warmsSinceLastRealRequest).toBe(1)
+    f.advance(60_000)
+    const lastStep = append(
+      append(refused, 'new primary on round'),
+      'short gap',
+    )
+    const short = await prepare(lastStep)
+    expect(await short.request.clone().json()).toMatchObject({ model: target })
+    await f.respond(short, reply(target))
+    expect(owner.manager.trackedRequest(sessionID)?.bodyText).toBe(
+      before?.bodyText,
+    )
+    expect(owner.manager.trackedPolicyState(sessionID)).toMatchObject({
+      warmsSinceLastRealRequest: 0,
+      warmCostSoFar: 0,
+      lastRealRequestAt: state?.lastRealRequestAt,
+    })
+    f.advance(54 * 60_000)
+    await f.timers.fire()
+    f.advance(6 * 60_000 + 1)
+    const returned = append(lastStep, 'idle gap past one hour')
+    const long = await prepare(returned)
+    const wire = JSON.parse(await long.request.clone().text())
+    expect(wire.model).toBe(source)
+    expect(wire.messages[0].content).toContainEqual(
+      expect.objectContaining({
+        text: 'clean source prefix only',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      }),
+    )
+    await f.respond(long, reply(source))
+    const nextRefusal = await prepare(append(returned, 'refuse again'))
+    await (await f.respond(nextRefusal, reply(source, true), false)).text()
+    expect(owner.roundNotices.snapshot()).toContainEqual(
+      expect.objectContaining({ sessionId: sessionID, remaining: 19 }),
+    )
+    return
+  }
+  await owner.persistence.drain()
+  const saved = await readdir(f.disk)
+  expect(saved.filter((name) => name.endsWith('.json.gz'))).toHaveLength(1)
+  // The host may end its attempt before rewriteResponse writes the dump.
+  // Disposal joins that outstanding request-artifact write.
+  await f.dispose()
+  const dumpBodies = await Promise.all(
+    (await readdir(dumpDir))
+      .filter((name) => name.endsWith('.body.json'))
+      .map((name) => readFile(join(dumpDir, name), 'utf8')),
+  )
+  expect(dumpBodies).toContain(roundBody)
+  expect(dumpBodies.join('\n')).not.toContain(credit)
+
+  const record = JSON.parse(
+    gunzipSync(await readFile(join(f.disk, saved[0]!))).toString(),
+  )
+  forgetCacheKeepProcess(f.paths.storageId)
+  const next = await f.start()
+  next.setSend(send)
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(1)
+  const wire = await next.sent[0]!.text()
+  expect(JSON.parse(wire)).toMatchObject({ model: source, max_tokens: 0 })
+  expect(JSON.parse(wire).messages).toEqual(
+    JSON.parse(warmByModel.get(source)!.wire).messages,
+  )
+  const modelBetas = (headers: Headers) =>
+    headers
+      .get('anthropic-beta')!
+      .split(',')
+      .filter((beta) => beta !== MESSAGE_THREADS_BETA)
+  expect(modelBetas(next.sent[0]!.headers)).toEqual([
+    ...resolveClaudeModelCapabilities(source)!.claudeCodeBetas.title,
+    SERVER_SIDE_FALLBACK_BETA,
+  ])
+  expect(await hasValidRequestBodySignature(wire)).toBe(true)
+  expect(record).not.toHaveProperty('refusalSourceModel')
+  expect(record).not.toHaveProperty('headers')
+  expect(record.policyState.warmsSinceLastRealRequest).toBe(1)
+  expect(record.nextPrewarmAt).toBeGreaterThan(
+    record.policyState.lastRealRequestAt + 60 * 60_000,
+  )
+}
+
+test('OpenCode 2 only warms the requested-model prefix during a round and after restart', () =>
+  exerciseRoundKeepWarm('restart'))
+test('OpenCode 2 round activity renews the warm budget and an idle end advances backoff', () =>
+  exerciseRoundKeepWarm('idle'))
+test('OpenCode 2 stops warming the requested-model prefix if the account disappears mid-round', () =>
+  exerciseRoundKeepWarm('account'))
+test('OpenCode 2 does not abort an in-flight requested-model warm when a round step starts', () =>
+  exerciseRoundKeepWarm('concurrent'))
 
 const CACHE_KEEP_SLOT = Symbol.for(
   'cortexkit.anthropic-auth.opencode2.cachekeep.v3',
@@ -3186,7 +3533,7 @@ test('OC2 aborted recovery reports nothing', async () => {
   }
 })
 
-test('OC2 ordinary acceptance captures the byte-identical pre-thread snapshot before returning', async () => {
+test('OC2 ordinary acceptance tracks the signed pre-thread snapshot before returning', async () => {
   const f = await fixture()
   const originalRewrite = wireTransform.rewriteRequestBody
   let captured: string | undefined
@@ -3203,7 +3550,9 @@ test('OC2 ordinary acceptance captures the byte-identical pre-thread snapshot be
     expect(JSON.parse(captured!).thread).toBeUndefined()
     await f.respond(draft, Response.json({ content: [], usage: {} }), false)
     expect(track).toHaveBeenCalledTimes(1)
-    expect(track.mock.calls[0]![0].bodyText).toBe(captured!)
+    expect(track.mock.calls[0]![0].bodyText).toBe(
+      await signRequestBody(captured!),
+    )
   } finally {
     rewrite.mockRestore()
     track.mockRestore()

@@ -7,15 +7,18 @@ import {
   isOAuthAccount,
   type LogTestRecord,
   type OAuthAccount,
+  SERVER_SIDE_FALLBACK_BETA,
   setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import type { TestLifetime } from '../../../core/src/tests/test-lifetime.ts'
-import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback'
 import { drainSidebarWrites, type getSidebarState } from '../sidebar-state'
 import { getPluginTestHandles } from './plugin-test-handles'
 import type { createMockClient } from './support/opencode1-client.ts'
-import { installLoaderSetup } from './support/opencode1-loader-setup.ts'
+import {
+  installLoaderSetup,
+  setUserRefusalFallbackMode,
+} from './support/opencode1-loader-setup.ts'
 import {
   bindMainAccount,
   bindMainQuotaToAccount,
@@ -2495,7 +2498,6 @@ describe('auth.loader', () => {
   })
 
   test('routes to API-key fallback after main OAuth returns 429 and strips server fallback fields from the custom provider request', async () => {
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
     await useTempAccountFile(
       createFallbackStorage({
         quota: {
@@ -2517,6 +2519,7 @@ describe('auth.loader', () => {
       }),
     )
 
+    await setUserRefusalFallbackMode(testContext, 'server')
     const requests: Array<{
       url: string
       authorization: string | null

@@ -22,6 +22,7 @@ import {
   type SettingsServiceOptions,
   type SettingsValues,
 } from '../settings-service.ts'
+import { settingsTestPaths } from './settings-record-paths-fixture.ts'
 
 const cleanup: (() => Promise<unknown>)[] = []
 afterEach(async () => {
@@ -39,6 +40,7 @@ async function fixture(
   let reads = 0
   const service = await openSettingsService({
     file,
+    records: (await settingsTestPaths(file)).records,
     ...overrides,
     dependencies: {
       readFile: async (path) => {
@@ -185,6 +187,7 @@ const fileValues = {
   routing_mode: 'fallback-first',
   max_same_account_wait: 'cache',
   wait_for_reset: true,
+  refusal_fallback: 'off',
   fallback_on: [502],
   refresh_enabled: false,
   refresh_interval_minutes: 12,
@@ -252,12 +255,13 @@ test('every file setting projects into its corresponding legacy-shaped leaf', as
     )
 })
 
-test('host levels apply to every setting except the account-floor list and the gateway', async () => {
+test('host levels apply only to settings that declare host overrides', async () => {
   const source = Object.fromEntries(
     Object.entries(fileValues).map(([key, value]) => [
       key,
-      // List, record and gateway settings take no host levels.
+      // These settings have one value for both hosts.
       key === 'killswitch_account_floors' ||
+      key === 'refusal_fallback' ||
       key === 'gateway_headers' ||
       key === 'gateway_url'
         ? value
@@ -467,8 +471,12 @@ for (const choice of ['default', 'on', 'off'] as const) {
 }
 
 test('legacy mode and a separate install preserve booleans and absence without defaults', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'settings-record-separate-'))
+  cleanup.push(() => rm(root, { recursive: true, force: true }))
+  const file = join(root, 'not-read.jsonc')
   const separate = await openSettingsService({
-    file: '/not-read/settings.jsonc',
+    file,
+    records: (await settingsTestPaths(file)).records,
     separateInstall: true,
     dependencies: {
       readFile: async () => {

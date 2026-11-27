@@ -1,5 +1,6 @@
-import { expect, test as registerTest, spyOn } from 'bun:test'
+import { afterEach, expect, test as registerTest, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
+import * as fs from 'node:fs/promises'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -57,12 +58,14 @@ import {
 import { PiCacheKeep } from '../cachekeep.ts'
 import { piForkEffortSnapshots } from '../forks.ts'
 import cortexKitPiAnthropicAuth from '../index.ts'
+import * as piNative from '../native.ts'
 import {
   closePiNativeRuntime,
   getPiNativeRuntime,
   PI_VAULT_POLL_INTERVAL_MS,
   PiNativeRuntime,
 } from '../native.ts'
+import { getPiAccountStoragePath } from '../paths.ts'
 import {
   __prewarmPiCacheKeepForTest,
   __sendPiAnthropicRequestForTest,
@@ -104,10 +107,62 @@ function captureBilling() {
   })
   return { reports, sessions }
 }
+let checkRuntimes: (() => void) | undefined
+let trackDirectRuntime:
+  | ((runtime: PiNativeRuntime, storagePath: string) => void)
+  | undefined
+
+// Run after the fixture cleanups. A runtime is not retired until its close
+// promise has settled successfully, including the vault's last roster drain.
+afterEach(() => {
+  const check = checkRuntimes
+  checkRuntimes = undefined
+  trackDirectRuntime = undefined
+  check?.()
+})
+
 const wrapBody = <Args extends unknown[]>(body: (...args: Args) => unknown) =>
-  lifetimes.wrapBody((...args: Args) =>
-    trackPiTestBody(Promise.resolve().then(() => body(...args))),
-  )
+  lifetimes.wrapBody((...args: Args) => {
+    const seen = new WeakSet<PiNativeRuntime>()
+    const open = new Map<PiNativeRuntime, string>()
+    const trackRuntime = (runtime: PiNativeRuntime, storagePath: string) => {
+      if (seen.has(runtime)) return
+      seen.add(runtime)
+      open.set(runtime, storagePath)
+      const close = runtime.close.bind(runtime)
+      runtime.close = () => {
+        const closing = close()
+        void closing.then(
+          () => open.delete(runtime),
+          () => {},
+        )
+        return closing
+      }
+    }
+    trackDirectRuntime = trackRuntime
+    const get = piNative.getPiNativeRuntime
+    const spy = spyOn(piNative, 'getPiNativeRuntime').mockImplementation(
+      (storagePath = getPiAccountStoragePath(), options) => {
+        const runtime = get(storagePath, options)
+        trackRuntime(runtime, storagePath)
+        return runtime
+      },
+    )
+    checkRuntimes = () => {
+      spy.mockRestore()
+      expect([...open.values()]).toEqual([])
+    }
+    return trackPiTestBody(Promise.resolve().then(() => body(...args)))
+  })
+
+function newFixtureRuntime(
+  ...args: ConstructorParameters<typeof PiNativeRuntime>
+) {
+  if (!trackDirectRuntime) throw new Error('Pi runtime needs a test lifetime')
+  const runtime = new PiNativeRuntime(...args)
+  trackDirectRuntime(runtime, args[0])
+  return runtime
+}
 const test = (name: string, body: () => unknown, timeout?: number) =>
   registerTest(name, wrapBody(body), timeout)
 let dir: string | undefined
@@ -2199,6 +2254,59 @@ for (const outcome of [
   })
 }
 
+test('Pi close drains an in-flight stale roster lock eviction', async () => {
+  const f = await fixture()
+  const lock = `${nativeVaultPaths(await resolveNativePoolPaths(f.path)).roster}.claustrum-roster.lock`
+  await writeFile(lock, JSON.stringify({ ownerId: 'expired', expiresAt: 0 }))
+  const entered = lifetimes.gate()
+  const release = lifetimes.gate()
+  const markerWrite = lifetimes.gate()
+  const read = fs.readFile
+  const open = fs.open
+  let closeReturned = false
+  let markerAfterClose: string | undefined
+  const reads = spyOn(fs, 'readFile').mockImplementation((async (
+    ...args: Parameters<typeof read>
+  ) => {
+    if (String(args[0]) === lock) {
+      entered.open()
+      await release.wait
+    }
+    return read(...args)
+  }) as typeof read)
+  const writes = spyOn(fs, 'open').mockImplementation(async (...args) => {
+    if (String(args[0]) === `${lock}.evicting/owner.json`) {
+      if (closeReturned) markerAfterClose = String(args[0])
+      markerWrite.open()
+      throw Object.assign(new Error('probe ends after marker create attempt'), {
+        code: 'EPERM',
+      })
+    }
+    return open(...args)
+  })
+  deferCleanup(() => reads.mockRestore())
+  deferCleanup(() => writes.mockRestore())
+  const polled = newFixtureRuntime(f.path, {
+    connect: f.connect,
+    vaultPoll: { intervalMs: 20 },
+  })
+  deferCleanup(() => polled.close())
+  await polled.service()
+  await entered.wait
+  const closing = (async () => {
+    await polled.close()
+    await closePiNativeRuntime(f.path)
+    closeReturned = true
+  })()
+  // This event-loop checkpoint is not a deadline: a close that does not await
+  // its work finishes here; a close that does await remains blocked on the read.
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  release.open()
+  await markerWrite.wait
+  await closing
+  expect(markerAfterClose).toBeUndefined()
+})
+
 test('Pi background vault poll adopts a main re-login while a fallback serves, with no request-time discovery', async () => {
   const f = await fixture('main-first')
   f.rows[0] = { ...f.rows[0]!, state: 'needs_reauth' }
@@ -2208,7 +2316,7 @@ test('Pi background vault poll adopts a main re-login while a fallback serves, w
   // Two Pi runtimes for the same storage share one vault connection. The
   // fixture's runtime was created with polling off; this second one turns the
   // shared background poll on at a short interval for this test.
-  const polled = new PiNativeRuntime(f.path, {
+  const polled = newFixtureRuntime(f.path, {
     connect: f.connect,
     vaultPoll: { intervalMs: 20 },
   })
@@ -2240,7 +2348,7 @@ for (const outcome of ['watching', 'fallback'] as const)
     const timers = recordedTimers(deferCleanup)
     // The fixture's runtime does not poll; this one shares its vault runtime
     // and turns the background poll on at Pi's default pace.
-    const polled = new PiNativeRuntime(f.path, {
+    const polled = newFixtureRuntime(f.path, {
       connect: f.connect,
       vaultPoll: {
         intervalMs: PI_VAULT_POLL_INTERVAL_MS,
@@ -2296,7 +2404,7 @@ test('Pi same-key replacement drains its predecessor without closing the shared 
     disposed = true
   })
   lifetimes.trackDetached(disposing)
-  const successor = new PiNativeRuntime(f.path, { connect: f.connect })
+  const successor = newFixtureRuntime(f.path, { connect: f.connect })
   deferCleanup(() => successor.close())
   expect(disposed).toBe(false)
   const second = await successor.authorize('main')
@@ -5910,17 +6018,23 @@ test('Pi keep-warm uses the gateway of the target runtime, not the default-path 
   const live = sent.at(-1)!
   expect(live.url).toBe(`${PI_GATEWAY}/target/v1/messages?beta=true`)
   // The default storage path now names another install with no runtime.
-  process.env.PI_ANTHROPIC_AUTH_FILE = join(dir!, 'other-install.json')
-  const prewarm = await __prewarmPiCacheKeepForTest({
-    sessionId: 'pi-gateway-target-warm',
-    url: 'https://api.anthropic.com/v1/messages?beta=true',
-    headers: new Headers(),
-    bodyText: live.body,
-    oauthAccountId: 'main',
-    oauthAccountIdentity: fixtureAccountIdentity('main'),
-    accountStoragePath: f.path,
-  })
-  expect(prewarm).toMatchObject({ ok: true })
-  expect(sent.at(-1)?.url).toBe(`${PI_GATEWAY}/target/v1/messages?beta=true`)
-  expect(sent.at(-1)?.headers.get('x-gateway-key')).toBe(PI_GATEWAY_SECRET)
+  const otherStoragePath = join(dir!, 'other-install.json')
+  process.env.PI_ANTHROPIC_AUTH_FILE = otherStoragePath
+  try {
+    const prewarm = await __prewarmPiCacheKeepForTest({
+      sessionId: 'pi-gateway-target-warm',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      headers: new Headers(),
+      bodyText: live.body,
+      oauthAccountId: 'main',
+      oauthAccountIdentity: fixtureAccountIdentity('main'),
+      accountStoragePath: f.path,
+    })
+    expect(prewarm).toMatchObject({ ok: true })
+    expect(sent.at(-1)?.url).toBe(`${PI_GATEWAY}/target/v1/messages?beta=true`)
+    expect(sent.at(-1)?.headers.get('x-gateway-key')).toBe(PI_GATEWAY_SECRET)
+  } finally {
+    // CacheKeep can open the default runtime to read refusal fallback mode.
+    await closePiNativeRuntime(otherStoragePath)
+  }
 })

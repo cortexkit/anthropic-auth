@@ -40,7 +40,10 @@ async function withProcesses(
         live: number
         warm: number
       }
-      if (['resume', 'takeover'].includes(phase) && value.warm !== 1)
+      if (
+        ['resume', 'round-resume', 'takeover'].includes(phase) &&
+        value.warm !== 1
+      )
         throw new Error(`Pi ${phase} sent ${value.warm} warms: ${stderr}`)
       return value
     })
@@ -94,6 +97,38 @@ test(
   () => restart('seed'),
   20_000,
 )
+
+test('Pi signs only the requested-model warm during a round and after restart', async () => {
+  await withProcesses(async (spawn) => {
+    expect(await spawn('round-seed').result).toEqual({ live: 4, warm: 1 })
+    expect(await spawn('round-resume').result).toEqual({ live: 0, warm: 1 })
+  })
+}, 20_000)
+
+test('Pi round activity renews the warm budget and an idle end advances backoff', async () => {
+  await withProcesses(async (spawn) => {
+    expect(await spawn('round-idle').result).toEqual({ live: 8, warm: 2 })
+  })
+}, 20_000)
+
+test('Pi does not abort an in-flight requested-model warm when a round step starts', async () => {
+  await withProcesses(async (spawn) => {
+    expect(await spawn('round-concurrent').result).toEqual({ live: 5, warm: 1 })
+  })
+}, 20_000)
+
+test('Pi stops warming when the OAuth account changes mid-round', async () => {
+  await withProcesses(async (spawn) => {
+    expect(await spawn('round-account').result).toEqual({ live: 4, warm: 1 })
+  })
+}, 20_000)
+
+test('Pi drops only the refused retry thinking from source replay after restart', async () => {
+  await withProcesses(async (spawn) => {
+    expect(await spawn('thinking-seed').result).toEqual({ live: 2, warm: 0 })
+    expect(await spawn('thinking-resume').result).toEqual({ live: 1, warm: 0 })
+  })
+}, 20_000)
 
 test(
   'Pi startup, turn and accepted response proceed while the keep-warm lock is held',

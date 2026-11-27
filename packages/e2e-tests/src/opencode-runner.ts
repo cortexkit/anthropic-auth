@@ -228,7 +228,8 @@ export type SpawnOptions = {
   /** Stand-in child used by preparation tests; ordinary runs use the locked host binary. */
   executable?: string
   hybridCache?: boolean
-  fallbackMode?: 'server' | 'legacy'
+  refusalFallbackMode?: 'client' | 'server' | 'off'
+  fixtureSettings?: Record<string, unknown>
   relay?: {
     url: string
     token: string
@@ -237,6 +238,9 @@ export type SpawnOptions = {
   port?: number
   beforeSpawn?: (env: IsolatedEnv) => void | Promise<void>
   childEnv?: Record<string, string | undefined>
+  /** Replace the inherited environment for hosts launched with disposable state. */
+  childBaseEnv?: Record<string, string>
+  configDependencies?: string
   childTmpDir?: string
   /** Defaults to `{ kind: 'local' }`. */
   nativeAccounts?: NativeAccountFixture
@@ -992,7 +996,9 @@ export async function spawnOpencode(
     await options.beforeSpawn?.(env)
 
     const childEnv: Record<string, string> = {}
-    for (const [key, value] of Object.entries(process.env)) {
+    for (const [key, value] of Object.entries(
+      options.childBaseEnv ?? process.env,
+    )) {
       if (value == null) continue
       if (key === 'OPENCODE_SERVER_PASSWORD') continue
       if (key === 'OPENCODE_SERVER_USERNAME') continue
@@ -1023,10 +1029,22 @@ export async function spawnOpencode(
       'opencode-anthropic-auth.log',
     )
     childEnv.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-    if (options.fallbackMode) {
-      childEnv.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = options.fallbackMode
-    } else {
-      delete childEnv.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
+    if (options.refusalFallbackMode) {
+      const settingsFile = join(env.configDir, 'anthropic-auth-settings.jsonc')
+      writeFileSync(
+        settingsFile,
+        JSON.stringify({
+          refusal_fallback: options.refusalFallbackMode,
+          quota_enabled: 'off',
+          refresh_enabled: false,
+          ...(options.hybridCache && {
+            claude_cache_enabled: 'on',
+            claude_cache_mode: 'hybrid',
+          }),
+          ...options.fixtureSettings,
+        }),
+      )
+      childEnv.ANTHROPIC_AUTH_SETTINGS_FILE = settingsFile
     }
     // XDG isolation alone is insufficient: OpenCode also reads ~/.opencode
     // and ~/.claude/skills during lazy project bootstrap. Keep those reads
@@ -1109,7 +1127,8 @@ export async function spawnOpencode(
       })
     }
 
-    const configDependencies = process.env[OPENCODE_CONFIG_DEPS_ENV]
+    const configDependencies =
+      options.configDependencies ?? process.env[OPENCODE_CONFIG_DEPS_ENV]
     if (configDependencies)
       await seedOpencodeConfigDependencies(env, childEnv, configDependencies)
 

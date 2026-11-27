@@ -16,7 +16,11 @@ import {
   type StoredCredential,
 } from '@cortexkit/common-auth/store'
 
-import { ClaudeOAuthRefreshError, refreshClaudeOAuthToken } from './auth.ts'
+import {
+  ClaudeOAuthRefreshError,
+  isInvalidGrantResponse,
+  refreshClaudeOAuthToken,
+} from './auth.ts'
 import {
   ClaudeUnsupportedAccessError,
   resolveClaudeCodeAccountIdentity,
@@ -420,8 +424,7 @@ function failureOf(error: Error): NativeRefreshFailure {
   const kind = error instanceof PoolOperationError ? error.kind : 'caller-hook'
   if (kind === 'provider' && cause instanceof ClaudeOAuthRefreshError) {
     // Only a 400 invalid_grant response establishes a dead refresh token.
-    const invalidGrant =
-      cause.status === 400 && /\binvalid_grant\b/.test(cause.body)
+    const invalidGrant = isInvalidGrantResponse(cause.status, cause.body)
     return {
       kind,
       classification: invalidGrant

@@ -545,7 +545,11 @@ async function primeFixture(
     outcomes,
     refreshes,
     held,
-    send: () => prime.manager.options.sendPrime('main'),
+    send: async () =>
+      prime.manager.options.sendPrime(
+        'main',
+        (await prime.manager.options.getAccountEvidence('main'))!,
+      ),
   }
 }
 

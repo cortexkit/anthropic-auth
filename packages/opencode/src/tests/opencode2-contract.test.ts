@@ -7,6 +7,7 @@ import {
   custodyTombstoneOAuth,
   fetchOAuthQuotaSnapshot,
   readNativeEnrollmentMode,
+  SERVER_SIDE_FALLBACK_BETA,
   THINKING_BINDING_CONTROLS_BETA,
 } from '@cortexkit/anthropic-auth-core'
 import type { OpenCode2HookContext } from '@cortexkit/common-auth/opencode2'
@@ -18,7 +19,6 @@ import {
 import type { IntegrationOAuthMethodRegistration } from '@opencode/plugin/promise/integration'
 import type { Registration } from '@opencode/plugin/promise/registration'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
-import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback'
 import {
   CLAUDE_POOL_LOGIN_METHOD_ID,
   CLAUDE_VAULT_ACTIVATION_METHOD_ID,
@@ -125,6 +125,48 @@ function request() {
 }
 
 describe('OpenCode 2 published installation contract', () => {
+  test('the native installer filters for session deletion and both idle events', async () => {
+    const filters: (readonly string[])[] = []
+    const deleted: string[] = []
+    const idle: string[] = []
+    const native = await installNativeAnthropic(
+      {
+        session: new Hooks(),
+        event: {
+          subscribe: async function* (options?: { types?: readonly string[] }) {
+            if (options?.types) filters.push(options.types)
+            yield {
+              type: 'session.deleted',
+              data: { sessionID: 'ses_deleted' },
+            }
+            yield { type: 'session.idle', data: { sessionID: 'ses_legacy' } }
+            yield {
+              type: 'session.status',
+              data: { sessionID: 'ses_idle', status: { type: 'idle' } },
+            }
+            yield {
+              type: 'session.status',
+              data: { sessionID: 'ses_busy', status: { type: 'busy' } },
+            }
+          } as NonNullable<OpenCode2HookContext['event']>['subscribe'],
+        },
+      },
+      {
+        source: source({ forgetTurn: (id) => void idle.push(id) }),
+        onSessionDeleted: (id) => void deleted.push(id),
+      },
+      { credential: preparedAnthropicCredential },
+    )
+    await native.dispose()
+    expect(filters).toContainEqual([
+      'session.deleted',
+      'session.idle',
+      'session.status',
+    ])
+    expect(deleted).toEqual(['ses_deleted'])
+    expect(idle).toEqual(['ses_legacy', 'ses_idle'])
+  })
+
   test('an API-key transport failure cannot leave an installer busy lease behind', async () => {
     const hooks = new Hooks()
     let now = Date.now()

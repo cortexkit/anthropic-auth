@@ -22,8 +22,8 @@ docs/           public user and contributor documentation
 - **Shared user settings:**
   - `settings-definition.ts` declares flat user-only keys and their host/model overrides; the generated schema ships at `packages/core/schema/anthropic-auth.schema.json`. No project settings file is read. Sidebar preferences and relay settings do not move into this file.
   - `settings-paths.ts` resolves the OS-specific `cortexkit/anthropic-auth.jsonc` user file, `ANTHROPIC_AUTH_SETTINGS_FILE` and separate installs. `settings-service.ts` owns the common-auth handle, per-path leases, watch, coherent in-memory model/host generations and keyed menu writes; `settings-record.ts` projects them into the policy record. `native-runtime-settings.ts` integrates the service with the account runtime.
-  - `settings-start.ts`, `settings-move-run.ts`, `settings-move-fence.ts` and `settings-move-{sources,source,map}.ts` own startup adoption and conversion from the active pool/vault stores. The move leaves sources unchanged and still in use for state that did not move. `settings-mode.ts` owns the `<target>.moved` marker, which prevents a second move after deletion; `.MOVED_READPLEASE` notes are informational. `settings-host-import.ts` preserves a later host's stricter legacy protection only where it has no explicit host value, recording the check in `<target>.moved.<host>`.
-  - `settings-protection-copy.ts` maintains owner-only `<target>.applied.json` beside the user file, with each host's complete last-applied user-file protection set and no credentials. `settings-protection-legacy.ts` provides per-runtime recovery when the file/copy is unusable. Recreation in `settings-service.ts` preserves both known host sets and refuses unknown protection; `settings-three-way.ts` preserves each reader's `default`/`on`/`off` semantics.
+  - `settings-start.ts`, `settings-move-run.ts`, `settings-move-fence.ts` and `settings-move-{sources,source,map}.ts` own startup adoption and conversion from the active pool/vault stores. The move leaves sources unchanged and still in use for state that did not move. `settings-mode.ts` owns the `moved` marker, which prevents a second move after deletion; `.MOVED_READPLEASE` notes are informational. `settings-host-import.ts` preserves a later host's stricter legacy protection only where it has no explicit host value, recording the check in `moved.<host>`. `settings-paths.ts` resolves the keyed state directory and the compatibility record paths beside the user file. This release writes both; a later release will stop writing beside the user file and remove the old records.
+  - `settings-protection-copy.ts` maintains owner-only `applied.json` in both locations, with each host's complete last-applied user-file protection set and no credentials. `settings-protection-legacy.ts` provides per-runtime recovery when the file/copy is unusable. Recreation in `settings-service.ts` preserves both known host sets and refuses unknown protection; `settings-three-way.ts` preserves each reader's `default`/`on`/`off` semantics.
 - **Accounts and custody:**
   - `native-account-runtime.ts` is the shared account service. `native-account-view.ts` holds its secret-free views and `native-settings.ts` its settings transforms.
   - Local custody: `native-local-*.ts`, `native-refresh-coordinator.ts`, `native-runtime.ts` and `pool-*.ts` (paths, store, binding, authority).
@@ -36,16 +36,18 @@ docs/           public user and contributor documentation
   - Claude Code shape: `claude-code.ts`, `cch.ts` (billing header and body signature), `constants.ts` (the emulated Claude Code version and betas).
   - Paid API-key routes: `api-key-request.ts` (history checks, internal-marker cleanup and model aliases without OAuth shaping) and `api-route-url.ts` (saved URL and environment precedence).
   - Cache diagnostics: `cache-diagnostics.ts` (previous-message tracking, record validation and debug formatting shared by all hosts).
-  - Per-model handling: `model-capabilities.ts` (one row per model) and `models.ts` (catalogue and pricing).
+  - Per-model handling: `model-capabilities.ts` (one row per model, including refusal-fallback routes) and `models.ts` (catalogue and pricing).
+  - Refusal fallback: `refusal-fallback-targets.ts` (target choice), `refusal-fallback-round.ts` (client round state), `refusal-fallback-dispatch.ts` (in-request retries), `refusal-fallback-stream.ts` (joined responses) and `server-fallback.ts` (Anthropic's server-side fallback).
   - Mid-conversation controls: `thinking-binding.ts`, `mid-conversation-output-config.ts` (effort markers) and `turn-end-note.ts`.
   - History and transport: `request-history.ts` (structural checks), `message-threads.ts`, `request-gzip.ts`, `relay.ts`, `oauth-origin.ts` and `request-abort.ts`.
 - **Routing and quota:**
   - Routing: `routing.ts` and `sticky-routing.ts`.
   - Quota policy: `killswitch.ts`, `quota-refusal.ts` and `session-cache-activity.ts`.
   - Quota readings: `quota-manager.ts`, `quota-headers.ts`, `insula-quota.ts` and `quotas.ts`.
-- **Cache:** `cache1h.ts`, `session-cache-policy.ts` (per-session policy from Thalamus), `cachekeep.ts`, `cachekeep-store.ts` (restart store), `cachekeep-registry.ts` (session list) and `prime.ts`.
+- **Cache:** `cache1h.ts`, `session-cache-policy.ts` (per-session policy from Thalamus), `cachekeep.ts` (one requested-model warm target per session, including during client fallback), `cachekeep-store.ts` (restart store), `cachekeep-registry.ts` (session list) and `prime.ts`.
 - **State layout:** `state-layout-*.ts`, `holder-registry.ts`, `layout-fence.ts`, `relocation-guard.ts` and `state-home-serving-guard.ts`.
 - **Shared plumbing:** `logger.ts`, `logging.ts`, `dump.ts`, `json.ts` (redacting JSON parse), `sse.ts`, `owner-only.ts`, `publication-rename.ts`, `network-errors.ts` and `provider-error.ts`.
+- **User data folders:** the [CacheKeep session list](docs/cachekeep-registry.md#location-and-permissions), [Prime markers](docs/cache.md#prime-and-lane-start) and [default request dumps](docs/transports.md#diagnostics-and-dumps) use `<data>/cortexkit/anthropic-auth/`.
 - `tests/`: Core unit tests. `test-lifetime.ts` holds the body-owned cleanup helper.
 - `../scripts/`: the Core build and the declaration-closure guard for bundled common-auth types (`check-native-type-closure.ts`).
 
@@ -55,7 +57,6 @@ docs/           public user and contributor documentation
 - `transform.ts`: OpenCode 1 request and stream rewriting.
 - `cachekeep-restart.ts`: OpenCode 1 restart ownership, persistence and staggered restore.
 - **Shared by OpenCode 1 and 2:**
-  - Server fallback and OpenCode 1 recovery rounds: `server-fallback.ts`, `fable-fallback.ts`.
   - Request plumbing: `effort-history.ts` (the effort plan), `billing-lineage.ts`, `lane-start.ts`, `routing-relay.ts` (shared routing), `prompt-context.ts`.
   - Diagnostics and display: `cache-diagnostics.ts` and `sidebar-state.ts`.
 - `v2/`: OpenCode 2, built to `dist/v2/server.js` and loaded through the `./server` export.

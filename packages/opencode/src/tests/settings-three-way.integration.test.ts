@@ -1,5 +1,8 @@
 import { describe, expect, mock } from 'bun:test'
-import { isCache1hEnabled } from '@cortexkit/anthropic-auth-core'
+import {
+  createNativeAccountRuntime,
+  isCache1hEnabled,
+} from '@cortexkit/anthropic-auth-core'
 import { installLoaderSetup } from './support/opencode1-loader-setup.ts'
 import {
   bindPoolAccounts,
@@ -139,6 +142,24 @@ describe('OpenCode 1 three-way request readers', () => {
           },
         ),
       ) as unknown as typeof fetch
+      if (on) {
+        // Cold fallback validation can wait on a background quota save's
+        // runtime lock. Validate first so the test isolates how quota.enabled
+        // affects routing.
+        const pool = ctx.migratedPool
+        if (!pool) throw new Error('This test has no migrated pool')
+        const runtime = createNativeAccountRuntime({
+          paths: pool.paths,
+          host: 'opencode',
+        })
+        try {
+          expect((await runtime.authorizeLocal('fallback-1')).status).toBe(
+            'usable',
+          )
+        } finally {
+          await runtime.close()
+        }
+      }
       expect(await request()).toBe(200)
       expect(bearers).toEqual([
         on

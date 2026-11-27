@@ -127,6 +127,104 @@ test('raw rejected and full windows report independently with their own resets',
   ])
 })
 
+const unnamedFableWindowHeaders = {
+  'anthropic-ratelimit-unified-status': 'rejected',
+  'anthropic-ratelimit-unified-7d-status': 'allowed',
+  'anthropic-ratelimit-unified-7d-utilization': '0.55',
+  'anthropic-ratelimit-unified-7d_oi-status': 'rejected',
+  'anthropic-ratelimit-unified-7d_oi-utilization': '1.0',
+  'anthropic-ratelimit-unified-7d_oi-reset': '1796184000',
+}
+
+test.each([
+  ['single rejected scope', 1_796_184_000_000],
+  ['multiple rejected scopes', 1_796_270_400_000],
+  ['no reset header', undefined],
+] as const)(
+  'Fable 5.2 reports its weekly pool on an upstream 429 with %s',
+  async (fixture, expectedReset) => {
+    const reports: unknown[] = []
+    globals[key] = () => ({ report: (report: unknown) => reports.push(report) })
+    const headers = new Headers(unnamedFableWindowHeaders)
+    if (fixture === 'multiple rejected scopes') {
+      // This later reset appears first by header name, and the full, allowed
+      // window's reset is later still but must not be used.
+      headers.set('anthropic-ratelimit-unified-7d_aa-status', 'rejected')
+      headers.set('anthropic-ratelimit-unified-7d_aa-reset', '1796270400')
+      headers.set('anthropic-ratelimit-unified-7d_zz-status', 'allowed')
+      headers.set('anthropic-ratelimit-unified-7d_zz-utilization', '1.0')
+      headers.set('anthropic-ratelimit-unified-7d_zz-reset', '1796356800')
+    }
+    if (fixture === 'no reset header')
+      headers.delete('anthropic-ratelimit-unified-7d_oi-reset')
+    reportRoutingResponse('session', subject, headers, 429, 'claude-fable-5-2')
+    await Promise.resolve()
+    expect(reports).toEqual([
+      {
+        account_id: 'account',
+        credential_id: 'credential',
+        outcome: 'exhausted',
+        window: '7d',
+        pool: 'fable',
+        ...(expectedReset !== undefined && { resets_at: expectedReset }),
+      },
+    ])
+  },
+)
+
+test.each([
+  ['claude-opus-5-5', 'rejected', 'unnamed_scope_no_pool', '7d_oi'],
+  ['claude-fable-5-2', 'allowed', 'different_confirmed_scope', undefined],
+] as const)(
+  'an unnamed scope sends no report for %s when unified status is %s',
+  async (modelId, status, noReportReason, scope) => {
+    const reports: unknown[] = []
+    globals[key] = () => ({ report: (report: unknown) => reports.push(report) })
+    const debug = spyOn(logger, 'debug').mockImplementation(() => {})
+    try {
+      const headers = new Headers(unnamedFableWindowHeaders)
+      headers.set('anthropic-ratelimit-unified-status', status)
+      reportRoutingResponse('session', subject, headers, 429, modelId)
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      expect(reports).toEqual([])
+      expect(debug.mock.calls).toEqual([
+        [
+          'routing-relay',
+          'Anthropic HTTP 429 routing report',
+          {
+            rateLimitHeaders: {
+              ...unnamedFableWindowHeaders,
+              'anthropic-ratelimit-unified-status': status,
+            },
+            exhaustedReports: [],
+            noReportReason,
+            ...(scope && { scope }),
+          },
+        ],
+      ])
+    } finally {
+      debug.mockRestore()
+    }
+  },
+)
+
+test('an unnamed scoped window does not add a pool report when a general window explains the 429', async () => {
+  const reports: unknown[] = []
+  globals[key] = () => ({ report: (report: unknown) => reports.push(report) })
+  const headers = new Headers(unnamedFableWindowHeaders)
+  headers.set('anthropic-ratelimit-unified-7d-status', 'rejected')
+  reportRoutingResponse('session', subject, headers, 429, 'claude-fable-5-2')
+  await Promise.resolve()
+  expect(reports).toEqual([
+    {
+      account_id: 'account',
+      credential_id: 'credential',
+      outcome: 'exhausted',
+      window: '7d',
+    },
+  ])
+})
+
 test('unconfirmed headers do not use rounded utilization or claims without a full scoped poll', async () => {
   const reports: unknown[] = []
   let reads = 0

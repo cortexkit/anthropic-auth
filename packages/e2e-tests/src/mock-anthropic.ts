@@ -1,3 +1,5 @@
+import { gunzipSync } from 'node:zlib'
+
 export type MockUsage = {
   input_tokens: number
   output_tokens: number
@@ -77,10 +79,21 @@ export class MockAnthropicServer {
   private captured: CapturedAnthropicRequest[] = []
   private tokenRequestCount = 0
 
+  constructor(
+    private readonly refusal?: {
+      respond(
+        body: CapturedAnthropicRequest['body'],
+        request: CapturedAnthropicRequest,
+      ): Response | undefined | Promise<Response | undefined>
+    },
+  ) {}
+
   async start() {
     this.server = Bun.serve({
       hostname: '127.0.0.1',
       port: 0,
+      // Longer than the host-side idle timeout in the refusal fixtures.
+      idleTimeout: this.refusal ? 60 : undefined,
       fetch: (request) => this.handle(request),
     })
     const port = this.server.port
@@ -127,15 +140,19 @@ export class MockAnthropicServer {
       })
     }
 
-    const body = (await request.json().catch(() => ({}))) as Record<
-      string,
-      unknown
-    >
+    const body = (await (async () => {
+      if (request.headers.get('content-encoding') === 'gzip')
+        return JSON.parse(
+          gunzipSync(new Uint8Array(await request.arrayBuffer())).toString(),
+        )
+      return request.json()
+    })().catch(() => ({}))) as Record<string, unknown>
     const headers: Record<string, string> = {}
     request.headers.forEach((value, key) => {
       headers[key] = value
     })
-    this.captured.push({ url: request.url, headers, body })
+    const captured = { url: request.url, headers, body }
+    this.captured.push(captured)
 
     if (
       JSON.stringify(body).includes('Generate a title for this conversation')
@@ -176,6 +193,9 @@ export class MockAnthropicServer {
         },
       )
     }
+
+    const refusal = await this.refusal?.respond(body, captured)
+    if (refusal) return refusal
 
     const response = this.queue.shift() ?? {
       type: 'text' as const,

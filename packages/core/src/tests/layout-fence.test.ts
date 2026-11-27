@@ -1,10 +1,11 @@
-import { expect } from 'bun:test'
+import { test as bunTest, expect, spyOn } from 'bun:test'
 import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { HOLDER_FILE_NAME, type HolderLiveness } from '../holder-registry.ts'
 import {
+  defaultPreNArtifactLocations,
   holderFenceBlockers,
   type PreNArtifactLocations,
   preNArtifactBlockers,
@@ -12,7 +13,7 @@ import {
 import { checkSettingsMoveFence } from '../settings-move-fence.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
-const { test, deferCleanup } = createTestLifetimeSuite()
+const { test, wrapBody, deferCleanup } = createTestLifetimeSuite()
 const NOW = Date.UTC(2026, 0, 2, 12)
 const BOOT = Date.UTC(2026, 0, 2, 11)
 const clock = {
@@ -157,6 +158,52 @@ for (const kind of ['CacheKeep record', 'RPC port file'] as const) {
   })
 }
 
+bunTest.skipIf(process.platform === 'win32')(
+  'the legacy temp registry blocks for a live same-user writer but not another user',
+  wrapBody(async () => {
+    const root = await folder()
+    const oldTmp = process.env.TMPDIR
+    process.env.TMPDIR = root
+    try {
+      const dir = join(
+        root,
+        'opencode-anthropic-auth',
+        'cachekeep-sessions',
+        'pi',
+      )
+      const path = join(
+        dir,
+        `${process.pid}-5f24847c-d2f1-4d4b-875a-e354cbbe2b50.json`,
+      )
+      await mkdir(dir, { recursive: true, mode: 0o700 })
+      await writeFile(
+        path,
+        JSON.stringify({ version: 1, updatedAt: NOW, sessions: [] }),
+      )
+      await utimes(path, new Date(NOW), new Date(NOW))
+      const locations = defaultPreNArtifactLocations({ HOME: root }, root)
+      expect(locations.cacheKeepDirs).toContain(dir)
+      const scan = () =>
+        preNArtifactBlockers(locations, liveness.pidAlive, clock)
+      expect(await scan()).toEqual([
+        { kind: 'pre-n-artifact', artifact: path, pid: process.pid },
+      ])
+
+      if (!process.getuid) throw new Error('Expected a POSIX UID')
+      const uid = process.getuid()
+      const getuid = spyOn(process, 'getuid').mockReturnValue(uid + 1)
+      try {
+        expect(await scan()).toEqual([])
+      } finally {
+        getuid.mockRestore()
+      }
+    } finally {
+      if (oldTmp === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = oldTmp
+    }
+  }),
+)
+
 test('an invalid RPC record from a live filename pid and a non-directory RPC root keep blocking', async () => {
   const { path, locations } = await artifact('RPC port file', {}, NOW)
   await writeFile(path, '{}')
@@ -170,6 +217,19 @@ test('an invalid RPC record from a live filename pid and a non-directory RPC roo
   )
   expect(blockers).toHaveLength(1)
   expect(blockers[0]).toMatchObject({ kind: 'artifact-scan', path })
+})
+
+test('the fence treats oversized publisher records as malformed but still clears stale files', async () => {
+  const { path, locations } = await artifact('RPC port file', {}, NOW)
+  const bytes = Buffer.from(
+    JSON.stringify({ pid: process.pid, writer: { protocol: 1 } }),
+  )
+  await writeFile(path, Buffer.concat([bytes, Buffer.alloc(64 * 1024, 32)]))
+  await utimes(path, new Date(NOW), new Date(NOW))
+  expect(await preNArtifactBlockers(locations, () => true, clock)).toEqual([
+    { kind: 'artifact-scan', path, reason: 'invalid' },
+  ])
+  expect(await preNArtifactBlockers(locations, () => false, clock)).toEqual([])
 })
 
 test('malformed holder entries and registries keep the settings fence closed without any live pid', async () => {

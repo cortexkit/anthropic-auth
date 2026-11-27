@@ -1893,11 +1893,8 @@ describe('auth.loader', () => {
     })
 
     try {
-      const response = await Promise.race([
-        request,
-        Bun.sleep(1_000).then(() => null),
-      ])
-      expect(response?.status).toBe(200)
+      const response = await request
+      expect(response.status).toBe(200)
       expect(cancelBody).toHaveBeenCalledTimes(1)
     } finally {
       pendingCancel.open()

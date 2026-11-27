@@ -4,9 +4,14 @@ import {
   type ReportRoutingInput,
   reportRouting,
 } from '@cortexkit/common-auth/routing-accessor'
+import { logger } from './logger.ts'
 import { copyStreamResponseTiming } from './stream-completion.ts'
 
-type BillingReport = Extract<ReportRoutingInput, { kind: 'billing' }>
+export type AnthropicBillingReport = Extract<
+  ReportRoutingInput,
+  { kind: 'billing' }
+>
+type BillingReport = AnthropicBillingReport
 export type AnthropicBillingWarming = NonNullable<
   NonNullable<BillingReport['cache']>['warming']
 >
@@ -29,6 +34,15 @@ export type AnthropicBillingRequest = Omit<
    * produced. Must not wait or do I/O; `undefined` leaves `cache.warming` out.
    */
   cacheWarming?: () => AnthropicBillingWarming | undefined
+  /**
+   * Set only for an origin request that finished without a refusal, and is
+   * still the session's current request: its report waits (at most one
+   * second) for the keep-warm template to be published, so the report's
+   * warming state includes it.
+   */
+  cacheWarmingAfter?: () => Promise<void> | undefined
+  /** In-process consumer of each billing report; nothing it adds is sent to shared routing. */
+  onReport?: (report: AnthropicBillingReport) => void
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -123,17 +137,29 @@ function hasRoutingAccessor() {
   }
 }
 
-function detachReport(report: BillingReport) {
-  if (!hasRoutingAccessor()) return
+function detachReport(
+  report: BillingReport,
+  onReport?: AnthropicBillingRequest['onReport'],
+) {
+  const routing = hasRoutingAccessor()
+  if (!routing && !onReport) return
   // Routing's report callback may never settle; request handling never awaits it.
   setTimeout(() => {
     try {
-      reportRouting(report)
+      if (routing) reportRouting(report)
+    } catch {}
+    try {
+      onReport?.(report)
     } catch {}
   }, 0).unref?.()
 }
 
-function identity({ cacheWarming: _, ...input }: AnthropicBillingRequest) {
+function identity({
+  cacheWarming: _,
+  cacheWarmingAfter: _after,
+  onReport: _observer,
+  ...input
+}: AnthropicBillingRequest) {
   return {
     ...input,
     kind: 'billing' as const,
@@ -143,7 +169,10 @@ function identity({ cacheWarming: _, ...input }: AnthropicBillingRequest) {
 }
 
 export function reportAnthropicBillingFailure(input: AnthropicBillingRequest) {
-  detachReport({ ...identity(input), cache: undefined, outcome: 'failed' })
+  detachReport(
+    { ...identity(input), cache: undefined, outcome: 'failed' },
+    input.onReport,
+  )
 }
 
 /** One collector per physical upstream response, including relay responses. */
@@ -161,30 +190,68 @@ export function createAnthropicBillingObserver(
   let sent = false
   let finalUsage = false
   let failed = status >= 400
+  let stopReason: unknown
+  let stopped = false
+  let refusalContent = false
   let providerResponseId: string | undefined
   let rawUsage: Record<string, unknown> = {}
   const finish = () => {
     if (sent) return
     sent = true
     const measured = anthropicBillingUsage(rawUsage)
-    // message_start's zero output is not a measurement of a cut-off answer.
+    // message_start's zero output is not a measurement of final output.
     if (!finalUsage) delete measured.usage.output
-    const outcome = failed ? 'failed' : !finalUsage ? 'cut' : 'completed'
-    let cache = failed ? undefined : base.cache
-    if (outcome === 'completed' && !cache?.warming && input.cacheWarming) {
-      let warming: AnthropicBillingWarming | undefined
-      try {
-        warming = input.cacheWarming()
-      } catch {}
-      if (warming) cache = { ...cache, warming }
+    // A stream is complete only once message_stop arrives after its final usage.
+    const completed = finalUsage && (!sse || stopped)
+    const outcome = failed ? 'failed' : completed ? 'completed' : 'cut'
+    const publish = (readWarming: boolean) => {
+      let cache = failed ? undefined : base.cache
+      if (readWarming && !cache?.warming && input.cacheWarming) {
+        let warming: AnthropicBillingWarming | undefined
+        try {
+          warming = input.cacheWarming()
+        } catch {}
+        if (warming) cache = { ...cache, warming }
+      }
+      detachReport(
+        { ...base, cache, providerResponseId, outcome, ...measured },
+        input.onReport,
+      )
     }
-    detachReport({
-      ...base,
-      cache,
-      providerResponseId,
-      outcome,
-      ...measured,
-    })
+    if (outcome !== 'completed' || !input.cacheWarmingAfter) {
+      publish(outcome === 'completed')
+      return
+    }
+    let publication: Promise<void> | undefined
+    if (
+      stopped &&
+      !refusalContent &&
+      (stopReason === 'end_turn' ||
+        stopReason === 'tool_use' ||
+        stopReason === 'max_tokens')
+    ) {
+      try {
+        publication = input.cacheWarmingAfter()
+      } catch {}
+    }
+    if (!publication) {
+      publish(false)
+      return
+    }
+    // Billing may wait for signing and tracking, but must never hold the stream.
+    let reported = false
+    const report = () => {
+      if (reported) return
+      reported = true
+      clearTimeout(timeout)
+      publish(true)
+    }
+    const timeout = setTimeout(() => {
+      logger.warn('billing', 'timed out waiting for the CacheKeep template')
+      report()
+    }, 1000)
+    timeout.unref?.()
+    void publication.then(report, report)
   }
   const observe = (value: unknown) => {
     const event = record(value)
@@ -192,11 +259,32 @@ export function createAnthropicBillingObserver(
     const message = record(event.message) ?? event
     if (typeof message.id === 'string') providerResponseId = message.id
     const usage = record(message.usage)
-    if (usage) rawUsage = { ...rawUsage, ...usage }
+    if (usage) {
+      const startCache = record(rawUsage.cache_creation)
+      const endCache = record(usage.cache_creation)
+      rawUsage = {
+        ...rawUsage,
+        ...usage,
+        ...((startCache || endCache) && {
+          cache_creation: { ...startCache, ...endCache },
+        }),
+      }
+    }
     if (event.type === 'error') failed = true
-    if (event.type === 'message_delta' && usage) finalUsage = true
+    if (
+      event.type === 'content_block_start' &&
+      record(event.content_block)?.type === 'refusal'
+    )
+      refusalContent = true
+    if (event.type === 'message_delta') {
+      if (usage) finalUsage = true
+      stopReason = record(event.delta)?.stop_reason
+    }
     if (event.type === 'message' && usage) finalUsage = true
-    if (event.type === 'message_stop') finish()
+    if (event.type === 'message_stop') {
+      stopped = true
+      finish()
+    }
   }
   const decoder = new TextDecoder()
   const maxPending = 1_048_576
@@ -240,12 +328,14 @@ export function createAnthropicBillingObserver(
 export function observeAnthropicBillingResponse(
   input: AnthropicBillingRequest,
   response: Response,
+  sse?: boolean,
 ): Response {
-  if (!hasRoutingAccessor()) return response
+  if (!hasRoutingAccessor() && !input.onReport) return response
   const observer = createAnthropicBillingObserver(
     input,
     response.status,
     response.headers,
+    sse,
   )
   if (!response.ok || !response.body) {
     observer.finish()

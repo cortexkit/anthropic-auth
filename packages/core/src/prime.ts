@@ -1,8 +1,7 @@
 import { createHash } from 'node:crypto'
 import * as fs from 'node:fs'
-import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { chmod, lstat, mkdir, open, readdir, rm } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 import { canonicalFilePathSync } from '@cortexkit/common-auth/fs'
 
 import {
@@ -17,12 +16,19 @@ import {
   type PrimeUsageCounters,
   quotaSnapshotOmitsFiveHour,
 } from './accounts.ts'
+import { getHostDataHome } from './host-paths.ts'
 import { logger } from './logger.ts'
 import {
   CLAUDE_HAIKU_4_5_MODEL_ID,
   CLAUDE_HAIKU_4_5_PRICING,
 } from './models.ts'
+import type { NativeAccountRuntime } from './native-account-runtime.ts'
 import { nativeAccountCanServe } from './native-account-view.ts'
+import {
+  ensureHolderDirectory,
+  ensureWindowsOwnerOnlyDirectory,
+} from './owner-only.ts'
+import { tokenFingerprint } from './token-fingerprint.ts'
 
 // Re-export pricing for downstream packages that import it through core's
 // public surface (the test suite verifies exact per-million-token values).
@@ -34,7 +40,7 @@ export { CLAUDE_HAIKU_4_5_PRICING }
  * Every OAuth account (main + enabled fallbacks) gets one minimal request
  * fired ~60s after its `five_hour.resetsAt`, exactly once across concurrent
  * OpenCode processes. Catch-up on boot; redundancy guard via fresh quota
- * check; cross-process atomic marker claim via `writeFile(..., flag: 'wx')`.
+ * check; cross-process atomic marker claim via exclusive file creation.
  */
 
 export const CLAUDE_PRIME_COMMAND_NAME = 'claude-prime'
@@ -74,10 +80,41 @@ export type PrimeSendResult =
       status?: number
       ms?: number
       error: string
+      // A failed Prime can still have reached Anthropic (e.g. a 401 before retry).
+      dispatched?: true
       // `vault-cold` is an expected off-path cache warm state, not evidence
       // of a failed provider request, so it must not emit the fire-failure warn.
-      reason?: 'token-refresh' | 'vault-cold' | 'send'
+      reason?: 'token-refresh' | 'vault-cold' | 'send' | 'account-changed'
     }
+
+export type PrimeAccountEvidence = {
+  readonly lineage: string
+  readonly accountIdentity?: string
+}
+
+/** Derive both parts from the authorized credential, not a second slot lookup. */
+export async function primeAccountEvidence(
+  runtime: Pick<NativeAccountRuntime, 'getOrCreateAuthLineage'>,
+  accountId: string,
+  fence: Parameters<NativeAccountRuntime['getOrCreateAuthLineage']>[1],
+): Promise<PrimeAccountEvidence | undefined> {
+  const lineage = await runtime.getOrCreateAuthLineage(accountId, fence)
+  if (!lineage) return undefined
+  const accountIdentity =
+    'accessToken' in fence ? fence.accountIdentity : fence.binding.identity
+  return { lineage, accountIdentity }
+}
+
+export function primeAccountMatches(
+  expected: PrimeAccountEvidence,
+  authorized: PrimeAccountEvidence | undefined,
+): boolean {
+  return (
+    expected.lineage === authorized?.lineage &&
+    (expected.accountIdentity === undefined ||
+      expected.accountIdentity === authorized.accountIdentity)
+  )
+}
 
 /**
  * Pure command parser — accepts `''` / `on` / `off` and treats anything else
@@ -391,8 +428,10 @@ type AccountEvaluation = {
 }
 
 function defaultMarkerDir(): string {
-  return join(tmpdir(), 'opencode-anthropic-auth', 'prime')
+  return join(getHostDataHome(), 'cortexkit', 'anthropic-auth', 'prime')
 }
+
+const warnedMarkerDirectories = new Set<string>()
 
 export function primeStorageFingerprint(storagePath: string): string {
   const absolutePath = resolve(storagePath)
@@ -450,6 +489,40 @@ function primeBootstrapMarkerPath(
   accountId: 'main' | string,
 ): string {
   return join(markerDir, `${encodeURIComponent(accountId)}-bootstrap`)
+}
+
+const claimMarkerSuffix = /-(?:bootstrap|-?\d+)$/
+
+function isClaimMarkerFor(name: string, owner: string): boolean {
+  return (
+    name.startsWith(owner) &&
+    name.slice(owner.length).search(claimMarkerSuffix) === 0
+  )
+}
+
+function isVerifiedMarkerName(name: string): boolean {
+  const digest = name.slice(0, 64)
+  return /^[a-f0-9]{64}$/.test(digest) && isClaimMarkerFor(name, digest)
+}
+
+function isStorageMarkerName(name: string): boolean {
+  const suffixStart = name.search(claimMarkerSuffix)
+  if (suffixStart < 1) return false
+  const account = name.slice(0, suffixStart)
+  try {
+    return encodeURIComponent(decodeURIComponent(account)) === account
+  } catch {
+    return false
+  }
+}
+
+function verifiedMarkerDigest(accountIdentity: string): string {
+  return createHash('sha256').update(accountIdentity).digest('hex')
+}
+
+type RetainedStorageClaim = {
+  accountIdentity: string
+  file: fs.Stats
 }
 
 function primeAccountLabel(
@@ -537,16 +610,15 @@ function storedResetMs(window?: AccountQuotaWindow): number | undefined {
  */
 export type PrimeManagerOptions = {
   loadStorage: () => Promise<AccountStorage | null>
-  /** Returns a non-secret digest, or undefined when identity is unavailable. */
-  getAccountFingerprint: (
+  /** Returns the authorized lineage and its verified Claude UUID, when known. */
+  getAccountEvidence: (
     accountId: 'main' | string,
-  ) => Promise<string | undefined>
-  /** Returns the verified Claude account UUID, never a local route id. */
-  getAccountIdentity?: (
-    accountId: 'main' | string,
-  ) => Promise<string | undefined>
+  ) => Promise<PrimeAccountEvidence | undefined>
   refreshQuota: (accountId: 'main' | string) => Promise<PrimeRefreshResult>
-  sendPrime: (accountId: 'main' | string) => Promise<PrimeSendResult>
+  sendPrime: (
+    accountId: 'main' | string,
+    evidence: PrimeAccountEvidence,
+  ) => Promise<PrimeSendResult>
   recordSuccess: (
     accountId: 'main' | string,
     usage: { inputTokens?: number; outputTokens?: number },
@@ -571,10 +643,13 @@ export class PrimeManager {
     string,
     { at: number; resetEpoch: number | undefined }
   >()
+  // Keep losing storage markers visible to older hosts. Only the manager
+  // that created one can reuse it; after restart it ages out like any marker.
+  private readonly retainedClaims = new Map<string, RetainedStorageClaim>()
   // Set true by `stop()` so a tick already in flight can short-circuit
   // before claim/send, preventing a stale in-flight cycle from firing
   // after `/claude-prime off` or after a newer plugin invocation has
-  // replaced this instance (M3b).
+  // replaced this instance.
   private stopped = false
   // The registry replaces this dependency bundle on plugin reload so the
   // singleton manager cannot retain closures from an obsolete plugin context.
@@ -650,14 +725,13 @@ export class PrimeManager {
   async tick(): Promise<void> {
     const now = this.options.now?.() ?? Date.now()
     logger.trace('prime', 'tick start', { now })
-    await this.sweepMarkers(now)
     if (this.stopped) {
       logger.trace('prime', 'tick: stopped, aborting')
       return
     }
     // Re-load persisted state at the start of every tick. The previous
     // read may pre-date an `/claude-prime off` from another process or
-    // a settings edit (M3b).
+    // a settings edit.
     const storage = await this.options.loadStorage()
     if (!storage) {
       logger.trace('prime', 'tick: no storage, skipping')
@@ -666,6 +740,13 @@ export class PrimeManager {
     if (storage.prime?.enabled !== true) {
       logger.trace('prime', 'tick: feature disabled, skipping')
       return
+    }
+    if (!(await this.privateMarkerDirectory(this.markerRoot())) || this.stopped)
+      return
+    await this.sweepMarkers(now)
+    for (const [path, { file }] of this.retainedClaims) {
+      if (now - file.mtimeMs > PRIME_MARKER_MAX_AGE_MS)
+        this.retainedClaims.delete(path)
     }
     const evaluations = evaluateAccounts(storage)
     await Promise.all(
@@ -750,26 +831,24 @@ export class PrimeManager {
         storedResetEpoch !== undefined &&
         now < storedResetEpoch + PRIME_DUE_OFFSET_MS
       ) {
-        // "Not due" is a routine tick outcome, not an operator-visible
-        // diagnostic. Per the spec's `trace` row for tick evaluation.
+        // "Not due" is a routine outcome of most ticks, so it logs at trace
+        // level rather than as an operator-visible diagnostic.
         logger.trace('prime', 'not due', { account: evaluation.label })
         return
       }
 
-      const accountFingerprint = await this.options.getAccountFingerprint(
-        evaluation.id,
-      )
-      if (!accountFingerprint) {
+      const evidence = await this.options.getAccountEvidence(evaluation.id)
+      if (!evidence) {
         logger.debug('prime', 'credential identity unavailable', {
           account: evaluation.label,
         })
         return
       }
+      const accountFingerprint = tokenFingerprint(evidence.lineage)
+      const { accountIdentity } = evidence
       const claimIdentity = `${evaluation.id}:${accountFingerprint
         .toLowerCase()
         .slice(0, 12)}`
-      // Resolving the marker folder rejects a non-hex fingerprint before any
-      // quota or send work runs.
       stage = 'marker'
       const markerDir = this.markerDir(accountFingerprint)
       const bootstrapMarkerPath = primeBootstrapMarkerPath(
@@ -781,21 +860,34 @@ export class PrimeManager {
         storedResetEpoch === undefined
           ? bootstrapMarkerPath
           : primeMarkerPath(markerDir, evaluation.id, storedResetEpoch)
-      try {
-        await stat(expectedMarkerPath)
-        // A completed claim makes another forced poll redundant; the normal
-        // background refresh will persist the reset when the usage API catches up.
-        return
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-      }
-      if (
-        storedResetEpoch === undefined &&
-        (await this.hasAnyClaimMarker(evaluation.id, accountFingerprint))
-      ) {
-        // The bootstrap sentinel is replaced only after an epoch claim exists.
-        // A stale process must observe one side of that transition.
-        return
+      if (await this.privateMarkerDirectory(markerDir, false)) {
+        try {
+          const file = await lstat(expectedMarkerPath)
+          // A completed claim makes another forced poll redundant; the normal
+          // background refresh will persist the reset when the usage API catches up.
+          if (
+            !this.retainedStorageClaim(
+              expectedMarkerPath,
+              accountIdentity,
+              file,
+            )
+          )
+            return
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        }
+        if (
+          storedResetEpoch === undefined &&
+          (await this.hasAnyClaimMarker(
+            markerDir,
+            evaluation.id,
+            accountIdentity,
+          ))
+        ) {
+          // The bootstrap sentinel is replaced only after an epoch claim exists.
+          // A stale process must observe one side of that transition.
+          return
+        }
       }
       if (this.stopped) return
 
@@ -827,7 +919,7 @@ export class PrimeManager {
       }
       // Re-check stop + persist opt-in after every await boundary so
       // an `/claude-prime off` (or a newer plugin instance's stop())
-      // aborts the cycle BEFORE claim or send (M3b).
+      // aborts the cycle BEFORE claim or send.
       if (this.stopped) return
       const reloaded = await this.options.loadStorage()
       if (reloaded?.prime?.enabled !== true) return
@@ -886,9 +978,6 @@ export class PrimeManager {
       // Claiming the marker is the cross-process exactly-once gate; only one
       // process per reset epoch reaches the send.
       stage = 'claim'
-      const accountIdentity = await this.options.getAccountIdentity?.(
-        evaluation.id,
-      )
       const markerPaths = await this.tryClaim(
         evaluation.id,
         accountFingerprint,
@@ -909,25 +998,24 @@ export class PrimeManager {
         return
       }
 
-      if (markerEpoch !== undefined) {
-        // Create the epoch claim before releasing the bootstrap sentinel so
-        // concurrent processes never observe an unclaimed transition gap.
-        await rm(bootstrapMarkerPath, { force: true })
-        if (accountIdentity) {
-          await rm(this.verifiedMarkerPath(accountIdentity), { force: true })
-        }
-        if (this.stopped) {
-          await Promise.all(
-            markerPaths.map((path) => rm(path, { force: true })),
-          )
-          return
-        }
-      }
-
       // The send and its counter update run only after this process owns the
       // marker; unexpected failures there are reported with the fire stage.
       stage = 'fire'
-      await this.fire(evaluation, now, postClaimStorage)
+      await this.fire(
+        evaluation,
+        now,
+        evidence,
+        markerPaths,
+        claimIdentity,
+        markerEpoch === undefined
+          ? []
+          : [
+              bootstrapMarkerPath,
+              ...(accountIdentity
+                ? [this.verifiedMarkerPath(accountIdentity)]
+                : []),
+            ],
+      )
     } catch {
       logger.warn('prime', 'account evaluation failed', {
         account: evaluation.label,
@@ -947,39 +1035,75 @@ export class PrimeManager {
       resetsAtEpochMs === undefined
         ? primeBootstrapMarkerPath(dir, accountId)
         : primeMarkerPath(dir, accountId, resetsAtEpochMs)
-    // Older hosts claim only the storage-scoped marker. Always win it first,
-    // and leave it to age out if another store already owns the UUID claim.
-    if (!(await this.tryClaimPath(dir, markerPath))) return null
+    // Older hosts claim only the storage marker; always own it first.
+    if (!(await this.privateMarkerDirectory(dir))) return null
+    let file: fs.Stats | null = null
+    if (this.retainedClaims.has(markerPath)) {
+      try {
+        const existing = await lstat(markerPath)
+        if (this.retainedStorageClaim(markerPath, accountIdentity, existing)) {
+          // Consume the record before awaiting the UUID claim so concurrent
+          // ticks cannot both reuse the same storage marker.
+          this.retainedClaims.delete(markerPath)
+          file = existing
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+    }
+    file ??= await this.tryClaimPath(markerPath)
+    if (!file) return null
     if (!accountIdentity) return [markerPath]
+    if (!(await this.privateMarkerDirectory(this.verifiedMarkerDir()))) {
+      await rm(markerPath, { force: true })
+      return null
+    }
     const verifiedPath = this.verifiedMarkerPath(
       accountIdentity,
       resetsAtEpochMs,
     )
-    if (resetsAtEpochMs === undefined) {
-      // An account in another store may already have replaced its bootstrap
-      // sentinel with an epoch claim while this store still has no reset.
-      const digest = createHash('sha256').update(accountIdentity).digest('hex')
-      if (
+    // Another store may already have retired its bootstrap marker for an
+    // epoch this store hasn't seen yet. Any verified claim blocks bootstrap.
+    if (
+      (resetsAtEpochMs === undefined &&
         (await this.readMarkerNames(this.verifiedMarkerDir())).some((name) =>
-          name.startsWith(`${digest}-`),
-        )
-      )
-        return null
-    }
-    if (!(await this.tryClaimPath(this.verifiedMarkerDir(), verifiedPath)))
+          isClaimMarkerFor(name, verifiedMarkerDigest(accountIdentity)),
+        )) ||
+      !(await this.tryClaimPath(verifiedPath))
+    ) {
+      this.retainedClaims.set(markerPath, { accountIdentity, file })
       return null
+    }
     return [markerPath, verifiedPath]
   }
 
+  private retainedStorageClaim(
+    path: string,
+    accountIdentity: string | undefined,
+    file: fs.Stats,
+  ): boolean {
+    const retained = this.retainedClaims.get(path)
+    if (!retained) return false
+    if (
+      file.dev !== retained.file.dev ||
+      file.ino !== retained.file.ino ||
+      file.ctimeMs !== retained.file.ctimeMs
+    ) {
+      this.retainedClaims.delete(path)
+      return false
+    }
+    return retained.accountIdentity === accountIdentity
+  }
+
   private verifiedMarkerDir(): string {
-    return join(this.options.markerDir ?? defaultMarkerDir(), 'accounts')
+    return join(this.markerRoot(), 'accounts')
   }
 
   private verifiedMarkerPath(
     accountIdentity: string,
     resetsAtEpochMs?: number,
   ): string {
-    const digest = createHash('sha256').update(accountIdentity).digest('hex')
+    const digest = verifiedMarkerDigest(accountIdentity)
     return join(
       this.verifiedMarkerDir(),
       `${digest}-${resetsAtEpochMs ?? 'bootstrap'}`,
@@ -995,18 +1119,14 @@ export class PrimeManager {
     }
   }
 
-  private async tryClaimPath(
-    dir: string,
-    markerPath: string,
-  ): Promise<string | null> {
+  private async tryClaimPath(markerPath: string): Promise<fs.Stats | null> {
     try {
-      await mkdir(dir, { recursive: true })
-    } catch {
-      // Directory-create failures are propagated by the writeFile attempt below.
-    }
-    try {
-      await writeFile(markerPath, '', { encoding: 'utf8', flag: 'wx' })
-      return markerPath
+      const file = await open(markerPath, 'wx', 0o600)
+      try {
+        return await file.stat()
+      } finally {
+        await file.close()
+      }
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
       if (code === 'EEXIST') return null
@@ -1015,33 +1135,56 @@ export class PrimeManager {
   }
 
   private async hasAnyClaimMarker(
+    dir: string,
     accountId: 'main' | string,
-    accountFingerprint: string,
+    accountIdentity: string | undefined,
   ): Promise<boolean> {
-    const dir = this.markerDir(accountFingerprint)
-    const prefix = `${encodeURIComponent(accountId)}-`
-    try {
-      return (await readdir(dir)).some((entry) => entry.startsWith(prefix))
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
-      throw error
+    const owner = encodeURIComponent(accountId)
+    for (const name of await this.readMarkerNames(dir)) {
+      if (!isClaimMarkerFor(name, owner)) continue
+      const path = join(dir, name)
+      if (!this.retainedClaims.has(path)) return true
+      try {
+        if (
+          !this.retainedStorageClaim(path, accountIdentity, await lstat(path))
+        )
+          return true
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
     }
+    return false
   }
 
   private async fire(
     evaluation: AccountEvaluation,
     now: number,
-    _storage: AccountStorage,
+    evidence: PrimeAccountEvidence,
+    markerPaths: readonly string[],
+    claimIdentity: string,
+    bootstrapMarkers: readonly string[],
   ): Promise<void> {
     let result: PrimeSendResult
     try {
-      result = await this.options.sendPrime(evaluation.id)
+      result = await this.options.sendPrime(evaluation.id, evidence)
     } catch {
       logger.warn('prime', 'prime fire threw', { account: evaluation.label })
       this.transient.set(evaluation.id, {
         lastPrimedAt: now,
         lastResult: 'error',
       })
+      return
+    }
+    if (result.ok || result.dispatched) {
+      // Keep the bootstrap marker until a request goes out, so a process
+      // without a reset time still sees a claim if the epoch marker is removed.
+      await Promise.all(
+        bootstrapMarkers.map((path) => rm(path, { force: true })),
+      )
+    } else if (result.reason === 'account-changed') {
+      // No request was sent. A later tick must evaluate the slot again.
+      await Promise.all(markerPaths.map((path) => rm(path, { force: true })))
+      this.lastForcedCheck.delete(claimIdentity)
       return
     }
     if (this.stopped) return
@@ -1145,9 +1288,22 @@ export class PrimeManager {
 
   private async sweepMarkers(now: number): Promise<void> {
     const dir = this.storageMarkerDir()
-    const swept =
-      (await this.sweepMarkerDirectory(dir, now)) +
-      (await this.sweepMarkerDirectory(this.verifiedMarkerDir(), now))
+    let swept = await this.sweepMarkerDirectory(
+      this.verifiedMarkerDir(),
+      now,
+      isVerifiedMarkerName,
+    )
+    if (await this.privateMarkerDirectory(dir, false)) {
+      for (const name of await this.readMarkerNames(dir)) {
+        if (/^[a-f0-9]{12}$/.test(name)) {
+          swept += await this.sweepMarkerDirectory(
+            join(dir, name),
+            now,
+            isStorageMarkerName,
+          )
+        }
+      }
+    }
     if (swept > 0) {
       logger.trace('prime', 'swept stale markers', { swept })
     }
@@ -1156,43 +1312,92 @@ export class PrimeManager {
   private async sweepMarkerDirectory(
     dir: string,
     now: number,
+    matches: (name: string) => boolean,
   ): Promise<number> {
-    let entries: string[]
-    try {
-      entries = await readdir(dir)
-    } catch {
-      return 0
-    }
+    if (!(await this.privateMarkerDirectory(dir, false))) return 0
+    const entries = await this.readMarkerNames(dir)
     let swept = 0
     for (const entry of entries) {
+      if (!matches(entry)) continue
       try {
         const path = join(dir, entry)
-        const s = await stat(path)
-        if (s.isDirectory()) {
-          swept += await this.sweepMarkerDirectory(path, now)
-          continue
-        }
-        if (now - s.mtimeMs > PRIME_MARKER_MAX_AGE_MS) {
+        const s = await lstat(path)
+        if (s.isFile() && now - s.mtimeMs > PRIME_MARKER_MAX_AGE_MS) {
           await rm(path, { force: true })
           swept += 1
         }
       } catch {
-        // Markers can vanish between readdir and stat; skip silently.
+        // Markers can vanish between listing and deletion.
       }
     }
     return swept
   }
 
+  private markerRoot(): string {
+    return this.options.markerDir ?? defaultMarkerDir()
+  }
+
+  private async privateMarkerDirectory(
+    path: string,
+    create = true,
+  ): Promise<boolean> {
+    const directory = resolve(path)
+    const root = resolve(this.markerRoot())
+    const parent = dirname(directory)
+    if (directory !== root && parent !== root) {
+      // Check the storage namespace before touching its account directory.
+      if (
+        dirname(parent) !== root ||
+        !(await this.privateMarkerDirectory(parent, create))
+      )
+        return false
+    }
+    const explicit = this.options.markerDir !== undefined
+    try {
+      let stat = await lstat(directory).catch(
+        (error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return undefined
+          throw error
+        },
+      )
+      if (!stat) {
+        if (!create) return false
+        if (explicit && process.platform !== 'win32') {
+          // An explicit path retains its non-recursive creation policy.
+          await mkdir(directory, { mode: 0o700 }).catch(
+            (error: NodeJS.ErrnoException) => {
+              if (error.code !== 'EEXIST') throw error
+            },
+          )
+        } else {
+          await ensureHolderDirectory(directory)
+        }
+        stat = await lstat(directory)
+      }
+      if (!stat.isDirectory()) throw new Error('Not a directory')
+      if (await ensureWindowsOwnerOnlyDirectory(directory, undefined, false))
+        return true
+      if (stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0)
+        throw new Error('Unsafe directory')
+      if (explicit && (stat.mode & 0o7777) !== 0o700)
+        await chmod(directory, 0o700)
+      return true
+    } catch {
+      if (!warnedMarkerDirectories.has(directory)) {
+        warnedMarkerDirectories.add(directory)
+        logger.warn('prime', 'private directory refused', { directory })
+      }
+      return false
+    }
+  }
+
   private storageMarkerDir(): string {
-    return primeMarkerNamespaceDir(
-      this.options.markerDir ?? defaultMarkerDir(),
-      this.options.storagePath,
-    )
+    return primeMarkerNamespaceDir(this.markerRoot(), this.options.storagePath)
   }
 
   private markerDir(accountFingerprint: string): string {
     return primeAccountMarkerDir(
-      this.options.markerDir ?? defaultMarkerDir(),
+      this.markerRoot(),
       this.options.storagePath,
       accountFingerprint,
     )

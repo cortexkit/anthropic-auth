@@ -21,20 +21,21 @@ import {
   type NativeHolderRegistration,
   type NativePoolPaths,
   type NativeUiOptions,
+  nativeAccountPolicy,
   nativeVaultRuntimeKey,
   openCodeHolderKind,
   readNativeEnrollmentMode,
   readPeerLegacySettingsProtection,
   registerNativePoolHolder,
   resolveNativePoolPaths,
-  resolveSettingsPaths,
-  type SettingsPaths,
   setDumpEnabled,
   setLogLevel,
+  signRequestBody,
   startSettings,
   stateLayoutIoFailure,
   stateLayoutOfPaths,
   unmovedRegistrationPolicy,
+  withoutFallbackCredit,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type PoolLoginMethod,
@@ -49,7 +50,11 @@ import {
   CLAUDE_VAULT_ACTIVATION_METHOD_ID,
 } from './activation'
 import { stateRefusalFrom } from './adapter'
-import { createNativeCacheKeep, type NativeCacheKeepOptions } from './cachekeep'
+import {
+  accountKey,
+  createNativeCacheKeep,
+  type NativeCacheKeepOptions,
+} from './cachekeep'
 import { installNativeAnthropic } from './install'
 import { startNativeAnthropicLifecycle } from './lifecycle'
 import { createNativeMenuCapabilities } from './menu'
@@ -98,6 +103,7 @@ export const ENROLLMENT_UNREADABLE =
   'The Claude vault enrollment could not be read; repair it and retry. Nothing was changed.'
 
 export interface ClaudeLoginMethodsInput {
+  readonly onMainReplaced?: () => void
   readonly verifyVault?: () => Promise<unknown>
   /** False once setup is disposed; every step refuses after that. */
   readonly isActive: () => boolean
@@ -219,6 +225,7 @@ export function claudeLoginMethods(
         credential,
         replace: true,
       })
+      input.onMainReplaced?.()
       ensureActive()
     },
     label: 'Claude native account pool',
@@ -349,31 +356,15 @@ export async function setupAnthropicAuth(
         OPENCODE_ANTHROPIC_AUTH_STATE_FILE: paths.legacyState,
       }
     : env
-  // A failure to resolve the settings paths must not abort this start:
-  // startSettings then resolves them itself and falls back as for any other
-  // settings startup failure. Only fixed text is logged, since the error may
-  // name a path.
-  let settingsPaths: SettingsPaths | undefined
-  try {
-    settingsPaths = await resolveSettingsPaths('opencode', {
-      env: settingsEnv,
-    })
-  } catch {
-    logger.warn(
-      'settings',
-      'Settings file paths could not be resolved; settings startup falls back to the last applied protection settings.',
-    )
-  }
   // The reload key only tells plugin instances apart; it is never resolved as
-  // a path. Without any settings path it records null, never an empty string,
-  // which path code would resolve against the working directory.
-  let settingsTarget = settingsPaths?.target
-  if (settingsTarget === undefined)
-    try {
-      settingsTarget = getSettingsFilePath({ env: settingsEnv })
-    } catch {
-      // Leave it undefined; startSettings resolves the path itself.
-    }
+  // a path. Name the target without touching disk; startSettings resolves the
+  // records only after its credential preflight passes.
+  let settingsTarget: string | undefined
+  try {
+    settingsTarget = getSettingsFilePath({ env: settingsEnv })
+  } catch {
+    // Leave it undefined; startSettings handles resolution failure.
+  }
   const requests = createReloadableRequestHooks(
     ctx,
     JSON.stringify([
@@ -401,7 +392,6 @@ export async function setupAnthropicAuth(
   const settingsStartup = await startSettings({
     host: 'opencode',
     env: settingsEnv,
-    paths: settingsPaths,
     ownPoolPaths: paths,
     initializeVaultSettings: () =>
       withLegacy(async (legacy) => {
@@ -527,9 +517,31 @@ export async function setupAnthropicAuth(
     },
     onRequestPrepared: async (input) => {
       try {
-        await cacheKeep?.track(input)
+        await cacheKeep?.track({
+          ...input,
+          bodyText: await withoutFallbackCredit(input.bodyText),
+        })
       } catch {
         logger.warn('cachekeep', 'live request tracking failed')
+      }
+    },
+    onCompletedFallbackRequest: async (input) => {
+      if (!cacheKeep) return
+      const bodyText = await signRequestBody(
+        await withoutFallbackCredit(input.bodyText),
+      )
+      if (!input.isFresh()) return
+      try {
+        await cacheKeep.track({ ...input, bodyText })
+        if (!input.isFresh()) return
+        cacheKeep.onResponseHeaders({
+          attemptId: input.attemptId,
+          status: 200,
+          acceptedAt: input.acceptedAt,
+          acceptedUsage: input.usage,
+        })
+      } finally {
+        cacheKeep.discardAttempt(input.attemptId)
       }
     },
     onCacheResponse: (input) => {
@@ -575,6 +587,8 @@ export async function setupAnthropicAuth(
     runtime,
     source,
     cacheKeepRegistry: cacheKeep.registry,
+    roundNotices: cacheKeep.roundNotices.snapshot,
+    onAccountRemoved: cacheKeep.forgetRoundAccount,
     start: async (sessionID, text) => {
       await ctx.session.synthetic({
         sessionID,
@@ -589,6 +603,73 @@ export async function setupAnthropicAuth(
     ctx,
     {
       source,
+      rounds: cacheKeep.rounds,
+      takeRoundThreadReset: cacheKeep.roundNotices.takeThreadReset,
+      roundPolicy: (input) => {
+        const { accountId, baseUrl, modelID, sessionID } = input
+        const cacheRoute = () => {
+          const account = runtime
+            .peek?.()
+            ?.accounts.find((row) => row.id === accountId)
+          return (
+            account && {
+              url: baseUrl,
+              accountId,
+              accountIdentity: accountKey(account),
+            }
+          )
+        }
+        return {
+          targetAllowed(model) {
+            const snapshot = runtime.peek?.()
+            const account = snapshot?.accounts.find(
+              (row) => row.id === accountId,
+            )
+            return Boolean(
+              snapshot &&
+                account &&
+                nativeAccountPolicy(account, snapshot, model).status ===
+                  'allowed',
+            )
+          },
+          cacheRoute: cacheRoute(),
+          onRoundActivity() {
+            const route = cacheRoute()
+            if (route)
+              cacheKeep.recordRoundActivity(sessionID, {
+                ...route,
+                requestedModel: modelID,
+              })
+          },
+        }
+      },
+      onRoundCacheTemplate(input) {
+        const { template, isCurrent, headers, ...scope } = input
+        if (!isCurrent() || !cacheKeep) return
+        const keeper = cacheKeep
+        const acceptedAt = options.cacheKeep?.now?.() ?? Date.now()
+        return (async () => {
+          const bodyText = await signRequestBody(template.bodyText)
+          if (!isCurrent()) return
+          try {
+            await keeper.track({
+              ...scope,
+              bodyText,
+              sourceHeaders: headers,
+              isCurrent,
+            })
+            if (isCurrent())
+              keeper.onResponseHeaders({
+                attemptId: scope.attemptId,
+                status: 200,
+                acceptedAt,
+                acceptedUsage: template.usage,
+              })
+          } finally {
+            keeper.discardAttempt(scope.attemptId)
+          }
+        })().catch(() => {})
+      },
       onSessionDeleted: (sessionID) => cacheKeep?.sessionDeleted(sessionID),
       now: options.cacheKeep?.now,
       log: { warn: (message, data) => logger.warn('opencode2', message, data) },
@@ -639,6 +720,7 @@ export async function setupAnthropicAuth(
       await registerOpenCode2AuthMethods(
         ctx,
         claudeLoginMethods({
+          onMainReplaced: () => cacheKeep?.forgetRoundAccount('main'),
           isActive: () => active,
           readMode: enrollment.readMode,
           verifyVault: () => runtime.vault.refresh(),

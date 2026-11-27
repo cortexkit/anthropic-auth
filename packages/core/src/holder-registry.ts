@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { lstat, mkdir, readFile } from 'node:fs/promises'
+import { lstat, readFile } from 'node:fs/promises'
 import { uptime } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { LockContentionError, writeJsonAtomic } from '@cortexkit/common-auth/fs'
@@ -14,10 +14,7 @@ import {
   withNativeLock,
 } from './native-lock-observer.ts'
 import { nativeVaultPaths } from './native-vault-paths.ts'
-import {
-  ensureWindowsOwnerOnlyDirectory,
-  type OwnerOnlyOptions,
-} from './owner-only.ts'
+import { ensureHolderDirectory, type OwnerOnlyOptions } from './owner-only.ts'
 import { type NativePoolPaths, stateLayoutOfPaths } from './pool-paths.ts'
 import {
   findRelocationTombstone,
@@ -32,6 +29,8 @@ import {
   configFolderIdentity,
   STATE_HOME_FILE_NAMES,
 } from './state-layout-paths.ts'
+
+export { ensureHolderDirectory } from './owner-only.ts'
 
 /** The file, beside a dataset's files, that lists the processes using them. */
 export const HOLDER_FILE_NAME = 'anthropic-auth-holders.json'
@@ -640,31 +639,6 @@ async function assertNoTombstone(paths: NativePoolPaths) {
     )
     throw new RelocatedError(found.path, found.pointer)
   }
-}
-
-/**
- * Create `dir` for a holder file when it is missing, readable by its owner
- * only: `0700` on POSIX, and on Windows a protected owner-only DACL set by
- * the native helper as the folder is created, along with any missing parent.
- * An existing folder is left exactly as it is: it may be the user's own
- * config folder, shared on purpose. On Windows a folder that another process
- * created first is adopted only if it is owner-only; otherwise this throws.
- */
-export async function ensureHolderDirectory(
-  dir: string,
-  ownerOnly: OwnerOnlyOptions = {},
-): Promise<void> {
-  if ((ownerOnly.platform ?? process.platform) !== 'win32') {
-    await mkdir(dir, { recursive: true, mode: 0o700 })
-    return
-  }
-  try {
-    await lstat(dir)
-    return
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
-  }
-  await ensureWindowsOwnerOnlyDirectory(dir, ownerOnly)
 }
 
 async function publishEntry(

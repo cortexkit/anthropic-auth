@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
 import { parse } from 'jsonc-parser'
+import { settingsTestPaths } from '../../../core/src/tests/settings-record-paths-fixture.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import {
   migrateNativeLocalForHost,
@@ -226,17 +227,25 @@ for (const copyHost of ['opencode', 'pi'] as const) {
         { killswitch: { enabled: true, main: { five_hour: 73 } } },
         'opencode',
       )
-      await core.writeSettingsProtectionCopy(f.target, copyHost, {
-        readAt: 1,
-        values: copied,
-      })
+      await core.writeSettingsProtectionCopy(
+        (await settingsTestPaths(f.target, { env: f.options.env })).records,
+        copyHost,
+        {
+          readAt: 1,
+          values: copied,
+        },
+      )
       // Under this explicit target Pi's protection is known only from its
       // applied copy: with no Pi store found, recreation would be refused.
       if (copyHost === 'opencode')
-        await core.writeSettingsProtectionCopy(f.target, 'pi', {
-          readAt: 1,
-          values: copied,
-        })
+        await core.writeSettingsProtectionCopy(
+          (await settingsTestPaths(f.target, { env: f.options.env })).records,
+          'pi',
+          {
+            readAt: 1,
+            values: copied,
+          },
+        )
       const storedProtection = {
         killswitch: { enabled: true, main: { five_hour: 31 } },
       }
@@ -265,6 +274,8 @@ for (const copyHost of ['opencode', 'pi'] as const) {
           : core.legacySettingsProtection(storedProtection, 'opencode')
       const service = await core.openSettingsService({
         file: f.target,
+        records: (await settingsTestPaths(f.target, { env: f.options.env }))
+          .records,
         host: 'opencode',
       })
       if (!service) throw new Error('Settings service did not open')
@@ -351,6 +362,8 @@ lifetimeTest(
     })
     const service = await core.openSettingsService({
       file: f.target,
+      records: (await settingsTestPaths(f.target, { env: f.options.env }))
+        .records,
       host: 'opencode',
     })
     if (!service) throw new Error('Settings service did not open')

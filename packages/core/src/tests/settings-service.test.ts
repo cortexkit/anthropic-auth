@@ -11,13 +11,15 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openSettings } from '@cortexkit/common-auth/settings'
-
 import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
 import { CLAUDE_MODEL_CAPABILITIES } from '../model-capabilities.ts'
 import { acquireNativeAccountRuntime } from '../native-account-runtime.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { settingsDefinition } from '../settings-definition.ts'
-import type { SettingsHost } from '../settings-paths.ts'
+import {
+  __waitForSettingsRecordMirrorsForTest,
+  type SettingsHost,
+} from '../settings-paths.ts'
 import {
   readSettingsProtectionCopy,
   writeSettingsProtectionCopy,
@@ -30,11 +32,18 @@ import {
   type SettingsProtectionValues,
   type SettingsServiceOptions,
 } from '../settings-service.ts'
+import { settingsTestPaths } from './settings-record-paths-fixture.ts'
 
 const cleanup: (() => void | Promise<void>)[] = []
 afterEach(async () => {
   __setLogTestSink(null)
-  for (const close of cleanup.splice(0).reverse()) await close()
+  // State-folder mirror writes are detached. Let each one finish before its
+  // folder is removed, or it fails later and warns inside another test.
+  for (const close of cleanup.splice(0).reverse()) {
+    await __waitForSettingsRecordMirrorsForTest()
+    await close()
+  }
+  await __waitForSettingsRecordMirrorsForTest()
 })
 
 function gate() {
@@ -62,6 +71,7 @@ async function fixture(source = '{}', realWatch = false) {
   let trigger = () => {}
   let onGet: ((key: string, count: number) => Promise<void>) | undefined
   const options: SettingsServiceOptions = {
+    records: (await settingsTestPaths(file)).records,
     file,
     // A host lease opened here uses the file unless a test says otherwise.
     adopted: () => true,
@@ -122,6 +132,39 @@ async function fixture(source = '{}', realWatch = false) {
       onGet = hook
     },
   }
+}
+
+test('a trusted settings file without a fallback mode defaults to client', async () => {
+  const service = await (await fixture()).open()
+  for (const host of ['opencode', 'pi'] as const) {
+    expect(service.resolve(host).refusal_fallback).toBe('client')
+  }
+})
+
+for (const [label, contents] of [
+  ['empty', ''],
+  ['truncated', '{"refusal_fallback":'],
+  ['newer-schema', '{"schema_version":2,"refusal_fallback":"client"}'],
+] as const) {
+  test(`a settings file (${label}) keeps the last applied off fallback mode`, async () => {
+    const f = await fixture('{"refusal_fallback":"off"}')
+    const clients = await Promise.all(
+      (['opencode', 'pi'] as const).map(async (host) => ({
+        host,
+        service: await f.open({ host }),
+      })),
+    )
+    for (const { host, service } of clients)
+      expect(service.resolve(host).refusal_fallback).toBe('off')
+    await writeFile(f.file, contents)
+    for (const { host, service } of clients) {
+      await service.refresh()
+      const protection = service.snapshot().protection[host]
+      expect(protection.usable).toBe(false)
+      expect(protection.values.refusal_fallback).toBe('off')
+      expect(service.resolve(host).refusal_fallback).toBe('off')
+    }
+  })
 }
 
 test('one path owns one handle and watch until its last plugin lease is disposed', async () => {
@@ -313,7 +356,8 @@ for (const restore of [false, true]) {
       )
     }
     expect(
-      (await readSettingsProtectionCopy(f.file, 'pi'))?.killswitch_enabled,
+      (await readSettingsProtectionCopy(f.options.records, 'pi'))
+        ?.killswitch_enabled,
     ).toBe(!restore)
   })
 }
@@ -365,7 +409,7 @@ test('a delayed read and repeated triggers serialize passes and publish only the
   expect(service.resolve('pi').prime_enabled).toBe(true)
   await service.dispose()
   expect(
-    (await readSettingsProtectionCopy(f.file, 'pi'))
+    (await readSettingsProtectionCopy(f.options.records, 'pi'))
       ?.killswitch_default_five_hour,
   ).toBe(72)
 })
@@ -911,6 +955,7 @@ function protectionOf(values: SettingsGeneration['contexts']['pi']['noModel']) {
 }
 
 const distinctProtection: SettingsProtectionValues = {
+  refusal_fallback: 'client',
   killswitch_enabled: true,
   killswitch_default_five_hour: 31,
   killswitch_default_seven_day: 42,
@@ -1135,6 +1180,7 @@ test('unavailable recovery sources use exactly the most restrictive set', async 
     },
   })
   const expected: SettingsProtectionValues = {
+    refusal_fallback: 'client',
     killswitch_enabled: true,
     killswitch_default_five_hour: 5,
     killswitch_default_seven_day: 10,
@@ -1391,7 +1437,7 @@ test('adoption saves the adopted set as the applied copy and as last-good at onc
     '{"killswitch_enabled":true,"killswitch_default_five_hour":61}',
   )
   // An older, weaker copy of OpenCode's set is all that is on disk.
-  await writeSettingsProtectionCopy(f.file, 'opencode', {
+  await writeSettingsProtectionCopy(f.options.records, 'opencode', {
     readAt: 1,
     values: weaker,
   })

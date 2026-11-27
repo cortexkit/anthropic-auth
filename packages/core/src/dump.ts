@@ -8,12 +8,18 @@ import {
   unlink,
   writeFile,
 } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
+import { fallbackCreditRequestDumpView } from './fallback-credit.ts'
 import { isClaudeGatewaySecretHeader } from './gateway.ts'
+import { getHostDataHome } from './host-paths.ts'
 import { parseJsonRedacted } from './json.ts'
 import { isSecretKey, logger, relayLog } from './logger.ts'
+import {
+  createWindowsOwnerOnly,
+  ensureHolderDirectory,
+  ensureWindowsOwnerOnlyDirectory,
+} from './owner-only.ts'
 import type { ProviderErrorSummary } from './provider-error.ts'
 import {
   type IncompleteStreamDiagnostics,
@@ -32,7 +38,8 @@ const DUMP_USAGE =
   'Usage: `/claude-dump`, `/claude-dump on`, or `/claude-dump off`.'
 const DUMP_DIR_ENV = 'OPENCODE_ANTHROPIC_AUTH_DUMP_DIR'
 const DUMP_MAX_BYTES_ENV = 'OPENCODE_ANTHROPIC_AUTH_DUMP_MAX_BYTES'
-const DEFAULT_DUMP_DIR = join(tmpdir(), 'opencode-anthropic-auth-dumps')
+const defaultDumpDirectory = () =>
+  join(getHostDataHome(), 'cortexkit', 'anthropic-auth', 'dumps')
 const DEFAULT_DUMP_MAX_BYTES = 512 * 1024 * 1024
 const DUMP_SWEEP_INTERVAL_MS = 5 * 60 * 1000
 const DUMP_SWEEP_NEWNESS_FLOOR_MS = 60 * 1000
@@ -91,7 +98,7 @@ export function resetDumpState() {
 }
 
 export function getDumpDirectory() {
-  return process.env[DUMP_DIR_ENV] || DEFAULT_DUMP_DIR
+  return process.env[DUMP_DIR_ENV] || defaultDumpDirectory()
 }
 
 function getDumpMaxBytes() {
@@ -131,12 +138,21 @@ function isDumpPartialFileName(name: string) {
 }
 
 export async function writeDumpFile(path: string, contents: string) {
+  const directory = dirname(path)
+  const isDefault = resolve(directory) === resolve(defaultDumpDirectory())
+  if (isDefault && !(await ensureDefaultDumpDirectory(directory, false)))
+    return false
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const nonce = randomBytes(12).toString('hex')
     const partialPath = `${path}.${nonce}.partial`
     let created = false
     try {
-      await writeFile(partialPath, contents, { encoding: 'utf8', flag: 'wx' })
+      if (!(isDefault && (await createWindowsOwnerOnly(partialPath, contents))))
+        await writeFile(partialPath, contents, {
+          encoding: 'utf8',
+          flag: 'wx',
+          mode: 0o600,
+        })
       created = true
       await rename(partialPath, path)
       return true
@@ -147,6 +163,31 @@ export async function writeDumpFile(path: string, contents: string) {
     }
   }
   return false
+}
+
+const warnedDumpDirectories = new Set<string>()
+
+async function ensureDefaultDumpDirectory(path: string, create: boolean) {
+  const directory = resolve(path)
+  try {
+    if (create) await ensureHolderDirectory(directory)
+    const stat = await lstat(directory)
+    if (!stat.isDirectory()) throw new Error('Not a directory')
+    if (await ensureWindowsOwnerOnlyDirectory(directory, undefined, false))
+      return true
+    if (stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0)
+      throw new Error('Unsafe directory')
+    return true
+  } catch (error) {
+    if (
+      (create || (error as NodeJS.ErrnoException).code !== 'ENOENT') &&
+      !warnedDumpDirectories.has(directory)
+    ) {
+      warnedDumpDirectories.add(directory)
+      logger.warn('dump', 'private directory refused', { directory })
+    }
+    return false
+  }
 }
 
 /**
@@ -173,6 +214,11 @@ export async function sweepDumpDirectory(options: {
   if (!isConfiguredDumpDirectory(dumpDir) || maxBytes <= 0) return emptyResult
 
   try {
+    if (
+      resolve(dumpDir) === resolve(defaultDumpDirectory()) &&
+      !(await ensureDefaultDumpDirectory(dumpDir, false))
+    )
+      return emptyResult
     const dumpDirStats = await lstat(dumpDir)
     if (dumpDirStats.isSymbolicLink()) return emptyResult
     const protectedPaths = new Set(
@@ -629,6 +675,7 @@ async function dumpRequest(input: {
   error?: string
   bodyText: string
   previousBodyText?: string
+  directPreviousKey?: string
   payload?: unknown
   relayBytes?: number
   tag?: DumpTag
@@ -660,10 +707,20 @@ async function dumpRequest(input: {
   if (input.request !== undefined) files.request = `${prefix}.request.json`
 
   try {
-    await mkdir(dumpDir, { recursive: true })
+    const view = fallbackCreditRequestDumpView(input.bodyText)
+    const bodyText = view?.bodyText ?? input.bodyText
+    const json = (value: unknown) => {
+      const text = JSON.stringify(value, null, 2)
+      return `${view ? view.json(text) : text}\n`
+    }
+    if (resolve(dumpDir) === resolve(defaultDumpDirectory())) {
+      if (!(await ensureDefaultDumpDirectory(dumpDir, true))) return null
+    } else {
+      await mkdir(dumpDir, { recursive: true })
+    }
     const previousBodyText =
       input.previousBodyText ?? (await loadLatestDumpBody(input))
-    const bodySummary = bodyStructureSummary(input.bodyText)
+    const bodySummary = bodyStructureSummary(bodyText)
     const metadata = {
       thread: 'thread' in bodySummary ? bodySummary.thread : undefined,
       id,
@@ -674,27 +731,24 @@ async function dumpRequest(input: {
       mode: input.mode,
       route: input.route,
       status: input.status,
-      error: input.error,
+      error: view ? view.text(input.error) : input.error,
       tag: input.tag,
-      bodyBytes: input.bodyText.length,
+      bodyBytes: bodyText.length,
       relayBytes: input.relayBytes,
-      bodyHash: hashText(input.bodyText),
-      diff: diffSummary(previousBodyText, input.bodyText),
+      bodyHash: hashText(bodyText),
+      diff: diffSummary(previousBodyText, bodyText),
       body: bodySummary,
       files,
     }
 
     const writes = [
-      writeDumpFile(files.body, input.bodyText),
-      writeDumpFile(files.metadata, `${JSON.stringify(metadata, null, 2)}\n`),
+      writeDumpFile(files.body, bodyText),
+      writeDumpFile(files.metadata, json(metadata)),
     ]
 
     if (input.payload !== undefined && files.relay) {
       writes.push(
-        writeDumpFile(
-          files.relay,
-          `${JSON.stringify(redactForDump(input.payload), null, 2)}\n`,
-        ),
+        writeDumpFile(files.relay, json(redactForDump(input.payload))),
       )
     }
 
@@ -702,19 +756,19 @@ async function dumpRequest(input: {
       writes.push(
         writeDumpFile(
           files.request,
-          `${JSON.stringify(
+          json(
             redactForDump({
               ...input.request,
               headers: headersToRecord(input.request.headers),
             }),
-            null,
-            2,
-          )}\n`,
+          ),
         ),
       )
     }
 
     await Promise.all(writes)
+    if (input.directPreviousKey !== undefined)
+      rememberDirectDumpBody(input.directPreviousKey, bodyText)
     scheduleDumpSweep(dumpDir, Object.values(files))
 
     relayLog(
@@ -746,7 +800,7 @@ export async function dumpDirectRequest(input: {
   if (!dumpEnabled) return null
   const previousKey = directDumpPreviousKey(input)
   const previousBodyText = directDumpPreviousBodies.get(previousKey)
-  const handle = await dumpRequest({
+  return dumpRequest({
     affinity: input.affinity,
     transport: 'direct',
     route: input.route,
@@ -754,6 +808,7 @@ export async function dumpDirectRequest(input: {
     error: input.error,
     bodyText: input.bodyText,
     previousBodyText,
+    directPreviousKey: previousKey,
     request: {
       url: input.url,
       method: input.method,
@@ -761,8 +816,6 @@ export async function dumpDirectRequest(input: {
     },
     tag: input.tag,
   })
-  rememberDirectDumpBody(previousKey, input.bodyText)
-  return handle
 }
 
 export async function dumpRelayRequest(input: {

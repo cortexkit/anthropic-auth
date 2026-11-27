@@ -1116,17 +1116,15 @@ async function runPrime(
   // only a fixed reason and the status. The reason is still what the plugin's
   // sendPrime hands PrimeManager, so capture that result through the
   // manager's own options without adding any API.
-  const options: unknown = Reflect.get(prime, 'options')
-  if (typeof options !== 'object' || options === null)
-    throw new Error('Prime manager has no options')
-  const realSend: unknown = Reflect.get(options, 'sendPrime')
-  if (typeof realSend !== 'function')
-    throw new Error('Prime manager has no sendPrime')
+  const options = prime.options
   const results: unknown[] = []
-  Reflect.set(options, 'sendPrime', async (accountId: string) => {
-    const result: unknown = await Reflect.apply(realSend, options, [accountId])
-    results.push(result)
-    return result
+  prime.updateOptions({
+    ...options,
+    async sendPrime(accountId, evidence) {
+      const result = await options.sendPrime(accountId, evidence)
+      results.push(result)
+      return result
+    },
   })
   const records = captureLogs()
   try {

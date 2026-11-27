@@ -10,6 +10,7 @@ import { parse } from 'jsonc-parser'
 import { nativeAccountSettings } from '../../../core/src/native-account-view'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
+import { settingsTestPaths } from '../../../core/src/tests/settings-record-paths-fixture.ts'
 import {
   CLAUDE_POOL_LOGIN_METHOD_ID,
   CLAUDE_VAULT_ACTIVATION_METHOD_ID,
@@ -589,7 +590,10 @@ test('OC2 legacy startup with a failed service open joins a later move on the au
   )
   expect(opens).toBe(beforeRequest)
   await put(f.target, { quota_enabled: 'off', claude_fast_enabled: false })
-  await core.writeSettingsMoveMarker(f.target, { env: f.env })
+  await core.writeSettingsMoveMarker(
+    await settingsTestPaths(f.target, { env: f.env }),
+    { env: f.env },
+  )
   unavailable = false
   await ticks[0]!()
   expect(instance.runtime.getSettingsStatus?.()).toBeDefined()
@@ -650,6 +654,7 @@ test('OC2 import-refused after a failed write serves legacy settings without reo
   let attempts = 0
   const failing = await f.openSettings({
     file: f.target,
+    records: (await settingsTestPaths(f.target, { env: f.env })).records,
     dependencies: {
       open: (options) => {
         const handle = openSettings<typeof core.settingsDefinition.settings>(
@@ -842,10 +847,14 @@ test('OC2 service open failure after a move enforces the stricter applied copy u
     ...core.legacySettingsProtection(before.settings, 'opencode'),
     killswitch_default_five_hour: 80,
   }
-  await core.writeSettingsProtectionCopy(f.target, 'opencode', {
-    readAt: now,
-    values: stricter,
-  })
+  await core.writeSettingsProtectionCopy(
+    (await settingsTestPaths(f.target, { env: f.env })).records,
+    'opencode',
+    {
+      readAt: now,
+      values: stricter,
+    },
+  )
   let unavailable = true
   let opens = 0
   const openFailure = spyOn(core, 'openSettingsService').mockImplementation(
@@ -1122,7 +1131,10 @@ test('OC2 rechecks legacy authority at instance start and on read and write menu
       expect(result.mode).toBe('legacy')
       if (publishAtInstanceStart) {
         await put(f.target, { dump_enabled: false })
-        await core.writeSettingsMoveMarker(f.target, { env: f.env })
+        await core.writeSettingsMoveMarker(
+          await settingsTestPaths(f.target, { env: f.env }),
+          { env: f.env },
+        )
       }
       return result
     },
@@ -1132,7 +1144,10 @@ test('OC2 rechecks legacy authority at instance start and on read and write menu
   expect(await first.source.isDumpEnabled?.()).toBe(true)
   expect(first.runtime.getSettingsStatus?.()).toBeUndefined()
   await put(f.target, { dump_enabled: false })
-  await core.writeSettingsMoveMarker(f.target, { env: f.env })
+  await core.writeSettingsMoveMarker(
+    await settingsTestPaths(f.target, { env: f.env }),
+    { env: f.env },
+  )
   const menu = createNativeMenuCapabilities({
     runtime: first.runtime,
     source: first.source,
@@ -1314,7 +1329,10 @@ test.each(['local', 'claustrum'] as const)(
 for (const pi of ['never ran', 'stricter', 'unreadable'] as const) {
   test(`OC2 recreating a missing settings file when Pi's store is ${pi} ${pi === 'unreadable' ? 'is refused' : 'succeeds'}`, async () => {
     const f = await fixture()
-    await core.writeSettingsMoveMarker(f.target, { env: f.env })
+    await core.writeSettingsMoveMarker(
+      await settingsTestPaths(f.target, { env: f.env }),
+      { env: f.env },
+    )
     // Pi's own settings store (its account pool) under the same home.
     const store = join(
       dirname(core.getDefaultSettingsStorePaths('pi', { env: f.env }).account),

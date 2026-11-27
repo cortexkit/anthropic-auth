@@ -1,22 +1,17 @@
+import { logger } from './logger.ts'
 import {
-  logger,
   normalizeAnthropicModelId,
   resolveClaudeModelCapabilities,
+} from './model-capabilities.ts'
+import {
   SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_FALLBACK_USAGE_MARKER_TEXT,
   SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
-  SERVER_SIDE_FALLBACK_BETA,
   stripServerFallbackUsageMarkers,
-} from '@cortexkit/anthropic-auth-core'
-import { recoverableRefusalFamily } from './fable-fallback'
+} from './server-fallback-usage.ts'
+import type { RefusalFallbackMode } from './settings-definition.ts'
 
 export const SERVER_FALLBACK_MARKER_TEXT = '\u2060'
-export {
-  SERVER_FALLBACK_SIGNATURE_PREFIX,
-  SERVER_FALLBACK_USAGE_MARKER_TEXT,
-  SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
-  SERVER_SIDE_FALLBACK_BETA,
-}
 
 type ServerSideFallbackIteration = {
   model: string
@@ -86,8 +81,6 @@ function validateFallbackUsage(usage: Record<string, unknown> | undefined) {
     signature: SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX + payload,
   }
 }
-
-export type ContentFilterFallbackMode = 'server' | 'legacy'
 
 export type ServerSideFallbackOutcome = {
   requestedModel: string
@@ -226,28 +219,24 @@ function rewriteStoredMarkers(body: Record<string, unknown>, enabled: boolean) {
         block?.type === 'thinking' &&
         typeof block.signature === 'string' &&
         block.signature.startsWith(SERVER_FALLBACK_SIGNATURE_PREFIX)
-      if (!isInternalMarker) {
-        rewritten.push(rawBlock)
-        continue
-      }
-
-      const marker = decodeMarkerSignature(block.signature)
-      if (enabled && marker) {
-        rewritten.push(fallbackBlock(marker))
-        restoredMarkers++
-      } else {
+      if (!enabled && block?.type === 'fallback') {
         droppedMarkers++
+      } else if (!isInternalMarker) {
+        rewritten.push(rawBlock)
+      } else {
+        const marker = decodeMarkerSignature(block.signature)
+        if (enabled && marker) {
+          rewritten.push(fallbackBlock(marker))
+          restoredMarkers++
+        } else {
+          droppedMarkers++
+        }
       }
     }
-    message.content = rewritten
+    if (rewritten.length !== message.content.length || enabled)
+      message.content = rewritten
   }
   return { restoredMarkers, droppedMarkers }
-}
-
-export function resolveContentFilterFallbackMode(
-  value: string | undefined,
-): ContentFilterFallbackMode {
-  return value?.trim().toLowerCase() === 'legacy' ? 'legacy' : 'server'
 }
 
 export function applyServerSideFallbackToBody(
@@ -264,16 +253,56 @@ export function applyServerSideFallbackToBody(
   const markerResult = rewriteStoredMarkers(body, enabled)
   if (enabled) {
     body.fallbacks = 'default'
-  } else if (body.fallbacks === 'default') {
+  } else {
     delete body.fallbacks
   }
   return { enabled, ...markerResult }
 }
 
+function isUnsignedThinking(value: unknown): boolean {
+  const block = asRecord(value)
+  return (
+    block?.type === 'thinking' &&
+    (typeof block.signature !== 'string' || block.signature.length === 0)
+  )
+}
+
+/** Drop replayed thinking that the upstream never signed, preserving other blocks. */
+export function stripUnsignedThinkingBlocks(
+  body: Record<string, unknown>,
+): boolean {
+  if (!Array.isArray(body.messages)) return false
+  let changed = false
+  for (let index = body.messages.length - 1; index >= 0; index--) {
+    const message = asRecord(body.messages[index])
+    if (!Array.isArray(message?.content)) continue
+    const blocks = message.content
+    if (!blocks.some(isUnsignedThinking)) continue
+    const content = blocks.filter((value) => !isUnsignedThinking(value))
+    if (content.length === 0 && message.role === 'assistant')
+      body.messages.splice(index, 1)
+    else message.content = content
+    changed = true
+  }
+  return changed
+}
+
+/** Enforce the fallback mode on the payload after caller edits, before signing. */
+export function sanitizeClaudeCodeRequestBody(
+  body: Record<string, unknown>,
+  mode: RefusalFallbackMode,
+): boolean {
+  const removedThinking = stripUnsignedThinkingBlocks(body)
+  if (mode === 'server') return removedThinking
+  const hadFallbacks = Object.hasOwn(body, 'fallbacks')
+  const { droppedMarkers } = applyServerSideFallbackToBody(body, false)
+  return removedThinking || hadFallbacks || droppedMarkers > 0
+}
+
 function parseSseEvent(rawEvent: string): ParsedSseEvent {
   let event: string | undefined
   const dataLines: string[] = []
-  for (const line of rawEvent.split(/\r?\n/)) {
+  for (const line of rawEvent.split(/\r\n|\r|\n/)) {
     if (line.startsWith('event:')) {
       event = line.slice('event:'.length).trim()
     } else if (line.startsWith('data:')) {
@@ -290,12 +319,13 @@ function parseSseEvent(rawEvent: string): ParsedSseEvent {
   }
 }
 
-function findSseBoundary(value: string) {
-  const lf = value.indexOf('\n\n')
-  const crlf = value.indexOf('\r\n\r\n')
-  if (lf === -1) return crlf === -1 ? null : { index: crlf, length: 4 }
-  if (crlf === -1 || lf < crlf) return { index: lf, length: 2 }
-  return { index: crlf, length: 4 }
+function findSseBoundary(value: string, atFrameStart: boolean) {
+  // A blank first line needs only one terminator. Otherwise, CRLF must
+  // count as one line ending, never as a CR followed by a blank LF line.
+  const boundary =
+    (atFrameStart && /^\r\n?|^\n/.exec(value)) ||
+    /(?:\r\n|\r(?!\n)|\n)(?:\r\n?|\n)/.exec(value)
+  return boundary && { index: boundary.index, length: boundary[0].length }
 }
 
 function sseFrame(event: string, data: Record<string, unknown>) {
@@ -324,22 +354,28 @@ function hiddenThinkingFrames(index: number, text: string, signature: string) {
 }
 
 function sameRequestedModel(requestedModel: string, servedModel: string) {
-  const requestedFamily = recoverableRefusalFamily(requestedModel)
-  const servedFamily = recoverableRefusalFamily(servedModel)
+  const requestedFamily =
+    resolveClaudeModelCapabilities(requestedModel)?.refusalRecoveryFamily
+  const servedFamily =
+    resolveClaudeModelCapabilities(servedModel)?.refusalRecoveryFamily
   if (requestedFamily && servedFamily) return requestedFamily === servedFamily
   return requestedModel === servedModel
 }
 
 export function createServerSideFallbackStreamRewriter(options: {
   requestedModel: string
+  /** True only when this response's request was sent in server mode with `fallbacks: "default"`. */
+  serverSideFallbackSent?: boolean
   maxPendingBytes?: number
   onOutcome?: (outcome: ServerSideFallbackOutcome) => void
-  onRefusalAfterToolUse?: () => boolean | undefined
 }) {
   let pending = ''
   let pendingBytes = 0
   let resync = false
   let resyncCarry = ''
+  // A CR completes the line immediately. A leading LF in the next chunk
+  // belongs to that same terminator; keep it only if the CR was forwarded.
+  let splitCr: 'forward' | 'discard' | undefined
   let servedModel: string | undefined
   let handoff: ServerSideFallbackMarker | undefined
   let fallbackIterationModel: string | undefined
@@ -455,14 +491,14 @@ export function createServerSideFallbackStreamRewriter(options: {
           })
       }
       if (
+        options.serverSideFallbackSent === true &&
         stopReason === 'refusal' &&
         hasCompletedToolUse &&
         openToolUseIndexes.size === 0 &&
-        delta &&
-        options.onRefusalAfterToolUse &&
-        options.onRefusalAfterToolUse() !== false
+        delta
       ) {
         delta.stop_reason = 'tool_use'
+        delete delta.stop_details
         return `${usageMarker}${parsed.event ? `event: ${parsed.event}\n` : ''}${data ? `data: ${JSON.stringify(data)}\n` : ''}${boundary}`
       }
       return usageMarker + rawEvent + boundary
@@ -473,16 +509,17 @@ export function createServerSideFallbackStreamRewriter(options: {
   const drain = () => {
     let output = ''
     while (true) {
-      const boundary = findSseBoundary(pending)
+      const boundary = findSseBoundary(pending, true)
       if (!boundary) break
       const rawEvent = pending.slice(0, boundary.index)
-      const delimiter = pending.slice(
-        boundary.index,
-        boundary.index + boundary.length,
-      )
-      pending = pending.slice(boundary.index + boundary.length)
+      const end = boundary.index + boundary.length
+      const delimiter = pending.slice(boundary.index, end)
+      pending = pending.slice(end)
       pendingBytes = new TextEncoder().encode(pending).byteLength
-      output += rewriteEvent(rawEvent, delimiter)
+      const rewritten = rewriteEvent(rawEvent, delimiter)
+      if (!pending && delimiter.endsWith('\r'))
+        splitCr = rewritten.endsWith('\r') ? 'forward' : 'discard'
+      output += rewritten
     }
     return output
   }
@@ -493,15 +530,24 @@ export function createServerSideFallbackStreamRewriter(options: {
     },
     push(text: string) {
       let output = ''
+      if (!text) return output
+      if (splitCr) {
+        if (text.startsWith('\n')) {
+          if (splitCr === 'forward') output = '\n'
+          text = text.slice(1)
+        }
+        splitCr = undefined
+      }
       if (resync) {
         const window = resyncCarry + text
-        const boundary = findSseBoundary(window)
+        const boundary = findSseBoundary(window, false)
         if (!boundary) {
           resyncCarry = window.slice(-3)
-          return text
+          return output + text
         }
         const end = boundary.index + boundary.length
-        output = text.slice(0, Math.max(0, end - resyncCarry.length))
+        output += text.slice(0, Math.max(0, end - resyncCarry.length))
+        if (end === window.length && window.endsWith('\r')) splitCr = 'forward'
         text = window.slice(end)
         resync = false
         resyncCarry = ''

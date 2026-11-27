@@ -4,9 +4,11 @@ import {
   type NativeAccountRuntime,
   type NativePoolPaths,
   nativeAccountCanServe,
+  type PrimeAccountEvidence,
   PrimeManager,
   type PrimeSendResult,
-  tokenFingerprint,
+  primeAccountEvidence,
+  primeAccountMatches,
 } from '@cortexkit/anthropic-auth-core'
 import type { Attempt, RequestScope } from '@cortexkit/common-auth/opencode2'
 import {
@@ -37,7 +39,10 @@ export function createNativePrime(options: {
     agent: 'prime',
     kind: 'generate',
   })
-  const send = async (accountId: string): Promise<PrimeSendResult> => {
+  const send = async (
+    accountId: string,
+    evidence: PrimeAccountEvidence,
+  ): Promise<PrimeSendResult> => {
     const scope = scopeFor(accountId)
     const native = createNativeAnthropicAdapter({
       source: {
@@ -51,6 +56,7 @@ export function createNativePrime(options: {
       },
     })
     const started = performance.now()
+    let dispatched = false
     try {
       for (let index = 0; index < 3; index++) {
         abort.signal.throwIfAborted()
@@ -90,6 +96,18 @@ export function createNativePrime(options: {
           void response.body?.cancel().catch(() => {})
         }
         try {
+          if (
+            !primeAccountMatches(
+              evidence,
+              await source.primeEvidence(authorized.attempt.provenance),
+            )
+          ) {
+            return {
+              ok: false,
+              ...(index === 0 && { reason: 'account-changed' as const }),
+              error: 'Native Prime account changed before dispatch',
+            }
+          }
           const request = await native.adapter.rewriteRequest?.({
             ...scope,
             accountId,
@@ -109,6 +127,11 @@ export function createNativePrime(options: {
           }
           const final = new Request(request, { headers })
           const physical = await (options.fetch ?? fetch)(final)
+          dispatched ||=
+            attempt.data?.dispatch !== 'http-relay' ||
+            /^req_[A-Za-z0-9_-]+$/.test(
+              physical.headers.get('request-id') ?? '',
+            )
           // Rewrite each physical response before Prime reads it. The native
           // adapter scrubs error metadata and bodies with the sent credentials
           // and applies Core's 1 MiB error-body limit. Quota classification and
@@ -164,6 +187,7 @@ export function createNativePrime(options: {
             discard(response)
             return {
               ok: false,
+              ...(dispatched && { dispatched: true as const }),
               status,
               ms: performance.now() - started,
               error: 'Native Prime upstream refused the request',
@@ -226,6 +250,7 @@ export function createNativePrime(options: {
     } catch {
       return {
         ok: false,
+        ...(dispatched && { dispatched: true as const }),
         error: 'Native Prime was not completed',
         ms: performance.now() - started,
       }
@@ -236,7 +261,7 @@ export function createNativePrime(options: {
   const manager = new PrimeManager({
     storagePath: options.paths.legacyConfig,
     loadStorage: async () => (await runtime.read()).policyStorage,
-    async getAccountFingerprint(accountId) {
+    async getAccountEvidence(accountId) {
       const snapshot = await runtime.read()
       const account = snapshot.accounts.find((row) => row.id === accountId)
       if (!nativeAccountCanServe(account) || account?.type !== 'oauth')
@@ -251,23 +276,14 @@ export function createNativePrime(options: {
         return undefined
       if (account.source === 'vault') {
         const receipt = await runtime.authorizeVault(accountId, abort.signal)
-        const lineage = await runtime.getOrCreateAuthLineage(accountId, receipt)
-        return lineage ? tokenFingerprint(lineage) : undefined
+        return primeAccountEvidence(runtime, accountId, receipt)
       }
       const credential = await runtime.authorizeLocal(accountId, {
         signal: abort.signal,
       })
       if (credential.status !== 'usable') return undefined
-      const lineage = await runtime.getOrCreateAuthLineage(
-        accountId,
-        credential.subject,
-      )
-      return lineage ? tokenFingerprint(lineage) : undefined
+      return primeAccountEvidence(runtime, accountId, credential.subject)
     },
-    getAccountIdentity: async (accountId) =>
-      (await runtime.read()).accounts.find(
-        (account) => account.id === accountId,
-      )?.accountIdentity,
     async refreshQuota(accountId) {
       const snapshot = await runtime.read()
       if (
@@ -283,8 +299,8 @@ export function createNativePrime(options: {
         fresh: true,
       }
     },
-    sendPrime(accountId) {
-      const pending = send(accountId)
+    sendPrime(accountId, evidence) {
+      const pending = send(accountId, evidence)
       sends.add(pending)
       void pending.finally(() => sends.delete(pending))
       return pending

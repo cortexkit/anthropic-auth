@@ -1,10 +1,12 @@
 import {
   logger,
+  type PrimeAccountEvidence,
   PrimeManager,
   type PrimeManagerOptions,
   type PrimeSendResult,
+  primeAccountEvidence,
+  primeAccountMatches,
   primeStorageFingerprint,
-  tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import type { PiNativeAttempt, PiNativeRuntime } from './native.ts'
 
@@ -13,7 +15,9 @@ export type PiPrimeSendOptions = {
   storagePath: string
   accountId: string
   signal: AbortSignal
+  checkAccount: (attempt: PiNativeAttempt) => Promise<void>
   beforeSend: () => Promise<void>
+  onDispatched?: () => void
   onServed: (attempt: PiNativeAttempt) => void
   fetch?: typeof fetch
 }
@@ -58,7 +62,7 @@ class PiPrime {
       // across hosts, even when their local account files differ.
       storagePath: owner.storagePath,
       loadStorage: async () => (await this.owner().native.view()).policyStorage,
-      getAccountFingerprint: async (accountId) => {
+      getAccountEvidence: async (accountId) => {
         if (!sendPrimeRequest) return undefined
         const runtime = await this.owner().native.service()
         const signal = this.abort.signal
@@ -77,13 +81,8 @@ class PiPrime {
                     : undefined,
                 )
         if (!fence) return undefined
-        const lineage = await runtime.getOrCreateAuthLineage(accountId, fence)
-        return lineage ? tokenFingerprint(lineage) : undefined
+        return primeAccountEvidence(runtime, accountId, fence)
       },
-      getAccountIdentity: async (accountId) =>
-        (await this.owner().native.view()).accounts.find(
-          (account) => account.id === accountId,
-        )?.accountIdentity,
       refreshQuota: async (accountId) => ({
         quota: await (await this.owner().native.service()).fetchQuota(
           accountId,
@@ -92,8 +91,8 @@ class PiPrime {
         ),
         fresh: true,
       }),
-      sendPrime: (accountId) => {
-        const pending = this.send(accountId, options.fetch)
+      sendPrime: (accountId, evidence) => {
+        const pending = this.send(accountId, evidence, options.fetch)
         this.sends.add(pending)
         void pending.finally(() => this.sends.delete(pending))
         return pending
@@ -151,12 +150,14 @@ class PiPrime {
 
   private async send(
     accountId: string,
+    evidence: PrimeAccountEvidence,
     fetchImpl?: typeof fetch,
   ): Promise<PrimeSendResult> {
     const { native, storagePath } = this.owner()
     const signal = this.abort.signal
     const started = performance.now()
     let response: Response | undefined
+    const binding = { changed: false, dispatched: false }
     try {
       const send = sendPrimeRequest
       if (!send) throw new Error('Pi Prime transport is unavailable')
@@ -168,6 +169,21 @@ class PiPrime {
         accountId,
         signal,
         fetch: fetchImpl,
+        checkAccount: async (attempt) => {
+          const fence =
+            attempt.source === 'vault'
+              ? attempt.receipt
+              : attempt.admission.subject
+          if (
+            !primeAccountMatches(
+              evidence,
+              await primeAccountEvidence(runtime, accountId, fence),
+            )
+          ) {
+            binding.changed = true
+            throw new Error('Pi Prime account changed before dispatch')
+          }
+        },
         beforeSend: async () => {
           const snapshot = await native.view(signal)
           signal.throwIfAborted()
@@ -177,10 +193,15 @@ class PiPrime {
         onServed: (attempt) => {
           served = attempt
         },
+        onDispatched: () => {
+          binding.dispatched = true
+        },
       })
       if (!response.ok || !served)
         return {
           ok: false,
+          ...(binding.changed && { reason: 'account-changed' as const }),
+          ...(binding.dispatched && { dispatched: true as const }),
           status: response.status,
           error: 'Pi Prime upstream refused the request',
         }
@@ -204,6 +225,8 @@ class PiPrime {
     } catch {
       return {
         ok: false,
+        ...(binding.changed && { reason: 'account-changed' as const }),
+        ...(binding.dispatched && { dispatched: true as const }),
         error: 'Pi Prime was not completed',
         ms: performance.now() - started,
       }

@@ -18,7 +18,9 @@ import {
   observeMessageThreadResponse,
   prepareMessageThreadRequest,
 } from '../message-threads.ts'
+import { sanitizeClaudeCodeRequestBody } from '../server-fallback.ts'
 import {
+  SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_FALLBACK_USAGE_MARKER_TEXT,
   SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
 } from '../server-fallback-usage.ts'
@@ -40,6 +42,36 @@ function input(): MessageThreadInput {
 }
 const assistant = { role: 'assistant', content: 'answer' }
 const next = { role: 'user', content: 'two' }
+
+test('a credited thread send keeps the token only in its signed physical body', async () => {
+  const seen: string[] = []
+  class RecordingTracker extends MessageThreadTracker {
+    override prepare(request: MessageThreadInput) {
+      seen.push(JSON.stringify(request.body))
+      return super.prepare(request)
+    }
+  }
+  const tracker = new RecordingTracker()
+  const body = {
+    ...input().body,
+    system: [
+      {
+        type: 'text',
+        text: 'x-anthropic-billing-header: cc_version=2.1.0; cc_entrypoint=cli; cch=00000;',
+      },
+    ],
+  }
+  const sentinel = 'sentinel_thread_credit_f314c'
+  const prepared = await prepareMessageThreadRequest(tracker, {
+    ...input(),
+    headers: new Headers(),
+    bodyText: JSON.stringify({ ...body, fallback_credit_token: sentinel }),
+  })
+  expect(seen).toEqual([await signRequestBody(JSON.stringify(body))])
+  expect(JSON.parse(prepared.bodyText).fallback_credit_token).toBe(sentinel)
+  expect(prepared.bodyText).toBe(await signRequestBody(prepared.bodyText))
+})
+
 function anchor(tracker: MessageThreadTracker, request = input()) {
   const prepared = tracker.prepare(request)
   prepared.complete({
@@ -1807,6 +1839,77 @@ test.each([
   }
 })
 
+test.each([
+  [400, 'invalid_request_error', 'thread_fingerprint_mismatch'],
+  [404, 'not_found_error', 'thread_not_found'],
+] as const)(
+  'thread recovery returns the original %i response when its body stalls',
+  async (status, type, code) => {
+    const tracker = new MessageThreadTracker()
+    const full = advance(
+      anchor(tracker, {
+        ...input(),
+        account: `stalled-error-${status}`,
+        betas: ['base', MESSAGE_THREADS_BETA],
+      }),
+    )
+    const request = await prepareMessageThreadRequest(tracker, {
+      ...full,
+      bodyText: JSON.stringify(full.body),
+      headers: new Headers({ 'anthropic-beta': 'base' }),
+    })
+    expect(JSON.parse(request.bodyText).thread.type).toBe('continue')
+    const text = JSON.stringify({
+      error: { type, details: { error_code: code } },
+    })
+    let bodyController!: ReadableStreamDefaultController<Uint8Array>
+    const original = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          bodyController = controller
+          controller.enqueue(new TextEncoder().encode(text))
+        },
+      }),
+      { status },
+    )
+    const copy = original.clone()
+    const reader = copy.body!.getReader()
+    const stalled = Promise.withResolvers<void>()
+    const read = reader.read.bind(reader)
+    let reads = 0
+    spyOn(reader, 'read').mockImplementation(() => {
+      if (++reads === 2) stalled.resolve()
+      return read()
+    })
+    spyOn(copy.body!, 'getReader').mockReturnValue(reader)
+    spyOn(original, 'clone').mockReturnValue(copy)
+    const cancel = spyOn(reader, 'cancel')
+    const deadline = new AbortController()
+    const timeout = spyOn(AbortSignal, 'timeout').mockReturnValue(
+      deadline.signal,
+    )
+    let sends = 0
+    try {
+      const pending = request.recover(original, async () => {
+        sends++
+        return new Response('unexpected resend')
+      })
+      await stalled.promise
+      expect(timeout.mock.calls).toEqual([[5_000]])
+      deadline.abort(
+        new DOMException('thread error read timed out', 'TimeoutError'),
+      )
+      expect(await pending).toBe(original)
+      expect(sends).toBe(0)
+      expect(cancel).toHaveBeenCalledTimes(1)
+    } finally {
+      timeout.mockRestore()
+      bodyController.close()
+    }
+    expect(await original.text()).toBe(text)
+  },
+)
+
 test.each(['accepted', 'downstream rejected'])(
   'audit recovered create: %s resend has a fresh lifecycle',
   async (outcome) => {
@@ -2153,6 +2256,82 @@ test.each(['default', 'different-policy', null])(
     )
   },
 )
+
+test('the first client request after a server opt-in creates once without stored fallback markers', async () => {
+  const tracker = new MessageThreadTracker()
+  const original = { ...input(), account: 'fallback-mode-upgrade' }
+  original.body.fallbacks = 'default'
+  const headers = new Headers({ 'anthropic-beta': 'base' })
+  const prepare = (body: MessageThreadInput['body']) =>
+    prepareMessageThreadRequest(tracker, {
+      ...original,
+      headers,
+      bodyText: JSON.stringify(body),
+    })
+  const finish = (id: string, text: string) =>
+    sse([
+      {
+        type: 'message_start',
+        message: { id, content: [{ type: 'text', text }] },
+      },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      { type: 'message_stop' },
+    ])
+
+  const first = await prepare(original.body)
+  expect(JSON.parse(first.bodyText).fallbacks).toBe('default')
+  await first.observe(finish('msg_server', 'answer')).text()
+  const candidate = advance(original).body
+  const ordinaryContent = [{ type: 'text', text: 'answer' }]
+  candidate.messages = [
+    { role: 'user', content: 'one' },
+    {
+      role: 'assistant',
+      content: [
+        ...ordinaryContent,
+        {
+          type: 'thinking',
+          thinking: '',
+          signature: `${SERVER_FALLBACK_SIGNATURE_PREFIX}claude-opus-5-5|claude-opus-5`,
+        },
+      ],
+    },
+    next,
+  ]
+  sanitizeClaudeCodeRequestBody(candidate, 'client')
+  const upgraded = await prepare(candidate)
+  expect(JSON.parse(upgraded.bodyText)).toEqual({
+    model: 'claude-opus-5-5',
+    system: original.body.system,
+    tools: original.body.tools,
+    output_config: original.body.output_config,
+    messages: [
+      { role: 'user', content: 'one' },
+      { role: 'assistant', content: ordinaryContent },
+      next,
+    ],
+    thread: { type: 'create' },
+  })
+  await upgraded.observe(finish('msg_client', 'second answer')).text()
+  const latest = { role: 'user', content: 'three' }
+  const followup = await prepare({
+    ...candidate,
+    messages: [
+      ...(candidate.messages as unknown[]),
+      { role: 'assistant', content: 'second answer' },
+      latest,
+    ],
+  })
+  const wire = JSON.parse(followup.bodyText)
+  expect(wire.thread).toEqual({
+    type: 'continue',
+    previous_message_id: 'msg_client',
+  })
+  expect(wire.messages).toHaveLength(1)
+  expect(wire.messages[0].role).toBe('user')
+  const content = wire.messages[0].content
+  expect(typeof content === 'string' ? content : content[0].text).toBe('three')
+})
 
 test.each([
   'adjacent assistant',

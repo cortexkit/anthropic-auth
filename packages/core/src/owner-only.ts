@@ -1,4 +1,4 @@
-import { lstat } from 'node:fs/promises'
+import { lstat, mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { types as utilTypes } from 'node:util'
 import type * as PrivateFiles from '@cortexkit/private-files'
@@ -98,11 +98,13 @@ export async function createWindowsOwnerOnly(
 
 /**
  * Create only missing Windows directories; never tighten an existing shared directory.
+ * With createMissing disabled, only verify a directory that already exists.
  * Returns false off Windows so callers retain their POSIX directory policy.
  */
 export async function ensureWindowsOwnerOnlyDirectory(
   path: string,
   options: OwnerOnlyOptions = {},
+  createMissing = true,
 ): Promise<boolean> {
   const backend = await windowsBackend(options)
   if (!backend) return false
@@ -173,14 +175,45 @@ export async function ensureWindowsOwnerOnlyDirectory(
   }
   async function ancestors(directory: string): Promise<void> {
     if (await exists(directory)) return safe(directory)
+    if (!createMissing) throw refused('safe-parent', 'io-error')
     const parent = dirname(directory)
     if (parent === directory) throw refused('safe-parent', 'io-error')
     await ancestors(parent)
     await create(directory)
   }
   // Existing ancestors need entry integrity; the requested leaf needs confidentiality.
+  if (!createMissing) {
+    if (await exists(path)) {
+      await ancestors(dirname(path))
+      await privateDirectory(path)
+    }
+    return true
+  }
   await ancestors(dirname(path))
   if (await exists(path)) await privateDirectory(path)
   else await create(path)
   return true
+}
+
+/**
+ * Create missing per-user storage directories with mode 0700 on POSIX or a
+ * protected owner-only access control list on Windows. Leave existing directories
+ * alone: the user may have shared them intentionally. If a Windows creation
+ * races another process, adopt the winning directory only if it is owner-only.
+ */
+export async function ensureHolderDirectory(
+  dir: string,
+  ownerOnly: OwnerOnlyOptions = {},
+): Promise<void> {
+  if ((ownerOnly.platform ?? process.platform) !== 'win32') {
+    await mkdir(dir, { recursive: true, mode: 0o700 })
+    return
+  }
+  try {
+    await lstat(dir)
+    return
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+  }
+  await ensureWindowsOwnerOnlyDirectory(dir, ownerOnly)
 }

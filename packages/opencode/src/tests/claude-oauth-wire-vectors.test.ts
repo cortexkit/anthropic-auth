@@ -485,6 +485,7 @@ async function rebuildRequest(testCase: VectorCase): Promise<VectorOutput> {
   setOAuthHeaders(headers, fixed.accessToken, {
     body: JSON.parse(body),
     identity,
+    refusalFallbackMode: 'server',
   })
   if (fastModeRequested) addFastModeBetaHeader(headers)
   // Production sets a fresh crypto.randomUUID() per request; the vectors hold
@@ -598,7 +599,7 @@ describe('shared Claude OAuth wire vectors', () => {
   describe('rebuilt request equals the vector', () => {
     // x-stainless-os and x-stainless-arch read process.platform and
     // process.arch on every call; the vectors pin them. Environment overrides
-    // of the base URL, model or fallback mode would change the request.
+    // of the base URL or model would change the request.
     const originalPlatform = process.platform
     const originalArch = process.arch
     const ENV_OVERRIDES = [
@@ -609,7 +610,6 @@ describe('shared Claude OAuth wire vectors', () => {
       'ANTHROPIC_DEFAULT_HAIKU_MODEL',
       'ANTHROPIC_DEFAULT_FABLE_MODEL',
       'ANTHROPIC_CUSTOM_HEADERS',
-      'OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE',
     ]
     const savedEnv = new Map<string, string | undefined>()
 

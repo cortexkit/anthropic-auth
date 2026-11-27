@@ -210,7 +210,7 @@ describe('OpenCode Anthropic auth e2e', () => {
   }, 90_000)
 
   it('replays a mid-output Anthropic safety fallback boundary through OpenCode', async () => {
-    harness = await E2EHarness.create()
+    harness = await E2EHarness.create({ refusalFallbackMode: 'server' })
     harness.script([
       {
         type: 'server_fallback',
@@ -232,7 +232,6 @@ describe('OpenCode Anthropic auth e2e', () => {
     )
     expect(JSON.stringify(fallbackResult)).toContain('source prefix')
     expect(JSON.stringify(fallbackResult)).toContain('fallback suffix')
-    await harness.waitForSessionText(sessionId, 'Anthropic safety fallback')
 
     const restoredResult = await harness.sendPrompt(
       sessionId,
@@ -241,7 +240,6 @@ describe('OpenCode Anthropic auth e2e', () => {
       'claude-fable-5',
     )
     expect(JSON.stringify(restoredResult)).toContain('source restored')
-    await harness.waitForSessionText(sessionId, 'Returning to Fable 5')
 
     const generationRequests = harness.anthropic.requests().filter((request) => {
       const serializedBody = JSON.stringify(request.body)
@@ -323,9 +321,10 @@ describe('OpenCode Anthropic auth e2e', () => {
     ).toBe(true)
   }, 90_000)
 
-  it('continues a completed fallback tool call on Opus without replaying the side effect', async () => {
+  it('continues a completed server fallback tool call without replaying the side effect', async () => {
     harness = await E2EHarness.create({
       hybridCache: true,
+      refusalFallbackMode: 'server',
       // Use Haiku 5.5 for titles: a filter that excludes only Haiku 4.5 must fail.
       beforeSpawn: async (env) => {
         const path = join(env.configDir, 'opencode.json')
@@ -383,7 +382,6 @@ describe('OpenCode Anthropic auth e2e', () => {
     expect(JSON.stringify(recovered)).toContain(
       'continued with the existing tool result',
     )
-    await harness.waitForSessionText(sessionId, 'Switched to Opus 4.8')
 
     expect(await Bun.file(sideEffectPath).text()).toBe('x')
     expect(
@@ -403,11 +401,32 @@ describe('OpenCode Anthropic auth e2e', () => {
     expect(generationRequests.map((request) => request.body.model)).toEqual([
       'claude-fable-5',
       'claude-fable-5',
-      'claude-opus-4-8',
+      'claude-fable-5',
     ])
-    expect(JSON.stringify(generationRequests[2]?.body)).toContain('tool_result')
-    expect(generationRequests[2]?.body.fallbacks).toBeUndefined()
-    expect(JSON.stringify(generationRequests[2]?.body)).not.toContain(
+    const continuation = generationRequests[2]!.body
+    expect(continuation.fallbacks).toBe('default')
+    expect(continuation.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        role: 'assistant',
+        content: expect.arrayContaining([
+          {
+            type: 'fallback',
+            from: { model: 'claude-fable-5' },
+            to: { model: 'claude-opus-4-8' },
+          },
+        ]),
+      }),
+      expect.objectContaining({
+        role: 'user',
+        content: expect.arrayContaining([
+          expect.objectContaining({
+            type: 'tool_result',
+            tool_use_id: 'toolu_fallback_refusal',
+          }),
+        ]),
+      }),
+    ]))
+    expect(JSON.stringify(continuation)).not.toContain(
       'cortexkit-server-fallback-v1:',
     )
 
@@ -422,190 +441,11 @@ describe('OpenCode Anthropic auth e2e', () => {
     ).toHaveLength(0)
   }, 60_000)
 
-  it('retries a Fable refusal with Opus without warming Fable', async () => {
-    harness = await E2EHarness.create({
-      hybridCache: true,
-      fallbackMode: 'legacy',
-    })
-    harness.script([
-      { type: 'refusal' },
-      {
-        type: 'text',
-        text: 'recovered through opus',
-        delayMs: 3_000,
-      },
-    ])
-
-    const sessionId = await harness.createSession()
-    const resultPromise = harness.sendPrompt(
-      sessionId,
-      'recover from the Fable content filter',
-      60_000,
-      'claude-fable-5',
-    )
-
-    await harness.waitFor(
-      () =>
-        harness!.anthropic
-          .requests()
-          .filter((request) => request.body.max_tokens !== 0).length >= 2,
-      { label: 'delayed Opus recovery request captured' },
-    )
-    const result = await resultPromise
-    const serialized = JSON.stringify(result)
-    expect(serialized).toContain('recovered through opus')
-    await harness.waitForSessionText(sessionId, 'Switched to Opus 4.8')
-    expect(serialized).not.toContain('ContentFilterError')
-    expect(
-      harness.anthropic
-        .requests()
-        .filter(
-          (request) =>
-            request.body.model === 'claude-fable-5' &&
-            request.body.max_tokens === 0,
-        ),
-    ).toHaveLength(0)
-
-    const sessionRequests = harness.anthropic.requests().filter((request) => {
-      const serializedBody = JSON.stringify(request.body)
-      return (
-        request.body.max_tokens !== 0 &&
-        !serializedBody.includes('Generate a title for this conversation')
-      )
-    })
-    expect(sessionRequests.map((request) => request.body.model)).toEqual([
-      'claude-fable-5',
-      'claude-opus-4-8',
-    ])
-  }, 90_000)
-
-  it('bridges back to a stale Opus cache after more than 20 Fable blocks', async () => {
-    harness = await E2EHarness.create({
-      hybridCache: true,
-      fallbackMode: 'legacy',
-    })
-    harness.script([
-      { type: 'refusal' },
-      ...Array.from({ length: 10 }, (_, index) => ({
-        type: 'text' as const,
-        text: `opus recovery ${index}`,
-      })),
-      ...Array.from({ length: 11 }, (_, index) => ({
-        type: 'text' as const,
-        text: `healthy Fable response ${index}`,
-      })),
-      { type: 'refusal' },
-      { type: 'text', text: 'second Opus recovery' },
-    ])
-
-    const sessionId = await harness.createSession()
-    await harness.sendPrompt(
-      sessionId,
-      'start first Fable recovery cycle',
-      60_000,
-      'claude-fable-5',
-    )
-    for (let index = 0; index < 9; index++) {
-      await harness.sendPrompt(
-        sessionId,
-        `continue Opus cycle ${index}`,
-        60_000,
-        'claude-fable-5',
-      )
-    }
-    await harness.waitForSessionText(sessionId, 'Returning to Fable 5')
-    for (let index = 0; index < 11; index++) {
-      await harness.sendPrompt(
-        sessionId,
-        `healthy Fable turn ${index}`,
-        60_000,
-        'claude-fable-5',
-      )
-    }
-    const recovered = await harness.sendPrompt(
-      sessionId,
-      'trigger second Fable recovery cycle',
-      60_000,
-      'claude-fable-5',
-    )
-    expect(JSON.stringify(recovered)).toContain('second Opus recovery')
-
-    const generationRequests = harness.anthropic.requests().filter((request) => {
-      const serializedBody = JSON.stringify(request.body)
-      return (
-        request.body.max_tokens !== 0 &&
-        !serializedBody.includes('Generate a title for this conversation')
-      )
-    })
-    expect(generationRequests).toHaveLength(24)
-    expect(generationRequests.slice(0, 11).map((request) => request.body.model)).toEqual([
-      'claude-fable-5',
-      ...Array.from({ length: 10 }, () => 'claude-opus-4-8'),
-    ])
-    expect(
-      generationRequests.slice(11, 23).map((request) => request.body.model),
-    ).toEqual(Array.from({ length: 12 }, () => 'claude-fable-5'))
-    const firstCycleOpus = generationRequests.at(10)
-    const finalOpus = generationRequests.at(23)
-    if (!firstCycleOpus || !finalOpus)
-      throw new Error('expected two complete model recovery cycles')
-    expect(finalOpus.body.model).toBe('claude-opus-4-8')
-
-    const markedMessageIndexes = (body: Record<string, unknown>) => {
-      const messages = Array.isArray(body.messages) ? body.messages : []
-      return messages.flatMap((message, index) => {
-        if (!message || typeof message !== 'object') return []
-        const content = Array.isArray((message as { content?: unknown }).content)
-          ? ((message as { content: unknown[] }).content ?? [])
-          : []
-        return content.some(
-          (block) =>
-            block != null &&
-            typeof block === 'object' &&
-            'cache_control' in block,
-        )
-          ? [index]
-          : []
-      })
-    }
-    const messageEndBlockPosition = (
-      body: Record<string, unknown>,
-      messageIndex: number,
-    ) => {
-      const messages = Array.isArray(body.messages) ? body.messages : []
-      let blocks = 0
-      for (let index = 0; index <= messageIndex; index++) {
-        const message = messages[index]
-        if (!message || typeof message !== 'object') continue
-        const content = (message as { content?: unknown }).content
-        blocks += Array.isArray(content) ? content.length : content == null ? 0 : 1
-      }
-      return blocks - 1
-    }
-
-    const lastFirstCycleOpus = firstCycleOpus.body
-    const secondCycleOpus = finalOpus.body
-    const oldOpusTail = markedMessageIndexes(lastFirstCycleOpus).at(-1)
-    const secondCycleMarkers = markedMessageIndexes(secondCycleOpus)
-    expect(oldOpusTail).toBeNumber()
-    expect(secondCycleMarkers).toContain(oldOpusTail!)
-    expect(secondCycleMarkers.at(-1)).toBe(
-      (secondCycleOpus.messages as unknown[]).length - 1,
-    )
-    expect(
-      messageEndBlockPosition(secondCycleOpus, secondCycleMarkers.at(-1)!) -
-        messageEndBlockPosition(secondCycleOpus, oldOpusTail!) +
-        1,
-    ).toBeGreaterThan(20)
-    expect(
-      (secondCycleOpus.system as Array<{ cache_control?: unknown }>).some(
-        (block) => block.cache_control,
-      ),
-    ).toBe(false)
-  }, 180_000)
-
   it('preserves server-side fallback opt-in and response normalization through the websocket relay', async () => {
-    harness = await E2EHarness.create({ relay: 'websocket' })
+    harness = await E2EHarness.create({
+      relay: 'websocket',
+      refusalFallbackMode: 'server',
+    })
     harness.script([
       {
         type: 'server_fallback',
@@ -623,7 +463,6 @@ describe('OpenCode Anthropic auth e2e', () => {
       'claude-fable-5',
     )
     expect(JSON.stringify(result)).toContain('relay fallback ok')
-    await harness.waitForSessionText(sessionId, 'Anthropic safety fallback')
     const request = await harness.waitFor(
       () =>
         harness!.anthropic

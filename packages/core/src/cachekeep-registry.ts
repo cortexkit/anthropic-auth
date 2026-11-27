@@ -9,7 +9,6 @@ import {
   rm,
   writeFile,
 } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import * as nodePath from 'node:path'
 import { dirname, join } from 'node:path'
 
@@ -144,11 +143,6 @@ function isExpiredRecord(
   return record.updatedAt <= now && now - record.updatedAt > leaseMs
 }
 
-export function getLegacyCacheKeepRegistryDirectory(scope: 'opencode' | 'pi') {
-  // Remove in the release after the next one: 2.5.3 reads only the temp registry.
-  return join(tmpdir(), 'opencode-anthropic-auth', 'cachekeep-sessions', scope)
-}
-
 export function getDefaultCacheKeepRegistryDirectory(
   scope: 'opencode' | 'pi',
   env: NodeJS.ProcessEnv = process.env,
@@ -178,24 +172,17 @@ export function getCacheKeepRegistryDirectories(
     ]
   return {
     directory: directory || getDefaultCacheKeepRegistryDirectory(scope, env),
-    // Remove in the release after the next one: overrides must not leak into
-    // default folders, but default writers also serve 2.5.3 temp-folder readers.
-    legacyDirectory: directory
-      ? undefined
-      : getLegacyCacheKeepRegistryDirectory(scope),
   }
 }
 
 export class CacheKeepSessionRegistry {
-  private readonly directories: string[]
-  private readonly filePaths: string[]
+  private readonly filePath: string
   private writeChain: Promise<void> = Promise.resolve()
   private lastSweepAt?: number
 
   constructor(
     private readonly options: {
       directory: string
-      legacyDirectory?: string
       ownerOnly?: OwnerOnlyOptions
       liveness?: HolderLiveness
       now?: () => number
@@ -204,17 +191,7 @@ export class CacheKeepSessionRegistry {
     },
   ) {
     const instanceId = options.instanceId ?? `${process.pid}-${randomUUID()}`
-    // Remove in the release after the next one: dual publication and merged reads.
-    this.directories = [
-      ...new Set(
-        [options.directory, options.legacyDirectory].filter(
-          (dir): dir is string => !!dir,
-        ),
-      ),
-    ]
-    this.filePaths = this.directories.map((dir) =>
-      join(dir, `${instanceId}.json`),
-    )
+    this.filePath = join(options.directory, `${instanceId}.json`)
   }
 
   publish(sessions: readonly CacheKeepTrackedSession[]): Promise<void> {
@@ -230,12 +207,10 @@ export class CacheKeepSessionRegistry {
           sessions: snapshot,
           writer: writerStamp(),
         }
-        for (const filePath of this.filePaths) {
-          if (snapshot.length === 0) {
-            await rm(filePath, { force: true })
-            continue
-          }
-          const directory = dirname(filePath)
+        if (snapshot.length === 0) {
+          await rm(this.filePath, { force: true })
+        } else {
+          const directory = dirname(this.filePath)
           if (
             !(await ensureWindowsOwnerOnlyDirectory(
               directory,
@@ -247,7 +222,6 @@ export class CacheKeepSessionRegistry {
           const stat = await lstat(directory)
           if (
             !stat.isDirectory() ||
-            stat.isSymbolicLink() ||
             !(await isOwnerOnly(
               directory,
               () =>
@@ -257,7 +231,7 @@ export class CacheKeepSessionRegistry {
             ))
           )
             throw new Error('Unsafe CacheKeep registry directory')
-          const tempPath = `${filePath}.${randomUUID()}.tmp`
+          const tempPath = `${this.filePath}.${randomUUID()}.tmp`
           try {
             const bytes = `${JSON.stringify(record)}\n`
             if (
@@ -268,7 +242,7 @@ export class CacheKeepSessionRegistry {
               ))
             )
               await writeFile(tempPath, bytes, { flag: 'wx', mode: 0o600 })
-            await renameWithWindowsSharingRetry(tempPath, filePath, {
+            await renameWithWindowsSharingRetry(tempPath, this.filePath, {
               platform: this.options.ownerOnly?.platform,
             })
           } finally {
@@ -326,23 +300,18 @@ export class CacheKeepSessionRegistry {
 
   async dispose(): Promise<void> {
     await this.writeChain.catch(() => {})
-    await Promise.all(this.filePaths.map((path) => rm(path, { force: true })))
+    await rm(this.filePath, { force: true })
   }
 
   private async recordPaths(): Promise<string[]> {
-    return (
-      await Promise.all(
-        this.directories.map(async (directory) => {
-          try {
-            return (await readdir(directory))
-              .filter((name) => name.endsWith('.json'))
-              .map((name) => join(directory, name))
-          } catch {
-            return []
-          }
-        }),
-      )
-    ).flat()
+    const { directory } = this.options
+    try {
+      return (await readdir(directory))
+        .filter((name) => name.endsWith('.json'))
+        .map((name) => join(directory, name))
+    } catch {
+      return []
+    }
   }
 
   private async mayRemove(
@@ -373,7 +342,7 @@ export class CacheKeepSessionRegistry {
 
     await Promise.all(
       (await this.recordPaths()).map(async (recordPath) => {
-        if (this.filePaths.includes(recordPath)) return
+        if (this.filePath === recordPath) return
 
         let initialRecord: CacheKeepRegistryRecord | undefined
         try {

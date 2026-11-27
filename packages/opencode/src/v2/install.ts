@@ -50,6 +50,7 @@ export async function installNativeAnthropic<Q, P>(
     finish: () => void
     hostAttempt: number
     discardQuotaStop?: () => void
+    preserveCache?: () => boolean
     route?: string
     attemptId?: string
   }>()
@@ -89,8 +90,10 @@ export async function installNativeAnthropic<Q, P>(
       if (request) {
         native.bindHostAttempt(input.attempt, request.hostAttempt)
         const data = input.attempt.data
-        if (data)
+        if (data) {
           request.discardQuotaStop = () => native.discardQuotaStopMessage(data)
+          request.preserveCache = () => native.preservesCacheTemplate(data)
+        }
         request.route = input.attempt.data?.route
         request.attemptId = input.attempt.attemptId
         attemptFinishers.set(input.attempt.attemptId, request.finish)
@@ -217,12 +220,14 @@ export async function installNativeAnthropic<Q, P>(
           finish: () => void
           hostAttempt: number
           discardQuotaStop?: () => void
+          preserveCache?: () => boolean
           route?: string
           attemptId?: string
         }
         const finish = () => {
           try {
-            turn?.finish()
+            if (completion?.preserveCache?.()) turn?.pause()
+            else turn?.finish()
           } catch {}
           signal?.removeEventListener('abort', finish)
           if (completion?.attemptId)
@@ -309,6 +314,7 @@ export async function installNativeAnthropic<Q, P>(
         try {
           for await (const event of events.subscribe({
             signal: abort.signal,
+            types: ['session.deleted', 'session.idle', 'session.status'],
           })) {
             if (event.type === 'session.deleted') {
               forgetSession(event.data.sessionID)

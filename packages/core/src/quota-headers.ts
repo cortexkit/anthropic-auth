@@ -80,6 +80,24 @@ export function hasScopedQuotaExhaustionHeaders(headers: Headers) {
   return false
 }
 
+export function latestRejectedScopedQuotaWindow(headers: Headers) {
+  let latest: { id: string; resetsAt?: number } | undefined
+  for (const name of headers.keys()) {
+    if (!name.endsWith('-status')) continue
+    const id = SCOPED_WINDOW_HEADER.exec(name)?.[1]
+    if (!id || headers.get(name) !== 'rejected') continue
+    const reset = headerResetAt(headers, id)
+    const resetsAt = reset === undefined ? undefined : Date.parse(reset)
+    if (
+      !latest ||
+      (resetsAt !== undefined &&
+        (latest.resetsAt === undefined || resetsAt > latest.resetsAt))
+    )
+      latest = { id, resetsAt }
+  }
+  return latest
+}
+
 /** Only a rejected status or raw utilization at least one confirms a 429's limit. */
 export function quotaExhaustionFromHeaders(
   headers: Headers,

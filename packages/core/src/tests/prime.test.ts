@@ -49,6 +49,7 @@ import {
   primeIsEligible,
   primeMarkerPath,
 } from '../prime.ts'
+import { tokenFingerprint } from '../token-fingerprint.ts'
 
 const STORAGE_TS = 1_721_111_111_000
 const DUE_TS = STORAGE_TS - 60_000
@@ -344,6 +345,8 @@ function makePrimeFixture(opts?: {
   return { storage, accountId }
 }
 
+const TEST_LINEAGE = '0123456789abcdef'
+
 interface Harness {
   manager: PrimeManager
   sendCalls: SendCall[]
@@ -379,7 +382,7 @@ async function makeHarness(opts: {
   const manager = new PrimeManager({
     storagePath,
     loadStorage: async () => opts.storage,
-    getAccountFingerprint: async () => '0123456789abcdef',
+    getAccountEvidence: async () => ({ lineage: TEST_LINEAGE }),
     refreshQuota: async (id) => {
       refreshCalls.push(id)
       if (opts.refreshError) throw opts.refreshError
@@ -426,7 +429,7 @@ async function makeHarness(opts: {
     markerDir: primeAccountMarkerDir(
       opts.markerDir,
       storagePath,
-      '0123456789abcdef',
+      tokenFingerprint(TEST_LINEAGE),
     ),
     cleanup: async () => {
       manager.stop()

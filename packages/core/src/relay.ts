@@ -8,6 +8,10 @@ import {
   reportAnthropicBillingFailure,
 } from './billing.ts'
 import { dumpRelayRequest } from './dump.ts'
+import {
+  hasFallbackCreditInRequest,
+  protectFallbackCreditResponse,
+} from './fallback-credit.ts'
 import { claudeGatewayProxyApplies } from './gateway.ts'
 import { parseJsonRedacted } from './json.ts'
 import { logger, relayLog } from './logger.ts'
@@ -21,6 +25,7 @@ import {
   type ProviderResponseMode,
 } from './provider-error.ts'
 import { raceWithSignal } from './request-abort.ts'
+import { SERVER_SIDE_FALLBACK_BETA } from './server-fallback-usage.ts'
 import { SseFrameTooLargeError } from './sse.ts'
 
 export type RelayConfig = {
@@ -163,6 +168,10 @@ type RelaySendResult = {
 export type RelayAttemptAuthorization = {
   headers: Headers
   billing?: AnthropicBillingRequest
+  /** Receives the single-use token that credits a retry for this refusal; the returned response never contains it. */
+  onRefusalCredit?: (credit: string) => void
+  /** Observe the guarded upstream body before billing, without reading ahead. */
+  observePhysicalResponse?: (response: Response) => Response
   /** Called only for a genuine upstream response, never optimistic/transport status. */
   onUpstreamStatus?: (status: number) => void
   /**
@@ -625,6 +634,7 @@ function updateLocalRelayState(
 async function postRelayAttempt(
   config: RelayConfig,
   payload: RelayPayload,
+  bodyText: string,
   signal: AbortSignal | null | undefined,
   authorizeAttempt: AuthorizeRelayAttempt | undefined,
   mode: ProviderResponseMode,
@@ -644,13 +654,24 @@ async function postRelayAttempt(
     throw safe
   }
   try {
+    const guarded = protectFallbackCreditResponse(raw, {
+      requestHeaders: new Headers(payload.upstream.headers),
+      requestBodyText: bodyText,
+      framing: mode,
+      onRefusalCredit: authorization?.onRefusalCredit,
+    })
+    const clean = scope.redactResponse(guarded)
     const upstream =
-      raw.ok || /^req_[A-Za-z0-9_-]+$/.test(raw.headers.get('request-id') ?? '')
+      clean.ok ||
+      /^req_[A-Za-z0-9_-]+$/.test(clean.headers.get('request-id') ?? '')
+    const response = upstream
+      ? (authorization?.observePhysicalResponse?.(clean) ?? clean)
+      : clean
     const observed =
       authorization?.billing && upstream
-        ? observeAnthropicBillingResponse(authorization.billing, raw)
-        : raw
-    return { authorization, scope, response: scope.redactResponse(observed) }
+        ? observeAnthropicBillingResponse(authorization.billing, response)
+        : response
+    return { authorization, scope, response: observed }
   } catch (error) {
     // Never hand the unscrubbed response on; the scope accepted nothing.
     scope.dispose()
@@ -692,6 +713,7 @@ async function sendRelayHttp(options: {
   let attempt = await postRelayAttempt(
     config,
     actualPayload,
+    bodyText,
     signal,
     authorizeAttempt,
     mode,
@@ -705,6 +727,7 @@ async function sendRelayHttp(options: {
     attempt = await postRelayAttempt(
       config,
       actualPayload,
+      bodyText,
       signal,
       authorizeAttempt,
       mode,
@@ -863,6 +886,11 @@ function disposeWebSocketAttemptScopes(scopes: WebSocketAttemptScopes) {
 }
 
 type PendingWebSocketRequest = {
+  wrapPhysicalResponse: boolean
+  physicalResponseObserved?: boolean
+  creditResponseInit?: ResponseInit
+  rawCreditStream?: ReadableStream<Uint8Array> | null
+  resolveCreditStream?: (body: ReadableStream<Uint8Array> | null) => void
   billingObserver?: ReturnType<typeof createAnthropicBillingObserver>
   abortCleanup?: () => void
   payload: RelayPayload
@@ -1224,6 +1252,14 @@ class PersistentRelaySession {
       const pending: PendingWebSocketRequest = {
         payload,
         bodyText,
+        wrapPhysicalResponse:
+          Boolean(attempt.authorization?.onRefusalCredit) ||
+          Boolean(attempt.authorization?.observePhysicalResponse) ||
+          (new Headers(payload.upstream.headers)
+            .get('anthropic-beta')
+            ?.split(',')
+            .some((beta) => beta.trim() === SERVER_SIDE_FALLBACK_BETA) ??
+            false),
         resolve,
         reject,
         streamDone: false,
@@ -1300,6 +1336,7 @@ class PersistentRelaySession {
     // them before its response_start.
     if (pending.streamByteCount > 0) return false
     if (pending.streamDone) return false
+    if (pending.physicalResponseObserved) return false
     // A non-optimistic response has already handed the host its real status,
     // headers and a body bound to this attempt's credentials. A replay could
     // not change that status, and its body would be scrubbed with the wrong
@@ -1357,6 +1394,7 @@ class PersistentRelaySession {
         pending.accepted = false
         pending.acceptedAt = undefined
         pending.responseStartedAt = undefined
+        pending.creditResponseInit = undefined
         pending.stagedResponseHeaders = undefined
         pending.responseHeadersDelivered = false
         pending.sentAt = perfNowMs()
@@ -1400,6 +1438,7 @@ class PersistentRelaySession {
   ) {
     if (
       !pending.billingObserver &&
+      !pending.physicalResponseObserved &&
       pending.accepted &&
       pending.authorization?.billing
     )
@@ -1422,6 +1461,7 @@ class PersistentRelaySession {
   private retireAttempt(pending: PendingWebSocketRequest) {
     if (
       !pending.billingObserver &&
+      !pending.physicalResponseObserved &&
       pending.accepted &&
       pending.authorization?.billing
     )
@@ -1457,7 +1497,111 @@ class PersistentRelaySession {
     this.deliverResponseHeaders(pending)
     pending.streamChunkCount += 1
     pending.streamByteCount += chunk.byteLength
+    // An optimistic host response can exist before the relay tells us the
+    // physical response's framing. Never release body bytes without it.
+    if (pending.wrapPhysicalResponse && pending.responseStartedAt == null)
+      return
+    if (!this.startCreditStream(pending)) return
     this.forwardStreamBytes(pending, chunk)
+  }
+
+  private startCreditStream(pending: PendingWebSocketRequest): boolean {
+    const init = pending.creditResponseInit
+    if (!init || !pending.resolveCreditStream) return true
+    pending.creditResponseInit = undefined
+    try {
+      const physical = new Response(
+        NULL_BODY_STATUSES.has(init.status ?? 200)
+          ? null
+          : pending.rawCreditStream,
+        init,
+      )
+      this.selectCreditStream(
+        pending,
+        this.observePhysicalResponse(pending, physical).body,
+      )
+      return true
+    } catch {
+      this.failInvalidResponseStart()
+      return false
+    }
+  }
+
+  private observePhysicalResponse(
+    pending: PendingWebSocketRequest,
+    response: Response,
+  ) {
+    if (!pending.wrapPhysicalResponse) return response
+    const guarded = protectFallbackCreditResponse(response, {
+      requestHeaders: new Headers(pending.payload.upstream.headers),
+      requestBodyText: pending.bodyText,
+      framing: pending.responseMode,
+      onRefusalCredit: pending.authorization?.onRefusalCredit,
+    })
+    pending.physicalResponseObserved = true
+    const observed =
+      pending.authorization?.observePhysicalResponse?.(guarded) ?? guarded
+    return pending.authorization?.billing
+      ? observeAnthropicBillingResponse(pending.authorization.billing, observed)
+      : observed
+  }
+
+  private deferredCreditStream(
+    pending: PendingWebSocketRequest,
+    stream: ReadableStream<Uint8Array> | null,
+  ) {
+    pending.rawCreditStream = stream
+    const ready = new Promise<ReadableStream<Uint8Array> | null>((resolve) => {
+      pending.resolveCreditStream = resolve
+    })
+    const getReader = (body: ReadableStream<Uint8Array>) => body.getReader()
+    let reader: ReturnType<typeof getReader> | undefined
+    let cancelled = false
+    return new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const body = await ready
+        if (cancelled) return
+        if (body) reader ??= getReader(body)
+        try {
+          const next = await reader?.read()
+          if (cancelled) return
+          if (!next || next.done) {
+            reader?.releaseLock()
+            controller.close()
+          } else controller.enqueue(next.value)
+        } catch (error) {
+          if (!cancelled) {
+            reader?.releaseLock()
+            controller.error(error)
+          }
+        }
+      },
+      async cancel(reason) {
+        cancelled = true
+        // Before response_start, cancellation must also settle the waiting pull.
+        if (pending.resolveCreditStream) {
+          pending.resolveCreditStream(null)
+          pending.resolveCreditStream = undefined
+          pending.rawCreditStream = undefined
+          await stream?.cancel(reason)
+        } else if (reader) {
+          try {
+            await reader.cancel(reason)
+          } finally {
+            reader.releaseLock()
+          }
+        } else await (await ready)?.cancel(reason)
+      },
+    })
+  }
+
+  private selectCreditStream(
+    pending: PendingWebSocketRequest,
+    body = pending.rawCreditStream ?? null,
+  ) {
+    pending.resolveCreditStream?.(body)
+    pending.resolveCreditStream = undefined
+    pending.rawCreditStream = undefined
   }
 
   /**
@@ -1584,7 +1728,12 @@ class PersistentRelaySession {
         })
     let response: Response
     try {
-      response = new Response(stream, { status, statusText, headers })
+      response = new Response(
+        pending.optimisticResponse && pending.wrapPhysicalResponse
+          ? this.deferredCreditStream(pending, stream)
+          : stream,
+        { status, statusText, headers },
+      )
     } catch {
       this.failInvalidResponseStart()
       return
@@ -1611,14 +1760,17 @@ class PersistentRelaySession {
       // then non-2xx headers cannot be checked, so onResponseHeaders gets none.
       if (headers && response.ok)
         pending.stagedResponseHeaders = new Headers(response.headers)
-      pending.resolve(response)
+      pending.resolve(this.observePhysicalResponse(pending, response))
       return
     }
     // Remove echoed credentials from error bodies using the request's mode.
     pending.rawBody = true
     let scrubbed: Response
     try {
-      scrubbed = responseScope.redactResponse(response)
+      scrubbed = this.observePhysicalResponse(
+        pending,
+        responseScope.redactResponse(response),
+      )
     } catch (error) {
       // Never hand the unscrubbed response on.
       pending.responseStarted = false
@@ -1726,7 +1878,11 @@ class PersistentRelaySession {
     if (message.type === 'response_start') {
       if (pending.responseStartedAt != null) return
       try {
-        if (pending.authorization?.billing)
+        if (
+          pending.authorization?.billing &&
+          (!pending.wrapPhysicalResponse ||
+            (pending.optimisticResponse && message.status >= 400))
+        )
           pending.billingObserver = createAnthropicBillingObserver(
             pending.authorization.billing,
             message.status,
@@ -1753,6 +1909,15 @@ class PersistentRelaySession {
         return
       }
       if (!this.stageOptimisticResponseHeaders(pending, message)) return
+      if (pending.wrapPhysicalResponse && message.status < 400) {
+        // If the socket closes before any bytes arrive, the relay can still
+        // reconnect with a different physical response and its own framing.
+        pending.creditResponseInit = {
+          status: message.status,
+          statusText: message.statusText,
+          headers: message.headers,
+        }
+      } else this.selectCreditStream(pending)
       if (message.status >= 400) {
         this.deliverResponseHeaders(pending)
         this.forwardStreamBytes(
@@ -1783,6 +1948,7 @@ class PersistentRelaySession {
           `websocket relay error during optimistic response session=${shortAffinity(this.affinity)} request=${pending.payload.id} status=${Number.isFinite(message.status) ? message.status : 'unknown'} code=relay_stream_error chunks=${pending.streamChunkCount} bytes=${pending.streamByteCount}`,
         )
         this.deliverResponseHeaders(pending)
+        if (!this.startCreditStream(pending)) return
         this.forwardStreamBytes(
           pending,
           new TextEncoder().encode(
@@ -1812,6 +1978,7 @@ class PersistentRelaySession {
   private finishPending(done?: RelayDone) {
     const pending = this.pending
     if (!pending) return
+    if (!this.startCreditStream(pending)) return
     const finishedAt = perfNowMs()
     const workerStats =
       done && 'frames' in done
@@ -1829,6 +1996,7 @@ class PersistentRelaySession {
         const tail = pending.rawBody ? [] : (pending.scope?.finish() ?? [])
         for (const chunk of tail) pending.streamController?.enqueue(chunk)
         pending.streamController?.close()
+        this.selectCreditStream(pending)
       }
     } finally {
       this.retireAttempt(pending)
@@ -1857,6 +2025,7 @@ class PersistentRelaySession {
     pending.onResponseHeaders = undefined
     if (pending.responseStarted) {
       pending.streamController?.error(safe)
+      this.selectCreditStream(pending)
     } else {
       pending.reject(safe)
     }
@@ -1981,6 +2150,14 @@ export async function sendViaRelay(options: {
   } = options
   requireUpstreamUrl?.(input instanceof Request ? input.url : input.toString())
   if (!config || !isRelayableAnthropicRequest(input, body)) return fallback()
+  const bodyText = body as string
+  // The relay may replay a request, and keeps the last body it accepted as the
+  // base for sending later requests as diffs. A credit token is single-use, so
+  // it must not go through the relay until the relay can guarantee one send.
+  if (hasFallbackCreditInRequest(bodyText)) {
+    if (config.fallbackToDirect) return fallback()
+    throw new Error('Fallback credit cannot be sent through the relay')
+  }
   if (relayProxyApplies(config.url)) {
     // Nothing is sent to the relay. Like a relay that cannot be reached, this
     // goes direct when fallbackToDirect allows it and fails otherwise.
@@ -1998,7 +2175,6 @@ export async function sendViaRelay(options: {
     return fallback()
   }
 
-  const bodyText = body as string
   const hashStart = perfNowMs()
   const nextHash = hashBody(bodyText)
   relayPerfLog('hash_body', {

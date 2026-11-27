@@ -3143,7 +3143,7 @@ for (const provenance of [true, false]) {
       const url = input instanceof Request ? input.url : input.toString()
       if (!url.startsWith(relayUrl)) return fixture.fetchProvider(input, init)
       return Response.json(
-        { content: [], usage: {} },
+        { content: [], stop_reason: 'end_turn', usage: {} },
         { headers: provenance ? { 'request-id': 'req_cache_accepted' } : {} },
       )
     })
@@ -3205,7 +3205,10 @@ for (const cacheKeepEnabled of [true, false]) {
       if (!url.includes('/v1/messages'))
         return fixture.fetchProvider(input, init)
       if (failure) throw new TypeError('synthetic transport failure')
-      return Response.json({ content: [], usage: {} }, { status })
+      return Response.json(
+        { content: [], stop_reason: 'end_turn', usage: {} },
+        { status },
+      )
     })
     const plugin = await createPlugin({
       claustrumScopedConnect: async () => fixture.scopedClient,

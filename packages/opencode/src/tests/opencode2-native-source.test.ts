@@ -81,6 +81,7 @@ import {
 } from '../../../core/src/tests/native-refresh-quota-fixture.ts'
 import { holdNativeRelayLock } from '../../../core/src/tests/native-relay-lock-fixture.ts'
 import { requestLockProbe } from '../../../core/src/tests/native-request-lock-fixture.ts'
+import { settingsTestPaths } from '../../../core/src/tests/settings-record-paths-fixture.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { vaultOutageClock } from '../../../core/src/tests/vault-outage-clock.ts'
 import { tokenFingerprint } from '../../../core/src/token-fingerprint'
@@ -610,6 +611,142 @@ describe('OC2 shared routing relay', () => {
     expect(asks).toBe(1)
   })
 
+  test.each([
+    'main general floor',
+    'relay target floor',
+    'main killswitch',
+  ] as const)(
+    'a client extra send gets no quota exemption or wait at the %s',
+    async (scenario) => {
+      const fixture = await vaultWithFallback()
+      const clock = capacityClock()
+      const sourceModel = 'claude-fable-5-2'
+      const targetModel = 'claude-opus-4-8'
+      const checkedAt = clock.now()
+      let atFloor = false
+      const runtime: NativeAccountRuntime = {
+        ...fixture.runtime,
+        read: async (model) => {
+          const snapshot = await fixture.runtime.read(model)
+          return {
+            ...snapshot,
+            policyStorage: {
+              ...snapshot.policyStorage,
+              wait_for_reset: true,
+              max_same_account_wait: 60,
+              quota: {
+                enabled: true,
+                minimumRemaining: { five_hour: 20, seven_day: 0 },
+              },
+              killswitch: {
+                enabled: scenario === 'main killswitch',
+                main: { five_hour: 20 },
+              },
+            },
+            accounts: snapshot.accounts.map((account) => {
+              const targetBlocked = atFloor && model === targetModel
+              const remaining =
+                !targetBlocked || scenario === 'relay target floor'
+                  ? 100
+                  : scenario === 'main killswitch'
+                    ? 20
+                    : 19
+              return {
+                ...account,
+                quota: {
+                  checkedAt,
+                  five_hour: {
+                    usedPercent: 100 - remaining,
+                    remainingPercent: remaining,
+                    checkedAt,
+                    resetsAt: new Date(checkedAt + 30_000).toISOString(),
+                  },
+                  seven_day: {
+                    usedPercent: 0,
+                    remainingPercent: 100,
+                    checkedAt,
+                  },
+                  scoped: [
+                    {
+                      id: 'seven_day_opus',
+                      title: 'Opus weekly',
+                      modelId: targetModel,
+                      modelName: 'Opus 4.8',
+                      remainingPercent:
+                        targetBlocked && scenario === 'relay target floor'
+                          ? 0
+                          : 100,
+                      usedPercent:
+                        targetBlocked && scenario === 'relay target floor'
+                          ? 100
+                          : 0,
+                      checkedAt,
+                      resetsAt: new Date(checkedAt + 30_000).toISOString(),
+                    },
+                  ],
+                },
+              }
+            }),
+          }
+        },
+      }
+      const native = source(runtime, fixture.paths, cleanups, clock)
+      const requested = { ...scope, modelID: sourceModel }
+      let asks = 0
+      let accountId = 'main'
+      if (scenario === 'relay target floor') {
+        bridge(() => {
+          asks++
+          return {
+            account_id: fallbackIdentity,
+            credential_id: 'oauth:anthropic:work',
+          }
+        })
+        const selected = await native.chooseAccount(requested)
+        if (typeof selected !== 'string')
+          throw new Error('Expected a routing grant')
+        accountId = selected
+      }
+      const initial = await native.authorizeAccount(requested, accountId)
+      if (initial?.route !== 'oauth') throw new Error('Expected OAuth source')
+      const target = {
+        ...requested,
+        modelID: targetModel,
+        extraSend: {
+          kind: 'refusal' as const,
+          credentialId: initial.credentialId,
+        },
+      }
+      const authorized = await native.authorizeAccount(target, accountId)
+      if (authorized?.route !== 'oauth')
+        throw new Error('Expected initial target admission')
+
+      atFloor = true
+      await expect(
+        native.admitRequest?.({
+          ...context(authorized.provenance),
+          ...target,
+          accountId,
+        }),
+      ).rejects.toThrow('policy changed before dispatch')
+      expect(await native.authorizeAccount(target, accountId)).toBeUndefined()
+      expect(await native.authorizeAccount(requested, accountId)).toBeDefined()
+      if (scenario === 'relay target floor') {
+        // Without extraSend, the same target request is an ordinary send that
+        // shared routing admitted for this session, so it still authorizes;
+        // only the fallback retry loses that admission.
+        expect(
+          await native.authorizeAccount(
+            { ...target, extraSend: undefined },
+            accountId,
+          ),
+        ).toBeDefined()
+      }
+      expect(asks).toBe(scenario === 'relay target floor' ? 1 : 0)
+      expect(clock.sleep).not.toHaveBeenCalled()
+    },
+  )
+
   test('OC2 capacity refusal does not wait or rewrite the provider 429 stop text', async () => {
     const f = await vaultWithFallback()
     const native = source(f.runtime, f.paths)
@@ -1086,7 +1223,6 @@ describe('OC2 shared routing relay', () => {
     const authorize = spyOn(f.runtime, 'authorizeVault').mockImplementation(
       async (...args) => ({
         ...(await authorizeVault(...args)),
-        credentialId: 'oauth:resend',
         accessToken: 'sk-ant-oat01-resend',
       }),
     )
@@ -1144,7 +1280,7 @@ describe('OC2 shared routing relay', () => {
     ).toEqual([
       {
         account_id: identity,
-        credential_id: 'oauth:resend',
+        credential_id: 'oauth:anthropic',
         outcome: 'served',
         headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
       },
@@ -1422,6 +1558,89 @@ describe('OC2 shared routing relay', () => {
           ? 'Bearer sk-ant-oat01-oauth:anthropic'
           : 'Bearer sk-ant-oat01-oauth:anthropic:work',
       )
+    },
+  )
+
+  test.each([
+    'general floor',
+    'target scope',
+    'killswitch',
+    'at killswitch',
+    'at killswitch below general floor',
+  ] as const)(
+    'OC2 refusal target admission on a shared-routed account: %s',
+    async (policy) => {
+      const f = await vault()
+      const native = source(f.runtime, f.paths)
+      const input = { ...scope, modelID: 'claude-fable-5-2' }
+      const target = 'claude-opus-4-8'
+      const atKillswitch = policy.startsWith('at killswitch')
+      const remainingPercent = atKillswitch ? 20 : 10
+      await f.store.updateSettings((settings) => ({
+        ...settings,
+        quota: {
+          enabled: true,
+          minimumRemaining: {
+            five_hour: policy === 'at killswitch below general floor' ? 30 : 20,
+            seven_day: 0,
+          },
+        },
+        killswitch: {
+          enabled: policy === 'killswitch' || atKillswitch,
+          main: { five_hour: 20 },
+        },
+      }))
+      const receipt = await f.runtime.authorizeVault('main')
+      const checkedAt = Date.now()
+      await f.runtime.vault.publish(receipt, {
+        quota: {
+          accountIdentity: identity,
+          checkedAt,
+          five_hour: {
+            usedPercent: 100 - remainingPercent,
+            remainingPercent,
+            checkedAt,
+          },
+          seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt },
+          scoped:
+            policy === 'target scope'
+              ? [
+                  {
+                    id: 'opus',
+                    title: 'Opus weekly',
+                    modelId: target,
+                    modelName: target,
+                    usedPercent: 100,
+                    remainingPercent: 0,
+                    checkedAt,
+                  },
+                ]
+              : [],
+        },
+      })
+      bridge(() => ({
+        account_id: identity,
+        credential_id: receipt.credentialId,
+      }))
+      expect(await native.chooseAccount(input)).toBe('main')
+      const primary = await native.authorizeAccount(input, 'main')
+      if (primary?.route !== 'oauth')
+        throw new Error('Expected routed OAuth source')
+      const retry = await native.authorizeAccount(
+        {
+          ...input,
+          modelID: target,
+          extraSend: { kind: 'refusal', credentialId: primary.credentialId },
+        },
+        'main',
+      )
+      if (policy === 'general floor')
+        expect(retry).toMatchObject({
+          route: 'oauth',
+          credentialId: primary.credentialId,
+          identity: primary.identity,
+        })
+      else expect(retry).toBeUndefined()
     },
   )
 
@@ -2069,7 +2288,10 @@ async function storage(owned = cleanups, waitForReset = false) {
         routing_mode: 'sticky-balanced',
       }),
     )
-    const service = await openSettingsService({ file: settingsFile })
+    const service = await openSettingsService({
+      file: settingsFile,
+      records: (await settingsTestPaths(settingsFile)).records,
+    })
     if (!service) throw new Error('Could not open reset-wait settings')
     owned.push(() => service.dispose())
     settingsService = service
@@ -2612,7 +2834,8 @@ async function retryHost(native: ReturnType<typeof source>) {
                 sent = true
                 controller.enqueue(
                   new TextEncoder().encode(
-                    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n',
+                    'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
+                      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n',
                   ),
                 )
               },
@@ -2634,7 +2857,13 @@ async function retryHost(native: ReturnType<typeof source>) {
             output += new TextDecoder().decode(chunk.value)
           }
         })(),
-      ).rejects.toThrow('connection lost mid-body')
+      ).rejects.toThrow(
+        request.headers
+          .get('anthropic-beta')
+          ?.includes('server-side-fallback-2026-07-01')
+          ? 'Could not read fallback response'
+          : 'connection lost mid-body',
+      )
       expect(output).toContain('partial')
     },
     async retry(

@@ -16,6 +16,7 @@ import {
   nativeQuotaModelScope,
   toNativeQuotaMap,
 } from '../native-quota-codec.ts'
+import { NativeQuotaObservations } from '../native-quota-observations.ts'
 import { normalizeQuotaHeaders } from '../quota-headers.ts'
 
 // Different timestamps expose accidental timestamp reuse between quota windows.
@@ -604,8 +605,103 @@ test('new native header merges retain the poll clock even though legacy data cou
   expect(afterSecond.checkedAt).toBe(laterPollAt)
   expect(afterSecond.scoped).toEqual([])
   expect(afterSecond.extraUsage).toBeUndefined()
+  // A legacy snapshot without a recoverable poll clock may already have seen
+  // a later poll. Leave it alone until a poll newer than the headers arrives.
   expect(nativeQuotaCodec.merge(legacy(first), latePoll)).toEqual(legacy(first))
 })
+
+test('an older poll cannot replace a poll already covered by newer headers', () => {
+  const poll = (checkedAt: number, withDetails: boolean) =>
+    toNativeQuotaMap({
+      accountIdentity: full.accountIdentity,
+      source: 'poll',
+      checkedAt,
+      five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt },
+      seven_day: { usedPercent: 20, remainingPercent: 80, checkedAt },
+      ...(withDetails && {
+        scoped: full.scoped?.map((window) => ({ ...window, checkedAt })),
+        extraUsage: full.extraUsage,
+      }),
+    })
+  const headers = toNativeQuotaMap({
+    ...normalizeQuotaHeaders(
+      new Headers({
+        'anthropic-ratelimit-unified-5h-utilization': '0.12',
+        'anthropic-ratelimit-unified-7d-utilization': '0.21',
+      }),
+      300,
+    ),
+    accountIdentity: full.accountIdentity,
+  })
+  const stored = nativeQuotaCodec.merge(poll(200, false), headers)
+  expect(fromNativeQuotaMap(stored)).toMatchObject({
+    source: 'headers',
+    checkedAt: 200,
+    five_hour: { checkedAt: 300 },
+    seven_day: { checkedAt: 300 },
+  })
+  expect(nativeQuotaCodec.merge(stored, poll(100, true))).toEqual(stored)
+
+  const newer = poll(400, true)
+  expect(nativeQuotaCodec.merge(stored, newer)).toEqual(newer)
+})
+
+test('a header-only snapshot waits for a newer poll if the first poll is older than its headers', () => {
+  const headers: OAuthQuotaSnapshot = {
+    accountIdentity: full.accountIdentity,
+    source: 'headers',
+    checkedAt: 2000,
+    five_hour: { usedPercent: 12, remainingPercent: 88, checkedAt: 2000 },
+    seven_day: { usedPercent: 21, remainingPercent: 79, checkedAt: 2000 },
+  }
+  const poll: OAuthQuotaSnapshot = {
+    accountIdentity: full.accountIdentity,
+    source: 'poll',
+    checkedAt: full.checkedAt,
+    five_hour: full.five_hour,
+    seven_day: full.seven_day,
+    scoped: full.scoped,
+    extraUsage: full.extraUsage,
+  }
+  expect(quotaPollCheckedAt(headers)).toBe(0)
+  const stored = toNativeQuotaMap(headers)
+  expect(nativeQuotaCodec.merge(stored, toNativeQuotaMap(poll))).toEqual(stored)
+})
+
+test.each(['headers', 'poll'] as const)(
+  'newer held %s supersedes a pending quota poll write',
+  async (source) => {
+    const observations = new NativeQuotaObservations()
+    const reading = (source: 'headers' | 'poll', checkedAt: number) => ({
+      lineage: 'same-credential',
+      accountUuid: 'same-account',
+      generalExhausted: false,
+      entry: {
+        quota: { source, checkedAt },
+        checkedAt,
+        refreshAfter: checkedAt,
+      },
+    })
+    let writes = 0
+    try {
+      const published = observations.publish(
+        'main',
+        reading('poll', 1000),
+        async () => {
+          writes++
+          return true
+        },
+      )
+      const latest = reading(source, 2000)
+      expect(observations.hold('main', latest)).toBe(true)
+      await published
+      expect(writes).toBe(0)
+      expect(observations.get('main')).toBe(latest)
+    } finally {
+      await observations.close()
+    }
+  },
+)
 
 test('a newer complete poll replaces the whole snapshot and clears older scoped limits and extra usage', () => {
   const stored = toNativeQuotaMap({ ...full, source: 'poll' })

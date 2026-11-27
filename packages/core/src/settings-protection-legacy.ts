@@ -9,6 +9,7 @@ import { nativeAccountSettings } from './native-account-view.ts'
 import { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
 import type { createNativePoolStore } from './pool-store.ts'
 import { getMaxSameAccountWait } from './routing.ts'
+import { DEFAULT_REFUSAL_FALLBACK_MODE } from './settings-definition.ts'
 import type { SettingsHost } from './settings-paths.ts'
 import type { SettingsProtectionValues } from './settings-service.ts'
 import { toThreeWay } from './settings-three-way.ts'
@@ -46,6 +47,7 @@ export function legacySettingsProtection(
   const main = getKillswitchThresholdsForAccount(storage)
   const minimum = getQuotaMinimumRemainingThresholds(storage)
   return {
+    refusal_fallback: DEFAULT_REFUSAL_FALLBACK_MODE,
     killswitch_enabled: isKillswitchEnabled(storage),
     killswitch_default_five_hour: main.five_hour,
     killswitch_default_seven_day: main.seven_day,

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import {
   mkdir,
   mkdtemp,
@@ -25,6 +26,11 @@ import {
   RelocatedError,
   RequestGzipLatch,
   resetBillingHeaderCCH,
+  SERVER_FALLBACK_MARKER_TEXT,
+  SERVER_FALLBACK_SIGNATURE_PREFIX,
+  SERVER_FALLBACK_USAGE_MARKER_TEXT,
+  SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
+  SERVER_SIDE_FALLBACK_BETA,
   signRequestBody,
   TRAILING_ASSISTANT_HISTORY_MESSAGE,
   USER_AGENT,
@@ -45,13 +51,6 @@ import {
   markOpenCodeEffortTransitions,
 } from '../effort-history'
 import { LANE_START_REQUEST_HEADER } from '../lane-start'
-import {
-  SERVER_FALLBACK_MARKER_TEXT,
-  SERVER_FALLBACK_SIGNATURE_PREFIX,
-  SERVER_FALLBACK_USAGE_MARKER_TEXT,
-  SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
-  SERVER_SIDE_FALLBACK_BETA,
-} from '../server-fallback'
 import {
   hasPinnedFirstUserTextForTest,
   NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
@@ -128,6 +127,8 @@ afterEach(() => {
 })
 
 const UPSTREAM = 'https://api.anthropic.com/v1/messages'
+const wireDigest = (body: string) =>
+  createHash('sha256').update(body).digest('hex')
 const ACCOUNT_UUID =
   '6f1d1c2e-0000-4000-8000-00000000a11c' as ProviderAccountUuid
 const IDENTITY: ClaudeCodeIdentity = {
@@ -495,6 +496,1013 @@ function hostRequest(
 
 const sse = (event: string, data: unknown) =>
   `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+
+test('OpenCode 2 ignores the removed fallback environment switch on each request', () => {
+  const wire = createNativeWirePolicy()
+  const input = {
+    agent: 'build',
+    correlation: {},
+    sessionID: 'ses_fallback_mode',
+  }
+  const request = (refusalFallbackMode?: core.RefusalFallbackMode) =>
+    wire.requestOptions(
+      { ...input, attemptId: refusalFallbackMode ?? 'default' },
+      { policyStorage: {}, refusalFallbackMode } as core.NativeAccountSnapshot,
+    )
+  process.env.OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK = 'server'
+  expect(request().serverSideFallbackEnabled).toBe(false)
+  expect(request('off').serverSideFallbackEnabled).toBe(false)
+  process.env.OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK = 'legacy'
+  expect(request('server').serverSideFallbackEnabled).toBe(true)
+  expect(request('off').serverSideFallbackEnabled).toBe(false)
+  const response = (attemptId: string) =>
+    wire.responseOptions({
+      ...input,
+      attemptId,
+      kind: 'primary',
+      accountId: 'main',
+      serverSideFallbackModel: 'claude-fable-5',
+      status: 200,
+    })
+  expect(response('server').serverSideFallbackModel).toBe('claude-fable-5')
+  expect(response('off').serverSideFallbackModel).toBeUndefined()
+})
+
+test.each(['client', 'off'] as const)(
+  'OpenCode 2 in %s strips and re-signs a prewarm prepared in server mode',
+  async (refusalFallbackMode) => {
+    const wire = createNativeWirePolicy()
+    const { source } = makeSource({
+      requestOptions: (input) =>
+        wire.requestOptions(input, {
+          policyStorage: {},
+          refusalFallbackMode,
+        } as core.NativeAccountSnapshot),
+    })
+    const native = createNativeAnthropicAdapter({ source })
+    try {
+      const clean = {
+        model: 'claude-fable-5',
+        max_tokens: 0,
+        system: [
+          {
+            type: 'text',
+            text: 'x-anthropic-billing-header: cc_version=2.1.302; cc_entrypoint=cli; cch=00000;',
+          },
+        ],
+        messages: [{ role: 'user', content: 'kept prefix' }],
+      }
+      const stale = await signRequestBody(
+        JSON.stringify({ ...clean, fallbacks: 'default' }),
+      )
+      const host = new Host(native.adapter)
+      const { final } = await host.run(
+        scopeOf({ agent: 'cachekeep', modelID: clean.model }),
+        hostRequest(JSON.parse(stale)),
+      )
+      expect(final.headers.get('anthropic-beta')?.split(',')).toContain(
+        SERVER_SIDE_FALLBACK_BETA,
+      )
+      const text = await final.text()
+      expect(text).toBe(await signRequestBody(JSON.stringify(clean)))
+      // Pin the signed prewarm bytes, including the billing signature.
+      expect(wireDigest(text)).toBe(
+        '986899fcd40ef585fe4d31119a70125c1a44b4d9a30e0f8c0b7ac82a9da072c2',
+      )
+    } finally {
+      native.dispose()
+    }
+  },
+)
+
+test('OpenCode 2 reuses the parsed payload for an unchanged keep-warm send', async () => {
+  const { source } = makeSource({})
+  const native = createNativeAnthropicAdapter({ source })
+  const payload = {
+    model: 'claude-sonnet-5',
+    max_tokens: 0,
+    messages: [{ role: 'user', content: 'keep-warm parse reuse' }],
+  }
+  const body = JSON.stringify(payload)
+  const parse = spyOn(JSON, 'parse')
+  try {
+    const { final } = await new Host(native.adapter).run(
+      scopeOf({ agent: 'cachekeep', modelID: payload.model }),
+      hostRequest(payload),
+    )
+    expect(await final.text()).toBe(body)
+    expect(parse.mock.calls.filter(([text]) => text === body)).toHaveLength(3)
+  } finally {
+    parse.mockRestore()
+    native.dispose()
+  }
+})
+
+test.each([
+  ['server', 'claude-fable-5', true, 'tool_use'],
+  ['server', 'claude-fable-5', false, 'refusal'],
+  ['server', 'claude-opus-4-8', true, 'refusal'],
+  ['off', 'claude-fable-5', true, 'refusal'],
+  ['client', 'claude-fable-5', true, 'tool_use'],
+] as const)(
+  'OpenCode 2 in %s with sent model %s and closed call %s delivers %s',
+  async (mode, model, closedCall, stopReason) => {
+    const wire = createNativeWirePolicy()
+    const { source } = makeSource({
+      requestOptions: (input) =>
+        wire.requestOptions(input, {
+          policyStorage: {},
+          refusalFallbackMode: mode,
+        } as core.NativeAccountSnapshot),
+      responseOptions: wire.responseOptions,
+    })
+    const native = createNativeAnthropicAdapter({ source })
+    const host = new Host(native.adapter)
+    try {
+      const { attempt, final } = await host.run(
+        scopeOf({ modelID: 'claude-fable-5' }),
+        hostRequest({
+          ...sonnetPayload(),
+          model,
+          stream: true,
+          fallbacks: false,
+        }),
+      )
+      const enabled = mode === 'server' && model === 'claude-fable-5'
+      const sentBody = (await final.clone().json()) as Record<string, unknown>
+      expect(sentBody.fallbacks).toBe(enabled ? 'default' : undefined)
+      expect(
+        final.headers
+          .get('anthropic-beta')
+          ?.split(',')
+          .includes(SERVER_SIDE_FALLBACK_BETA),
+      ).toBe(model === 'claude-fable-5')
+      const stopDetails = { type: 'refusal', category: 'test' }
+      const frames = [
+        sse('message_start', {
+          type: 'message_start',
+          message: { id: 'msg_refusal', model },
+        }),
+        ...(closedCall
+          ? [
+              sse('content_block_start', {
+                type: 'content_block_start',
+                index: 0,
+                content_block: {
+                  type: 'tool_use',
+                  id: 'toolu_closed',
+                  name: 'mcp_Bash',
+                  input: {},
+                },
+              }),
+              sse('content_block_stop', {
+                type: 'content_block_stop',
+                index: 0,
+              }),
+            ]
+          : []),
+        sse('message_delta', {
+          type: 'message_delta',
+          delta: { stop_reason: 'refusal', stop_details: stopDetails },
+        }),
+        sse('message_stop', { type: 'message_stop' }),
+      ]
+      const response = await native.adapter.rewriteResponse?.({
+        ...attempt,
+        attempt,
+        request: final,
+        response: sseResponse(frames.join('')),
+      })
+      const text = await response?.text()
+      const delta =
+        stopReason === 'tool_use'
+          ? { stop_reason: 'tool_use' }
+          : { stop_reason: 'refusal', stop_details: stopDetails }
+      expect(text).toContain(
+        sse('message_delta', { type: 'message_delta', delta }),
+      )
+      expect(text).toEndWith(frames.at(-1)!)
+      expect(host.sent).toHaveLength(1)
+    } finally {
+      native.dispose()
+    }
+  },
+)
+
+const FALLBACK_SOURCE = 'claude-fable-5-2'
+const FALLBACK_TARGET = 'claude-opus-4-8'
+const PRIVATE_CREDIT = 'oc2_private_credit_sentinel_932'
+
+function fallbackReply(model: string, refuses = false) {
+  return sseResponse(
+    [
+      sse('message_start', {
+        type: 'message_start',
+        message: {
+          id: `msg_${model}`,
+          model,
+          usage: { input_tokens: refuses ? 12 : 25 },
+        },
+      }),
+      ...(!refuses
+        ? [
+            sse('content_block_start', {
+              type: 'content_block_start',
+              index: 0,
+              content_block: { type: 'text', text: 'the retry answered' },
+            }),
+            sse('content_block_stop', { type: 'content_block_stop', index: 0 }),
+          ]
+        : []),
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: refuses
+          ? {
+              stop_reason: 'refusal',
+              stop_details: {
+                type: 'refusal',
+                category: 'cyber',
+                fallback_credit_token: PRIVATE_CREDIT,
+              },
+            }
+          : { stop_reason: 'end_turn' },
+        usage: { output_tokens: 7 },
+      }),
+      sse('message_stop', { type: 'message_stop' }),
+    ].join(''),
+  )
+}
+
+test.each([
+  'relay without request-id',
+  'event-only message_stop',
+  'message_stop without stop_reason',
+  'missing fallback beta',
+  'JSON',
+] as const)(
+  'OpenCode 2 only settles the source return on a terminal reply without the refusal join: %s',
+  async (scenario) => {
+    const scope = scopeOf({
+      modelID: FALLBACK_SOURCE,
+      sessionID: `ses_unjoined_return_${scenario}`,
+    })
+    const cacheRoute = {
+      url: UPSTREAM,
+      accountId: 'acct-local',
+      accountIdentity: ACCOUNT_UUID,
+    }
+    const relay = scenario !== 'missing fallback beta' && scenario !== 'JSON'
+    const { source } = makeSource({
+      authorize: () =>
+        oauth(
+          'test-source-oauth',
+          { custody: 'local', receipt: 'return' },
+          {
+            dispatch: relay
+              ? {
+                  kind: 'http-relay',
+                  url: 'https://relay.example.test',
+                  token: 'test-relay-token',
+                }
+              : { kind: 'direct' },
+          },
+        ),
+    })
+    let now = 1
+    const storage = {
+      version: 1 as const,
+      accounts: [],
+      claudeCache: { enabled: true, mode: 'hybrid' as const },
+      cacheKeep: { enabled: true, always: true },
+    }
+    const cacheKeep = new core.CacheKeepManager({
+      loadStorage: async () => storage,
+      now: () => now,
+    })
+    const events: core.RefusalFallbackRoundEvent[] = []
+    const rounds = new core.RefusalFallbackRoundEngine(
+      (event) => events.push(event),
+      { cacheKeep, now: () => now },
+    )
+    let templates = 0
+    const native = createNativeAnthropicAdapter({
+      source,
+      rounds,
+      roundPolicy: () => ({ cacheRoute, targetAllowed: () => true }),
+      onRoundCacheTemplate() {
+        templates++
+      },
+    })
+    const host = new Host(native.adapter)
+    const marker = { type: 'ephemeral' }
+    const prompt = {
+      role: 'user',
+      content: [{ type: 'text', text: 'kept prefix' }],
+    }
+    const payload = {
+      model: FALLBACK_SOURCE,
+      stream: true,
+      max_tokens: 100,
+      messages: [
+        prompt,
+        { role: 'assistant', content: 'prior answer' },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'current turn', cache_control: marker },
+          ],
+        },
+      ],
+    }
+    const plan = () =>
+      rounds.plan({
+        sessionId: scope.sessionID,
+        requestedModel: scope.modelID,
+        kind: 'primary',
+        mode: 'client',
+        bodyText: JSON.stringify(payload),
+        oauth: {
+          accountId: cacheRoute.accountId,
+          credentialId: 'synthetic-credential-row',
+          targetAllowed: () => true,
+          cache: cacheRoute,
+        },
+      })
+    const prepare = async () => {
+      const send = await host.run(scope, hostRequest(payload))
+      expect(native.preservesCacheTemplate(send.attempt.data!)).toBe(true)
+      if (relay) expect(send.final.url).toBe('https://relay.example.test/')
+      if (scenario === 'missing fallback beta')
+        expect(send.final.headers.get('anthropic-beta')).not.toContain(
+          SERVER_SIDE_FALLBACK_BETA,
+        )
+      return send
+    }
+    const rewrite = async (
+      send: Awaited<ReturnType<typeof prepare>>,
+      response: Response,
+    ) => {
+      if (relay) response.headers.delete('request-id')
+      return (
+        (await native.adapter.rewriteResponse?.({
+          ...send.attempt,
+          attempt: send.attempt,
+          request: send.final,
+          response,
+        })) ?? response
+      )
+    }
+    const applyHeaders = core.applyClaudeCodeHeaders
+    const headers =
+      scenario === 'missing fallback beta' &&
+      spyOn(core, 'applyClaudeCodeHeaders').mockImplementation((...args) => {
+        const result = applyHeaders(...args)
+        result.set(
+          'anthropic-beta',
+          (result.get('anthropic-beta') ?? '')
+            .split(',')
+            .filter((beta) => beta.trim() !== SERVER_SIDE_FALLBACK_BETA)
+            .join(','),
+        )
+        return result
+      })
+    try {
+      const initial = plan().request!
+      expect(rounds.markSent(initial)).toBe(true)
+      const start = rounds.lifecycle(initial, {
+        isFresh: () => true,
+        targetAllowed: () => true,
+      })
+      start?.onRefusal?.({ category: 'cyber', releasedTool: false })
+      start?.onRetryCompleted?.(
+        { stopReason: 'end_turn' },
+        { model: FALLBACK_TARGET, folded: false },
+      )
+      expect(rounds.hasRound(scope.sessionID)).toBe(true)
+      now += 300_001
+      // CacheKeep still has the first prompt's cache marker after the round times out.
+      expect(
+        cacheKeep.track({
+          sessionId: scope.sessionID,
+          url: cacheRoute.url,
+          oauthAccountId: cacheRoute.accountId,
+          oauthAccountIdentity: cacheRoute.accountIdentity,
+          storage,
+          cacheMode: 'hybrid',
+          headers: new Headers(),
+          bodyText: JSON.stringify({
+            ...payload,
+            messages: [
+              {
+                ...prompt,
+                content: [{ ...prompt.content[0], cache_control: marker }],
+              },
+            ],
+          }),
+        }).tracked,
+      ).toBe(true)
+      expect(plan()).toHaveProperty('sourceCacheMarkerRestored', true)
+
+      const complete = () =>
+        scenario === 'JSON'
+          ? Response.json({
+              type: 'message',
+              model: FALLBACK_SOURCE,
+              content: [],
+              stop_reason: 'end_turn',
+            })
+          : fallbackReply(FALLBACK_SOURCE, relay)
+      const readComplete = async (
+        send: Awaited<ReturnType<typeof prepare>>,
+      ) => {
+        const body = (await rewrite(send, complete())).text()
+        // This request asked for SSE; the host-facing guard still rejects JSON.
+        if (scenario === 'JSON')
+          await expect(body).rejects.toThrow('before message_stop')
+        else expect(await body).toContain('message_stop')
+      }
+      const incompleteFrames = [
+        sse('message_start', {
+          type: 'message_start',
+          message: { model: FALLBACK_SOURCE },
+        }),
+      ]
+      if (scenario === 'event-only message_stop')
+        incompleteFrames.push(
+          sse('message_delta', {
+            type: 'message_delta',
+            delta: { stop_reason: 'end_turn' },
+          }),
+          sse('message_stop', {}),
+        )
+      if (scenario === 'message_stop without stop_reason')
+        incompleteFrames.push(
+          sse('message_delta', { type: 'message_delta', delta: {} }),
+          sse('message_stop', { type: 'message_stop' }),
+        )
+      const incompleteText = incompleteFrames.join('')
+      const incomplete = (
+        await rewrite(await prepare(), sseResponse(incompleteText))
+      ).text()
+      if (relay) expect(await incomplete).toBe(incompleteText)
+      else await expect(incomplete).rejects.toThrow('before message_stop')
+      expect(plan()).toHaveProperty('sourceCacheMarkerRestored', true)
+
+      const stale = await prepare()
+      const latest = await prepare()
+      await readComplete(stale)
+      expect(plan()).toHaveProperty('sourceCacheMarkerRestored', true)
+      await readComplete(latest)
+      expect(plan()).not.toHaveProperty('sourceCacheMarkerRestored')
+      expect(events.map(({ kind }) => kind)).toEqual([
+        'round_started',
+        'step_served',
+        'round_ended',
+      ])
+      expect(templates).toBe(0)
+    } finally {
+      if (headers) headers.mockRestore()
+      native.dispose()
+      cacheKeep.stop()
+    }
+  },
+)
+
+test.each([false, true])(
+  'OpenCode 2 sends round and routed title bodies with source headers and resends a target 400 once (source socket loss: %s)',
+  async (loseResend) => {
+    const events: core.RefusalFallbackRoundEvent[] = []
+    const rounds = new core.RefusalFallbackRoundEngine((event) =>
+      events.push(event),
+    )
+    const physicalExtras: Array<{ body: string; headers: Headers }> = []
+    const templates: string[] = []
+    const admitted: string[] = []
+    const reports: core.AnthropicBillingReport[] = []
+    const { source } = makeSource({
+      admitRequest(input) {
+        admitted.push(input.modelID)
+      },
+      billingRequest: (input) => ({
+        sessionId: input.sessionID,
+        credentialId: 'synthetic-credential-row',
+        requestKind: input.kind,
+        model: input.modelID,
+        onReport: (report) => reports.push(report),
+      }),
+    })
+    const native = createNativeAnthropicAdapter({
+      source,
+      rounds,
+      onRoundCacheTemplate(input) {
+        if (input.template) templates.push(input.template.bodyText)
+      },
+      fetch: (async (_url, init) => {
+        const body = String(init?.body)
+        physicalExtras.push({ body, headers: new Headers(init?.headers) })
+        const model = JSON.parse(body).model
+        if (loseResend && physicalExtras.length === 3)
+          throw new Error('source socket closed before headers')
+        return fallbackReply(model, model === FALLBACK_SOURCE)
+      }) as typeof fetch,
+    })
+    const host = new Host(native.adapter)
+    const primary = scopeOf({ modelID: FALLBACK_SOURCE })
+    const payload = { ...sonnetPayload(), model: FALLBACK_SOURCE, stream: true }
+    const messages = [{ role: 'user', content: 'source turn' }]
+    const next = [
+      ...messages,
+      { role: 'assistant', content: 'the retry answered' },
+      { role: 'user', content: 'next turn' },
+    ]
+    const prepare = (history: typeof messages, scope = primary) =>
+      host.run(scope, hostRequest({ ...payload, messages: history }))
+    const expose = (
+      send: Awaited<ReturnType<typeof prepare>>,
+      response: Response,
+    ) =>
+      native.adapter.rewriteResponse?.({
+        ...send.attempt,
+        attempt: send.attempt,
+        request: send.final,
+        response,
+      })
+    try {
+      const original = await prepare(messages)
+      const stableHeaders = (headers: Headers) =>
+        [...headers].filter(([name]) => name !== 'x-client-request-id')
+      const originalHeaders = stableHeaders(original.final.headers)
+      expect(
+        await (
+          await expose(original, fallbackReply(FALLBACK_SOURCE, true))
+        )?.text(),
+      ).toContain('the retry answered')
+      expect(events[0]).toMatchObject({
+        kind: 'round_started',
+        requestedModel: FALLBACK_SOURCE,
+        servingModel: FALLBACK_TARGET,
+        category: 'cyber',
+        stepsLeft: 9,
+      })
+      expect(templates).toEqual([])
+
+      const title = await prepare([{ role: 'user', content: 'make a title' }], {
+        ...primary,
+        agent: 'title',
+        kind: 'title',
+      })
+      const titleText = await title.final.clone().text()
+      expect(JSON.parse(titleText).model).toBe(FALLBACK_TARGET)
+      expect(JSON.parse(titleText)).not.toHaveProperty('thread')
+      expect(await core.hasValidRequestBodySignature(titleText)).toBe(true)
+      const round = await prepare(next)
+      const roundText = await round.final.clone().text()
+      expect(JSON.parse(roundText).model).toBe(FALLBACK_TARGET)
+      expect(stableHeaders(round.final.headers)).toEqual(originalHeaders)
+      expect(await core.hasValidRequestBodySignature(roundText)).toBe(true)
+      expect(roundText).not.toContain(PRIVATE_CREDIT)
+      expect(admitted.slice(-2)).toEqual([FALLBACK_TARGET, FALLBACK_TARGET])
+
+      const bad = () =>
+        Response.json(
+          { error: { message: 'invalid target request' } },
+          { status: 400 },
+        )
+      await (await expose(title, bad()))?.text()
+      expect(events.map(({ kind }) => kind)).toEqual([
+        'round_started',
+        'step_served',
+      ])
+      const result = await expose(round, bad())
+      expect(await result?.text()).toContain(
+        loseResend ? 'invalid target request' : '"stop_reason":"refusal"',
+      )
+      expect(events.at(-1)).toMatchObject({
+        kind: 'round_ended',
+        reason: 'target-400',
+      })
+      expect(physicalExtras.map(({ body }) => JSON.parse(body).model)).toEqual([
+        FALLBACK_TARGET,
+        FALLBACK_SOURCE,
+        FALLBACK_SOURCE,
+      ])
+      for (const { body } of physicalExtras.slice(1)) {
+        expect(JSON.parse(body)).not.toHaveProperty('thread')
+        expect(body).not.toContain(PRIVATE_CREDIT)
+        expect(await core.hasValidRequestBodySignature(body)).toBe(true)
+      }
+      if (loseResend) {
+        await Bun.sleep(10)
+        expect(
+          reports.filter(
+            ({ outcome, status, model }) =>
+              outcome === 'failed' &&
+              status === undefined &&
+              model === FALLBACK_SOURCE,
+          ),
+        ).toHaveLength(1)
+      }
+    } finally {
+      native.dispose()
+    }
+  },
+)
+
+test('OpenCode 2 joins a credited retry after a rejected continue recovers to a refusal', async () => {
+  const sent: Record<string, unknown>[] = []
+  const sentDigests: string[] = []
+  const reports: core.AnthropicBillingReport[] = []
+  const { source } = makeSource({
+    billingRequest: (input) => ({
+      sessionId: input.sessionID,
+      credentialId: 'synthetic-credential-row',
+      requestKind: input.kind,
+      model: input.modelID,
+      onReport: (report) => reports.push(report),
+    }),
+  })
+  const native = createNativeAnthropicAdapter({
+    source,
+    fetch: (async (_url, init) => {
+      const text = String(init?.body)
+      sentDigests.push(wireDigest(text))
+      const body = JSON.parse(text)
+      sent.push(body)
+      return fallbackReply(body.model, body.model === FALLBACK_SOURCE)
+    }) as typeof fetch,
+  })
+  const host = new Host(native.adapter)
+  const scope = scopeOf({
+    modelID: FALLBACK_SOURCE,
+    sessionID: 'ses_credited_recovery_wire',
+  })
+  const messages = [{ role: 'user', content: 'first' }]
+  const payload = { model: FALLBACK_SOURCE, stream: true, max_tokens: 100 }
+  const prepare = (history: typeof messages) =>
+    host.run(scope, hostRequest({ ...payload, messages: history }))
+  const expose = (
+    { attempt, final }: Awaited<ReturnType<typeof prepare>>,
+    response: Response,
+  ) =>
+    native.adapter.rewriteResponse?.({
+      ...attempt,
+      attempt,
+      request: final,
+      response,
+    })
+  try {
+    await (
+      await expose(await prepare(messages), fallbackReply(FALLBACK_SOURCE))
+    )?.text()
+    const next = [
+      ...messages,
+      { role: 'assistant', content: 'the retry answered' },
+      { role: 'user', content: 'second' },
+    ]
+    const continued = await prepare(next)
+    const continuation = await continued.final.clone().text()
+    expect(JSON.parse(continuation).thread).toMatchObject({ type: 'continue' })
+    const response = await expose(
+      continued,
+      Response.json(
+        {
+          type: 'error',
+          error: {
+            type: 'not_found_error',
+            details: { error_code: 'thread_not_found' },
+          },
+        },
+        { status: 404 },
+      ),
+    )
+    const text = await response?.text()
+    expect(sent[0]).toMatchObject({
+      model: FALLBACK_SOURCE,
+      thread: { type: 'create' },
+      messages: next,
+    })
+    expect(text).toContain('the retry answered')
+    expect(text).not.toContain(PRIVATE_CREDIT)
+    expect(text).not.toContain('"stop_reason":"refusal"')
+    expect(sent).toHaveLength(2)
+    expect(sent[1]).toMatchObject({
+      model: FALLBACK_TARGET,
+      thread: { type: 'create' },
+      messages: next,
+      fallback_credit_token: PRIVATE_CREDIT,
+    })
+    // Pin the signed bytes of the continuation, recovery create and credited
+    // retry. Parsed JSON checks would miss changes to property order.
+    expect([wireDigest(continuation), ...sentDigests]).toEqual([
+      'f9d508b2c5c08c4130ec429a1b7280a2a67ec8f8433d77ef06c5edf4239b7296',
+      '1cf02a9338da5602814d5730ec0ca78ea9a50091b66f5ab96d8b3e5c122d6bb9',
+      '43fb87cb79707bab6a68c18d70d3bdb532e6a18b75cb38a28480f48fe8cccf20',
+    ])
+    await until(() => reports.length >= 4)
+    expect(reports.map(({ model, status }) => [model, status])).toEqual([
+      [FALLBACK_SOURCE, 200],
+      [FALLBACK_SOURCE, 404],
+      [FALLBACK_SOURCE, 200],
+      [FALLBACK_TARGET, 200],
+    ])
+  } finally {
+    native.dispose()
+  }
+})
+
+test.each([
+  [false, 'http-relay'],
+  [true, 'http-relay'],
+  [false, 'direct'],
+  [true, 'direct'],
+] as const)(
+  'OpenCode 2 relay-origin refusal follows fallbackToDirect=%s with %s authorization',
+  async (fallbackToDirect, retryDispatch) => {
+    const dispatch = {
+      kind: 'http-relay' as const,
+      url: 'https://relay.example.test',
+      token: 'relay-token',
+    }
+    const sent: Array<{ url: string; body: Record<string, unknown> }> = []
+    const { source } = makeSource({
+      allowsDirectRefusalRetry: () => fallbackToDirect,
+      authorizeAccount: (input) =>
+        oauth(
+          'stable-relay-oauth',
+          { custody: 'local', receipt: 'relay-row' },
+          {
+            dispatch:
+              input.extraSend && retryDispatch === 'direct'
+                ? { kind: 'direct' }
+                : dispatch,
+          },
+        ),
+    })
+    const native = createNativeAnthropicAdapter({
+      source,
+      fetch: (async (url, init) => {
+        sent.push({ url: String(url), body: JSON.parse(String(init?.body)) })
+        return fallbackReply(FALLBACK_TARGET)
+      }) as typeof fetch,
+    })
+    try {
+      const { attempt, final } = await new Host(native.adapter).run(
+        scopeOf({ modelID: FALLBACK_SOURCE }),
+        hostRequest({
+          model: FALLBACK_SOURCE,
+          stream: true,
+          max_tokens: 100,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      )
+      expect(final.url).toBe(`${dispatch.url}/`)
+      const response = await native.adapter.rewriteResponse?.({
+        ...attempt,
+        attempt,
+        request: final,
+        response: fallbackReply(FALLBACK_SOURCE, true),
+      })
+      expect(await response?.text()).toContain(
+        fallbackToDirect ? 'the retry answered' : '"stop_reason":"refusal"',
+      )
+      expect(sent).toEqual(
+        fallbackToDirect
+          ? [
+              {
+                url: `${UPSTREAM}?beta=true`,
+                body: expect.objectContaining({
+                  model: FALLBACK_TARGET,
+                  fallback_credit_token: PRIVATE_CREDIT,
+                }),
+              },
+            ]
+          : [],
+      )
+    } finally {
+      native.dispose()
+    }
+  },
+)
+
+test.each(['answer', 'reject', 'gateway moved', 'new primary'] as const)(
+  'OpenCode 2 client fallback: %s',
+  async (scenario) => {
+    let gateway: core.ClaudeGateway = {
+      origin: 'https://gateway.example',
+      pathPrefix: '/claude',
+      headers: [['x-gateway-test', 'value']],
+    }
+    const authModels: string[] = []
+    const admittedModels: string[] = []
+    const reports: core.AnthropicBillingReport[] = []
+    const prepared = spyOn(
+      { record: (_input: { bodyText: string }) => {} },
+      'record',
+    )
+    const sent: Request[] = []
+    const completed: string[] = []
+    const { source } = makeSource({
+      authorizeAccount(input) {
+        authModels.push(input.modelID)
+        return oauth(
+          input.extraSend ? 'retry-oauth-bearer' : 'origin-oauth-bearer',
+          { custody: 'local', receipt: 'local:1' },
+          { gateway },
+        )
+      },
+      admitRequest(input) {
+        admittedModels.push(input.modelID)
+      },
+      onFinalRequestPrepared: prepared,
+      onCompletedFallbackRequest(input) {
+        completed.push(input.bodyText)
+      },
+      billingRequest: (input) => ({
+        sessionId: input.sessionID,
+        credentialId: 'synthetic-credential-row',
+        requestKind: input.kind,
+        model: input.modelID,
+        onReport: (report) => reports.push(report),
+      }),
+    })
+    const native = createNativeAnthropicAdapter({
+      source,
+      fetch: (async (url, init) => {
+        sent.push(
+          new Request(url instanceof Request ? url.url : url.toString(), init),
+        )
+        return scenario === 'reject'
+          ? Response.json(
+              {
+                type: 'error',
+                error: { message: `rejected ${PRIVATE_CREDIT}` },
+              },
+              { status: 429 },
+            )
+          : fallbackReply(FALLBACK_TARGET)
+      }) as typeof fetch,
+    })
+    const host = new Host(native.adapter)
+    const scope = scopeOf({ modelID: FALLBACK_SOURCE })
+    const input = () =>
+      hostRequest({ ...sonnetPayload(), model: FALLBACK_SOURCE, stream: true })
+    try {
+      const { attempt, final } = await host.run(scope, input())
+      if (scenario === 'gateway moved')
+        gateway = { ...gateway, origin: 'https://other.example' }
+      if (scenario === 'new primary') await host.run(scope, input())
+      const response = await native.adapter.rewriteResponse?.({
+        ...attempt,
+        attempt,
+        request: final,
+        response: fallbackReply(FALLBACK_SOURCE, true),
+      })
+      const text = await response?.text()
+      expect(text).not.toContain(PRIVATE_CREDIT)
+      expect(text?.match(/event: message_start/g)).toHaveLength(1)
+      expect(text).toContain(`"model":"${FALLBACK_SOURCE}"`)
+      if (scenario === 'gateway moved' || scenario === 'new primary') {
+        expect(sent).toHaveLength(0)
+        expect(text).toContain('"stop_reason":"refusal"')
+        expect(completed).toEqual([])
+        return
+      }
+      expect(authModels).toEqual([FALLBACK_SOURCE, FALLBACK_TARGET])
+      expect(admittedModels).toEqual([FALLBACK_SOURCE, FALLBACK_TARGET])
+      expect(sent).toHaveLength(1)
+      const retry = sent[0]!
+      expect(retry.url).toBe(final.url)
+      expect(retry.redirect).toBe('error')
+      expect(retry.headers.get('authorization')).toBe(
+        'Bearer retry-oauth-bearer',
+      )
+      expect(retry.headers.get('x-gateway-test')).toBe('value')
+      const physical = await retry.text()
+      expect(JSON.parse(physical)).toMatchObject({
+        model: FALLBACK_TARGET,
+        fallback_credit_token: PRIVATE_CREDIT,
+      })
+      expect(await core.hasValidRequestBodySignature(physical)).toBe(true)
+      const original = await final.clone().text()
+      const sameHeaders = (request: Request) =>
+        [...request.headers].filter(([name]) => name !== 'authorization')
+      expect(sameHeaders(retry)).toEqual(sameHeaders(final))
+      expect(await core.withoutFallbackCredit(physical)).toBe(
+        await signRequestBody(
+          original.replace(FALLBACK_SOURCE, FALLBACK_TARGET),
+        ),
+      )
+      expect(prepared.mock.calls).toHaveLength(2)
+      for (const [entry] of prepared.mock.calls)
+        expect(entry.bodyText).not.toContain(PRIVATE_CREDIT)
+      expect(JSON.parse(prepared.mock.calls[1]![0].bodyText).model).toBe(
+        FALLBACK_TARGET,
+      )
+      await until(() => reports.length >= 2)
+      expect(reports.map(({ model }) => model)).toEqual([
+        FALLBACK_SOURCE,
+        FALLBACK_TARGET,
+      ])
+      expect(JSON.stringify(reports)).not.toContain(PRIVATE_CREDIT)
+      if (scenario === 'answer') {
+        expect(text).toContain('the retry answered')
+        expect(text).toContain('"input_tokens":25')
+        expect(text).not.toContain('"stop_reason":"refusal"')
+        expect(completed).toEqual([])
+      } else {
+        expect(text).toContain('"stop_reason":"refusal"')
+        expect(text).not.toContain('the retry answered')
+        expect(completed).toEqual([])
+      }
+    } finally {
+      native.dispose()
+    }
+  },
+)
+
+test.each([
+  ['title kind', scopeOf({ kind: 'title' }), false],
+  ['title agent', scopeOf({ agent: 'title' }), false],
+  ['compaction', scopeOf({ agent: 'compaction' }), false],
+  ['cachekeep', scopeOf({ agent: 'cachekeep' }), false],
+  ['lane start', scopeOf(), true],
+] as const)(
+  'OpenCode 2 client fallback does not retry %s',
+  async (_label, scope, laneStart) => {
+    const send = spyOn(
+      { run: async () => fallbackReply(FALLBACK_TARGET) },
+      'run',
+    )
+    const native = createNativeAnthropicAdapter({
+      source: makeSource().source,
+      fetch: send as unknown as typeof fetch,
+    })
+    try {
+      const { attempt, final } = await new Host(native.adapter).run(
+        { ...scope, modelID: FALLBACK_SOURCE },
+        hostRequest(
+          { ...sonnetPayload(), model: FALLBACK_SOURCE, stream: true },
+          laneStart
+            ? { headers: { [LANE_START_REQUEST_HEADER]: '1' } }
+            : undefined,
+        ),
+      )
+      const response = await native.adapter.rewriteResponse?.({
+        ...attempt,
+        attempt,
+        request: final,
+        response: fallbackReply(FALLBACK_SOURCE, true),
+      })
+      const text = await response?.text()
+      expect(text).toContain('"stop_reason":"refusal"')
+      expect(text).not.toContain(PRIVATE_CREDIT)
+      expect(send).not.toHaveBeenCalled()
+    } finally {
+      native.dispose()
+    }
+  },
+)
+
+test('OpenCode 2 bills the sent model on a routed title, not on a routed Prime', async () => {
+  const reports: core.AnthropicBillingReport[] = []
+  const { source } = makeSource({
+    billingRequest: (input) =>
+      input.agent === 'prime'
+        ? undefined
+        : {
+            sessionId: input.sessionID,
+            credentialId: 'synthetic-credential-row',
+            requestKind: input.kind,
+            model: input.modelID,
+            onReport: (report) => reports.push(report),
+          },
+  })
+  const native = createNativeAnthropicAdapter({ source })
+  const host = new Host(native.adapter)
+  try {
+    for (const agent of ['title', 'prime']) {
+      const { attempt, final } = await host.run(
+        scopeOf({ modelID: FALLBACK_SOURCE, agent }),
+        hostRequest({
+          ...sonnetPayload(),
+          model: 'claude-opus-5',
+          stream: true,
+        }),
+      )
+      const response = await native.adapter.rewriteResponse?.({
+        ...attempt,
+        request: final,
+        attempt,
+        response: fallbackReply('claude-opus-5'),
+      })
+      await response?.text()
+    }
+    await until(() => reports.length >= 1)
+    expect(reports.map(({ model }) => model)).toEqual(['claude-opus-5'])
+  } finally {
+    native.dispose()
+  }
+})
 
 function cacheDiagnosticsHost() {
   const wire = createNativeWirePolicy()
@@ -1181,7 +2189,11 @@ describe('OpenCode 2 native Anthropic adapter: request shape', () => {
   test('logs one INFO record with only validated metadata for each server fallback step', async () => {
     const wire = createNativeWirePolicy()
     const { source } = makeSource({
-      options: { serverSideFallbackEnabled: true },
+      requestOptions: (input) =>
+        wire.requestOptions(input, {
+          policyStorage: {},
+          refusalFallbackMode: 'server',
+        } as core.NativeAccountSnapshot),
       responseOptions: wire.responseOptions,
     })
     const native = createNativeAnthropicAdapter({ source })

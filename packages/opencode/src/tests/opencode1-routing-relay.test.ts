@@ -5,6 +5,12 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { ROUTING_HOLD_LIMIT_MS } from '../routing-relay'
+import {
+  refusalThinkingReply,
+  SOURCE_MODEL,
+  TARGET_MODEL,
+  TARGET_SIGNATURE,
+} from './fixtures/refusal-thinking'
 import { getPluginTestHandles } from './plugin-test-handles'
 import { installLoaderSetup } from './support/opencode1-loader-setup'
 import {
@@ -19,6 +25,7 @@ import {
 import {
   createOpencode1Test,
   createOpencode1TestContext,
+  getBodyLifetime,
   installOpencode1TestHooks,
 } from './support/opencode1-test-context'
 import { extractUrl, MESSAGES_URL } from './test-fetch'
@@ -107,7 +114,10 @@ describe('OC1 shared routing relay', () => {
           quota: {
             enabled: true,
             checkIntervalMinutes: 5,
-            minimumRemaining: { five_hour: 1, seven_day: 1 },
+            minimumRemaining: {
+              five_hour: mode === 'refusal floor' ? 20 : 1,
+              seven_day: 1,
+            },
             failClosedOnUnknownQuota: true,
             mainQuota: {
               ...quota(
@@ -150,7 +160,9 @@ describe('OC1 shared routing relay', () => {
                       mode === 'unknown quota'
                         ? undefined
                         : quota(
-                            mode === 'floor' || mode === 'blocked' ? 10 : 80,
+                            ['floor', 'blocked', 'refusal floor'].includes(mode)
+                              ? 10
+                              : 80,
                           ),
                     ...(mode === 'signed out'
                       ? {
@@ -275,6 +287,11 @@ describe('OC1 shared routing relay', () => {
     'OC1 %s scoped Fable retry prefers the last accepted cache account',
     async (mode) => {
       let sends = 0
+      const reply = {
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }
       const f = await fixture(
         'three accounts for warm retry',
         () =>
@@ -289,7 +306,7 @@ describe('OC1 shared routing relay', () => {
                   ),
                 },
               })
-            : new Response('ok'),
+            : Response.json(reply),
         undefined,
         mode,
         false,
@@ -307,11 +324,11 @@ describe('OC1 shared routing relay', () => {
         messages: [{ role: 'user', content: 'hello' }],
         max_tokens: 10,
       }
-      expect(await (await f.send(payload)).text()).toBe('ok')
+      expect(await (await f.send(payload)).json()).toEqual(reply)
       expect(f.sends).toEqual(['Bearer sk-ant-oat01-third-access'])
       accountId = syntheticMainAccountUuid
       if (mode === 'main-first') delete globals[key]
-      expect(await (await f.send(payload)).text()).toBe('ok')
+      expect(await (await f.send(payload)).json()).toEqual(reply)
       expect(f.sends).toEqual([
         'Bearer sk-ant-oat01-third-access',
         'Bearer sk-ant-oat01-main-access',
@@ -729,10 +746,9 @@ describe('OC1 shared routing relay', () => {
 
   test('sticky routing detaches refusal cancellation when the migrated send throws', async () => {
     const upstream = new Response('primary refused', { status: 403 })
-    const pending = Promise.withResolvers<void>()
-    const cancel = spyOn(upstream.body!, 'cancel').mockReturnValue(
-      pending.promise,
-    )
+    // If the request times out, teardown opens the gate so the test can drain.
+    const pending = getBodyLifetime(ctx).gate()
+    const cancel = spyOn(upstream.body!, 'cancel').mockReturnValue(pending.wait)
     let sends = 0
     const f = await fixture('normal', () => {
       if (++sends === 1) return upstream
@@ -750,16 +766,14 @@ describe('OC1 shared routing relay', () => {
     })
     const request = f.send()
     try {
-      await expect(
-        Promise.race([request, Bun.sleep(1_000).then(() => null)]),
-      ).rejects.toThrow('migration transport failed')
+      await expect(request).rejects.toThrow('migration transport failed')
       expect(cancel).toHaveBeenCalledTimes(1)
       expect(f.sends).toEqual([
         'Bearer sk-ant-oat01-main-access',
         'Bearer sk-ant-oat01-fallback-access',
       ])
     } finally {
-      pending.resolve()
+      pending.open()
       await Promise.allSettled([request])
       cancel.mockRestore()
     }
@@ -936,9 +950,9 @@ describe('OC1 shared routing relay', () => {
   for (const mode of ['sticky-balanced', 'main-first'] as const) {
     test(`${mode} returns routing refusal while abandoned body cancellation is pending`, async () => {
       const upstream = new Response('upstream refusal', { status: 403 })
-      const cancel = Promise.withResolvers<void>()
+      const cancel = getBodyLifetime(ctx).gate()
       const cancelBody = spyOn(upstream.body!, 'cancel').mockReturnValue(
-        cancel.promise,
+        cancel.wait,
       )
       const f = await fixture('normal', () => upstream, undefined, mode)
       let asks = 0
@@ -956,19 +970,15 @@ describe('OC1 shared routing relay', () => {
       })
       const request = f.send()
       try {
-        const response = await Promise.race([
-          request,
-          Bun.sleep(1_000).then(() => null),
-        ])
-        expect(response).not.toBeNull()
-        expect(response?.status).toBe(403)
-        expect(await response?.json()).toMatchObject({
+        const response = await request
+        expect(response.status).toBe(403)
+        expect(await response.json()).toMatchObject({
           error: { code: 'account_selection_final' },
         })
         expect(cancelBody).toHaveBeenCalledTimes(1)
         expect(asks).toBe(2)
       } finally {
-        cancel.resolve()
+        cancel.open()
         await Promise.allSettled([request])
         cancelBody.mockRestore()
       }
@@ -994,8 +1004,8 @@ describe('OC1 shared routing relay', () => {
 
   test('fallback-first detaches main refusal cancellation when a later local fallback serves', async () => {
     const main = new Response('main refused', { status: 403 })
-    const pending = Promise.withResolvers<void>()
-    const cancel = spyOn(main.body!, 'cancel').mockReturnValue(pending.promise)
+    const pending = getBodyLifetime(ctx).gate()
+    const cancel = spyOn(main.body!, 'cancel').mockReturnValue(pending.wait)
     const responses = [
       new Response('first fallback refused', { status: 403 }),
       main,
@@ -1016,11 +1026,8 @@ describe('OC1 shared routing relay', () => {
     })
     const request = f.send()
     try {
-      const response = await Promise.race([
-        request,
-        Bun.sleep(1_000).then(() => null),
-      ])
-      expect(await response?.text()).toBe('second fallback served')
+      const response = await request
+      expect(await response.text()).toBe('second fallback served')
       expect(asks).toBe(3)
       expect(f.sends).toEqual([
         'Bearer sk-ant-oat01-fallback-access',
@@ -1029,7 +1036,7 @@ describe('OC1 shared routing relay', () => {
       ])
       expect(cancel).toHaveBeenCalledTimes(1)
     } finally {
-      pending.resolve()
+      pending.open()
       await Promise.allSettled([request])
       cancel.mockRestore()
     }
@@ -1037,8 +1044,8 @@ describe('OC1 shared routing relay', () => {
 
   for (const streaming of [false, true]) {
     test(`sticky routing migrates while ${streaming ? 'stream inspection' : 'refused body'} cancellation is pending`, async () => {
-      const pending = Promise.withResolvers<void>()
-      const cancel = mock(() => pending.promise)
+      const pending = getBodyLifetime(ctx).gate()
+      const cancel = mock(() => pending.wait)
       const refused = new Response(
         new ReadableStream({
           start(controller) {
@@ -1087,18 +1094,15 @@ describe('OC1 shared routing relay', () => {
         messages: [{ role: 'user', content: 'hello' }],
       })
       try {
-        const response = await Promise.race([
-          request,
-          Bun.sleep(1_000).then(() => null),
-        ])
-        expect(await response?.text()).toContain('migrated')
+        const response = await request
+        expect(await response.text()).toContain('migrated')
         expect(cancel).toHaveBeenCalledTimes(1)
         expect(f.sends).toEqual([
           'Bearer sk-ant-oat01-main-access',
           'Bearer sk-ant-oat01-fallback-access',
         ])
       } finally {
-        pending.resolve()
+        pending.open()
         await Promise.allSettled([request])
       }
     })
@@ -1614,6 +1618,38 @@ describe('OC1 shared routing relay', () => {
     },
   )
 
+  test('OC1 refusal retry uses the same routed account below its general quota floor', async () => {
+    let sends = 0
+    const f = await fixture('refusal floor', () => {
+      const response = refusalThinkingReply(
+        ++sends === 1 ? SOURCE_MODEL : TARGET_MODEL,
+      )
+      response.headers.delete('anthropic-ratelimit-unified-5h-utilization')
+      response.headers.delete('anthropic-ratelimit-unified-7d-utilization')
+      return response
+    })
+    globals[key] = () => ({
+      accountFor: async () => ({
+        account_id: syntheticFallbackAccountUuid(0),
+        credential_id: 'local',
+      }),
+    })
+    const response = await f.send({
+      model: SOURCE_MODEL,
+      stream: true,
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    expect(await response.text()).toContain(TARGET_SIGNATURE)
+    expect(f.sends).toEqual(
+      Array(2).fill('Bearer sk-ant-oat01-fallback-access'),
+    )
+    expect(f.bodies.map((body) => JSON.parse(body).model)).toEqual([
+      SOURCE_MODEL,
+      TARGET_MODEL,
+    ])
+  })
+
   test('a signed-out routing pick is replaced by our own OC1 subscription', async () => {
     const f = await fixture('signed out')
     const reports: any[] = []
@@ -1819,4 +1855,43 @@ describe('OC1 shared routing relay', () => {
       ])
     })
   }
+
+  test('Fable 5.2 429 with only a 7d_oi rejection reports its weekly pool on OpenCode 1', async () => {
+    let calls = 0
+    const f = await fixture('fable-without-poll', () =>
+      ++calls === 1
+        ? new Response('limited', {
+            status: 429,
+            headers: {
+              'anthropic-ratelimit-unified-status': 'rejected',
+              'anthropic-ratelimit-unified-7d-status': 'allowed',
+              'anthropic-ratelimit-unified-7d-utilization': '0.55',
+              'anthropic-ratelimit-unified-7d_oi-status': 'rejected',
+              'anthropic-ratelimit-unified-7d_oi-utilization': '1.0',
+              'anthropic-ratelimit-unified-7d_oi-reset': '1796184000',
+            },
+          })
+        : new Response('ok'),
+    )
+    const reports: Array<{ outcome: string; [key: string]: unknown }> = []
+    globals[key] = () => ({
+      accountFor: async () => null,
+      report: (report: (typeof reports)[number]) => reports.push(report),
+    })
+    const response = await f.send({
+      model: 'claude-fable-5-2',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 10,
+    })
+    await response.body?.cancel()
+    expect(reports.filter((report) => report.outcome === 'exhausted')).toEqual([
+      {
+        account_id: syntheticMainAccountUuid,
+        outcome: 'exhausted',
+        window: '7d',
+        pool: 'fable',
+        resets_at: 1_796_184_000_000,
+      },
+    ])
+  })
 })

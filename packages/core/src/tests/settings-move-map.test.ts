@@ -21,6 +21,7 @@ import {
   openSettingsService,
   SETTINGS_PROTECTION_KEYS,
 } from '../settings-service.ts'
+import { settingsTestPaths } from './settings-record-paths-fixture.ts'
 
 const cleanup: (() => Promise<void> | void)[] = []
 afterEach(async () => {
@@ -61,6 +62,7 @@ async function move(
 async function resolve(file: string) {
   const service = await openSettingsService({
     file,
+    records: (await settingsTestPaths(file)).records,
     dependencies: {
       open: (options) => ({
         ...openSettings(settingsDefinition, options),

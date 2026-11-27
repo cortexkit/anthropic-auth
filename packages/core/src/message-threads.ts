@@ -1,5 +1,9 @@
 import { createHash, type Hash, randomUUID } from 'node:crypto'
 import { signRequestBody } from './cch.ts'
+import {
+  hasFallbackCreditInRequest,
+  withoutFallbackCredit,
+} from './fallback-credit.ts'
 import { logger } from './logger.ts'
 import {
   type FullCacheTail,
@@ -8,6 +12,7 @@ import {
   MessageThreadTailStore,
 } from './message-thread-tail-store.ts'
 import type { NativeLocalPoolBinding } from './pool-binding.ts'
+import { raceWithSignal } from './request-abort.ts'
 import { isServerFallbackUsageMarker } from './server-fallback-usage.ts'
 import { createSseFramer, decodeSseFrame, parseSseFrame } from './sse.ts'
 import { copyStreamResponseTiming } from './stream-completion.ts'
@@ -1434,12 +1439,13 @@ async function readThreadError(response: Response): Promise<Body | undefined> {
   if (response.status !== 400 && response.status !== 404) return undefined
   const reader = response.clone().body?.getReader()
   if (!reader) return undefined
+  const signal = AbortSignal.timeout(5_000)
   let text = ''
   let remaining = 16_384
   const decoder = new TextDecoder()
   try {
     while (remaining > 0) {
-      const chunk = await reader.read()
+      const chunk = await raceWithSignal(signal, () => reader.read())
       if (chunk.done) break
       remaining -= chunk.value.byteLength
       if (remaining < 0) return undefined
@@ -1554,7 +1560,12 @@ export async function prepareMessageThreadRequest(
     signal?: AbortSignal
   },
 ) {
-  const fullText = input.bodyText
+  // Only the one physical retry carries the credit. Thread history, cache
+  // annotations and the snapshot are prepared from the signed replayable view.
+  const credited = hasFallbackCreditInRequest(input.bodyText)
+  const fullText = credited
+    ? await withoutFallbackCredit(input.bodyText)
+    : input.bodyText
   let full: Body | undefined
   const fullBody = () => (full ??= JSON.parse(fullText) as Body)
   if (input.session) {
@@ -1617,7 +1628,15 @@ export async function prepareMessageThreadRequest(
       ? JSON.stringify(prepared.body)
       : fullOutgoing()
     : fullOutgoing()
-  let bodyText = await signRequestBody(outgoing)
+  let bodyText = await signRequestBody(
+    credited
+      ? JSON.stringify({
+          ...JSON.parse(outgoing),
+          fallback_credit_token: JSON.parse(input.bodyText)
+            .fallback_credit_token,
+        })
+      : outgoing,
+  )
   let recovered = false
   let credential = input.credential
   const mayResend = async (
@@ -1684,7 +1703,7 @@ export async function prepareMessageThreadRequest(
       // At most one create and one stateless resend for thread errors.
       // A separate gzip rejection may replay a request uncompressed once,
       // then turns gzip off until process restart.
-      if (!threading || recovered) return response
+      if (credited || !threading || recovered) return response
       const rejectedCreate =
         prepared.decision.type === 'create' &&
         (await isThreadCreateRejection(response))

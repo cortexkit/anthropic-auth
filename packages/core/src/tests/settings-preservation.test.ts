@@ -17,7 +17,6 @@ import {
   SETTINGS_THREE_WAY_READERS,
   settingsDefinition,
 } from '../settings-definition.ts'
-import { settingsImportRecordPath } from '../settings-mode.ts'
 import {
   runSettingsMoveAtStartup,
   type SettingsMoveStartupOptions,
@@ -223,10 +222,10 @@ for (const host of ['opencode', 'pi'] as const) {
         const allowed = [
           f.stores.opencode.config,
           f.stores.pi.config,
-          f.paths.marker,
+          f.paths.records.beside.moved,
           f.paths.target,
-          ...(['opencode', 'pi'] as const).map((acting) =>
-            settingsImportRecordPath(f.paths.target, acting),
+          ...(['opencode', 'pi'] as const).map(
+            (acting) => f.paths.records.beside.imports[acting],
           ),
           ...Object.values(f.stores).map(
             (store) => `${store.config}.MOVED_READPLEASE`,
@@ -241,6 +240,7 @@ for (const host of ['opencode', 'pi'] as const) {
         f.reads.length = 0
         const service = await openSettingsService({
           file: f.paths.target,
+          records: f.paths.records,
           host,
           dependencies: {
             open: (config) => ({
@@ -293,7 +293,11 @@ for (const host of ['opencode', 'pi'] as const) {
     cleanup.push(() => store.close())
     await store.initialize()
     expect((await runSettingsMoveAtStartup(f.options)).outcome).toBe('moved')
-    const service = await openSettingsService({ file: f.paths.target, host })
+    const service = await openSettingsService({
+      file: f.paths.target,
+      records: f.paths.records,
+      host,
+    })
     if (!service) throw new Error('Missing settings service')
     cleanup.push(() => service.dispose())
     const runtime = createNativeAccountRuntime({
@@ -349,7 +353,7 @@ for (const host of ['opencode', 'pi'] as const) {
     const config =
       '{"enabled":false,"main":{"five_hour":5,"seven_day":10,"scoped":0},"accounts":{}}'
     expect(status.split('\nSettings file:')[0]).toBe(
-      `${host === 'opencode' ? config : `Killswitch: disabled\n${config}`}\nSettings: shared file \`${f.paths.target}\``,
+      `${host === 'opencode' ? config : `Killswitch: disabled\n${config}`}\nSettings: shared file \`${f.paths.target}\`\nSettings records: beside the settings file in "${dirname(f.paths.target)}" and in "${f.paths.records.state?.directory}"`,
     )
     expect(status).toContain(`Settings file: ${f.paths.target}`)
     const snapshot = await runtime.read()
@@ -487,6 +491,7 @@ for (const host of ['opencode', 'pi'] as const) {
       // This host moved the file, so it uses it.
       const service = await openSettingsService({
         file: f.paths.target,
+        records: f.paths.records,
         host,
         adopted: () => true,
       })

@@ -1,10 +1,23 @@
 import { afterEach, expect, test } from 'bun:test'
 import {
+  type AnthropicBillingReport,
   type AnthropicBillingRequest,
   observeAnthropicBillingResponse,
   withAnthropicBilling,
 } from '../billing.ts'
 import { CacheKeepManager } from '../cachekeep.ts'
+import { protectFallbackCreditResponse } from '../fallback-credit.ts'
+import {
+  __setLogTestSink,
+  getLogLevel,
+  type LogTestRecord,
+  setLogLevel,
+} from '../logger.ts'
+import {
+  createServerSideFallbackStreamRewriter,
+  logServedServerFallback,
+} from '../server-fallback.ts'
+import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback-usage.ts'
 
 const key = Symbol.for('cortexkit.routing')
 const globals = globalThis as Record<symbol, unknown>
@@ -47,6 +60,65 @@ const start = {
   type: 'message_start',
   message: { id: 'msg_test', usage: { input_tokens: 12, output_tokens: 0 } },
 }
+
+test('redacted responses keep reply text out of server events, logs, and billing reports', async () => {
+  const reports = capture()
+  const records: LogTestRecord[] = []
+  const events: unknown[] = []
+  const sentinel = 'sentinel_internal_content_69f7'
+  const credit = 'sentinel_internal_credit_1a7b'
+  const level = getLogLevel()
+  setLogLevel('info')
+  __setLogTestSink((record) => records.push(record))
+  try {
+    const guarded = protectFallbackCreditResponse(
+      response([
+        {
+          type: 'message_start',
+          message: {
+            ...start.message,
+            id: credit,
+            model: 'claude-opus-5',
+            fallback_credit_token: credit,
+          },
+        },
+        { type: 'content_block_delta', delta: { text: sentinel } },
+        {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: { output_tokens: 3 },
+        },
+        { type: 'message_stop' },
+      ]),
+      {
+        requestHeaders: new Headers({
+          'anthropic-beta': SERVER_SIDE_FALLBACK_BETA,
+        }),
+      },
+    )
+    const recorded = observeAnthropicBillingResponse(request, guarded)
+    const rewriter = createServerSideFallbackStreamRewriter({
+      requestedModel: 'claude-opus-4-8',
+      onOutcome: (outcome) => {
+        events.push(outcome)
+        logServedServerFallback('test', outcome)
+      },
+    })
+    expect(rewriter.push(await recorded.text()) + rewriter.flush()).toContain(
+      sentinel,
+    )
+    await Bun.sleep(10)
+    expect(reports).toHaveLength(1)
+    expect(events).toHaveLength(1)
+    expect(records).toHaveLength(1)
+    const metadata = JSON.stringify([reports, records, events])
+    expect(metadata).not.toContain(sentinel)
+    expect(metadata).not.toContain(credit)
+  } finally {
+    __setLogTestSink(null)
+    setLogLevel(level)
+  }
+})
 
 test.each(['\r', '\r\n'])(
   'billing accepts SSE framing %j across byte chunks',
@@ -219,6 +291,80 @@ test('billing marks a cut-off stream partial without pricing unread output as ze
   await Bun.sleep(10)
   expect(reports).toHaveLength(1)
   expect(reports[0]).toMatchObject({ outcome: 'cut', usage: { input: 12 } })
+  expect(reports[0]?.usage).not.toHaveProperty('output')
+})
+
+test.each(['EOF', 'read error', 'cancel'] as const)(
+  'billing keeps usage without message_stop but reports a cut on %s',
+  async (ending) => {
+    const reports = capture()
+    let warmingReads = 0
+    const tracked: AnthropicBillingRequest = {
+      ...request,
+      cache: { ttlMs: 300_000 },
+      cacheWarming: () => {
+        warmingReads++
+        return { on: true }
+      },
+    }
+    const bytes = new TextEncoder().encode(
+      frame(start) +
+        frame({ type: 'message_delta', usage: { output_tokens: 7 } }),
+    )
+    const error = new Error('connection reset')
+    let sentUsage = false
+    const upstream = new Response(
+      new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            if (!sentUsage) {
+              sentUsage = true
+              controller.enqueue(bytes)
+            } else if (ending === 'read error') {
+              controller.error(error)
+            } else {
+              controller.close()
+            }
+          },
+        },
+        { highWaterMark: 0 },
+      ),
+      { headers: { 'content-type': 'text/event-stream' } },
+    )
+    const sent = await withAnthropicBilling(tracked, async () => upstream)
+    if (!sent.body) throw new Error('Expected a streamed response')
+    const reader = sent.body.getReader()
+    expect(await reader.read()).toEqual({ done: false, value: bytes })
+    if (ending === 'cancel') await reader.cancel()
+    else if (ending === 'read error')
+      await expect(reader.read()).rejects.toBe(error)
+    else expect((await reader.read()).done).toBe(true)
+    await Bun.sleep(10)
+    expect({ reports, warmingReads }).toEqual({
+      reports: [
+        expect.objectContaining({
+          outcome: 'cut',
+          usage: { input: 12, output: 7 },
+          cache: { ttl_ms: 300_000 },
+        }),
+      ],
+      warmingReads: 0,
+    })
+  },
+)
+
+test('billing reports message_stop without final usage as cut', async () => {
+  const reports = capture()
+  const sent = await withAnthropicBilling(request, async () =>
+    response([start, { type: 'message_stop' }]),
+  )
+  await sent.text()
+  await Bun.sleep(10)
+  expect(reports).toHaveLength(1)
+  expect(reports[0]).toMatchObject({
+    outcome: 'cut',
+    usage: { input: 12 },
+  })
   expect(reports[0]?.usage).not.toHaveProperty('output')
 })
 
@@ -447,7 +593,7 @@ test('oversized non-usage stream lines cannot hide a later usage frame', async (
   await Bun.sleep(10)
   expect(reports).toHaveLength(1)
   expect(reports[0]).toMatchObject({
-    outcome: 'completed',
+    outcome: 'cut',
     usage: { input: 12, output: 8 },
   })
 })
@@ -488,6 +634,78 @@ test.each(['count-cap', 'deadline-missed'] as const)(
       ['cut', { ttl_ms: 300_000 }],
       ['failed', undefined],
     ])
+  },
+)
+
+test('a stalled CacheKeep template delays only the accepted origin billing row, for at most one second', async () => {
+  const report = Promise.withResolvers<AnthropicBillingReport>()
+  let warmingReads = 0
+  let waits = 0
+  const stalled = new Promise<void>(() => {})
+  const upstream = response([
+    start,
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: { output_tokens: 4 },
+    },
+    { type: 'message_stop' },
+  ])
+  const stream = observeAnthropicBillingResponse(
+    {
+      ...request,
+      onReport: report.resolve,
+      cacheWarmingAfter: () => {
+        waits++
+        return stalled
+      },
+      cacheWarming: () => {
+        warmingReads++
+        return { on: true }
+      },
+    },
+    upstream,
+  )
+  expect(await stream.text()).toContain('message_stop')
+  expect(waits).toBe(1)
+  expect(warmingReads).toBe(0)
+  const result = await report.promise
+  expect(result).toMatchObject({
+    outcome: 'completed',
+    cache: { warming: { on: true } },
+  })
+  expect(warmingReads).toBe(1)
+})
+
+test.each(['refused', 'incomplete', 'stale'] as const)(
+  'a %s origin neither waits nor reports warming',
+  async (scenario) => {
+    const reported = Promise.withResolvers<AnthropicBillingReport>()
+    const upstream = response([
+      start,
+      {
+        type: 'message_delta',
+        delta: { stop_reason: scenario === 'refused' ? 'refusal' : 'end_turn' },
+        usage: { output_tokens: 1 },
+      },
+      ...(scenario !== 'incomplete' ? [{ type: 'message_stop' }] : []),
+    ])
+    let waits = 0
+    await observeAnthropicBillingResponse(
+      {
+        ...request,
+        onReport: reported.resolve,
+        cacheWarming: () => ({ on: true }),
+        cacheWarmingAfter: () => {
+          waits++
+          if (scenario !== 'stale') throw new Error('unexpected wait')
+          return undefined
+        },
+      },
+      upstream,
+    ).text()
+    expect((await reported.promise).cache?.warming).toBeUndefined()
+    expect(waits).toBe(scenario === 'stale' ? 1 : 0)
   },
 )
 

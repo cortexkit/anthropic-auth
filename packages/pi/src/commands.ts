@@ -1,5 +1,6 @@
 import { join } from 'node:path'
 import {
+  type CommandMenuModel,
   createNativeUi,
   disconnectNativeVaultForHost,
   type NativeMenuCommandId,
@@ -11,6 +12,8 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { type ExtensionAPI, getAgentDir } from '@earendil-works/pi-coding-agent'
 import { queuePiLaneStart } from './lane-start.ts'
+import { getPiAccountStoragePath } from './paths.ts'
+import { forgetPiRefusalRoute, piRefusalRoundStatus } from './stream.ts'
 
 /** Backend callbacks use native authority; the renderer never receives credentials. */
 export interface PiNativeCommands {
@@ -74,7 +77,7 @@ export function registerCommands(pi: ExtensionAPI, backend: PiNativeCommands) {
           deliverAs: 'followUp',
         })
       }
-      const menu = createNativeUi({
+      const nativeMenu = createNativeUi({
         host: 'pi',
         dispatch: (request, options) =>
           backend.dispatch(request, options, queueLaneStart),
@@ -89,6 +92,7 @@ export function registerCommands(pi: ExtensionAPI, backend: PiNativeCommands) {
           // the cleared vault placeholder. Reload failure cannot undo the completed
           // disconnect, so report it separately without exposing the exception.
           if (result === 'disconnected' || result === 'idle') {
+            forgetPiRefusalRoute(getPiAccountStoragePath())
             try {
               await ctx.modelRegistry.refresh()
             } catch {
@@ -102,6 +106,36 @@ export function registerCommands(pi: ExtensionAPI, backend: PiNativeCommands) {
         },
         interactive: ctx.hasUI,
       })
+      const withRoundStatus = (menu: CommandMenuModel): CommandMenuModel => {
+        const status = piRefusalRoundStatus(sessionId)
+        return status
+          ? {
+              ...menu,
+              sections: [
+                {
+                  id: 'Status',
+                  slot: 'diagnostics',
+                  title: 'Status',
+                  lines: [status],
+                  items: [],
+                  actions: [],
+                },
+                ...menu.sections,
+              ],
+            }
+          : menu
+      }
+      const menu: typeof nativeMenu = {
+        ...nativeMenu,
+        async open(invocation) {
+          const result = await nativeMenu.open(invocation)
+          return { ...result, menu: withRoundStatus(result.menu) }
+        },
+        async apply(request, invocation) {
+          const result = await nativeMenu.apply(request, invocation)
+          return { ...result, menu: withRoundStatus(result.menu) }
+        },
+      }
       if (ctx.hasUI) {
         await runPiCommandMenu(menu, ctx.ui, { sessionId })
       } else {

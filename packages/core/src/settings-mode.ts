@@ -10,7 +10,12 @@ import {
   resolvePathOptions,
 } from './path-options.ts'
 import { canonicalPath } from './pool-paths.ts'
-import type { SettingsHost, SettingsPaths } from './settings-paths.ts'
+import {
+  mirrorSettingsRecord,
+  type SettingsHost,
+  type SettingsPaths,
+  type SettingsRecordPaths,
+} from './settings-paths.ts'
 import type { SettingsService } from './settings-service.ts'
 import { writeOwnerOnlyExclusive } from './state-layout-io.ts'
 
@@ -28,6 +33,8 @@ export interface SettingsModeOptions extends PathResolutionOptions {
   ownership?: OwnerOnlyOptions
   now?: () => number
   moveCompleted?: boolean
+  /** A usable settings file still uses beside records if the mirror folder is unusable. */
+  useBesideIfStateFolderUnavailable?: boolean
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -42,37 +49,46 @@ async function exists(path: string): Promise<boolean> {
 
 /** Only existence confers authority; informational move notes are never read. */
 export function hasSettingsMoveMarker(
-  target: string,
+  { records }: Pick<SettingsPaths, 'records'>,
   options: SettingsModeOptions = {},
 ): Promise<boolean> {
-  return (options.fs?.exists ?? exists)(`${target}.moved`)
-}
-
-/** Publish once after a completed move or a usable hand-made file is found. */
-export async function writeSettingsMoveMarker(
-  target: string,
-  options: SettingsModeOptions = {},
-): Promise<void> {
-  if (await hasSettingsMoveMarker(target, options)) return
-  const context = resolvePathOptions(options)
-  await writeSettingsRecord(
-    target,
-    `${target}.moved`,
-    {
-      version: 1,
-      target: await canonicalPath(target, context),
-      at: (options.now ?? Date.now)(),
-    },
+  return hasSettingsRecord(
+    records,
+    records.beside.moved,
+    records.state?.moved,
     options,
   )
 }
 
-/** Where `host` records that its legacy store's protection is in the file. */
-export function settingsImportRecordPath(
-  target: string,
-  host: SettingsHost,
-): string {
-  return `${target}.moved.${host}`
+async function hasSettingsRecord(
+  records: SettingsRecordPaths,
+  beside: string,
+  state: string | undefined,
+  options: SettingsModeOptions,
+): Promise<boolean> {
+  const check = options.fs?.exists ?? exists
+  if (await check(beside)) return true
+  if (records.stateUnavailable && !options.useBesideIfStateFolderUnavailable)
+    throw records.stateUnavailable
+  return state ? check(state) : false
+}
+
+/** Publish once after a completed move or a usable hand-made file is found. */
+export async function writeSettingsMoveMarker(
+  { target, records }: Pick<SettingsPaths, 'target' | 'records'>,
+  options: SettingsModeOptions = {},
+): Promise<void> {
+  await writeSettingsRecordCopies(
+    records,
+    records.beside.moved,
+    records.state?.moved,
+    async () => ({
+      version: 1,
+      target: await canonicalPath(target, options),
+      at: (options.now ?? Date.now)(),
+    }),
+    options,
+  )
 }
 
 /**
@@ -81,11 +97,16 @@ export function settingsImportRecordPath(
  * its `.moved` marker decide which source is in charge.
  */
 export function hasSettingsImportRecord(
-  target: string,
+  { records }: Pick<SettingsPaths, 'records'>,
   host: SettingsHost,
   options: SettingsModeOptions = {},
 ): Promise<boolean> {
-  return (options.fs?.exists ?? exists)(settingsImportRecordPath(target, host))
+  return hasSettingsRecord(
+    records,
+    records.beside.imports[host],
+    records.state?.imports[host],
+    options,
+  )
 }
 
 /**
@@ -94,34 +115,53 @@ export function hasSettingsImportRecord(
  * the file is published. It holds no settings values.
  */
 export async function writeSettingsImportRecord(
-  target: string,
+  { records }: Pick<SettingsPaths, 'records'>,
   host: SettingsHost,
   options: SettingsModeOptions = {},
 ): Promise<void> {
-  if (await hasSettingsImportRecord(target, host, options)) return
-  await writeSettingsRecord(
-    target,
-    settingsImportRecordPath(target, host),
-    {
+  await writeSettingsRecordCopies(
+    records,
+    records.beside.imports[host],
+    records.state?.imports[host],
+    async () => ({
       version: 1,
       host,
       release: anthropicAuthRelease(),
       at: (options.now ?? Date.now)(),
-    },
+    }),
     options,
   )
 }
 
-/** Write a small owner-only record beside the settings file, exactly once. */
+async function writeSettingsRecordCopies(
+  records: SettingsRecordPaths,
+  beside: string,
+  state: string | undefined,
+  record: () => Promise<Record<string, unknown>>,
+  options: SettingsModeOptions,
+): Promise<void> {
+  const check = options.fs?.exists ?? exists
+  let bytes: Uint8Array | undefined
+  const encode = async () => Buffer.from(`${JSON.stringify(await record())}\n`)
+  if (!(await check(beside))) {
+    bytes = await encode()
+    await writeSettingsRecord(beside, bytes, options)
+  }
+  if (state)
+    mirrorSettingsRecord(records, state, async () => {
+      if (!(await check(state)))
+        await writeSettingsRecord(state, bytes ?? (await encode()), options)
+    })
+}
+
+/** Write a small owner-only record, exactly once. */
 async function writeSettingsRecord(
-  target: string,
   path: string,
-  record: Record<string, unknown>,
+  bytes: Uint8Array,
   options: SettingsModeOptions,
 ): Promise<void> {
   const context = resolvePathOptions(options)
-  const bytes = Buffer.from(`${JSON.stringify(record)}\n`)
-  const parent = context.paths.dirname(target)
+  const parent = context.paths.dirname(path)
   if (options.fs?.mkdir) await options.fs.mkdir(parent)
   // An existing folder is left as it is: %APPDATA%\cortexkit is shared with
   // other CortexKit plugins and keeps its inherited access-control lists,
@@ -149,15 +189,13 @@ async function writeSettingsRecord(
 
 /** Startup/menu/watch/timer work only: request readers consume the cached mode. */
 export async function resolveSettingsMode(
-  paths: Pick<SettingsPaths, 'target' | 'separate'>,
+  paths: Pick<SettingsPaths, 'target' | 'separate' | 'records'>,
   options: SettingsModeOptions = {},
 ): Promise<SettingsMode> {
   if (paths.separate) return 'separate'
   if (options.moveCompleted) return 'user-file'
   if (await (options.fs?.exists ?? exists)(paths.target)) return 'user-file'
-  return (await hasSettingsMoveMarker(paths.target, options))
-    ? 'user-file'
-    : 'legacy'
+  return (await hasSettingsMoveMarker(paths, options)) ? 'user-file' : 'legacy'
 }
 
 /**

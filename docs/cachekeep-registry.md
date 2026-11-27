@@ -40,15 +40,13 @@ instance owns `<pid>-<uuid>.json`; several files can exist for one host, and
 several instances can report the same session. Ignore files not ending in
 `.json`, including unfinished temporary files. Do not modify registry files.
 
-For one release, default-path writers also publish to the old system-temp
-folder, `<temp>/opencode-anthropic-auth/cachekeep-sessions/{opencode,pi}`.
-Readers in the plugin merge both locations so 2.5.3 processes and newer
-processes can coexist. The temp root is the OS temp directory (`TMPDIR` on
-Unix, normally `TEMP` on Windows). New integrations should use the data folder.
-
-The first release shipping this data-folder interface is the transition
-release; the following release removes the compatibility paths. Version 2.5.3
-predates the data-folder interface.
+The plugin no longer publishes to or combines sessions from the old system-temp
+registry, `<temp>/opencode-anthropic-auth/cachekeep-sessions/{opencode,pi}`.
+Version 2.5.4 introduced the data-folder registry. If a version from 2.5.3 or
+earlier runs alongside this version, its CacheKeep status will not include
+sessions published only by the new plugin. This does not change its keep-warm
+behavior. Before moving settings or state, the plugin still checks the old
+temp registry for running older instances; that check does not modify it.
 
 OpenCode 1, OpenCode 2 and Pi share a **private restart store** implementation, which does
 contain compressed replay bodies and is not this public interface. OpenCode 2
@@ -92,11 +90,10 @@ foreign-account, changed-login and disabled-account records, and reauthorize
 and re-sign prewarms through their normal send path. Overdue restored warms are
 staggered rather than sent in a restart burst.
 
-For the transition release, an empty OpenCode 2 store loads once from the old
+An empty OpenCode 2 store can load once from the old
 `<temp>/cortexkit-anthropic-auth-cachekeep-<storage-id-hash>/` folder. Successfully
 restored files are saved in the new store before their old copies are removed;
-stale old records are discarded. This fallback is removed immediately after
-the transition release, as defined above.
+stale old records are discarded.
 
 ## Version 1 record
 

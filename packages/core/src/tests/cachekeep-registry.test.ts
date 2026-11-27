@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import {
+  mkdir,
   mkdtemp,
   readdir,
   readFile,
@@ -16,7 +17,6 @@ import {
   type CacheKeepTrackedSession,
   getCacheKeepRegistryDirectories,
   getDefaultCacheKeepRegistryDirectory,
-  getLegacyCacheKeepRegistryDirectory,
 } from '../cachekeep-registry.ts'
 import { getHostDataHome } from '../host-paths.ts'
 import type { OwnerOnlyOptions } from '../owner-only.ts'
@@ -243,14 +243,12 @@ test('registry path overrides win for both hosts without writing to default fold
   }
   expect(getCacheKeepRegistryDirectories('opencode', undefined, env)).toEqual({
     directory: '/oc-override',
-    legacyDirectory: undefined,
   })
   expect(getCacheKeepRegistryDirectories('pi', undefined, env)).toEqual({
     directory: '/pi-override',
-    legacyDirectory: undefined,
   })
   expect(getCacheKeepRegistryDirectories('opencode', '/explicit', env)).toEqual(
-    { directory: '/explicit', legacyDirectory: undefined },
+    { directory: '/explicit' },
   )
   const data = join(tmpdir(), 'cachekeep-data')
   expect(
@@ -263,7 +261,6 @@ test('registry path overrides win for both hosts without writing to default fold
       'cachekeep-sessions',
       'pi',
     ),
-    legacyDirectory: getLegacyCacheKeepRegistryDirectory('pi'),
   })
   expect(
     getDefaultCacheKeepRegistryDirectory(
@@ -277,13 +274,11 @@ test('registry path overrides win for both hosts without writing to default fold
   )
 })
 
-test('dual publication is private, merges both folders, and is accepted by the 2.5.3 parser', async () => {
+test('data-folder publication is private and is accepted by the 2.5.3 parser', async () => {
   const directory = await makeDirectory()
-  const legacyDirectory = await makeDirectory()
   const now = Date.now()
   const writer = new CacheKeepSessionRegistry({
     directory,
-    legacyDirectory,
     instanceId: 'writer',
     now: () => now,
   })
@@ -298,7 +293,6 @@ test('dual publication is private, merges both folders, and is accepted by the 2
   }
   await writer.publish([tracked])
   const raw = await readFile(join(directory, 'writer.json'), 'utf8')
-  expect(await readFile(join(legacyDirectory, 'writer.json'), 'utf8')).toBe(raw)
   if (process.platform !== 'win32') {
     expect((await stat(directory)).mode & 0o777).toBe(0o700)
     expect((await stat(join(directory, 'writer.json'))).mode & 0o777).toBe(
@@ -314,17 +308,58 @@ test('dual publication is private, merges both folders, and is accepted by the 2
       },
     ]),
   )
-  const newer = { ...tracked, cacheExpiresAt: tracked.cacheExpiresAt + 1000 }
-  const older = session('ses_old')
-  await writeFile(
-    join(legacyDirectory, 'other.json'),
-    JSON.stringify(record(now, [newer, older])),
-  )
-  expect(await writer.list()).toEqual([newer, older])
+  expect(await writer.list()).toEqual([tracked])
   await writer.dispose()
   expect(await readdir(directory)).toEqual([])
-  expect(await readdir(legacyDirectory)).toEqual(['other.json'])
 })
+
+test.skipIf(process.platform === 'win32')(
+  'the default session registry publishes only in the data folder and leaves the legacy registry alone',
+  async () => {
+    const base = await makeDirectory()
+    const data = join(base, 'data')
+    const legacyDirectory = join(
+      base,
+      'opencode-anthropic-auth',
+      'cachekeep-sessions',
+      'opencode',
+    )
+    const expectedDirectory = join(
+      data,
+      'cortexkit',
+      'anthropic-auth',
+      'cachekeep-sessions',
+      'opencode',
+    )
+    const original = process.env.TMPDIR
+    process.env.TMPDIR = base
+    try {
+      const now = Date.now()
+      const legacyPath = join(legacyDirectory, 'other.json')
+      const legacyBytes = JSON.stringify(record(now, [session('ses_old')]))
+      await mkdir(legacyDirectory, { recursive: true, mode: 0o700 })
+      await writeFile(legacyPath, legacyBytes)
+      const writer = new CacheKeepSessionRegistry({
+        ...getCacheKeepRegistryDirectories('opencode', undefined, {
+          XDG_DATA_HOME: data,
+        }),
+        instanceId: 'writer',
+        now: () => now,
+      })
+      const tracked = session('ses_private')
+      await writer.publish([tracked])
+      expect(await readdir(expectedDirectory)).toEqual(['writer.json'])
+      expect(await readdir(legacyDirectory)).toEqual(['other.json'])
+      expect(await writer.list()).toEqual([tracked])
+      await writer.dispose()
+      expect(await readdir(expectedDirectory)).toEqual([])
+      expect(await readFile(legacyPath, 'utf8')).toBe(legacyBytes)
+    } finally {
+      if (original === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = original
+    }
+  },
+)
 
 test('stale live or unidentifiable process files survive; dead and pre-boot files are removed', async () => {
   const directory = await makeDirectory()

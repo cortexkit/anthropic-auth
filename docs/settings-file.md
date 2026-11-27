@@ -47,6 +47,7 @@ file are flat, lower-case snake_case, not the legacy nested camelCase names.
 | Killswitch | `killswitch_enabled`, `killswitch_default_five_hour`, `killswitch_default_seven_day`, `killswitch_default_scoped`, `killswitch_account_floors` |
 | Cache | `claude_cache_enabled`, `claude_cache_mode`, `cache_keep_enabled`, `cache_keep_always`, `cache_keep_window`, `cache_keep_subagents` |
 | Request features | `dump_enabled`, `prime_enabled`, `claude_fast_enabled`, `cost_zeroing_enabled` |
+| Refusal fallback | `refusal_fallback`: `client` (default), `server` or `off` (see [refusal fallback](refusal-fallback.md)) |
 | Logging | `log_level` |
 | Thinking binding | `thinking_binding_prefix_mismatch_behavior` |
 | Turn-end notes | `turn_end_note_tools` |
@@ -120,8 +121,8 @@ drop the `[1m]` qualifier and use the table's longest matching model id/suffix.
 Unknown models use the no-model values. Unrecognized model override keys are
 ignored, logged and named in Status.
 
-`killswitch_account_floors`, `gateway_url` and `gateway_headers` are the
-exceptions: they take **no overrides**. The floors setting is a list of
+`killswitch_account_floors`, `refusal_fallback`, `gateway_url` and `gateway_headers`
+are exceptions: they take **no overrides**. The floors setting is a list of
 complete `{account, host, five_hour, seven_day, scoped}` entries. `host` is
 `opencode`, `pi` or `both`; each host applies its own and `both` entries. `account` is the local row id or vault roster route id, never an email
 or account identity. Entries may not overlap for the same account and host.
@@ -322,8 +323,8 @@ file does not already set that key at the host's level. This includes the
 killswitch, quota floors, unknown-quota policy and same-account wait.
 Missing per-account floors are added with that host's tag
 when they exceed the file's default floors; existing account entries are not
-replaced. A `<target path>.moved.<host>` record (`opencode` or `pi`) records this
-check. Ordinary legacy preferences are never merged. If its legacy protection
+replaced. A `moved.<host>` record (`opencode` or `pi`) records this check.
+Ordinary legacy preferences are never merged. If its legacy protection
 cannot be read, or the protection import cannot be written, the host keeps using
 its old settings. It retries at a later settings check or the next start. Startup
 logs also name legacy values that differ from the file.
@@ -340,9 +341,35 @@ under the `anthropic-auth` key, not in this settings file.
 An existing hand-made user file is authoritative too, subject to the same
 one-time protection check; ordinary legacy preferences are not merged into it.
 A successful move (even with no sources), or finding a hand-made file that
-parses, writes the owner-only `<target path>.moved` marker. The
-`MOVED_READPLEASE` notes are informational; the plugin never uses them to decide
-authority. Do not delete the marker to try to restore settings from stale stores.
+parses, writes the owner-only `moved` marker. The `MOVED_READPLEASE` notes are
+informational; the plugin never uses them to decide authority. Do not delete the
+marker to try to restore settings from stale stores.
+
+### Where the records are kept
+
+The plugin writes four owner-only records: `moved`, `moved.opencode`, `moved.pi`
+and `applied.json`. It writes them under `<state root>/settings/<key>/` and also
+beside the settings file as `<target>.moved`, `<target>.moved.opencode`,
+`<target>.moved.pi` and `<target>.applied.json`. The state root is
+`$XDG_STATE_HOME/cortexkit/anthropic-auth` if `XDG_STATE_HOME` is absolute;
+otherwise it is `~/.local/state/cortexkit/anthropic-auth` on every OS. The mirror
+is disabled if the resolved root is not fully qualified. The key is
+specific to the configured filename in its canonical parent folder; a symlink
+at the filename does not change the key.
+
+The record beside the settings file is authoritative while it exists, even if
+it cannot be read or its `applied.json` has no entry for the acting host. Only
+when the beside record is missing does the plugin check the state copy. An
+unreadable or invalid state copy is unknown, not missing. The plugin finishes
+writing beside records before attempting their state copies in the background.
+If the state folder cannot be used, the plugin warns and a usable settings file
+continues with the beside records. `/claude` Status, and the setup command (run
+with OpenCode and Pi stopped), show the record locations.
+
+The copies beside the settings file keep 2.17.x working during mixed-version use
+and after rollback. This release removes neither copy. A later release will stop
+writing beside the settings file and remove those copies, with this release as
+the oldest supported rollback.
 
 ### Setup
 
@@ -367,12 +394,14 @@ same-account wait) are recovered as a complete set, never by skipping a bad
 account entry. An unusable file keeps last-good protection values. At startup
 the recovery order is this host's last-applied copy, then its readable legacy
 store, then the restrictive fallback: killswitch on at the default floors,
-unknown quota refused and same-account wait off.
+unknown quota refused and same-account wait off. If there is no beside-file
+copy and the state copy cannot be read or is invalid, recovery goes straight to
+the restrictive fallback; menu writes and setup cannot use that fallback to
+recreate the file.
 
-The owner-only `<target path>.applied.json` beside the user file holds a complete
-last-applied protection set per host and no credentials. It is updated from
-usable user-file values only. It is a recovery copy, not another settings file
-to edit.
+The owner-only `applied.json` records hold a complete last-applied protection
+set per host and no credentials. They are updated from usable user-file values
+only. They are recovery copies, not settings files to edit.
 
 A menu write that recreates a missing file preserves the writer's currently
 applied protection values and the other host's recoverable protection set, then

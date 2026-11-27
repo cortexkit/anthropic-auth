@@ -2,7 +2,6 @@ import { afterEach, expect, spyOn, test } from 'bun:test'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-
 import { createNativePoolStore } from '../pool-store.ts'
 import {
   legacySettingsProtection,
@@ -12,6 +11,7 @@ import {
   openSettingsService,
   type SettingsProtectionValues,
 } from '../settings-service.ts'
+import { settingsTestPaths } from './settings-record-paths-fixture.ts'
 
 const cleanup: (() => Promise<unknown>)[] = []
 afterEach(async () => {
@@ -19,6 +19,7 @@ afterEach(async () => {
 })
 
 const emptyProtection: SettingsProtectionValues = {
+  refusal_fallback: 'client',
   killswitch_enabled: false,
   killswitch_default_five_hour: 5,
   killswitch_default_seven_day: 10,
@@ -88,6 +89,7 @@ for (const host of ['opencode', 'pi'] as const) {
           },
         })
         expect(result).toEqual({
+          refusal_fallback: 'client',
           killswitch_enabled: true,
           killswitch_default_five_hour: 31,
           killswitch_default_seven_day: 42,
@@ -277,6 +279,7 @@ test('same-host leases sharing one bad target apply their own real stores on run
   const open = async (localStore: typeof f.local.store) => {
     const service = await openSettingsService({
       file,
+      records: (await settingsTestPaths(file)).records,
       protection: {
         readLegacyProtection: (host) =>
           readLegacySettingsProtection({

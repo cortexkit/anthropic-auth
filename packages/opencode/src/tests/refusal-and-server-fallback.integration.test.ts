@@ -1,39 +1,45 @@
 import { describe, expect, mock, spyOn } from 'bun:test'
+import { readdir, readFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import {
   type AccountStorage,
+  cacheKeepStoreDirectory,
+  hasValidRequestBodySignature,
   logger,
-  tokenFingerprint,
-} from '@cortexkit/anthropic-auth-core'
-import {
-  drainNotifications,
-  resetNotificationsForTest,
-} from '../rpc/notifications'
-import {
+  MESSAGE_THREADS_BETA,
+  RecoveryThinkingStore,
   SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
-} from '../server-fallback'
-import type { getSidebarState } from '../sidebar-state'
+} from '@cortexkit/anthropic-auth-core'
+import {
+  RECOVERY_FAMILY,
+  refusalThinkingReply,
+  SOURCE_MODEL,
+  TARGET_DIGEST,
+  TARGET_SIGNATURE,
+} from './fixtures/refusal-thinking'
 import { getPluginTestHandles } from './plugin-test-handles'
 import { createMockClient } from './support/opencode1-client.ts'
-import { installLoaderSetup } from './support/opencode1-loader-setup.ts'
 import {
-  bindPoolAccounts,
+  installLoaderSetup,
+  setUserRefusalFallbackMode,
+} from './support/opencode1-loader-setup.ts'
+import {
   createFallbackStorage,
   getPlugin as getPluginWithCtx,
+  replacePoolMainLogin,
   syntheticMainHostAuth,
+  updatePoolRelay,
   useTempAccountFile as useTempAccountFileWithCtx,
   withNativeAdmission as withNativeAdmissionWithCtx,
 } from './support/opencode1-pool-fixture.ts'
-import {
-  waitForMockCall,
-  waitForSidebarState as waitForSidebarStateWithCtx,
-} from './support/opencode1-state-observers.ts'
 import type { PluginRuntimeOverrides } from './support/opencode1-test-context.ts'
 import {
   createOpencode1Test,
   createOpencode1TestContext,
+  getBodyLifetime,
   installOpencode1TestHooks,
-  recordedCondition as recordedConditionWithCtx,
 } from './support/opencode1-test-context.ts'
 import { extractUrl, MESSAGES_URL } from './test-fetch'
 
@@ -41,9 +47,6 @@ const testContext = createOpencode1TestContext()
 installOpencode1TestHooks(testContext)
 const test = createOpencode1Test(testContext)
 
-function recordedCondition() {
-  return recordedConditionWithCtx(testContext)
-}
 function useTempAccountFile(
   storage: AccountStorage,
   mainHostAuth: {
@@ -66,18 +69,19 @@ function getPlugin(
 ): any {
   return getPluginWithCtx(testContext, client, directory, runtimeOverrides)
 }
-function waitForSidebarState(
-  predicate: (state: Awaited<ReturnType<typeof getSidebarState>>) => boolean,
-) {
-  return waitForSidebarStateWithCtx(testContext, predicate)
-}
-
 describe('auth.loader', () => {
   installLoaderSetup(testContext)
 
-  test('normalizes a server fallback response even when no session-affinity header is available', async () => {
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
+  test('normalizes a server fallback response without session affinity, ignoring the removed OpenCode 1 switch', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    await setUserRefusalFallbackMode(testContext, 'server')
+    const previous = process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
+    process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = 'legacy'
+    getBodyLifetime(testContext).deferCleanup(() => {
+      if (previous === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
+      else process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = previous
+    })
     const frame = (event: string, data: unknown) =>
       `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
     const fallbackSse = [
@@ -172,14 +176,13 @@ describe('auth.loader', () => {
   })
 
   const assertServerFallbackTransitions = async (modelId: string) => {
-    const label = modelId === 'claude-fable-5-2' ? 'Fable 5.2' : 'Fable 5.1'
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
     await useTempAccountFile(
       createFallbackStorage({
         accounts: [],
         quota: { enabled: false } as AccountStorage['quota'],
       }),
     )
+    await setUserRefusalFallbackMode(testContext, 'server')
     const requestBodies: Array<Record<string, unknown>> = []
     const requestBetas: string[] = []
     let modelRequest = 0
@@ -288,32 +291,7 @@ describe('auth.loader', () => {
       ),
     ) as unknown as typeof fetch
 
-    const latestUserMessageId = 'msg_000000000100AAAAAAAAAAAAAA'
-    const latestAssistantMessageId = 'msg_000000000200BBBBBBBBBBBBBB'
-    const mockClient = createMockClient([
-      {
-        info: {
-          id: latestUserMessageId,
-          role: 'user',
-          agent: 'Alfonso - CTO',
-          model: {
-            providerID: 'anthropic',
-            modelID: modelId,
-            variant: 'xhigh',
-          },
-        },
-      },
-      {
-        info: {
-          id: latestAssistantMessageId,
-          role: 'assistant',
-          agent: 'Alfonso - CTO',
-          providerID: 'anthropic',
-          modelID: modelId,
-          variant: 'xhigh',
-        },
-      },
-    ])
+    const mockClient = createMockClient([])
     const plugin = await getPlugin(mockClient)
     const result = await plugin.auth.loader(
       () =>
@@ -346,1171 +324,59 @@ describe('auth.loader', () => {
       expect(requestBodies[0]?.fallbacks).toBe('default')
       expect(requestBetas[0]?.split(',')).toContain(SERVER_SIDE_FALLBACK_BETA)
 
-      modelRequest = 0
       const nextResponse = await result.fetch(MESSAGES_URL, request)
-      await expect(nextResponse.text()).resolves.toContain('fallback answer')
+      await expect(nextResponse.text()).resolves.toContain('source answer')
+      expect(requestBodies.map((body) => body.model)).toEqual([
+        modelId,
+        modelId,
+      ])
       expect(requestBodies[1]?.fallbacks).toBe('default')
       expect(
-        info.mock.calls.filter(
-          ([channel, message]) =>
-            channel === 'server-fallback' ||
-            message === 'Anthropic server-side safety fallback active',
-        ),
-      ).toHaveLength(2)
+        info.mock.calls.filter(([channel]) => channel === 'server-fallback'),
+      ).toHaveLength(1)
+      await plugin.event?.({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'ses_server_fallback' },
+        },
+      })
+      expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
     } finally {
       info.mockRestore()
     }
-    const switched = await waitForSidebarState((state) =>
-      Boolean(
-        state.fableRecoveries?.some(
-          (recovery) =>
-            recovery.sessionId === 'ses_server_fallback' &&
-            recovery.mode === 'server',
-        ),
-      ),
-    )
-    expect(switched.fableRecoveries?.[0]).toMatchObject({
-      requestedModelId: modelId,
-      targetModelId: 'claude-opus-5',
-      remaining: 0,
-    })
-    await plugin.event?.({
-      event: {
-        type: 'message.updated',
-        properties: {
-          info: {
-            id: latestAssistantMessageId,
-            sessionID: 'ses_server_fallback',
-            role: 'assistant',
-            finish: 'tool-calls',
-            time: { completed: Date.now() },
-          },
-        },
-      },
-    })
-    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
-
-    await plugin.event?.({
-      event: {
-        type: 'message.updated',
-        properties: {
-          info: {
-            id: latestAssistantMessageId,
-            sessionID: 'ses_server_fallback',
-            role: 'assistant',
-            finish: 'stop',
-            time: { completed: Date.now() },
-          },
-        },
-      },
-    })
-    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
-
-    await plugin.event?.({
-      event: {
-        type: 'session.status',
-        properties: {
-          sessionID: 'ses_server_fallback',
-          status: { type: 'idle' },
-        },
-      },
-    })
-    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
-
-    await plugin.event?.({
-      event: {
-        type: 'session.idle',
-        properties: { sessionID: 'ses_server_fallback' },
-      },
-    })
-    await waitForMockCall(mockClient.session.promptAsync)
-    expect(mockClient.session.promptAsync.mock.calls[0]?.[0]).toEqual(
-      expect.objectContaining({
-        path: { id: 'ses_server_fallback' },
-        body: expect.objectContaining({
-          noReply: true,
-          parts: [
-            expect.objectContaining({
-              text: `Anthropic safety fallback served this step on Opus 5; the next step tries ${label} again.`,
-            }),
-          ],
-        }),
-      }),
-    )
-
-    // Model the real host: the first ignored notice becomes the newest user
-    // message. A second notice must have a distinct ordered ID, registered
-    // before promptAsync emits its user-message event.
-    const firstNotice = mockClient.session.promptAsync.mock.calls[0]?.[0] as {
-      body: { messageID: string }
-    }
-    const originalMessages = await mockClient.session.messages!()
-    mockClient.session.messages = mock(async () => ({
-      data: [
-        ...originalMessages.data,
-        { info: { id: firstNotice.body.messageID, role: 'user' } },
-      ],
-    }))
-    const noticeWasTrackedAtDispatch: boolean[] = []
-    mockClient.session.promptAsync.mockImplementation(
-      async (input: unknown) => {
-        const notice = input as {
-          path: { id: string }
-          body: { messageID: string }
-        }
-        noticeWasTrackedAtDispatch.push(
-          typeof notice.body.messageID === 'string' &&
-            getPluginTestHandles(plugin).isDesktopNoticeMessage(
-              notice.path.id,
-              notice.body.messageID,
-            ),
-        )
-        await plugin.event?.({
-          event: {
-            type: 'message.updated',
-            properties: {
-              info: {
-                id: notice.body.messageID,
-                sessionID: notice.path.id,
-                role: 'user',
-              },
-            },
-          },
-        })
-      },
-    )
-
-    const restoredResponse = await result.fetch(MESSAGES_URL, request)
-    // OpenCode can publish the assistant-completed event before the wrapped
-    // response emits its final fallback outcome. The idle event must flush a notice
-    // queued after that completion event without requiring a later session update.
-    await plugin.event?.({
-      event: {
-        type: 'message.updated',
-        properties: {
-          info: {
-            id: latestAssistantMessageId,
-            sessionID: 'ses_server_fallback',
-            role: 'assistant',
-            time: { completed: Date.now() },
-          },
-        },
-      },
-    })
-    await expect(restoredResponse.text()).resolves.toContain('source answer')
-    const restored = await waitForSidebarState((state) =>
-      Boolean(
-        state.fableRecoveries?.some(
-          (recovery) =>
-            recovery.sessionId === 'ses_server_fallback' &&
-            recovery.mode === 'fable',
-        ),
-      ),
-    )
-    expect(restored.fableRecoveries?.[0]?.requestedModelId).toBe(modelId)
-    await plugin.event?.({
-      event: {
-        type: 'session.idle',
-        properties: { sessionID: 'ses_server_fallback' },
-      },
-    })
-    await waitForMockCall({
-      mock: {
-        get calls() {
-          return mockClient.session.promptAsync.mock.calls.slice(1)
-        },
-      },
-    })
-    expect(mockClient.session.promptAsync.mock.calls[1]?.[0]).toEqual(
-      expect.objectContaining({
-        body: expect.objectContaining({
-          parts: [
-            expect.objectContaining({
-              text: expect.stringContaining(`Returning to ${label}`),
-            }),
-          ],
-        }),
-      }),
-    )
-
-    const secondNotice = mockClient.session.promptAsync.mock.calls[1]?.[0] as {
-      body: { messageID: string }
-    }
-    expect(noticeWasTrackedAtDispatch).toEqual([true])
-    expect(secondNotice.body.messageID > firstNotice.body.messageID).toBe(true)
-    expect(secondNotice.body.messageID < latestAssistantMessageId).toBe(true)
-
-    // The host history still contains only notice 1. Notice 2's own event must
-    // leave the idle lease intact, and local allocation must avoid reusing its
-    // ID even before session.messages catches up. No new idle event is sent.
-    modelRequest = 0
-    const thirdTransition = await result.fetch(MESSAGES_URL, request)
-    await thirdTransition.text()
-    await waitForMockCall({
-      mock: {
-        get calls() {
-          return mockClient.session.promptAsync.mock.calls.slice(2)
-        },
-      },
-    })
-    const thirdNotice = mockClient.session.promptAsync.mock.calls[2]?.[0] as {
-      body: { messageID: string }
-    }
-    expect(thirdNotice.body.messageID > secondNotice.body.messageID).toBe(true)
-    expect(thirdNotice.body.messageID < latestAssistantMessageId).toBe(true)
-    expect(noticeWasTrackedAtDispatch).toEqual([true, true])
-
-    // A rapid fallback cycle can replace the pending switch notice while its
-    // asynchronous prompt-context lookup is still in flight. The stale send
-    // must stand down and the active flush must continue with the replacement.
-    mockClient.session.promptAsync.mockClear()
-    modelRequest = 0
-    const immediateMessages = mockClient.session.messages
-    let releasePromptContext: (() => void) | undefined
-    let messageLookups = 0
-    mockClient.session.messages = mock(() => {
-      messageLookups++
-      if (messageLookups > 1) {
-        return immediateMessages?.() ?? Promise.resolve({ data: [] })
-      }
-      return new Promise<{ data: unknown[] }>((resolve) => {
-        releasePromptContext = () => {
-          void Promise.resolve(immediateMessages?.()).then((response) =>
-            resolve(response ?? { data: [] }),
-          )
-        }
-      })
-    })
-    const overtakenRequest = {
-      ...request,
-      headers: { 'x-session-affinity': 'ses_server_fallback_overtaken' },
-    }
-    const overtakenFallback = await result.fetch(MESSAGES_URL, overtakenRequest)
-    await overtakenFallback.text()
-    await plugin.event?.({
-      event: {
-        type: 'message.updated',
-        properties: {
-          info: {
-            id: latestUserMessageId,
-            sessionID: 'ses_server_fallback_overtaken',
-            role: 'user',
-          },
-        },
-      },
-    })
-    await plugin.event?.({
-      event: {
-        type: 'session.idle',
-        properties: { sessionID: 'ses_server_fallback_overtaken' },
-      },
-    })
-    for (let attempt = 0; attempt < 100 && !releasePromptContext; attempt++) {
-      await Bun.sleep(1)
-    }
-    expect(releasePromptContext).toBeDefined()
-
-    const overtakenRestoration = await result.fetch(
-      MESSAGES_URL,
-      overtakenRequest,
-    )
-    await overtakenRestoration.text()
-    releasePromptContext?.()
-    await waitForMockCall(mockClient.session.promptAsync)
-
-    expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
-    expect(mockClient.session.promptAsync.mock.calls[0]?.[0]).toEqual(
-      expect.objectContaining({
-        body: expect.objectContaining({
-          parts: [
-            expect.objectContaining({
-              text: expect.stringContaining(`Returning to ${label}`),
-            }),
-          ],
-        }),
-      }),
-    )
-    // Missing ordering context must retain the notice, never send a host-minted
-    // user ID. Once the host exposes a safe boundary, the same notice can drain.
-    mockClient.session.promptAsync.mockClear()
-    mockClient.session.messages = mock(async () => ({ data: [] }))
-    modelRequest = 0
-    const unplaced = await result.fetch(MESSAGES_URL, {
-      ...request,
-      headers: { 'x-session-affinity': 'ses_notice_unplaced' },
-    })
-    await unplaced.text()
-    await plugin.event?.({
-      event: {
-        type: 'session.idle',
-        properties: { sessionID: 'ses_notice_unplaced' },
-      },
-    })
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    expect(mockClient.session.messages).toHaveBeenCalled()
-    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
-    mockClient.session.messages = immediateMessages
-    await plugin.event?.({
-      event: {
-        type: 'session.idle',
-        properties: { sessionID: 'ses_notice_unplaced' },
-      },
-    })
-    await waitForMockCall(mockClient.session.promptAsync)
-    expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
   }
   test.each(['claude-fable-5-1', 'claude-fable-5-2'])(
-    'uses Anthropic server-side fallback for %s and reports transitions',
+    'uses server-side fallback for %s without creating a recovery round or notice',
     assertServerFallbackTransitions,
   )
 
-  test('downgrades a filtered Fable session for ten completed Opus responses without source warms', async () => {
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        claudeCache: { enabled: true, mode: 'hybrid' },
-        cacheKeep: { enabled: false },
-      }),
-    )
-    const normalModels: string[] = []
-    let firstFable = true
-    const recorded = recordedCondition()
-    const successfulSse = [
-      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok"}}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
-      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-    ].join('')
-    const refusalSse = [
-      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_filtered"}}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
-      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-    ].join('')
-
-    globalThis.fetch = mock(
-      withNativeAdmission((input: any, init: any) => {
-        const url = extractUrl(input)
-        if (url.includes('/api/oauth/usage')) {
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: 0 },
-                seven_day: { utilization: 0 },
-                limits: [],
-              }),
-              { status: 200 },
-            ),
-          )
-        }
-        const body = JSON.parse(String(init?.body)) as Record<string, unknown>
-        expect(body.max_tokens).not.toBe(0)
-        normalModels.push(String(body.model))
-        recorded.changed()
-        if (body.model === 'claude-fable-5' && firstFable) {
-          firstFable = false
-          return Promise.resolve(new Response(refusalSse, { status: 200 }))
-        }
-        return Promise.resolve(new Response(successfulSse, { status: 200 }))
-      }),
-    ) as unknown as typeof fetch
-
-    const latestUserMessageId = 'msg_000000000100AAAAAAAAAAAAAA'
-    const latestAssistantMessageId = 'msg_000000000200BBBBBBBBBBBBBB'
-    let releaseStaleIdleStatus:
-      | ((statuses: Record<string, { type: string }>) => void)
-      | undefined
-    let noticeStatusChecks = 0
-    const mockClient = createMockClient(
-      [
-        {
-          info: {
-            id: latestUserMessageId,
-            role: 'user',
-            agent: 'Alfonso - CTO',
-            model: {
-              providerID: 'anthropic',
-              modelID: 'claude-fable-5',
-              variant: 'xhigh',
-            },
-          },
-        },
-        {
-          info: {
-            id: latestAssistantMessageId,
-            role: 'assistant',
-            agent: 'Alfonso - CTO',
-            providerID: 'anthropic',
-            modelID: 'claude-fable-5',
-            variant: 'xhigh',
-          },
-        },
-      ],
-      () => {
-        noticeStatusChecks++
-        if (noticeStatusChecks === 1) {
-          return new Promise<Record<string, { type: string }>>((resolve) => {
-            releaseStaleIdleStatus = resolve
-            recorded.changed()
-          })
-        }
-        return {}
-      },
-    )
-    // Record each notice the plugin sends so the test can wait for it.
-    mockClient.session.promptAsync = mock((_input: unknown) => {
-      queueMicrotask(recorded.changed)
-      return Promise.resolve()
-    })
-    const plugin = await getPlugin(mockClient)
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'sk-ant-oat01-main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100000,
-        }),
-      { models: {} },
-    )
-    const request = {
-      method: 'POST',
-      headers: { 'x-session-affinity': 'ses_fable_filter' },
-      body: JSON.stringify({
-        model: 'claude-fable-5',
-        max_tokens: 128_000,
-        stream: true,
-        system: [{ type: 'text', text: 'stable system' }],
-        messages: [{ role: 'user', content: 'same session input' }],
-      }),
-    }
-
-    const filtered = await result.fetch(MESSAGES_URL, request)
-    const reader = filtered.body!.getReader()
-    let caught: unknown
-    try {
-      while (!(await reader.read()).done) {}
-    } catch (error) {
-      caught = error
-    }
-    expect((caught as { code?: string }).code).toBe('ECONNRESET')
-    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
-    const switchedState = await waitForSidebarState((state) =>
-      Boolean(
-        state.fableRecoveries?.some(
-          (recovery) =>
-            recovery.sessionId === 'ses_fable_filter' &&
-            recovery.mode === 'opus',
-        ),
-      ),
-    )
-    expect(
-      switchedState.fableRecoveries?.find(
-        (recovery) => recovery.sessionId === 'ses_fable_filter',
-      )?.remaining,
-    ).toBe(10)
-
-    // The switch notice is deliberately held until the first successful Opus
-    // response proves that OpenCode's internal retry has completed.
-    const firstOpus = await result.fetch(MESSAGES_URL, request)
-    await firstOpus.text()
-
-    // Seed the user-message identity that produced the upcoming idle event.
-    await plugin.event?.({
-      event: {
-        type: 'message.updated',
-        properties: {
-          info: {
-            id: latestUserMessageId,
-            sessionID: 'ses_fable_filter',
-            role: 'user',
-          },
-        },
-      },
-    })
-
-    // Reproduce the host race: an idle probe starts, then a new
-    // prompt marks the session busy before the asynchronous status response
-    // arrives with its now-stale idle snapshot. The notice must remain queued;
-    // otherwise OpenCode can adopt that ignored user message as the active retry
-    // parent and dispatch an extra provider request.
-    await plugin.event?.({
-      event: {
-        type: 'session.idle',
-        properties: { sessionID: 'ses_fable_filter' },
-      },
-    })
-    await recorded.until(() => releaseStaleIdleStatus !== undefined)
-    expect(releaseStaleIdleStatus).toBeDefined()
-    await plugin.event?.({
-      event: {
-        type: 'session.status',
-        properties: {
-          sessionID: 'ses_fable_filter',
-          status: { type: 'busy' },
-        },
-      },
-    })
-    releaseStaleIdleStatus?.({})
-    await Bun.sleep(10)
-    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
-
-    // Also cover the later race window: status was idle, but a new prompt starts
-    // while the notification path is resolving message history for placement.
-    const immediateMessages = mockClient.session.messages
-    let releasePromptContext: (() => void) | undefined
-    mockClient.session.messages = mock(
-      () =>
-        new Promise<{ data: unknown[] }>((resolve) => {
-          releasePromptContext = () => {
-            void Promise.resolve(immediateMessages?.()).then((response) =>
-              resolve(response ?? { data: [] }),
-            )
-          }
-          recorded.changed()
-        }),
-    )
-    await plugin.event?.({
-      event: {
-        type: 'session.idle',
-        properties: { sessionID: 'ses_fable_filter' },
-      },
-    })
-    await recorded.until(() => releasePromptContext !== undefined)
-    expect(releasePromptContext).toBeDefined()
-    await plugin.event?.({
-      event: {
-        type: 'session.status',
-        properties: {
-          sessionID: 'ses_fable_filter',
-          status: { type: 'busy' },
-        },
-      },
-    })
-    releasePromptContext?.()
-    await Bun.sleep(10)
-    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
-    mockClient.session.messages = immediateMessages
-
-    // OpenCode can publish the new user message before its busy status update.
-    // That earlier event must also revoke the idle-delivery lease.
-    let releaseUserMessagePromptContext: (() => void) | undefined
-    mockClient.session.messages = mock(
-      () =>
-        new Promise<{ data: unknown[] }>((resolve) => {
-          releaseUserMessagePromptContext = () => {
-            void Promise.resolve(immediateMessages?.()).then((response) =>
-              resolve(response ?? { data: [] }),
-            )
-          }
-          recorded.changed()
-        }),
-    )
-    await plugin.event?.({
-      event: {
-        type: 'session.idle',
-        properties: { sessionID: 'ses_fable_filter' },
-      },
-    })
-    await recorded.until(() => releaseUserMessagePromptContext !== undefined)
-    expect(releaseUserMessagePromptContext).toBeDefined()
-    await plugin.event?.({
-      event: {
-        type: 'message.updated',
-        properties: {
-          info: {
-            id: 'msg_new_user',
-            sessionID: 'ses_fable_filter',
-            role: 'user',
-          },
-        },
-      },
-    })
-    releaseUserMessagePromptContext?.()
-    await Bun.sleep(10)
-    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
-    mockClient.session.messages = immediateMessages
-
-    // A later authoritative idle signal retries the still-queued notice.
-    await plugin.event?.({
-      event: {
-        type: 'session.idle',
-        properties: { sessionID: 'ses_fable_filter' },
-      },
-    })
-    await plugin.event?.({
-      event: {
-        type: 'message.updated',
-        properties: {
-          info: {
-            id: 'msg_new_user',
-            sessionID: 'ses_fable_filter',
-            role: 'user',
-          },
-        },
-      },
-    })
-    await plugin.event?.({
-      event: {
-        type: 'session.updated',
-        properties: { sessionID: 'ses_fable_filter' },
-      },
-    })
-    await recorded.until(
-      () => mockClient.session.promptAsync.mock.calls.length > 0,
-    )
-    expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
-    expect(mockClient.session.promptAsync.mock.calls[0]?.[0]).toEqual(
-      expect.objectContaining({
-        path: { id: 'ses_fable_filter' },
-        body: expect.objectContaining({
-          messageID: expect.any(String),
-          noReply: true,
-          agent: 'Alfonso - CTO',
-          model: {
-            providerID: 'anthropic',
-            modelID: 'claude-fable-5',
-          },
-          variant: 'xhigh',
-          parts: [
-            expect.objectContaining({
-              type: 'text',
-              ignored: true,
-              text: expect.stringContaining('Switched to Opus 4.8'),
-            }),
-          ],
-        }),
-      }),
-    )
-    const switchNotificationRequest = mockClient.session.promptAsync.mock
-      .calls[0]?.[0] as { body: { messageID?: string } } | undefined
-    const switchNotificationMessageId =
-      switchNotificationRequest?.body.messageID
-    expect(switchNotificationMessageId! > latestUserMessageId).toBe(true)
-    expect(switchNotificationMessageId! < latestAssistantMessageId).toBe(true)
-    expect(normalModels).toHaveLength(2)
-
-    for (let turn = 1; turn < 10; turn++) {
-      const response = await result.fetch(MESSAGES_URL, request)
-      await response.text()
-    }
-
-    expect(normalModels).toEqual([
-      'claude-fable-5',
-      ...Array.from({ length: 10 }, () => 'claude-opus-4-8'),
-    ])
-    const restoredState = await waitForSidebarState((state) =>
-      Boolean(
-        state.fableRecoveries?.some(
-          (recovery) =>
-            recovery.sessionId === 'ses_fable_filter' &&
-            recovery.mode === 'fable' &&
-            recovery.remaining === 0,
-        ),
-      ),
-    )
-    expect(
-      restoredState.fableRecoveries?.find(
-        (recovery) => recovery.sessionId === 'ses_fable_filter',
-      )?.mode,
-    ).toBe('fable')
-
-    // Queue the return-to-Fable notice at the tenth completed Opus response.
-    // Delivery must not depend on a source-cache prewarm request.
-    await plugin.event?.({
-      event: {
-        type: 'session.idle',
-        properties: { sessionID: 'ses_fable_filter' },
-      },
-    })
-    await plugin.event?.({
-      event: {
-        type: 'session.updated',
-        properties: { sessionID: 'ses_fable_filter' },
-      },
-    })
-    // The ignored switch notice is itself stored as a user message. Its event
-    // must not revoke the real user's idle-delivery lease for a newer notice.
-    await plugin.event?.({
-      event: {
-        type: 'message.updated',
-        properties: {
-          info: {
-            id: switchNotificationMessageId,
-            sessionID: 'ses_fable_filter',
-            role: 'user',
-          },
-        },
-      },
-    })
-    const restored = await result.fetch(MESSAGES_URL, request)
-    await restored.text()
-    expect(normalModels.at(-1)).toBe('claude-fable-5')
-
-    await recorded.until(
-      () => mockClient.session.promptAsync.mock.calls.length > 1,
-    )
-    expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(2)
-    expect(mockClient.session.promptAsync.mock.calls[1]?.[0]).toEqual(
-      expect.objectContaining({
-        path: { id: 'ses_fable_filter' },
-        body: expect.objectContaining({
-          messageID: expect.any(String),
-          noReply: true,
-          parts: [
-            expect.objectContaining({
-              type: 'text',
-              ignored: true,
-              text: expect.stringContaining('Returning to Fable 5'),
-            }),
-          ],
-        }),
-      }),
-    )
-    expect(normalModels).toHaveLength(12)
-    expect(
-      restoredState.fableRecoveries?.find(
-        (recovery) => recovery.sessionId === 'ses_fable_filter',
-      )?.remaining,
-    ).toBe(0)
-  })
-
-  test('server mode — refusal with no server-side handoff downgrades to Opus (wedge regression)', async () => {
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        claudeCache: { enabled: false },
-        cacheKeep: { enabled: false },
-      }),
-    )
-    const models: string[] = []
-    let firstFable = true
-    const refusalSse = [
-      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_filtered"}}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
-      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-    ].join('')
-    const successSse = [
-      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok"}}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
-      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-    ].join('')
-
-    globalThis.fetch = mock(
-      withNativeAdmission((input: any, init: any) => {
-        const url = extractUrl(input)
-        if (url.includes('/api/oauth/usage')) {
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: 0 },
-                seven_day: { utilization: 0 },
-              }),
-              { status: 200 },
-            ),
-          )
-        }
-        if (!url.includes('/v1/messages')) {
-          return Promise.resolve(new Response('{}', { status: 200 }))
-        }
-        const body = JSON.parse(String(init?.body)) as Record<string, unknown>
-        if (body.max_tokens === 0) {
-          return Promise.resolve(new Response('{}', { status: 200 }))
-        }
-        models.push(String(body.model))
-        if (body.model === 'claude-fable-5' && firstFable) {
-          firstFable = false
-          return Promise.resolve(new Response(refusalSse, { status: 200 }))
-        }
-        return Promise.resolve(new Response(successSse, { status: 200 }))
-      }),
-    ) as unknown as typeof fetch
-
-    const plugin = await getPlugin()
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'sk-ant-oat01-main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100000,
-        }),
-      { models: {} },
-    )
-    const request = {
-      method: 'POST',
-      headers: { 'x-session-affinity': 'ses_wedge' },
-      body: JSON.stringify({
-        model: 'claude-fable-5',
-        max_tokens: 128_000,
-        stream: true,
-        system: [{ type: 'text', text: 'stable system' }],
-        messages: [{ role: 'user', content: 'hello' }],
-      }),
-    }
-
-    // First request hits the refusal — onContentFilter fires, stream rejects.
-    // The second request must carry the downgraded Opus model.
-    const filtered = await result.fetch(MESSAGES_URL, request)
-    await expect(filtered.text()).rejects.toThrow()
-    const second = await result.fetch(MESSAGES_URL, request)
-    await second.text()
-
-    expect(models).toEqual(['claude-fable-5', 'claude-opus-4-8'])
-  })
-
-  test('server mode — absorbed server-side fallback does NOT activate client-side downgrade', async () => {
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        claudeCache: { enabled: false },
-        cacheKeep: { enabled: false },
-      }),
-    )
-    const models: string[] = []
-    const frame = (event: string, data: unknown) =>
-      `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
-    const fallbackSse = [
-      frame('message_start', {
-        type: 'message_start',
-        message: { id: 'msg_fallback', model: 'claude-opus-5' },
-      }),
-      frame('content_block_start', {
-        type: 'content_block_start',
-        index: 0,
-        content_block: {
-          type: 'fallback',
-          from: { model: 'claude-fable-5' },
-          to: { model: 'claude-opus-5' },
-        },
-      }),
-      frame('content_block_stop', { type: 'content_block_stop', index: 0 }),
-      frame('content_block_start', {
-        type: 'content_block_start',
-        index: 1,
-        content_block: { type: 'text', text: '' },
-      }),
-      frame('content_block_delta', {
-        type: 'content_block_delta',
-        index: 1,
-        delta: { type: 'text_delta', text: 'safe answer' },
-      }),
-      frame('content_block_stop', { type: 'content_block_stop', index: 1 }),
-      frame('message_delta', {
-        type: 'message_delta',
-        delta: { stop_reason: 'end_turn' },
-        usage: { output_tokens: 2 },
-      }),
-      frame('message_stop', { type: 'message_stop' }),
-    ].join('')
-
-    globalThis.fetch = mock(
-      withNativeAdmission((input: any, init: any) => {
-        const url = extractUrl(input)
-        if (url.includes('/api/oauth/usage')) {
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: 0 },
-                seven_day: { utilization: 0 },
-              }),
-              { status: 200 },
-            ),
-          )
-        }
-        if (!url.includes('/v1/messages')) {
-          return Promise.resolve(new Response('{}', { status: 200 }))
-        }
-        const body = JSON.parse(String(init?.body)) as Record<string, unknown>
-        if (body.max_tokens === 0) {
-          return Promise.resolve(new Response('{}', { status: 200 }))
-        }
-        models.push(String(body.model))
-        return Promise.resolve(new Response(fallbackSse, { status: 200 }))
-      }),
-    ) as unknown as typeof fetch
-
-    const plugin = await getPlugin()
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'sk-ant-oat01-main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100000,
-        }),
-      { models: {} },
-    )
-    const request = {
-      method: 'POST',
-      headers: { 'x-session-affinity': 'ses_no_double' },
-      body: JSON.stringify({
-        model: 'claude-fable-5',
-        max_tokens: 128_000,
-        stream: true,
-        system: [{ type: 'text', text: 'stable system' }],
-        messages: [{ role: 'user', content: 'hello' }],
-      }),
-    }
-
-    const first = await result.fetch(MESSAGES_URL, request)
-    await first.text()
-    const second = await result.fetch(MESSAGES_URL, request)
-    await second.text()
-
-    // Both requests stayed on Fable — no client-side downgrade triggered.
-    expect(models).toEqual(['claude-fable-5', 'claude-fable-5'])
-  })
-
-  test('server mode — downgraded Opus request does not carry server-side fallback opt-in', async () => {
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        claudeCache: { enabled: false },
-        cacheKeep: { enabled: false },
-      }),
-    )
-    const models: string[] = []
-    const bodies: Array<Record<string, unknown>> = []
-    let firstFable = true
-    const refusalSse = [
-      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_filtered"}}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
-      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-    ].join('')
-    const successSse = [
-      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok"}}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
-      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-    ].join('')
-
-    globalThis.fetch = mock(
-      withNativeAdmission((input: any, init: any) => {
-        const url = extractUrl(input)
-        if (url.includes('/api/oauth/usage')) {
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: 0 },
-                seven_day: { utilization: 0 },
-              }),
-              { status: 200 },
-            ),
-          )
-        }
-        if (!url.includes('/v1/messages')) {
-          return Promise.resolve(new Response('{}', { status: 200 }))
-        }
-        const body = JSON.parse(String(init?.body)) as Record<string, unknown>
-        if (body.max_tokens === 0) {
-          return Promise.resolve(new Response('{}', { status: 200 }))
-        }
-        models.push(String(body.model))
-        bodies.push(body)
-        if (body.model === 'claude-fable-5' && firstFable) {
-          firstFable = false
-          return Promise.resolve(new Response(refusalSse, { status: 200 }))
-        }
-        return Promise.resolve(new Response(successSse, { status: 200 }))
-      }),
-    ) as unknown as typeof fetch
-
-    const plugin = await getPlugin()
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'sk-ant-oat01-main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100000,
-        }),
-      { models: {} },
-    )
-    const request = {
-      method: 'POST',
-      headers: { 'x-session-affinity': 'ses_no_optin' },
-      body: JSON.stringify({
-        model: 'claude-fable-5',
-        max_tokens: 128_000,
-        stream: true,
-        system: [{ type: 'text', text: 'stable system' }],
-        messages: [{ role: 'user', content: 'hello' }],
-      }),
-    }
-
-    // First request hits the refusal. onContentFilter fires
-    // causing the stream to reject with a ContentFilterError.
-    const filtered = await result.fetch(MESSAGES_URL, request)
-    await expect(filtered.text()).rejects.toThrow()
-    const opus = await result.fetch(MESSAGES_URL, request)
-    await opus.text()
-
-    expect(models).toEqual(['claude-fable-5', 'claude-opus-4-8'])
-    // The Opus request must NOT carry the server-side fallback opt-in.
-    expect(bodies[1]?.fallbacks).toBeUndefined()
-  })
-
-  test('uses the sidebar instead of promptAsync when the matching TUI is connected', async () => {
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        claudeCache: { enabled: true, mode: 'hybrid' },
-      }),
-    )
-    resetNotificationsForTest()
-    drainNotifications(0, 'ses_tui_fable')
-    const refusal =
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"}}\n\n'
-
-    globalThis.fetch = mock(
-      withNativeAdmission((input: any) => {
-        if (extractUrl(input).includes('/api/oauth/usage')) {
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: 0 },
-                seven_day: { utilization: 0 },
-              }),
-              { status: 200 },
-            ),
-          )
-        }
-        return Promise.resolve(new Response(refusal, { status: 200 }))
-      }),
-    ) as unknown as typeof fetch
-
-    const mockClient = createMockClient()
-    const plugin = await getPlugin(mockClient)
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'sk-ant-oat01-main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100000,
-        }),
-      { models: {} },
-    )
-    const response = await result.fetch(MESSAGES_URL, {
-      method: 'POST',
-      headers: { 'x-session-affinity': 'ses_tui_fable' },
-      body: JSON.stringify({
-        model: 'claude-fable-5',
-        messages: [{ role: 'user', content: 'hello' }],
-      }),
-    })
-    try {
-      await response.text()
-    } catch {}
-    await plugin.event?.({
-      event: {
-        type: 'session.status',
-        properties: {
-          sessionID: 'ses_tui_fable',
-          status: { type: 'idle' },
-        },
-      },
-    })
-
-    await Bun.sleep(10)
-    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
-    const state = await waitForSidebarState((candidate) =>
-      Boolean(
-        candidate.fableRecoveries?.some(
-          (recovery) =>
-            recovery.sessionId === 'ses_tui_fable' &&
-            recovery.mode === 'opus' &&
-            recovery.remaining === 10,
-        ),
-      ),
-    )
-    expect(state.fableRecoveries).toHaveLength(1)
-  })
-
-  test('migrates recovery to an available OAuth account without warming the source', async () => {
-    const now = Date.now()
-    await useTempAccountFile(
-      bindPoolAccounts(
+  test.each(['server', 'off', 'client'] as const)(
+    '%s mode passes an unabsorbed refusal through without an OpenCode recovery round',
+    async (mode) => {
+      await useTempAccountFile(
         createFallbackStorage({
-          claudeCache: { enabled: true, mode: 'hybrid' },
+          accounts: [],
+          claudeCache: { enabled: false },
           cacheKeep: { enabled: false },
-          quota: {
-            enabled: true,
-            checkIntervalMinutes: 5,
-            minimumRemaining: { five_hour: 10, seven_day: 20 },
-            failClosedOnUnknownQuota: true,
-            mainQuota: {
-              five_hour: {
-                usedPercent: 0,
-                remainingPercent: 100,
-                checkedAt: now,
-              },
-              seven_day: {
-                usedPercent: 0,
-                remainingPercent: 100,
-                checkedAt: now,
-              },
-              checkedAt: now,
-              scoped: [
-                {
-                  id: 'claude-weekly-scoped-fable',
-                  title: 'Fable only',
-                  modelName: 'Fable',
-                  usedPercent: 100,
-                  remainingPercent: 0,
-                  checkedAt: now,
-                },
-              ],
-            },
-            mainQuotaCheckedAt: now,
-            mainQuotaToken: tokenFingerprint('sk-ant-oat01-main-access'),
-          } as AccountStorage['quota'],
-          accounts: [
-            {
-              id: 'fable-fallback',
-              type: 'oauth',
-              access: 'sk-ant-oat01-fallback-access',
-              refresh: 'fallback-refresh',
-              expires: now + 5 * 60 * 60 * 1000,
-              quota: {
-                five_hour: {
-                  usedPercent: 0,
-                  remainingPercent: 100,
-                  checkedAt: now,
-                },
-                seven_day: {
-                  usedPercent: 0,
-                  remainingPercent: 100,
-                  checkedAt: now,
-                },
-                scoped: [
-                  {
-                    id: 'claude-weekly-scoped-fable',
-                    title: 'Fable only',
-                    modelName: 'Fable',
-                    usedPercent: 25,
-                    remainingPercent: 75,
-                    checkedAt: now,
-                  },
-                ],
-              },
-            },
-          ],
         }),
-      ),
-    )
-    const calls: Array<{ model: string; auth: string; warm: boolean }> = []
-    let firstFable = true
-    const success =
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n'
-    const refusal =
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"}}\n\n'
+      )
+      await setUserRefusalFallbackMode(testContext, mode)
+      const bodies: Record<string, unknown>[] = []
+      const models: string[] = []
+      let firstFable = true
+      const refusalSse = [
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_filtered"}}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ].join('')
+      const successSse = [
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok"}}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ].join('')
 
-    globalThis.fetch = mock(
-      withNativeAdmission(
-        (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      globalThis.fetch = mock(
+        withNativeAdmission((input: any, init: any) => {
           const url = extractUrl(input)
           if (url.includes('/api/oauth/usage')) {
             return Promise.resolve(
@@ -1523,67 +389,954 @@ describe('auth.loader', () => {
               ),
             )
           }
-          const body = JSON.parse(String(init?.body)) as {
-            model: string
-            max_tokens?: number
+          if (!url.includes('/v1/messages')) {
+            return Promise.resolve(new Response('{}', { status: 200 }))
           }
-          const auth = new Headers(init?.headers).get('authorization') ?? ''
-          calls.push({
-            model: body.model,
-            auth,
-            warm: body.max_tokens === 0,
-          })
+          const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          if (body.max_tokens === 0) {
+            return Promise.resolve(new Response('{}', { status: 200 }))
+          }
+          bodies.push(body)
+          models.push(String(body.model))
           if (body.model === 'claude-fable-5' && firstFable) {
             firstFable = false
-            return Promise.resolve(new Response(refusal, { status: 200 }))
+            return Promise.resolve(new Response(refusalSse, { status: 200 }))
           }
-          return Promise.resolve(new Response(success, { status: 200 }))
+          return Promise.resolve(new Response(successSse, { status: 200 }))
+        }),
+      ) as unknown as typeof fetch
+
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'sk-ant-oat01-main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100000,
+          }),
+        { models: {} },
+      )
+      const request = {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses_wedge' },
+        body: JSON.stringify({
+          model: 'claude-fable-5',
+          max_tokens: 128_000,
+          stream: true,
+          system: [{ type: 'text', text: 'stable system' }],
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      }
+
+      const filtered = await result.fetch(MESSAGES_URL, request)
+      await expect(filtered.text()).resolves.toContain(
+        '"stop_reason":"refusal"',
+      )
+      expect(models).toEqual(['claude-fable-5'])
+      const second = await result.fetch(MESSAGES_URL, request)
+      await second.text()
+      expect(models).toEqual(['claude-fable-5', 'claude-fable-5'])
+      expect(bodies.map((body) => body.fallbacks)).toEqual(
+        mode === 'server' ? ['default', 'default'] : [undefined, undefined],
+      )
+    },
+  )
+
+  test('OpenCode 1 saves pending recovery thinking before plugin disposal returns', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ accounts: [], quota: { enabled: false } }),
+    )
+    await setUserRefusalFallbackMode(testContext, 'client')
+    globalThis.fetch = mock(
+      withNativeAdmission(
+        (input: string | URL | Request, init?: RequestInit) =>
+          extractUrl(input).includes('/v1/messages')
+            ? refusalThinkingReply(JSON.parse(String(init?.body)).model)
+            : Response.json({}),
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const host = await plugin.auth.loader(
+      () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
+      { models: {} },
+    )
+    const sessionID = 'ses_oc1_thinking_shutdown'
+    const joined = await host.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': sessionID },
+      body: JSON.stringify({
+        model: SOURCE_MODEL,
+        max_tokens: 256,
+        stream: true,
+        messages: [{ role: 'user', content: 'Hello' }],
+      }),
+    })
+    expect(await joined.text()).toContain(TARGET_SIGNATURE)
+    await plugin.dispose()
+    testContext.livePlugins.delete(plugin)
+
+    const restarted = new RecoveryThinkingStore()
+    await restarted.loadSession(sessionID)
+    expect(restarted.peek(sessionID, RECOVERY_FAMILY)?.has(TARGET_DIGEST)).toBe(
+      true,
+    )
+  })
+
+  test('client retry 429 ends the host stream with the original refusal after two sends', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ accounts: [], quota: { enabled: false } }),
+    )
+    await setUserRefusalFallbackMode(testContext, 'client')
+    const credit = 'credit_only_for_this_retry_987'
+    const sends: Array<{ body: string; headers: Headers }> = []
+    const refusal = [
+      {
+        type: 'message_start',
+        message: {
+          id: 'msg_source',
+          model: 'claude-fable-5-2',
+          usage: { input_tokens: 12 },
+        },
+      },
+      {
+        type: 'message_delta',
+        delta: {
+          stop_reason: 'refusal',
+          stop_details: {
+            type: 'refusal',
+            category: 'cyber',
+            fallback_credit_token: credit,
+          },
+        },
+        usage: { output_tokens: 1 },
+      },
+      { type: 'message_stop' },
+    ]
+      .map(
+        (event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+      )
+      .join('')
+    globalThis.fetch = mock(
+      withNativeAdmission(
+        (input: string | URL | Request, init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url.includes('/api/oauth/usage'))
+            return Response.json({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            })
+          if (!url.includes('/v1/messages')) return Response.json({})
+          const body = String(init?.body)
+          if (JSON.parse(body).max_tokens === 0) return Response.json({})
+          sends.push({ body, headers: new Headers(init?.headers) })
+          return sends.length === 1
+            ? new Response(refusal, {
+                headers: {
+                  'content-type': 'text/event-stream',
+                  'anthropic-ratelimit-unified-5h-utilization': '0',
+                  'anthropic-ratelimit-unified-7d-utilization': '0',
+                },
+              })
+            : Response.json(
+                {
+                  type: 'error',
+                  error: {
+                    type: 'rate_limit_error',
+                    message: `Rejected ${credit}`,
+                  },
+                },
+                { status: 429 },
+              )
         },
       ),
     ) as unknown as typeof fetch
 
     const plugin = await getPlugin()
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'sk-ant-oat01-main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100000,
-        }),
+    const host = await plugin.auth.loader(
+      () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
       { models: {} },
     )
-    const request = {
+    const response: Response = await host.fetch(MESSAGES_URL, {
       method: 'POST',
-      headers: { 'x-session-affinity': 'ses_account_bound_fable' },
+      headers: { 'x-session-affinity': 'ses_client_retry_429' },
       body: JSON.stringify({
-        model: 'claude-fable-5',
-        max_tokens: 100,
-        system: [{ type: 'text', text: 'stable system' }],
+        model: 'claude-fable-5-2',
+        max_tokens: 128_000,
+        stream: true,
         messages: [{ role: 'user', content: 'hello' }],
       }),
+    })
+    expect(response.status).toBe(200)
+    const text = await response.text()
+    expect(text.match(/"stop_reason":"refusal"/g)).toHaveLength(1)
+    expect(text.match(/"type":"message_stop"/g)).toHaveLength(1)
+    expect(text).not.toContain('event: error')
+    expect(text).not.toContain(credit)
+    expect(sends).toHaveLength(2)
+    const [source, retry] = sends
+    expect(JSON.parse(source!.body)).not.toHaveProperty('fallback_credit_token')
+    expect(JSON.parse(retry!.body)).toMatchObject({
+      model: 'claude-opus-4-8',
+      fallback_credit_token: credit,
+    })
+    expect(await hasValidRequestBodySignature(retry!.body)).toBe(true)
+    const sourceHeaders = new Headers(source!.headers)
+    sourceHeaders.delete('authorization')
+    const retryHeaders = new Headers(retry!.headers)
+    retryHeaders.delete('authorization')
+    expect([...retryHeaders]).toEqual([...sourceHeaders])
+  })
+
+  test('a newer primary makes the older refusal stand without a retry', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    await setUserRefusalFallbackMode(testContext, 'client')
+    const older =
+      Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>()
+    const encoder = new TextEncoder()
+    const frame = (type: string, fields = {}) =>
+      encoder.encode(`data: ${JSON.stringify({ type, ...fields })}\n\n`)
+    const sends: string[] = []
+    const headers = {
+      'content-type': 'text/event-stream',
+      'anthropic-ratelimit-unified-5h-utilization': '0',
+      'anthropic-ratelimit-unified-7d-utilization': '0',
+    }
+    globalThis.fetch = mock(
+      withNativeAdmission(
+        (input: string | URL | Request, init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url.includes('/api/oauth/usage'))
+            return Response.json({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            })
+          if (!url.includes('/v1/messages')) return Response.json({})
+          const { model, max_tokens } = JSON.parse(String(init?.body))
+          if (max_tokens === 0) return Response.json({})
+          sends.push(model)
+          const deferred = sends.length === 1
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  frame('message_start', {
+                    message: {
+                      id: deferred ? 'msg_older' : 'msg_newer',
+                      model,
+                      usage: { input_tokens: 3 },
+                    },
+                  }),
+                )
+                if (deferred) older.resolve(controller)
+                else {
+                  controller.enqueue(
+                    frame('message_delta', {
+                      delta: { stop_reason: 'end_turn' },
+                    }),
+                  )
+                  controller.enqueue(frame('message_stop'))
+                  controller.close()
+                }
+              },
+            }),
+            { headers },
+          )
+        },
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const host = await plugin.auth.loader(
+      () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
+      { models: {} },
+    )
+    const send = (text: string): Promise<Response> =>
+      host.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses_client_stale' },
+        body: JSON.stringify({
+          model: 'claude-fable-5-2',
+          max_tokens: 100,
+          stream: true,
+          messages: [{ role: 'user', content: text }],
+        }),
+      })
+    const previous = await send('older')
+    const controller = await older.promise
+    let newer: string
+    try {
+      newer = await (await send('newer')).text()
+    } finally {
+      controller.enqueue(
+        frame('message_delta', {
+          delta: {
+            stop_reason: 'refusal',
+            stop_details: {
+              type: 'refusal',
+              category: 'cyber',
+              fallback_credit_token: 'older_refusal_credit_951',
+            },
+          },
+        }),
+      )
+      controller.enqueue(frame('message_stop'))
+      controller.close()
+    }
+    expect(newer).toContain('"stop_reason":"end_turn"')
+    expect(await previous.text()).toContain('"stop_reason":"refusal"')
+    expect(sends).toEqual(['claude-fable-5-2', 'claude-fable-5-2'])
+  })
+
+  test.each([
+    'relay denied',
+    'relay allowed',
+    'late mandatory relay',
+    'late killswitch',
+    'killswitch changes during relay read',
+    'mandatory relay enabled during account read',
+  ] as const)('OC1 refusal retry: %s', async (scenario) => {
+    const relay = 'https://relay.example.test/'
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: false },
+      }),
+    )
+    const sent: Array<[string, string]> = []
+    globalThis.fetch = mock(
+      withNativeAdmission(
+        (input: string | URL | Request, init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url !== relay && !url.includes('/v1/messages'))
+            return Response.json({})
+          const wire = JSON.parse(String(init?.body))
+          const body = url === relay ? JSON.parse(wire.body) : wire
+          sent.push([url.split('?')[0]!, body.model])
+          return refusalThinkingReply(body.model)
+        },
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const runtime = getPluginTestHandles(plugin).nativeAccounts
+    const read = runtime.read.bind(runtime)
+    let retryReads = 0
+    let armed = false
+    let killswitch = false
+    let relayRead = false
+    let relayBecameMandatory = false
+    const readSpy = spyOn(runtime, 'read').mockImplementation(
+      async (...args) => {
+        if (
+          scenario === 'mandatory relay enabled during account read' &&
+          relayRead &&
+          args[0] === 'claude-opus-5' &&
+          !relayBecameMandatory
+        ) {
+          relayBecameMandatory = true
+          await updatePoolRelay(testContext, {
+            enabled: true,
+            url: relay,
+            token: 'fixture-relay-token',
+            transport: 'http',
+            fallbackToDirect: false,
+          })
+        }
+        const snapshot = await read(...args)
+        if (!killswitch) return snapshot
+        const checkedAt = Date.now()
+        return {
+          ...snapshot,
+          policyStorage: {
+            ...snapshot.policyStorage,
+            killswitch: { enabled: true, main: { five_hour: 20 } },
+          },
+          accounts: snapshot.accounts.map((account) =>
+            account.id === 'main'
+              ? {
+                  ...account,
+                  quota: {
+                    ...account.quota,
+                    checkedAt,
+                    five_hour: {
+                      checkedAt,
+                      usedPercent: 90,
+                      remainingPercent: 10,
+                    },
+                  },
+                }
+              : account,
+          ),
+        }
+      },
+    )
+    getBodyLifetime(testContext).deferCleanup(() => readSpy.mockRestore())
+    if (
+      scenario === 'killswitch changes during relay read' ||
+      scenario === 'mandatory relay enabled during account read'
+    ) {
+      const getRelayConfig = runtime.getRelayConfig.bind(runtime)
+      const relaySpy = spyOn(runtime, 'getRelayConfig').mockImplementation(
+        async () => {
+          const config = await getRelayConfig()
+          if (armed) {
+            relayRead = true
+            if (scenario === 'killswitch changes during relay read')
+              killswitch = true
+          }
+          return config
+        },
+      )
+      getBodyLifetime(testContext).deferCleanup(() => relaySpy.mockRestore())
+    }
+    const host = await plugin.auth.loader(
+      async () => {
+        if (scenario === 'late killswitch' && armed && ++retryReads === 2)
+          killswitch = true
+        return { type: 'oauth', ...syntheticMainHostAuth() }
+      },
+      { models: {} },
+    )
+    const relayed = scenario.startsWith('relay')
+    if (relayed)
+      await updatePoolRelay(testContext, {
+        enabled: true,
+        url: relay,
+        token: 'fixture-relay-token',
+        transport: 'http',
+        fallbackToDirect: scenario === 'relay allowed',
+      })
+    const response = await host.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: {
+        'x-session-affinity': `ses_refusal_admission_${scenario.replaceAll(' ', '_')}`,
+      },
+      body: JSON.stringify({
+        model: SOURCE_MODEL,
+        stream: true,
+        max_tokens: 256,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+    expect(sent[0]).toEqual([relayed ? relay : MESSAGES_URL, SOURCE_MODEL])
+    if (scenario === 'late mandatory relay')
+      await updatePoolRelay(testContext, {
+        enabled: true,
+        url: relay,
+        token: 'fixture-relay-token',
+        transport: 'http',
+        fallbackToDirect: false,
+      })
+    armed = true
+    const text = await response.text()
+    if (scenario.includes('killswitch')) expect(killswitch).toBe(true)
+    if (scenario === 'mandatory relay enabled during account read')
+      expect(relayBecameMandatory).toBe(true)
+    const permitted = scenario === 'relay allowed'
+    expect(sent).toEqual([
+      [relayed ? relay : MESSAGES_URL, SOURCE_MODEL],
+      ...(permitted
+        ? [[MESSAGES_URL, 'claude-opus-5'] as [string, string]]
+        : []),
+    ])
+    expect(text).toContain(
+      permitted ? TARGET_SIGNATURE : '"stop_reason":"refusal"',
+    )
+  })
+
+  test.each(['killswitch', 'model scope'] as const)(
+    'OC1 final read blocks the target-400 source resend on a late %s change',
+    async (policy) => {
+      await useTempAccountFile(
+        createFallbackStorage({ accounts: [], quota: { enabled: false } }),
+      )
+      const sent: string[] = []
+      let rejectedTarget = false
+      globalThis.fetch = mock(
+        withNativeAdmission(
+          (input: string | URL | Request, init?: RequestInit) => {
+            if (!extractUrl(input).includes('/v1/messages'))
+              return Response.json({})
+            const { model } = JSON.parse(String(init?.body))
+            sent.push(model)
+            if (sent.length === 3) {
+              expect(model).toBe('claude-opus-5')
+              rejectedTarget = true
+              return Response.json(
+                { error: { message: 'rejected target' } },
+                { status: 400 },
+              )
+            }
+            return refusalThinkingReply(model)
+          },
+        ),
+      ) as unknown as typeof fetch
+      const plugin = await getPlugin()
+      const runtime = getPluginTestHandles(plugin).nativeAccounts
+      const read = runtime.read.bind(runtime)
+      let finalReads = 0
+      const readSpy = spyOn(runtime, 'read').mockImplementation(
+        async (...args) => {
+          const snapshot = await read(...args)
+          if (!rejectedTarget || args[0] !== SOURCE_MODEL) return snapshot
+          finalReads++
+          const checkedAt = Date.now()
+          return {
+            ...snapshot,
+            policyStorage: {
+              ...snapshot.policyStorage,
+              killswitch: {
+                enabled: policy === 'killswitch',
+                main: { five_hour: 20 },
+              },
+            },
+            accounts: snapshot.accounts.map((account) => ({
+              ...account,
+              quota: {
+                ...account.quota,
+                checkedAt,
+                five_hour: { checkedAt, usedPercent: 90, remainingPercent: 10 },
+                ...(policy === 'model scope' && {
+                  scoped: [
+                    {
+                      id: 'fable',
+                      title: 'Fable',
+                      modelId: SOURCE_MODEL,
+                      modelName: SOURCE_MODEL,
+                      usedPercent: 100,
+                      remainingPercent: 0,
+                      checkedAt,
+                    },
+                  ],
+                }),
+              },
+            })),
+          }
+        },
+      )
+      getBodyLifetime(testContext).deferCleanup(() => readSpy.mockRestore())
+      const host = await plugin.auth.loader(
+        async () => ({ type: 'oauth', ...syntheticMainHostAuth() }),
+        { models: {} },
+      )
+      const first = [{ role: 'user', content: 'hello' }]
+      const send = (messages: Array<{ role: string; content: unknown }>) =>
+        host.fetch(MESSAGES_URL, {
+          method: 'POST',
+          headers: {
+            'x-session-affinity': `ses_refusal_resend_final_${policy.replace(' ', '_')}`,
+          },
+          body: JSON.stringify({
+            model: SOURCE_MODEL,
+            stream: true,
+            max_tokens: 256,
+            messages,
+          }),
+        })
+      expect(await (await send(first)).text()).toContain(TARGET_SIGNATURE)
+      const response = await send([
+        ...first,
+        {
+          role: 'assistant',
+          content: ['synthetic-source-signature', TARGET_SIGNATURE].map(
+            (signature) => ({
+              type: 'thinking',
+              thinking: 'synthetic',
+              signature,
+            }),
+          ),
+        },
+        { role: 'user', content: 'again' },
+      ])
+      expect(finalReads).toBe(1)
+      expect(sent).toEqual([SOURCE_MODEL, 'claude-opus-5', 'claude-opus-5'])
+      expect(response.status).toBe(400)
+      expect(await response.text()).toContain('rejected target')
+    },
+  )
+
+  const exerciseRoundWarm = async (
+    restart: boolean,
+    loseResend = false,
+    idle = false,
+    replaceAccount = false,
+  ) => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: false },
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: true, always: true },
+        dump: { enabled: true },
+      }),
+    )
+    const dumpDir = join(testContext.tempConfigDir!, 'round-dumps')
+    const previousDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+    getBodyLifetime(testContext).deferCleanup(() => {
+      if (previousDumpDir === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      else process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = previousDumpDir
+    })
+    const source = 'claude-fable-5-2'
+    const target = 'claude-opus-5'
+    const credit = 'round-test-credit-never-replayed'
+    const sends: Array<{
+      text: string
+      body: Record<string, unknown>
+      headers: Headers
+    }> = []
+    let now = Date.now()
+    const originalExpiry = now + 60 * 60_000
+    let refuse = false
+    let rejectTarget = false
+    let rejectIndependent = false
+    const routingKey = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const previousRouting = globals[routingKey]
+    const reports: Record<string, unknown>[] = []
+    if (loseResend || idle) {
+      globals[routingKey] = () => ({
+        report: (row: Record<string, unknown>) => {
+          reports.push(row)
+        },
+      })
+      getBodyLifetime(testContext).deferCleanup(() => {
+        if (previousRouting === undefined) delete globals[routingKey]
+        else globals[routingKey] = previousRouting
+      })
+    }
+    globalThis.fetch = mock(
+      withNativeAdmission(
+        (input: string | URL | Request, init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (
+            url.includes('/api/claude_cli/bootstrap') &&
+            new Headers(init?.headers).get('authorization') ===
+              'Bearer sk-ant-oat01-round-replacement'
+          )
+            return Response.json({
+              oauth_account: {
+                account_uuid: '00000000-0000-4000-8000-000000000099',
+              },
+            })
+          if (!url.includes('/v1/messages')) return Response.json({})
+          const text = String(init?.body)
+          const body = JSON.parse(text)
+          sends.push({ text, body, headers: new Headers(init?.headers) })
+          const usage = { input_tokens: 12, cache_read_input_tokens: 300 }
+          if (body.max_tokens === 0)
+            return Response.json({
+              id: 'msg_warm',
+              model: body.model,
+              usage,
+              content: [],
+              stop_reason: 'end_turn',
+            })
+          if (body.model === target && rejectTarget)
+            return Response.json(
+              { error: { message: 'rejected target' } },
+              { status: 400 },
+            )
+          if (rejectIndependent)
+            return Response.json(
+              { error: { message: 'unaccepted probe' } },
+              { status: 400 },
+            )
+          if (rejectTarget && loseResend && body.model === source)
+            throw new Error('source socket closed before headers')
+          const refused = body.model === source && refuse
+          if (refused) refuse = false
+          const events = [
+            {
+              type: 'message_start',
+              message: { id: `msg_${sends.length}`, model: body.model, usage },
+            },
+            ...(!refused
+              ? [
+                  {
+                    type: 'content_block_start',
+                    index: 0,
+                    content_block: { type: 'text', text: 'answer' },
+                  },
+                  { type: 'content_block_stop', index: 0 },
+                ]
+              : []),
+            {
+              type: 'message_delta',
+              delta: refused
+                ? {
+                    stop_reason: 'refusal',
+                    stop_details: {
+                      type: 'refusal',
+                      category: 'bio',
+                      fallback_credit_token: credit,
+                    },
+                  }
+                : { stop_reason: 'end_turn' },
+              usage: { output_tokens: 2 },
+            },
+            { type: 'message_stop' },
+          ]
+          return new Response(
+            events
+              .map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`)
+              .join(''),
+            {
+              headers: {
+                'content-type': 'text/event-stream',
+                'anthropic-ratelimit-unified-5h-utilization': '0',
+                'anthropic-ratelimit-unified-7d-utilization': '0',
+              },
+            },
+          )
+        },
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin(undefined, undefined, { now: () => now })
+    const independent = await getPlugin()
+    const auth = () =>
+      Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() })
+    const host = await plugin.auth.loader(auth, { models: {} })
+    const other = await independent.auth.loader(auth, { models: {} })
+    const sessionId = 'ses_round_source_warm'
+    const first = [{ role: 'user', content: 'the clean cached prefix' }]
+    const append = (history: typeof first, content: string) => [
+      ...history,
+      { role: 'assistant', content: 'answer' },
+      { role: 'user', content },
+    ]
+    const request = async (which: typeof host, messages: typeof first) =>
+      (
+        await which.fetch(MESSAGES_URL, {
+          method: 'POST',
+          headers: { 'x-session-affinity': sessionId },
+          body: JSON.stringify({
+            model: source,
+            stream: true,
+            max_tokens: 256,
+            messages,
+          }),
+        })
+      ).text() as Promise<string>
+    await request(host, first)
+    const second = append(first, 'the refused turn, not kept')
+    refuse = true
+    expect(await request(host, second)).not.toContain('"stop_reason":"refusal"')
+    expect(sends.slice(0, 3).map(({ body }) => body.model)).toEqual([
+      source,
+      source,
+      target,
+    ])
+    const third = append(second, 'the next primary')
+    if (!restart && !idle && !replaceAccount) {
+      // Probe the other instance's routing without accepting a newer source
+      // prefix and transferring the shared session's warm ownership to it.
+      rejectIndependent = true
+      await request(other, third)
+      rejectIndependent = false
+      expect(sends.at(-1)?.body.model).toBe(source)
+    }
+    await request(host, third)
+    const round = sends.at(-1)!
+    expect(round.body.model).toBe(target)
+    expect(round.body.thread).toEqual({ type: 'create' })
+    const stableHeaders = (headers: Headers) =>
+      [...headers].filter(([name]) => name !== 'x-client-request-id')
+    expect(stableHeaders(round.headers)).toEqual(
+      stableHeaders(sends[1]!.headers),
+    )
+    expect(round.text).not.toContain(credit)
+
+    const keeper = getPluginTestHandles(plugin).cacheKeepManager
+    await Promise.resolve()
+    const kept = keeper.trackedRequest(sessionId)
+    expect(kept?.bodyText).toContain('the clean cached prefix')
+    expect(kept?.bodyText).not.toContain('the refused turn')
+    now += 55 * 60_000
+    await keeper.tick()
+    const warm = sends.find(
+      ({ body }) => body.max_tokens === 0 && body.model === source,
+    )
+    expect(warm?.body).toMatchObject({ max_tokens: 0 })
+    expect(warm?.body).not.toHaveProperty('thread')
+    expect(warm?.body).not.toHaveProperty('fallbacks')
+    expect(warm?.text).not.toContain(credit)
+    expect(sends.filter(({ body }) => body.max_tokens === 0)).toEqual([warm!])
+
+    if (replaceAccount) {
+      const before = sends.length
+      await replacePoolMainLogin(
+        testContext,
+        {
+          access: 'sk-ant-oat01-round-replacement',
+          refresh: 'round-replacement-refresh',
+          expires: now + 8 * 60 * 60_000,
+        },
+        {
+          sameAccount: false,
+          accountIdentity: '00000000-0000-4000-8000-000000000099',
+        },
+      )
+      now += 55 * 60_000
+      await keeper.tick()
+      expect(sends).toHaveLength(before)
+      expect(keeper.trackedRequest(sessionId)).toBeUndefined()
+      return
     }
 
-    const filtered = await result.fetch(MESSAGES_URL, request)
-    const filteredReader = filtered.body!.getReader()
-    try {
-      while (!(await filteredReader.read()).done) {}
-    } catch {}
+    if (idle) {
+      const state = keeper.trackedPolicyState(sessionId)!
+      expect(state.warmsSinceLastRealRequest).toBe(1)
+      now += 60_000
+      const lastStep = append(third, 'shorter than a round step lifetime')
+      await request(host, lastStep)
+      expect(sends.at(-1)?.body.model).toBe(target)
+      expect(keeper.trackedRequest(sessionId)?.bodyText).toBe(kept?.bodyText)
+      expect(keeper.trackedPolicyState(sessionId)).toMatchObject({
+        warmsSinceLastRealRequest: 0,
+        warmCostSoFar: 0,
+        lastRealRequestAt: state.lastRealRequestAt,
+      })
+      await Bun.sleep(0)
+      expect(reports).toContainEqual(
+        expect.objectContaining({ kind: 'cache_touch', source: 'warm' }),
+      )
+      expect(
+        reports
+          .filter((row) => row.kind === 'billing' && row.model === target)
+          .at(-1),
+      ).toMatchObject({
+        cache: { warming: { on: true } },
+      })
+      const acceptedAt = now
+      now += 54 * 60_000
+      await keeper.tick()
+      expect(
+        sends
+          .filter(({ body }) => body.max_tokens === 0)
+          .map(({ body }) => body.model),
+      ).toEqual([source, source])
+      now = acceptedAt + 60 * 60_000 + 1
+      const returned = append(lastStep, 'longer than a round step lifetime')
+      await request(host, returned)
+      expect(sends.at(-1)?.body.model).toBe(source)
+      const wire = JSON.parse(sends.at(-1)!.text)
+      expect(wire.messages[0].content).toContainEqual(
+        expect.objectContaining({
+          text: 'the clean cached prefix',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        }),
+      )
+      const observed = spyOn(logger, 'info')
+      try {
+        refuse = true
+        await request(host, append(returned, 'the next refusal'))
+        expect(observed.mock.calls).toContainEqual([
+          'refusal-fallback',
+          'round_started',
+          expect.objectContaining({ stepsLeft: 19 }),
+        ])
+      } finally {
+        observed.mockRestore()
+      }
+      return
+    }
 
-    const opus = await result.fetch(MESSAGES_URL, request)
-    await opus.text()
+    if (restart) {
+      const modelBetas = (headers: Headers) =>
+        headers
+          .get('anthropic-beta')!
+          .split(',')
+          .filter((beta) => beta !== MESSAGE_THREADS_BETA)
+      await plugin.dispose()
+      testContext.livePlugins.delete(plugin)
+      await independent.dispose()
+      testContext.livePlugins.delete(independent)
+      const disk = cacheKeepStoreDirectory(
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
+        undefined,
+        'opencode1',
+      )
+      const entries = (await readdir(disk)).filter((name) =>
+        name.endsWith('.json.gz'),
+      )
+      expect(entries).toHaveLength(1)
+      const path = join(disk, entries[0]!)
+      const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+      const restarted = await getPlugin(undefined, undefined, {
+        now: () => now,
+      })
+      await restarted.auth.loader(auth, { models: {} })
+      const handles = getPluginTestHandles(restarted)
+      await handles.drainDispatchWork()
+      now = saved.nextPrewarmAt + 1
+      const before = sends.length
+      await handles.cacheKeepManager.tick()
+      const restored = sends.slice(before)
+      expect(restored).toHaveLength(1)
+      expect(restored[0]!.body).toMatchObject({
+        model: source,
+        max_tokens: 0,
+        messages: sends[0]!.body.messages,
+      })
+      expect(modelBetas(restored[0]!.headers)).toEqual(
+        modelBetas(warm!.headers),
+      )
+      expect(await hasValidRequestBodySignature(restored[0]!.text)).toBe(true)
+      expect(saved).not.toHaveProperty('refusalSourceModel')
+      expect(saved).not.toHaveProperty('headers')
+      expect(saved.policyState.warmsSinceLastRealRequest).toBe(1)
+      expect(saved.nextPrewarmAt).toBeGreaterThan(originalExpiry)
+      return
+    }
 
-    expect(calls).toEqual([
-      {
-        model: 'claude-fable-5',
-        auth: 'Bearer sk-ant-oat01-fallback-access',
-        warm: false,
-      },
-      {
-        model: 'claude-opus-4-8',
-        auth: 'Bearer sk-ant-oat01-main-access',
-        warm: false,
-      },
+    rejectTarget = true
+    const before400 = sends.length
+    expect(
+      await request(host, append(third, 'upstream rejects the round target')),
+    ).toContain(loseResend ? 'rejected target' : 'answer')
+    expect(sends.slice(before400).map(({ body }) => body.model)).toEqual([
+      target,
+      source,
     ])
-  })
+    expect(sends.at(-1)?.body).not.toHaveProperty('thread')
+    if (loseResend) {
+      await Bun.sleep(10)
+      expect(
+        reports.filter(
+          (row) =>
+            row.model === source &&
+            row.kind === 'billing' &&
+            row.status === undefined &&
+            row.outcome === 'failed',
+        ),
+      ).toHaveLength(1)
+      return
+    }
+    await request(host, append(third, 'source after the round'))
+    expect(sends.at(-1)?.body).toMatchObject({
+      model: source,
+      thread: { type: 'create' },
+    })
+    const dumpBodies = await Promise.all(
+      (await readdir(dumpDir))
+        .filter((name) => name.endsWith('.body.json'))
+        .map((name) => readFile(join(dumpDir, name), 'utf8')),
+    )
+    expect(dumpBodies).toContain(round.text)
+    expect(dumpBodies.join('\n')).not.toContain(credit)
+    for (const { text } of sends)
+      expect(await hasValidRequestBodySignature(text)).toBe(true)
+  }
+
+  test('OpenCode 1 warms the last clean source and serves a signed round only in its own plugin instance', () =>
+    exerciseRoundWarm(false))
+  test('OpenCode 1 bills a round source resend that loses its socket before headers', () =>
+    exerciseRoundWarm(false, true))
+  test('OpenCode 1 restart warms the last accepted requested-model prefix', () =>
+    exerciseRoundWarm(true))
+  test('OpenCode 1 round activity renews the warm budget and an idle end advances backoff', () =>
+    exerciseRoundWarm(false, false, true))
+  test('OpenCode 1 stops warming when the OAuth account changes mid-round', () =>
+    exerciseRoundWarm(false, false, false, true))
 })

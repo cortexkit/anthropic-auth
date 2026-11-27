@@ -50,6 +50,7 @@ export const STICKY_ROUTING_MAIN_ACCOUNT_ID = 'main'
 export const STICKY_ROUTING_ASSIGNMENT_TTL_MS = 7 * 24 * 60 * 60_000
 
 const STICKY_ROUTING_TOUCH_INTERVAL_MS = 60 * 60_000
+const STICKY_ROUTING_DISK_PRUNE_MARGIN_MS = 30 * 24 * 60 * 60_000
 const STICKY_ROUTING_LOCK_TTL_MS = 10_000
 const STICKY_ROUTING_LOCK_WAIT_MS = 5_000
 const STICKY_ROUTING_LOCK_POLL_MS = 10
@@ -1048,7 +1049,7 @@ export class StickySessionRouter {
       }
       // Imported pins must not replace newer destination choices. Ordinary
       // routing handles expired pins and accounts that no longer exist.
-      if (changed) await this.writeState(state, () => lock.assertOwned(), false)
+      if (changed) await this.writeState(state, () => lock.assertOwned())
     } finally {
       await lock.release()
     }
@@ -1082,10 +1083,17 @@ export class StickySessionRouter {
   private async writeState(
     state: StickyRouteState,
     beforeRename: () => Promise<void>,
-    prune = true,
   ) {
     await this.options.relocationGuard?.assertNotRelocated()
-    if (prune) this.prune(state)
+    // Keep pins well past read expiry so delayed touches and imports can finish.
+    // Bound disk retention by age only; a count cap could evict live pins.
+    const cutoff =
+      this.now() -
+      (this.options.assignmentTtlMs ?? STICKY_ROUTING_ASSIGNMENT_TTL_MS) -
+      STICKY_ROUTING_DISK_PRUNE_MARGIN_MS
+    for (const [key, assignment] of Object.entries(state.assignments)) {
+      if (assignment.lastSeenAt < cutoff) delete state.assignments[key]
+    }
     state.updatedAt = this.now()
     const tempPath = `${this.options.path}.${randomUUID()}.tmp`
     try {
@@ -1107,18 +1115,14 @@ export class StickySessionRouter {
   ) {
     let ownershipLost = false
     try {
-      await this.writeState(
-        state,
-        async () => {
-          try {
-            await assertOwned()
-          } catch (error) {
-            ownershipLost = true
-            throw error
-          }
-        },
-        false,
-      )
+      await this.writeState(state, async () => {
+        try {
+          await assertOwned()
+        } catch (error) {
+          ownershipLost = true
+          throw error
+        }
+      })
       return true
     } catch {
       // A failed publication keeps its session change pending for a later retry.
@@ -1177,7 +1181,7 @@ export class StickySessionRouter {
         state.vaultLegacySeed = 'complete'
         // Imported pins fill only missing assignments, leaving existing ones
         // unchanged. Publish the marker and additions in one owned rename.
-        await this.writeState(state, () => lock.assertOwned(), false)
+        await this.writeState(state, () => lock.assertOwned())
         this.seedFinalized = true
       } finally {
         await lock.release()

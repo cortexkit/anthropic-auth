@@ -141,6 +141,7 @@ describe('auth.loader', () => {
     globalThis.fetch = mock(
       withNativeAdmission(() =>
         Response.json({
+          stop_reason: 'end_turn',
           usage: { cache_read_input_tokens: 1500, input_tokens: 12 },
         }),
       ),
@@ -156,6 +157,70 @@ describe('auth.loader', () => {
       prefixTokens: 1500,
       inputTokens: 1512,
     })
+  })
+
+  test('OC1 leaves the completed CacheKeep template in place while a reply is pending and after it refuses', async () => {
+    await warmFixture()
+    const provider =
+      Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>()
+    let reply: 'completed' | 'refusal' = 'completed'
+    const encoder = new TextEncoder()
+    const sse = (event: Record<string, unknown>) =>
+      encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
+    globalThis.fetch = mock(
+      withNativeAdmission((input: string | URL | Request) => {
+        if (!extractUrl(input).includes('/v1/messages'))
+          return Response.json({})
+        if (reply === 'completed') {
+          return Response.json({
+            stop_reason: 'end_turn',
+            usage: { cache_read_input_tokens: 1500, input_tokens: 12 },
+          })
+        }
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                sse({ type: 'message_start', message: { id: 'msg_pending' } }),
+              )
+              provider.resolve(controller)
+            },
+          }),
+          { headers: { 'content-type': 'text/event-stream' } },
+        )
+      }),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const sessionId = 'oc1-refused-cache-template'
+    await acceptRequest(plugin, sessionId, 'completed prefix')
+    const { cacheKeepManager } = getPluginTestHandles(plugin)
+    const template = cacheKeepManager.trackedRequest(sessionId)?.bodyText
+    expect(template).toContain('completed prefix')
+
+    reply = 'refusal'
+    const host = await plugin.auth.loader(
+      () => Promise.resolve({ ...syntheticMainHostAuth(), type: 'oauth' }),
+      { models: {} },
+    )
+    const response: Response = await host.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': sessionId },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        stream: true,
+        messages: [{ role: 'user', content: 'refused prefix' }],
+      }),
+    })
+    const controller = await provider.promise
+    const whilePending = cacheKeepManager.trackedRequest(sessionId)?.bodyText
+    controller.enqueue(
+      sse({ type: 'message_delta', delta: { stop_reason: 'refusal' } }),
+    )
+    controller.enqueue(sse({ type: 'message_stop' }))
+    controller.close()
+    expect(await response.text()).toContain('"stop_reason":"refusal"')
+    expect(whilePending).toBe(template)
+    expect(cacheKeepManager.trackedRequest(sessionId)?.bodyText).toBe(template)
   })
 
   test('OC1 restores an idle warm once per server and keeps its durable budget', async () => {
@@ -186,7 +251,10 @@ describe('auth.loader', () => {
           warmBodies.push(body)
           reservations.push((await readRecord()).policyState)
         }
-        return Response.json({ usage: { cache_read_input_tokens: 1500 } })
+        return Response.json({
+          stop_reason: 'end_turn',
+          usage: { cache_read_input_tokens: 1500 },
+        })
       }),
     ) as unknown as typeof fetch
 
@@ -205,6 +273,7 @@ describe('auth.loader', () => {
     expect(saved).toMatchObject({ v: 1, id: sessionId })
     expect(saved.bodyText).toContain('a restartable prefix')
     expect(saved.headers).toBeUndefined()
+    expect(saved).not.toHaveProperty('refusalSourceModel')
     expect(saved.policyState.prefixTokens).toBe(1500)
 
     const plugins = await Promise.all([
@@ -226,6 +295,7 @@ describe('auth.loader', () => {
     await Promise.all(managers.map((manager) => manager.tick()))
     expect(warmBodies).toHaveLength(1)
     expect(warmBodies[0]).toContain('a restartable prefix')
+    expect(await core.hasValidRequestBodySignature(warmBodies[0]!)).toBe(true)
     expect(reservations).toEqual([
       expect.objectContaining({
         warmsSinceLastRealRequest: 1,
@@ -262,7 +332,10 @@ describe('auth.loader', () => {
     await warmFixture()
     globalThis.fetch = mock(
       withNativeAdmission(() =>
-        Response.json({ usage: { cache_read_input_tokens: 1500 } }),
+        Response.json({
+          stop_reason: 'end_turn',
+          usage: { cache_read_input_tokens: 1500 },
+        }),
       ),
     ) as unknown as typeof fetch
     const sessionId = 'oc1-late-restore'
@@ -318,7 +391,10 @@ describe('auth.loader', () => {
       await warmFixture()
       globalThis.fetch = mock(
         withNativeAdmission(() =>
-          Response.json({ usage: { cache_read_input_tokens: 1500 } }),
+          Response.json({
+            stop_reason: 'end_turn',
+            usage: { cache_read_input_tokens: 1500 },
+          }),
         ),
       ) as unknown as typeof fetch
 
@@ -510,7 +586,10 @@ describe('auth.loader', () => {
               status: 415,
             })
         }
-        return Response.json({ usage: { cache_read_input_tokens: 1 } })
+        return Response.json({
+          stop_reason: 'end_turn',
+          usage: { cache_read_input_tokens: 1 },
+        })
       }),
     ) as unknown as typeof fetch
     const plugin = await getPlugin()
@@ -556,7 +635,10 @@ describe('auth.loader', () => {
         requests.push(new Headers(init.headers))
         return Promise.resolve(
           new Response(
-            JSON.stringify({ usage: { cache_read_input_tokens: 1 } }),
+            JSON.stringify({
+              stop_reason: 'end_turn',
+              usage: { cache_read_input_tokens: 1 },
+            }),
             { status: 200 },
           ),
         )
@@ -627,7 +709,7 @@ describe('auth.loader', () => {
             ),
           )
         }
-        return Promise.resolve(new Response(null, { status: 200 }))
+        return Promise.resolve(Response.json({ stop_reason: 'end_turn' }))
       }),
     ) as unknown as typeof fetch
 
@@ -644,14 +726,16 @@ describe('auth.loader', () => {
       { models: {} },
     )
 
-    await result.fetch(MESSAGES_URL, {
-      method: 'POST',
-      headers: { 'x-session-affinity': 'session-1' },
-      body: JSON.stringify({
-        model: 'claude-opus-4-8',
-        messages: [{ role: 'user', content: 'hello' }],
-      }),
-    })
+    await (
+      await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'session-1' },
+        body: JSON.stringify({
+          model: 'claude-opus-4-8',
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+    ).text()
 
     const secondPlugin = await getPlugin(createMockClient())
     const secondResult = await secondPlugin.auth.loader(
@@ -664,14 +748,16 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
-    await secondResult.fetch(MESSAGES_URL, {
-      method: 'POST',
-      headers: { 'x-session-affinity': 'session-2' },
-      body: JSON.stringify({
-        model: 'claude-opus-4-8',
-        messages: [{ role: 'user', content: 'hello' }],
-      }),
-    })
+    await (
+      await secondResult.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'session-2' },
+        body: JSON.stringify({
+          model: 'claude-opus-4-8',
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+    ).text()
 
     const registryDirectory =
       process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR
@@ -1079,9 +1165,16 @@ describe('cache diagnostics', () => {
     diagnostics,
   })
 
-  const sseResponse = (data: Record<string, unknown>, status = 200) =>
+  const sseResponse = (
+    data: Record<string, unknown>,
+    status = 200,
+    completed = false,
+  ) =>
     new Response(
       `event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: data })}\n\n` +
+        (completed
+          ? 'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n'
+          : '') +
         'event: message_stop\ndata: {"type":"message_stop"}\n\n',
       { status },
     )
@@ -1093,6 +1186,73 @@ describe('cache diagnostics', () => {
       refresh: 'main-refresh',
       expires: Date.now() + 100_000,
     })
+
+  test.each(['refused', 'incomplete'] as const)(
+    'billing does not report warming on for a first %s reply',
+    async (outcome) => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          quota: { enabled: false },
+          claudeCache: { enabled: true, mode: 'hybrid' },
+          cacheKeep: { enabled: true, always: true },
+        }),
+      )
+      const providerId = `msg_first_${outcome}`
+      const billing = Promise.withResolvers<Record<string, unknown>>()
+      globals[routingKey] = () => ({
+        report: (row: Record<string, unknown>) => {
+          if (row.kind === 'billing' && row.provider_response_id === providerId)
+            billing.resolve(row)
+        },
+      })
+      const frames = [
+        { type: 'message_start', message: message(providerId) },
+        {
+          type: 'message_delta',
+          delta: {
+            stop_reason: outcome === 'refused' ? 'refusal' : 'end_turn',
+          },
+          usage: { output_tokens: 2 },
+        },
+        ...(outcome === 'refused' ? [{ type: 'message_stop' }] : []),
+      ]
+      globalThis.fetch = mock(
+        withNativeAdmission(
+          () =>
+            new Response(
+              frames
+                .map((frame) => `data: ${JSON.stringify(frame)}\n\n`)
+                .join(''),
+              { headers: { 'content-type': 'text/event-stream' } },
+            ),
+        ),
+      ) as unknown as typeof fetch
+      const plugin = await getPlugin()
+      const host = await plugin.auth.loader(oauthLoader, { models: {} })
+      const sessionId = `ses_first_${outcome}`
+      const response: Response = await host.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': sessionId },
+        body: JSON.stringify({
+          model: 'claude-opus-4-8',
+          max_tokens: 100,
+          stream: true,
+          messages: [{ role: 'user', content: 'keepable prefix' }],
+        }),
+      })
+      if (outcome === 'refused')
+        expect(await response.text()).toContain('"stop_reason":"refusal"')
+      else await expect(response.text()).rejects.toThrow()
+      const row = await billing.promise
+      expect(
+        (row.cache as { warming?: { on?: boolean } } | undefined)?.warming?.on,
+      ).not.toBe(true)
+      expect(
+        getPluginTestHandles(plugin).cacheKeepManager.trackedRequest(sessionId),
+      ).toBeUndefined()
+    },
+  )
 
   beforeEach(async () => {
     globalThis.fetch = originalFetch
@@ -1512,7 +1672,7 @@ describe('cache diagnostics', () => {
             ? Response.json(message('provider-thinking-warm'))
             : new Response(
                 `event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: message('provider-thinking-live') })}\n\n` +
-                  'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":2}}\n\n' +
+                  'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\n' +
                   'event: message_stop\ndata: {"type":"message_stop"}\n\n',
                 { headers: { 'content-type': 'text/event-stream' } },
               ),
@@ -1559,6 +1719,12 @@ describe('cache diagnostics', () => {
     expect(warm.body.max_tokens).toBe(0)
     expect(warm.body.thinking).toEqual(live.body.thinking)
     expect(warm.body.messages).toEqual(live.body.messages)
+    for (const request of [live, warm]) {
+      expect(request.body).not.toHaveProperty('fallbacks')
+      expect(request.headers.get('anthropic-beta')?.split(',')).toContain(
+        core.SERVER_SIDE_FALLBACK_BETA,
+      )
+    }
     expect(warm.headers.get('anthropic-beta')?.split(',')).toContain(
       'thinking-binding-controls-2026-08-01',
     )
@@ -1618,6 +1784,8 @@ describe('cache diagnostics', () => {
             message(
               normalRequests === 1 ? 'provider-real-A' : 'provider-real-C',
             ),
+            200,
+            true,
           ),
         )
       }),

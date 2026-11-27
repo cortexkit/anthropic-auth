@@ -53,6 +53,7 @@ export * from './commands/account.ts'
 export * from './constants.ts'
 export * from './custom-headers.ts'
 export * from './dump.ts'
+export * from './fallback-credit.ts'
 export * from './fast.ts'
 export * from './gateway.ts'
 export * from './holder-registry.ts'
@@ -70,6 +71,8 @@ export type {
   ClaudeModelCatalogue,
   ClaudeModelFamily,
   ClaudeModelPricing,
+  ClaudeModelTokenLimits,
+  ClaudeRefusalFallbackRoute,
   ClaudeRefusalRecoveryFamily,
 } from './model-capabilities.ts'
 // Named rather than `export *`: the beta constants and the id normalizer are
@@ -81,6 +84,7 @@ export {
   getClaudeModelCatalogue,
   pinsEffortOnEveryRequest,
   resolveClaudeModelCapabilities,
+  resolveClaudeModelTokenLimits,
 } from './model-capabilities.ts'
 export * from './model-remap.ts'
 export * from './models.ts'
@@ -364,6 +368,14 @@ export * from './quota-headers.ts'
 export * from './quota-manager.ts'
 export * from './quota-refusal.ts'
 export * from './quotas.ts'
+export * from './refusal-fallback-dispatch.ts'
+export * from './refusal-fallback-round.ts'
+export * from './refusal-fallback-stream.ts'
+export * from './refusal-fallback-targets.ts'
+export {
+  RecoveryThinkingStore,
+  recoveryThinkingStoreDirectory,
+} from './refusal-fallback-thinking.ts'
 export * from './relay.ts'
 export * from './relay-location.ts'
 export * from './relocation-guard.ts'
@@ -376,6 +388,7 @@ export * from './routing-relay.ts'
 export * from './routing-reports.ts'
 export { startRoutingWait } from './routing-wait.ts'
 export { readRunOutputCap } from './run-output-cap.ts'
+export * from './server-fallback.ts'
 export * from './server-fallback-usage.ts'
 export * from './session-cache-activity.ts'
 export * from './session-cache-policy.ts'

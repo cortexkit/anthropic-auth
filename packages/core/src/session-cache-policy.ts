@@ -195,6 +195,9 @@ function visitRequestCacheLifetimes(
   })
 }
 
+// Only strings are safe to memoize; callers may change an object between reads.
+let lastCacheLifetime: { bodyText: string; ttlMs: number } | undefined
+
 /**
  * Cache-touch reports and our local activity, hold and keep-warm timing use the
  * longest sent lifetime: the cache is fully cold only after every prefix expires.
@@ -203,10 +206,13 @@ function visitRequestCacheLifetimes(
 export function requestCacheLifetimeMs(
   input: Record<string, unknown> | string,
 ): number {
+  if (typeof input === 'string' && lastCacheLifetime?.bodyText === input)
+    return lastCacheLifetime.ttlMs
   let ttlMs = 0
   visitRequestCacheLifetimes(input, (lifetime) => {
     ttlMs = Math.max(ttlMs, lifetime)
   })
+  if (typeof input === 'string') lastCacheLifetime = { bodyText: input, ttlMs }
   return ttlMs
 }
 

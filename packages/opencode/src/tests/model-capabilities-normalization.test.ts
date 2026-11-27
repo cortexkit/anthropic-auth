@@ -28,6 +28,8 @@ async function rewrite(model: string, extra: Record<string, unknown>) {
 }
 
 for (const row of CLAUDE_MODEL_CAPABILITIES) {
+  // Opus 4.8's row records fallback limits; its request shaping is deliberately unchanged.
+  if (row.id === 'claude-opus-4-8') continue
   test(`${row.id}: OpenCode thinking normalization matches thinkingModes`, async () => {
     for (const mode of ['disabled', 'between_tools'] as const) {
       const rewritten = await rewrite(row.id, { thinking: { type: mode } })
@@ -48,3 +50,16 @@ for (const row of CLAUDE_MODEL_CAPABILITIES) {
     )
   })
 }
+
+test('ordinary Opus 4.8 request bytes match the wire body from before its capability row', async () => {
+  const body = {
+    model: 'claude-opus-4-8',
+    max_tokens: 32_000,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    thinking: { type: 'adaptive', display: 'summarized' },
+    output_config: { effort: 'high' },
+  }
+  expect(await rewriteRequestBody(JSON.stringify(body))).toBe(
+    `{"model":"claude-opus-4-8","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=5f627;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"max_tokens":32000,"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"high"}}`,
+  )
+})

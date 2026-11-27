@@ -4,6 +4,7 @@ import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
   applyRunnerTurnNotes,
+  applyServerSideFallbackToBody,
   applySessionCacheTtl,
   applyThinkingBindingControls,
   applyTurnEndNotes,
@@ -22,9 +23,12 @@ import {
   ClaudeCodeFirstUserTextTracker,
   type ClaudeCodeIdentity,
   type ClaudeCodeRequestClass,
+  copyStreamResponseTiming,
   countUserPrompts,
   createAnthropicStreamCompletion,
+  createServerSideFallbackStreamRewriter,
   createSseFramer,
+  decodeSseFrame,
   FAST_MODE_BETA,
   type IncompleteStreamDiagnostics,
   isClaudeFableOrMythos5Model,
@@ -36,19 +40,22 @@ import {
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
   mergeAnthropicBetas,
-  messageThreadCachePrefix,
   OPENCODE_IDENTITY_PREFIX,
   orderClaudeCodeBody,
   PARAGRAPH_REMOVAL_ANCHORS,
   parseSseFrame,
   REQUIRED_BETAS,
+  type RefusalFallbackMode,
   readSessionCachePolicy,
   remapRequestBodyModel,
   resolveClaudeModelCapabilities,
+  type ServerSideFallbackOutcome,
   SseFrameTooLargeError,
+  sanitizeClaudeCodeRequestBody,
   selectClaudeCodeBetas,
   signRequestBody,
   stripEmptyTrailingAssistantMessages,
+  stripUnsignedThinkingBlocks,
   TEXT_REPLACEMENTS,
   type ThinkingPrefixMismatchBehavior,
   TOOL_PREFIX,
@@ -70,14 +77,7 @@ import {
   EffortMarkerCorrelationError,
   type OpenCodeEffortMarkerPlan,
 } from './effort-history'
-import { stripRecoveryRoundThinking } from './recovery-thinking'
 import { makeByteBoundedMemo } from './sanitize-memo'
-import {
-  applyServerSideFallbackToBody,
-  createServerSideFallbackStreamRewriter,
-  SERVER_SIDE_FALLBACK_BETA,
-  type ServerSideFallbackOutcome,
-} from './server-fallback'
 
 export const NON_STREAMING_DIAGNOSTICS_MAX_BYTES = 8 * 1024 * 1024
 /**
@@ -302,18 +302,12 @@ export function setOAuthHeaders(
     body?: Record<string, unknown> | null
     identity?: ClaudeCodeIdentity
     requestClass?: ClaudeCodeRequestClass
+    refusalFallbackMode?: RefusalFallbackMode
   } = {},
 ): Headers {
   // This is the shared boundary where an access value becomes a bearer header.
   assertNotCustodyTombstone(accessToken, 'anthropic')
-  return applyClaudeCodeHeaders(headers, accessToken, {
-    ...options,
-    extraBetas: [
-      ...(options.body?.fallbacks === 'default'
-        ? [SERVER_SIDE_FALLBACK_BETA]
-        : []),
-    ],
-  })
+  return applyClaudeCodeHeaders(headers, accessToken, options)
 }
 
 /**
@@ -828,38 +822,6 @@ export function extractLatestHybridMessageCacheAnchor(
   }
 }
 
-/**
- * Fingerprints of every user message carrying a wire cache anchor, in
- * history order. A recovery-round source warm stays valid while the kept
- * request's earliest anchored message is still among them: compaction or a
- * history edit drops or rewrites that message, while later turns only append
- * after it. Membership (not position) is compared so an extra bridge anchor
- * on a longer history does not count as a prefix change.
- */
-export function hybridUserMessageCacheAnchorFingerprints(
-  bodyText: string,
-): string[] {
-  try {
-    const parsed = JSON.parse(bodyText) as Record<string, unknown>
-    if (!Array.isArray(parsed.messages)) return []
-    const fingerprints: string[] = []
-    for (const message of parsed.messages) {
-      if (
-        !isRecord(message) ||
-        message.role !== 'user' ||
-        !messageHasWireCacheAnchor(message)
-      ) {
-        continue
-      }
-      const fingerprint = cacheAnchorMessageFingerprint(message)
-      if (fingerprint) fingerprints.push(fingerprint)
-    }
-    return fingerprints
-  } catch {
-    return []
-  }
-}
-
 function updateCacheControlTtl(value: unknown, cache1hEnabled: boolean) {
   if (!isRecord(value)) return
   const cacheControl = getCacheControl(value) as CacheControl | null
@@ -908,126 +870,6 @@ function walkCacheControlTargets(
 function removeAllCacheControls(parsed: Record<string, unknown>) {
   removeCacheControl(parsed)
   walkCacheControlTargets(parsed, removeCacheControl)
-}
-
-function lastSourceCacheAnchor(source: Record<string, unknown>) {
-  if (!Array.isArray(source?.messages)) return undefined
-  let anchor:
-    | {
-        messageIndex: number
-        blockIndex: number
-        control: Record<string, unknown>
-      }
-    | undefined
-  source.messages.forEach((message, messageIndex) => {
-    if (!isRecord(message)) return
-    normalizeContentToArray(message.content)?.forEach((block, blockIndex) => {
-      if (!isRecord(block)) return
-      const control = getCacheControl(block)
-      if (control?.type === 'ephemeral')
-        anchor = { messageIndex, blockIndex, control }
-    })
-  })
-  return anchor
-}
-
-/** Match a continuation's last cache marker to the full body kept for warming. */
-export function sourceCacheAnchorMatchesWire(
-  templateBody: string,
-  wireBody: string,
-) {
-  try {
-    const template = JSON.parse(templateBody)
-    const wire = JSON.parse(wireBody)
-    const kept = lastSourceCacheAnchor(template)
-    const sent = lastSourceCacheAnchor(wire)
-    if (!kept || !sent) return false
-    const offset =
-      wire.thread?.type === 'continue'
-        ? template.messages.length - wire.messages.length
-        : 0
-    if (
-      offset < 0 ||
-      kept.messageIndex !== offset + sent.messageIndex ||
-      kept.blockIndex !== sent.blockIndex
-    )
-      return false
-    if (kept.control.ttl !== sent.control.ttl) return false
-    const prefix = messageThreadCachePrefix(
-      wire,
-      sent.messageIndex,
-      sent.blockIndex,
-    )
-    return Boolean(
-      prefix &&
-        prefix ===
-          messageThreadCachePrefix(
-            { ...template, messages: template.messages.slice(offset) },
-            sent.messageIndex,
-            sent.blockIndex,
-          ),
-    )
-  } catch {
-    return false
-  }
-}
-
-function restoreSourceCacheAnchor(
-  parsed: Record<string, unknown>,
-  sourceBody: string,
-) {
-  let source: Record<string, unknown>
-  try {
-    source = JSON.parse(sourceBody)
-  } catch {
-    return
-  }
-  if (!Array.isArray(parsed.messages)) return
-  const anchor = lastSourceCacheAnchor(source)
-  if (!anchor) return
-  const { messageIndex, blockIndex, control } = anchor
-  // A cache-policy change can make the old lifetime incompatible with the new
-  // tail: Anthropic requires every 1h marker to precede every 5m marker.
-  let ttlMismatch = false
-  walkCacheControlTargets(parsed, (target) => {
-    if (!isRecord(target)) return
-    const current = getCacheControl(target)
-    if (
-      current?.type === 'ephemeral' &&
-      (current.ttl ?? '5m') !== (control.ttl ?? '5m')
-    )
-      ttlMismatch = true
-  })
-  if (ttlMismatch) return
-  const prefix = messageThreadCachePrefix(source, messageIndex, blockIndex)
-  if (
-    !prefix ||
-    prefix !== messageThreadCachePrefix(parsed, messageIndex, blockIndex)
-  )
-    return
-  const message = parsed.messages[messageIndex]
-  if (!isRecord(message)) return
-  const content = normalizeContentToArray(message.content)
-  const block = content?.[blockIndex]
-  if (!isRecord(block)) return
-  message.content = content
-  block.cache_control = { ...control }
-  delete block.cacheControl
-
-  // The restored entry already covers the earliest anchors. Spend their slots
-  // first, preserving both the old cache boundary and the new tail write.
-  const marked: Record<string, unknown>[] = []
-  walkCacheControlTargets(parsed, (target) => {
-    if (isRecord(target) && getCacheControl(target)) marked.push(target)
-  })
-  let excess = marked.length - 4
-  for (const target of marked) {
-    if (excess <= 0) break
-    if (target === block || target === marked.at(-1)) continue
-    removeCacheControl(target)
-    excess--
-  }
-  return true
 }
 
 function applyAutomaticCache1h(parsed: Record<string, unknown>) {
@@ -1700,13 +1542,6 @@ export async function rewriteRequestBody(
     turnEndNote?: { tools: string[] }
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
-    sourceRecoveryBody?: string
-    /**
-     * Digests of thinking blocks written by the fallback model in this
-     * session's refusal-recovery rounds. Set only on requests to the source
-     * model; see recovery-thinking.ts.
-     */
-    recoveryRoundThinking?: ReadonlySet<string>
     serverSideFallbackEnabled?: boolean
     modelRemapEnabled?: boolean
     laneStart?: boolean
@@ -1728,6 +1563,7 @@ export async function rewriteRequestBody(
     const messagesBeforeStrip = Array.isArray(parsed.messages)
       ? parsed.messages.length
       : undefined
+    stripUnsignedThinkingBlocks(parsed)
     stripEmptyTrailingAssistantMessages(parsed.messages)
     const removedWhitespaceBlocks =
       stripLatestAssistantToolUseTrailingWhitespace(parsed)
@@ -1746,9 +1582,6 @@ export async function rewriteRequestBody(
 
     const modelNormalizeStart = rewriteNowMs()
     const removedNonAnthropicThinking = stripNonAnthropicThinkingBlocks(parsed)
-    const removedRecoveryRoundThinking = options.recoveryRoundThinking
-      ? stripRecoveryRoundThinking(parsed, options.recoveryRoundThinking)
-      : 0
     const serverSideFallback = applyServerSideFallbackToBody(
       parsed,
       options.serverSideFallbackEnabled === true,
@@ -1772,9 +1605,6 @@ export async function rewriteRequestBody(
       haiku55ThinkingDisplay: haiku55Thinking?.display,
       replacedHaiku55Thinking: haiku55Thinking?.replacedExisting ?? false,
       removedNonAnthropicThinking,
-      ...(removedRecoveryRoundThinking > 0
-        ? { removedRecoveryRoundThinking }
-        : {}),
       serverSideFallbackEnabled: serverSideFallback.enabled,
       serverFallbackMarkersRestored: serverSideFallback.restoredMarkers,
       serverFallbackMarkersDropped: serverSideFallback.droppedMarkers,
@@ -1901,25 +1731,11 @@ export async function rewriteRequestBody(
     const prefixStart = rewriteNowMs()
     if (options.modelRemapEnabled === true) remapRequestBodyModel(parsed)
     const toolNameMap = responseToolNames(parsed.tools, parsed.messages)
-    let prefixed = prefixToolNames(parsed, { isOAuth: options.isOAuth })
-    let sourceAnchorRestored = false
-    if (
-      options.sourceRecoveryBody &&
-      cacheEnabled &&
-      options.cache1hMode === 'hybrid'
-    ) {
-      sourceAnchorRestored =
-        restoreSourceCacheAnchor(parsed, options.sourceRecoveryBody) === true
-      prefixed = JSON.stringify(
-        orderClaudeCodeBody(parsed, { isOAuth: options.isOAuth }),
-      )
-    }
+    const prefixed = prefixToolNames(parsed, { isOAuth: options.isOAuth })
     const standbyAnchor = options.hybridStandbyAnchor
     options.onThreadCacheSlot?.(
       cacheEnabled && options.cache1hMode === 'hybrid'
-        ? sourceAnchorRestored
-          ? () => undefined
-          : (body) => hybridThreadCacheSlot(body, standbyAnchor)
+        ? (body) => hybridThreadCacheSlot(body, standbyAnchor)
         : undefined,
     )
     options.perf?.('prefix_tools_stringify', {
@@ -1946,6 +1762,24 @@ export async function rewriteRequestBody(
       error instanceof TrailingAssistantHistoryError
     ) {
       throw error
+    }
+    // A failed optional rewrite must not let caller-supplied fallback state or
+    // unsigned thinking through. Leave malformed JSON to the upstream as before.
+    let original: unknown
+    try {
+      original = JSON.parse(body)
+    } catch {
+      return body
+    }
+    if (
+      isRecord(original) &&
+      sanitizeClaudeCodeRequestBody(
+        original,
+        options.serverSideFallbackEnabled === true ? 'server' : 'client',
+      )
+    ) {
+      const cleaned = JSON.stringify(original)
+      return options.deferSigning ? cleaned : await signRequestBody(cleaned)
     }
     return body
   }
@@ -2193,10 +2027,6 @@ type SseFinishState = {
   resyncCarry: string
 }
 
-type SseFinishUpdate =
-  | { type: 'content-filter' }
-  | { type: 'complete'; finishReason: string }
-
 function createSseFinishState(): SseFinishState {
   return { pending: '', completed: false, disabled: false, resyncCarry: '' }
 }
@@ -2205,35 +2035,36 @@ function updateSseFinishState(
   state: SseFinishState,
   text: string,
   maxPendingBytes: number,
-): SseFinishUpdate | null {
-  if (!text || state.completed) return null
+): string | undefined {
+  if (!text || state.completed) return
   if (state.disabled) {
     const window = state.resyncCarry + text
     const boundary = findSseBoundary(window)
     if (!boundary) {
       state.resyncCarry = window.slice(-3)
-      return null
+      return
     }
     state.disabled = false
     state.resyncCarry = ''
     text = window.slice(boundary.index + boundary.length)
-    if (!text) return null
+    if (!text) return
   }
   state.pending += text
-  let update: SseFinishUpdate | null = null
-
+  let finishReason: string | undefined
   while (true) {
     const boundary = findSseBoundary(state.pending)
     if (!boundary) break
     const rawEvent = state.pending.slice(0, boundary.index)
     state.pending = state.pending.slice(boundary.index + boundary.length)
     const summary = summarizeSseEvent(rawEvent)
-    if (summary?.type !== 'message_delta' || !summary.stopReason) continue
+    if (
+      state.completed ||
+      summary?.type !== 'message_delta' ||
+      !summary.stopReason
+    )
+      continue
     state.completed = true
-    update ??=
-      summary.stopReason === 'refusal'
-        ? { type: 'content-filter' }
-        : { type: 'complete', finishReason: summary.stopReason }
+    if (summary.stopReason !== 'refusal') finishReason = summary.stopReason
   }
   if (new TextEncoder().encode(state.pending).byteLength > maxPendingBytes) {
     const tail = state.pending
@@ -2241,7 +2072,7 @@ function updateSseFinishState(
     state.disabled = true
     state.resyncCarry = tail.slice(-3)
   }
-  return update
+  return finishReason
 }
 
 type SseLaneStartFinishRewriteState = {
@@ -2338,19 +2169,6 @@ function retryableAnthropicStreamError(
   error.code = 'ECONNRESET'
   error.syscall = 'anthropic-sse'
   if (errorType) error.providerErrorType = errorType
-  return error
-}
-
-function retryableFableContentFilterError(
-  model: unknown,
-): RetryableAnthropicStreamError {
-  const label = isClaudeOpus5Model(model) ? 'Opus 5' : 'Fable'
-  const error = new Error(
-    `${label} response was blocked by the provider content filter; retrying with Opus 4.8`,
-  ) as RetryableAnthropicStreamError
-  error.code = 'ECONNRESET'
-  error.syscall = 'anthropic-sse'
-  error.providerErrorType = 'refusal'
   return error
 }
 
@@ -2498,6 +2316,110 @@ function sseDiagnosticStats(state: SseDiagnosticState) {
   }
 }
 
+/** Observe one guarded physical reply, not the host stream that may splice two replies. */
+export function observeCompletedCacheReply(
+  response: Response,
+  streaming: boolean,
+  onComplete: (usage: Record<string, unknown>) => void,
+): Response {
+  if (!response.ok || !response.body) return response
+  const reader = response.body.getReader()
+  const framer = streaming ? createSseFramer() : undefined
+  const decoder = !streaming ? new TextDecoder() : undefined
+  let json = ''
+  let jsonBytes = 0
+  let streamStart = true
+  let valid = true
+  let stopReason: unknown
+  const usage: Record<string, unknown> = {}
+  const observe = (message: Record<string, unknown> | undefined) => {
+    const content = message?.content
+    if (
+      Array.isArray(content) &&
+      content.some((block) => asDiagnosticRecord(block)?.type === 'refusal')
+    )
+      valid = false
+    stopReason = message?.stop_reason ?? stopReason
+    Object.assign(usage, asDiagnosticRecord(message?.usage))
+  }
+  const complete = () => {
+    if (
+      valid &&
+      (stopReason === 'end_turn' ||
+        stopReason === 'tool_use' ||
+        stopReason === 'max_tokens')
+    )
+      onComplete(usage)
+    valid = false
+  }
+  const body = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        try {
+          const next = await reader.read()
+          if (valid) {
+            try {
+              if (next.done) {
+                if (decoder) {
+                  observe(
+                    asDiagnosticRecord(JSON.parse(json + decoder.decode())),
+                  )
+                  complete()
+                }
+              } else if (framer) {
+                for (const frame of framer.push(next.value)) {
+                  const { data, event } = parseSseFrame(
+                    decodeSseFrame(frame, { streamStart }),
+                  )
+                  streamStart = false
+                  if (event === 'error') valid = false
+                  if (!data || data === '[DONE]') continue
+                  const payload = asDiagnosticRecord(JSON.parse(data))
+                  if (
+                    payload?.type === 'error' ||
+                    asDiagnosticRecord(payload?.content_block)?.type ===
+                      'refusal'
+                  )
+                    valid = false
+                  observe(asDiagnosticRecord(payload?.message))
+                  observe(asDiagnosticRecord(payload?.delta))
+                  Object.assign(usage, asDiagnosticRecord(payload?.usage))
+                  if (payload?.type === 'message_stop') complete()
+                }
+              } else if (decoder) {
+                jsonBytes += next.value.byteLength
+                valid = jsonBytes <= NON_STREAMING_DIAGNOSTICS_MAX_BYTES
+                json = valid
+                  ? json + decoder.decode(next.value, { stream: true })
+                  : ''
+              }
+            } catch {
+              // Diagnostics must not reject a response when observation fails.
+              valid = false
+            }
+          }
+          if (next.done) {
+            reader.releaseLock()
+            controller.close()
+          } else controller.enqueue(next.value)
+        } catch (error) {
+          reader.releaseLock()
+          controller.error(error)
+        }
+      },
+      async cancel(reason) {
+        try {
+          await reader.cancel(reason)
+        } finally {
+          reader.releaseLock()
+        }
+      },
+    },
+    { highWaterMark: 0 },
+  )
+  return copyStreamResponseTiming(response, new Response(body, response))
+}
+
 /**
  * Create a streaming response that strips the tool prefix from tool names.
  */
@@ -2508,12 +2430,9 @@ export function createStrippedStream(
     onToolNameRefusal?: () => void
     onResponseFailure?: () => void
     perf?: RewritePerfCallback
-    onContentFilter?: (context?: {
-      completedToolUse: boolean
-    }) => boolean | undefined
     onComplete?: (finishReason: string) => void
-    contentFilterModel?: unknown
     serverSideFallbackModel?: string
+    serverSideFallbackSent?: boolean
     onServerSideFallbackOutcome?: (outcome: ServerSideFallbackOutcome) => void
     onMessageStart?: (message: Record<string, unknown>) => void
     onMessageDelta?: (delta: {
@@ -2580,50 +2499,28 @@ export function createStrippedStream(
     } catch {}
   }
   const sseErrors = createSseErrorState()
-  const sseFinish =
-    options.onContentFilter || options.onComplete
-      ? createSseFinishState()
-      : undefined
+  const sseFinish = options.onComplete ? createSseFinishState() : undefined
   const laneStartFinish =
     options.laneStart && options.laneStartOAuthServed !== false
       ? createSseLaneStartFinishRewriteState()
       : undefined
-  let contentFilterInvoked = false
-  let contentFilterHandled = false
-  const invokeContentFilter = (completedToolUse = false) => {
-    if (!options.onContentFilter) return false
-    if (!contentFilterInvoked) {
-      contentFilterInvoked = true
-      contentFilterHandled =
-        options.onContentFilter({ completedToolUse }) !== false
-    }
-    return contentFilterHandled
-  }
   const serverSideFallback = options.serverSideFallbackModel
     ? createServerSideFallbackStreamRewriter({
         requestedModel: options.serverSideFallbackModel,
+        serverSideFallbackSent: options.serverSideFallbackSent,
         maxPendingBytes: NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
         onOutcome: options.onServerSideFallbackOutcome,
-        onRefusalAfterToolUse: options.onContentFilter
-          ? () => invokeContentFilter(true)
-          : undefined,
       })
     : undefined
 
   const updateFinish = (text: string) => {
-    if (!sseFinish) return null
-    const update = updateSseFinishState(
+    if (!sseFinish) return
+    const finishReason = updateSseFinishState(
       sseFinish,
       text,
       NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
     )
-    if (update?.type === 'content-filter' && options.onContentFilter) {
-      return invokeContentFilter()
-        ? retryableFableContentFilterError(options.contentFilterModel)
-        : null
-    }
-    if (update?.type === 'complete') options.onComplete?.(update.finishReason)
-    return null
+    if (finishReason) options.onComplete?.(finishReason)
   }
   const rewriteLaneStartFinish = (text: string, flush = false) =>
     laneStartFinish
@@ -2751,13 +2648,13 @@ export function createStrippedStream(
               true,
             )
             const retryableStreamError = jsonMode
-              ? updateFinish(laneStartRewritten)
-              : (updateSseErrorState(
+              ? null
+              : updateSseErrorState(
                   sseErrors,
                   finalDecoded,
                   NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
                   options.onRelayUpstreamError,
-                ) ?? updateFinish(laneStartRewritten))
+                )
             if (retryableStreamError) {
               // The provider's message stays out of logs; its type is enough.
               logProgress('stream_tool_prefix_retryable_error', {
@@ -2766,6 +2663,7 @@ export function createStrippedStream(
               await cancelReader(retryableStreamError)
               throw retryableStreamError
             }
+            updateFinish(laneStartRewritten)
             const flushed = toolNames.push(laneStartRewritten, true)
             rewriteMs += rewriteNowMs() - rewriteStart
             if (flushed || preamble) {
@@ -2839,13 +2737,13 @@ export function createStrippedStream(
             : decoded
           const laneStartRewritten = rewriteLaneStartFinish(serverRewritten)
           const retryableStreamError = jsonMode
-            ? updateFinish(laneStartRewritten)
-            : (updateSseErrorState(
+            ? null
+            : updateSseErrorState(
                 sseErrors,
                 decoded,
                 NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
                 options.onRelayUpstreamError,
-              ) ?? updateFinish(laneStartRewritten))
+              )
           if (retryableStreamError) {
             logProgress('stream_tool_prefix_retryable_error', {
               providerErrorType: retryableStreamError.providerErrorType,
@@ -2855,6 +2753,7 @@ export function createStrippedStream(
             releaseReader()
             throw retryableStreamError
           }
+          updateFinish(laneStartRewritten)
           const rewritten = toolNames.push(laneStartRewritten)
           rewriteMs += rewriteNowMs() - rewriteStart
           if (rewritten) {

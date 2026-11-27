@@ -2,15 +2,14 @@ import { expect, test } from 'bun:test'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
+  applyServerSideFallbackToBody,
+  resolveClaudeModelCapabilities,
+} from '@cortexkit/anthropic-auth-core'
+import {
   applyOpenCodeEffortMarkers,
   encodeOpenCodeEffortPlan,
   markOpenCodeEffortTransitions,
 } from '../effort-history'
-import {
-  isRecoverableRefusalModel,
-  recoverableRefusalFamily,
-} from '../fable-fallback'
-import { applyServerSideFallbackToBody } from '../server-fallback'
 import { rewriteRequestBody } from '../transform'
 import { createNativeClaudeModelRules } from '../v2/models'
 
@@ -250,8 +249,11 @@ async function renderModel(model: string) {
   }
   applyServerSideFallbackToBody(notRequested, false)
   return {
-    recoverableRefusalFamily: recoverableRefusalFamily(model),
-    isRecoverableRefusalModel: isRecoverableRefusalModel(model),
+    recoverableRefusalFamily:
+      resolveClaudeModelCapabilities(model)?.refusalRecoveryFamily ?? null,
+    isRecoverableRefusalModel: Boolean(
+      resolveClaudeModelCapabilities(model)?.refusalRecoveryFamily,
+    ),
     serverSideFallback: {
       enabled: fallback.enabled,
       fallbacks: fallbackBody.fallbacks ?? null,

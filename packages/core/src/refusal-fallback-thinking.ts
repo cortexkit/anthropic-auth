@@ -8,24 +8,25 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { join } from 'node:path'
+import { withLock } from '@cortexkit/common-auth/fs'
+import { getHostDataHome } from './host-paths.ts'
+import { logger } from './logger.ts'
 import {
   createWindowsOwnerOnly,
   ensureWindowsOwnerOnlyDirectory,
-  getHostDataHome,
   isOwnerOnly,
-  logger,
   type OwnerOnlyOptions,
   readWindowsOwnerOnly,
-  renameWithWindowsSharingRetry,
-} from '@cortexkit/anthropic-auth-core'
+} from './owner-only.ts'
+import { renameWithWindowsSharingRetry } from './publication-rename.ts'
+import { refusalBodyRecord as isBody } from './refusal-fallback-prefix.ts'
 
 /**
- * Thinking blocks written by Opus 4.8 during an OpenCode refusal-recovery
- * round, and how they are kept out of the source model's view.
+ * Thinking blocks written by a fallback model during refusal recovery.
  *
  * When the source model (Fable 5.2, for example) refuses part-way through a
- * turn, OpenCode keeps the refused response's signed thinking and appends the
- * Opus 4.8 retry to the same assistant message. That Anthropic turn then holds
+ * turn, the host keeps the refused response's signed thinking and appends the
+ * retry to the same assistant message. That Anthropic turn then holds
  * source-signed thinking followed by Opus-signed thinking. While that turn is
  * the latest assistant turn, the source model rejects the request with a
  * non-retryable 400 ("thinking or redacted_thinking blocks in the latest
@@ -93,11 +94,14 @@ function isToolResultOnlyUserMessage(message: Record<string, unknown>) {
  * results; any other user message starts a new turn. Other roles, such as
  * mid-conversation system messages, do not end a turn. A block is kept when
  * removing it would leave its message empty. Returns the number of blocks
- * removed; the body is untouched when nothing matches.
+ * removed. It also reports every block that matches recorded fallback-model
+ * thinking, including blocks it keeps, so a restart can tell a round happened.
  */
 export function stripRecoveryRoundThinking(
   body: Record<string, unknown>,
-  recorded: ReadonlySet<string>,
+  recorded: ReadonlyMap<string, symbol | undefined>,
+  liveRound?: symbol,
+  onRecordedThinking?: () => void,
 ): number {
   if (recorded.size === 0 || !Array.isArray(body.messages)) return 0
   let removed = 0
@@ -124,7 +128,11 @@ export function stripRecoveryRoundThinking(
         kept?.push(block)
         continue
       }
-      if (!sourceThinkingInTurn) {
+      onRecordedThinking?.()
+      if (
+        !sourceThinkingInTurn ||
+        (liveRound && recorded.get(digest) === liveRound)
+      ) {
         kept?.push(block)
         continue
       }
@@ -150,52 +158,55 @@ export function stripRecoveryRoundThinking(
  */
 export function createRecoveryThinkingObserver(
   onDigest: (digest: string) => void,
-): (event: Record<string, unknown>) => void {
+) {
   const open = new Map<
     number,
     { type: 'thinking' | 'redacted_thinking'; value: string }
   >()
-  return (event) => {
-    const index = event.index
-    if (typeof index !== 'number') return
-    if (event.type === 'content_block_start') {
-      const block = isRecord(event.content_block)
-        ? event.content_block
-        : undefined
-      if (block?.type === 'thinking') {
-        open.set(index, {
-          type: 'thinking',
-          value: typeof block.signature === 'string' ? block.signature : '',
-        })
-      } else if (block?.type === 'redacted_thinking') {
-        open.set(index, {
-          type: 'redacted_thinking',
-          value: typeof block.data === 'string' ? block.data : '',
-        })
-      } else {
-        open.delete(index)
+  function report(index: number) {
+    const entry = open.get(index)
+    open.delete(index)
+    if (entry?.value) onDigest(recoveryThinkingDigest(entry.type, entry.value))
+  }
+  return {
+    push(event: Record<string, unknown>, index: number) {
+      if (event.type === 'content_block_start') {
+        const block = isRecord(event.content_block)
+          ? event.content_block
+          : undefined
+        if (block?.type === 'thinking') {
+          open.set(index, {
+            type: 'thinking',
+            value: typeof block.signature === 'string' ? block.signature : '',
+          })
+        } else if (block?.type === 'redacted_thinking') {
+          open.set(index, {
+            type: 'redacted_thinking',
+            value: typeof block.data === 'string' ? block.data : '',
+          })
+        } else {
+          open.delete(index)
+        }
+        return
       }
-      return
-    }
-    if (event.type === 'content_block_delta') {
-      const entry = open.get(index)
-      const delta = isRecord(event.delta) ? event.delta : undefined
-      if (
-        entry?.type === 'thinking' &&
-        delta?.type === 'signature_delta' &&
-        typeof delta.signature === 'string'
-      ) {
-        entry.value += delta.signature
+      if (event.type === 'content_block_delta') {
+        const entry = open.get(index)
+        const delta = isRecord(event.delta) ? event.delta : undefined
+        if (
+          entry?.type === 'thinking' &&
+          delta?.type === 'signature_delta' &&
+          typeof delta.signature === 'string'
+        ) {
+          entry.value += delta.signature
+        }
+        return
       }
-      return
-    }
-    if (event.type === 'content_block_stop') {
-      const entry = open.get(index)
-      open.delete(index)
-      if (entry && entry.value.length > 0) {
-        onDigest(recoveryThinkingDigest(entry.type, entry.value))
-      }
-    }
+      if (event.type === 'content_block_stop') report(index)
+    },
+    close: report,
+    finish() {
+      for (const index of open.keys()) report(index)
+    },
   }
 }
 
@@ -225,10 +236,21 @@ const WRITE_DELAY_MS = 1_000
  */
 const SHUTDOWN_GRACE_MS = 1_000
 const MAX_FILE_BYTES = 2 * 1024 * 1024
+const READ_GRACE_MS = 2_000
+const RECORD_LOCK = {
+  name: 'recovery-thinking',
+  ttlMs: 10_000,
+  timeoutMs: 1_000,
+  renew: true,
+}
+
+type Families = Map<string, Map<string, symbol | undefined>>
 
 type SessionRecord = {
-  families: Map<string, Set<string>>
+  families: Families
   loading: Promise<void>
+  ready?: boolean
+  pins: number
   dirty: boolean
   deleted?: boolean
 }
@@ -253,7 +275,7 @@ export class RecoveryThinkingStore {
   private readonly sessions = new Map<string, SessionRecord>()
   /** Records evicted from memory whose last change is not on disk yet. */
   private readonly unwritten = new Map<string, SessionRecord>()
-  private readonly directory: string
+  private readonly directory: string | undefined
   private readonly now: () => number
   private readonly writeDelayMs: number
   private readonly ownerOnly: OwnerOnlyOptions | undefined
@@ -261,6 +283,7 @@ export class RecoveryThinkingStore {
   private timer: ReturnType<typeof setTimeout> | undefined
   private swept = false
   private warned = false
+  private warnedTimeout = false
 
   constructor(
     options: {
@@ -268,29 +291,83 @@ export class RecoveryThinkingStore {
       now?: () => number
       writeDelayMs?: number
       ownerOnly?: OwnerOnlyOptions
+      /** Do not read or write on-disk state. */
+      persist?: boolean
     } = {},
   ) {
-    this.directory = options.directory ?? recoveryThinkingStoreDirectory()
+    this.directory =
+      options.persist === false
+        ? undefined
+        : (options.directory ?? recoveryThinkingStoreDirectory())
     this.now = options.now ?? Date.now
     this.writeDelayMs = options.writeDelayMs ?? WRITE_DELAY_MS
     this.ownerOnly = options.ownerOnly
   }
 
-  /** The recorded digests for one session and family; loads once per session. */
-  async digests(
+  /** Wait for the first disk record, but do not block a request indefinitely. */
+  async loadSession(sessionId: string): Promise<void> {
+    if (!this.directory) return
+    const record = this.session(sessionId)
+    if (record.ready) return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        record.loading,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            record.ready = true
+            if (!this.warnedTimeout) {
+              this.warnedTimeout = true
+              logger.warn(
+                'fable-fallback',
+                'recovery thinking record read timed out; sending without it',
+              )
+            }
+            resolve()
+          }, READ_GRACE_MS)
+        }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  peek(
     sessionId: string,
     family: string,
-  ): Promise<ReadonlySet<string>> {
+  ): ReadonlyMap<string, symbol | undefined> | undefined {
+    return (
+      this.sessions.get(sessionId) ?? this.unwritten.get(sessionId)
+    )?.families.get(family)
+  }
+
+  /**
+   * Keep this session's in-memory round associations (which live round each
+   * recorded digest belongs to) until the retry or round that holds them ends.
+   */
+  retainSession(sessionId: string): () => void {
     const record = this.session(sessionId)
-    await record.loading
-    return record.families.get(family) ?? new Set()
+    record.pins++
+    return () => {
+      record.pins--
+      this.prune()
+    }
   }
 
   /** Record one fallback-model thinking block; the write happens later. */
-  record(sessionId: string, family: string, digest: string) {
+  record(sessionId: string, family: string, digest: string, round?: symbol) {
     if (!FAMILY.test(family) || !DIGEST.test(digest)) return
     const record = this.session(sessionId)
-    addDigest(record.families, family, digest)
+    // A digest already recorded keeps its first round association; a later
+    // round never takes it over.
+    const known = record.families.get(family)
+    addDigest(
+      record.families,
+      family,
+      digest,
+      known?.has(digest) ? known.get(digest) : round,
+    )
+    if (!this.directory) return
     record.dirty = true
     this.schedule()
   }
@@ -302,6 +379,7 @@ export class RecoveryThinkingStore {
       if (record) record.deleted = true
       records.delete(sessionId)
     }
+    if (!this.directory) return
     const path = join(this.directory, sessionFileName(sessionId))
     this.chain = this.chain
       .then(() => rm(path, { force: true }))
@@ -344,33 +422,67 @@ export class RecoveryThinkingStore {
       this.unwritten.delete(sessionId)
       this.sessions.delete(sessionId)
       this.sessions.set(sessionId, existing)
+      this.prune(existing)
       return existing
     }
     const record: SessionRecord = {
       families: new Map(),
       loading: Promise.resolve(),
       dirty: false,
+      pins: 0,
     }
-    record.loading = this.load(sessionId, record)
+    if (this.directory) {
+      record.loading = this.load(this.directory, sessionId, record).finally(
+        () => {
+          record.ready = true
+        },
+      )
+    }
     this.sessions.set(sessionId, record)
-    this.startSweep()
-    while (this.sessions.size > MAX_SESSIONS_IN_MEMORY) {
-      const oldest = this.sessions.keys().next().value
-      if (oldest === undefined) break
-      const evicted = this.sessions.get(oldest)
-      this.sessions.delete(oldest)
-      // Until its last change is on disk, a reload must not read the old file.
-      if (evicted?.dirty) {
-        this.unwritten.set(oldest, evicted)
-        this.enqueueWrite(oldest, evicted)
-      }
-    }
+    if (this.directory) this.startSweep(this.directory)
+    this.prune(record)
     return record
   }
 
-  private async load(sessionId: string, record: SessionRecord) {
+  private prune(exclude?: SessionRecord) {
+    for (const [id, record] of this.sessions) {
+      if (this.sessions.size <= MAX_SESSIONS_IN_MEMORY) break
+      if (record.pins || record === exclude) continue
+      this.sessions.delete(id)
+      // Until its last change is on disk, a reload must not read the old file.
+      if (record.dirty) {
+        this.unwritten.set(id, record)
+        this.enqueueWrite(id, record)
+      }
+    }
+  }
+
+  private async load(
+    directory: string,
+    sessionId: string,
+    record: SessionRecord,
+  ) {
+    const disk = await this.readRecord(
+      join(directory, sessionFileName(sessionId)),
+    )
+    for (const [family, loaded] of disk) {
+      // Digests recorded before the load finished are newer; keep them last.
+      const current = record.families.get(family)
+      const fromDisk = new Set(loaded.keys())
+      record.families.set(family, loaded)
+      for (const [digest, round] of current ?? [])
+        addDigest(
+          record.families,
+          family,
+          digest,
+          fromDisk.has(digest) ? undefined : round,
+        )
+    }
+  }
+
+  private async readRecord(path: string): Promise<Families> {
+    const families: Families = new Map()
     try {
-      const path = join(this.directory, sessionFileName(sessionId))
       const stat = await lstat(path)
       if (
         !stat.isFile() ||
@@ -381,30 +493,31 @@ export class RecoveryThinkingStore {
           () => stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0,
           this.ownerOnly,
         ))
-      )
-        return
+      ) {
+        this.warn('read')
+        return families
+      }
       const bytes =
         (await readWindowsOwnerOnly(path, this.ownerOnly)) ??
         (await readFile(path))
-      const parsed = JSON.parse(bytes.toString('utf8')) as unknown
-      if (!isRecord(parsed) || parsed.version !== STORE_FORMAT_VERSION) return
-      if (!isRecord(parsed.families)) return
+      const parsed = isBody(JSON.parse(bytes.toString('utf8')))
+      if (
+        parsed?.version !== STORE_FORMAT_VERSION ||
+        !isRecord(parsed.families)
+      ) {
+        this.warn('read')
+        return families
+      }
       for (const [family, digests] of Object.entries(parsed.families)) {
         if (!FAMILY.test(family) || !Array.isArray(digests)) continue
-        const loaded = digests.filter(
-          (digest): digest is string =>
-            typeof digest === 'string' && DIGEST.test(digest),
-        )
-        // Digests recorded before the load finished are newer; keep them last.
-        const current = record.families.get(family)
-        record.families.delete(family)
-        for (const digest of loaded) addDigest(record.families, family, digest)
-        for (const digest of current ?? [])
-          addDigest(record.families, family, digest)
+        for (const digest of digests)
+          if (typeof digest === 'string' && DIGEST.test(digest))
+            addDigest(families, family, digest)
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') this.warn('read')
     }
+    return families
   }
 
   /**
@@ -412,10 +525,10 @@ export class RecoveryThinkingStore {
    * never removes a temporary file this process is still writing. Requests
    * never wait for it.
    */
-  private startSweep() {
+  private startSweep(directory: string) {
     if (this.swept) return
     this.swept = true
-    this.chain = this.chain.then(() => this.sweep()).catch(() => {})
+    this.chain = this.chain.then(() => this.sweep(directory)).catch(() => {})
   }
 
   /** Whether a record file belongs to a session this process is using. */
@@ -429,10 +542,10 @@ export class RecoveryThinkingStore {
   }
 
   /** Delete idle records and stale temporaries. */
-  private async sweep() {
+  private async sweep(directory: string) {
     let names: string[]
     try {
-      names = await readdir(this.directory)
+      names = await readdir(directory)
     } catch {
       return
     }
@@ -440,7 +553,7 @@ export class RecoveryThinkingStore {
     for (const name of names) {
       const temp = TEMP.test(name)
       if (!temp && !FILE.test(name)) continue
-      const path = join(this.directory, name)
+      const path = join(directory, name)
       try {
         const stat = await lstat(path)
         const expired = temp
@@ -469,14 +582,16 @@ export class RecoveryThinkingStore {
   }
 
   private enqueueWrite(sessionId: string, record: SessionRecord) {
+    const directory = this.directory
+    if (!directory) return
     record.dirty = false
     this.chain = this.chain
       .then(async () => {
         await record.loading
         // A session deleted meanwhile must not be written back.
         if (record.deleted) return
-        if (!(await this.directoryReady())) return
-        await this.write(sessionId, record)
+        if (!(await this.directoryReady(directory)) || record.deleted) return
+        await this.write(directory, sessionId, record)
       })
       .catch(() => this.warn('write'))
       .finally(() => {
@@ -485,44 +600,58 @@ export class RecoveryThinkingStore {
       })
   }
 
-  private async directoryReady() {
-    if (
-      !(await ensureWindowsOwnerOnlyDirectory(this.directory, this.ownerOnly))
-    ) {
+  private async directoryReady(directory: string) {
+    if (!(await ensureWindowsOwnerOnlyDirectory(directory, this.ownerOnly))) {
       try {
-        await mkdir(this.directory, { recursive: true, mode: 0o700 })
+        await mkdir(directory, { recursive: true, mode: 0o700 })
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
       }
     }
-    const stat = await lstat(this.directory)
+    const stat = await lstat(directory)
     return (
       stat.isDirectory() &&
       !stat.isSymbolicLink() &&
       (await isOwnerOnly(
-        this.directory,
+        directory,
         () => stat.uid === process.getuid?.() && (stat.mode & 0o777) === 0o700,
         this.ownerOnly,
       ))
     )
   }
 
-  private async write(sessionId: string, record: SessionRecord) {
-    const path = join(this.directory, sessionFileName(sessionId))
-    const temp = `${path}.${randomUUID()}.tmp`
-    const families: Record<string, string[]> = {}
-    for (const [family, digests] of record.families)
-      families[family] = [...digests]
-    const bytes = JSON.stringify({ version: STORE_FORMAT_VERSION, families })
-    try {
-      if (!(await createWindowsOwnerOnly(temp, bytes, this.ownerOnly)))
-        await writeFile(temp, bytes, { flag: 'wx', mode: 0o600 })
-      await renameWithWindowsSharingRetry(temp, path, {
-        platform: this.ownerOnly?.platform,
-      })
-    } finally {
-      await rm(temp, { force: true })
-    }
+  private async write(
+    directory: string,
+    sessionId: string,
+    record: SessionRecord,
+  ) {
+    const path = join(directory, sessionFileName(sessionId))
+    await withLock(path, RECORD_LOCK, async (lease) => {
+      // Another host may have committed digests since we first read the file.
+      const disk = await this.readRecord(path)
+      if (record.deleted) return
+      for (const [family, digests] of record.families) {
+        const known = new Set(disk.get(family)?.keys())
+        for (const digest of digests.keys())
+          if (!known.has(digest)) addDigest(disk, family, digest)
+      }
+      const families = Object.fromEntries(
+        [...disk].map(([family, digests]) => [family, [...digests.keys()]]),
+      )
+      const bytes = JSON.stringify({ version: STORE_FORMAT_VERSION, families })
+      const temp = `${path}.${randomUUID()}.tmp`
+      try {
+        if (!(await createWindowsOwnerOnly(temp, bytes, this.ownerOnly)))
+          await writeFile(temp, bytes, { flag: 'wx', mode: 0o600 })
+        await lease.assertOwned()
+        if (record.deleted) return
+        await renameWithWindowsSharingRetry(temp, path, {
+          platform: this.ownerOnly?.platform,
+        })
+      } finally {
+        await rm(temp, { force: true })
+      }
+    })
   }
 
   private warn(stage: string) {
@@ -537,19 +666,20 @@ export class RecoveryThinkingStore {
 }
 
 function addDigest(
-  families: Map<string, Set<string>>,
+  families: Families,
   family: string,
   digest: string,
+  round?: symbol,
 ) {
   let digests = families.get(family)
   if (!digests) {
-    digests = new Set()
+    digests = new Map()
     families.set(family, digests)
   }
   digests.delete(digest)
-  digests.add(digest)
+  digests.set(digest, round)
   while (digests.size > MAX_DIGESTS_PER_FAMILY) {
-    const oldest = digests.values().next().value
+    const oldest = digests.keys().next().value
     if (oldest === undefined) break
     digests.delete(oldest)
   }

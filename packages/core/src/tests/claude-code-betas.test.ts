@@ -3,6 +3,34 @@ import {
   applyClaudeCodeHeaders,
   selectClaudeCodeBetas,
 } from '../claude-code.ts'
+import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback-usage.ts'
+
+test.each([
+  ['client', 'claude-fable-5-2', undefined, true],
+  ['off', 'claude-fable-5-2', undefined, true],
+  ['server', 'claude-fable-5-2', 'default', true],
+  ['server', 'claude-fable-5-2', undefined, false],
+  ['server', 'claude-fable-5-2', false, false],
+  ['client', 'claude-opus-4-8', undefined, false],
+  ['off', 'claude-opus-4-8', undefined, false],
+  ['server', 'claude-opus-4-8', 'default', false],
+] as const)(
+  '%s with %s and fallbacks %j selects only the managed fallback beta: %s',
+  (refusalFallbackMode, model, fallbacks, eligible) => {
+    for (const requestClass of ['main', 'auxiliary'] as const) {
+      const body = { model, ...(fallbacks === undefined ? {} : { fallbacks }) }
+      const headers = applyClaudeCodeHeaders(
+        new Headers({ 'anthropic-beta': SERVER_SIDE_FALLBACK_BETA }),
+        'test-token',
+        { body, requestClass, refusalFallbackMode },
+      )
+      const expected = selectClaudeCodeBetas(body, [], requestClass)
+      expect(headers.get('anthropic-beta')).toBe(
+        eligible ? `${expected},${SERVER_SIDE_FALLBACK_BETA}` : expected,
+      )
+    }
+  },
+)
 
 // Literal beta lists from recorded interactive Claude Code 2.1.302 requests,
 // not computed by the selector under test. They include display-updates while
@@ -17,6 +45,24 @@ const TITLE =
   'oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07'
 const QUOTA =
   'oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05'
+
+test('server fallback keeps the 2.17.1 anthropic-beta bytes for an incoming fallback beta followed by another beta', () => {
+  const headers = applyClaudeCodeHeaders(
+    new Headers({
+      'anthropic-beta': 'server-side-fallback-2026-07-01,context-1m-2025-08-07',
+    }),
+    'test-token',
+    {
+      body: { model: 'claude-fable-5-2', fallbacks: 'default' },
+      refusalFallbackMode: 'server',
+    },
+  )
+
+  // Captured with anthropic-auth 2.17.1's published header writer and OpenCode's appended beta.
+  expect(headers.get('anthropic-beta')).toBe(
+    `${MAIN},server-side-fallback-2026-07-01,context-1m-2025-08-07`,
+  )
+})
 
 for (const [model, expected] of [
   ['claude-sonnet-5-5', MAIN],

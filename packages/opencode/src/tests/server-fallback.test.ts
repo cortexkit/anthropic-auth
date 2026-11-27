@@ -2,14 +2,13 @@ import { describe, expect, test } from 'bun:test'
 import {
   applyServerSideFallbackToBody,
   createServerSideFallbackStreamRewriter,
-  resolveContentFilterFallbackMode,
   SERVER_FALLBACK_MARKER_TEXT,
   SERVER_FALLBACK_SIGNATURE_PREFIX,
   SERVER_FALLBACK_USAGE_MARKER_TEXT,
   SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
   type ServerSideFallbackOutcome,
-} from '../server-fallback'
+} from '@cortexkit/anthropic-auth-core'
 import { createStrippedStream, rewriteRequestBody } from '../transform'
 
 const sse = (event: string, data: unknown) =>
@@ -154,21 +153,13 @@ function fallbackStream(options?: {
   return frames.join('')
 }
 
-describe('resolveContentFilterFallbackMode', () => {
-  test('defaults to Anthropic server-side fallback', () => {
-    expect(resolveContentFilterFallbackMode(undefined)).toBe('server')
-    expect(resolveContentFilterFallbackMode('')).toBe('server')
-    expect(resolveContentFilterFallbackMode('invalid')).toBe('server')
-  })
-
-  test('retains the ten-response recovery behind the legacy value', () => {
-    expect(resolveContentFilterFallbackMode('legacy')).toBe('legacy')
-    expect(resolveContentFilterFallbackMode(' LEGACY ')).toBe('legacy')
-    expect(resolveContentFilterFallbackMode('server')).toBe('server')
-  })
-})
-
 describe('applyServerSideFallbackToBody', () => {
+  test('removes caller-supplied fallback policies when server fallback is off', () => {
+    const body = { model: 'claude-fable-5', fallbacks: ['claude-opus-5'] }
+    expect(applyServerSideFallbackToBody(body, false).enabled).toBe(false)
+    expect(body).not.toHaveProperty('fallbacks')
+  })
+
   test('opts only recoverable Fable/Opus models into the default server policy', () => {
     for (const model of [
       'claude-fable-5',
@@ -371,7 +362,7 @@ describe('applyServerSideFallbackToBody', () => {
     ])
   })
 
-  test('drops historical internal markers when legacy mode is selected', () => {
+  test('drops historical internal markers when server fallback is not selected', () => {
     const body = {
       model: 'claude-fable-5',
       messages: [
@@ -648,7 +639,6 @@ describe('createServerSideFallbackStreamRewriter', () => {
   })
 
   test('does not absorb a refusal while a tool call is incomplete', () => {
-    let handled = 0
     const stream = [
       sse('message_start', {
         type: 'message_start',
@@ -659,6 +649,17 @@ describe('createServerSideFallbackStreamRewriter', () => {
         index: 0,
         content_block: {
           type: 'tool_use',
+          id: 'toolu_complete',
+          name: 'mcp_Bash',
+          input: {},
+        },
+      }),
+      sse('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 1,
+        content_block: {
+          type: 'tool_use',
           id: 'toolu_incomplete',
           name: 'mcp_Bash',
           input: {},
@@ -666,7 +667,7 @@ describe('createServerSideFallbackStreamRewriter', () => {
       }),
       sse('content_block_delta', {
         type: 'content_block_delta',
-        index: 0,
+        index: 1,
         delta: { type: 'input_json_delta', partial_json: '{"command":' },
       }),
       sse('message_delta', {
@@ -681,21 +682,16 @@ describe('createServerSideFallbackStreamRewriter', () => {
     ].join('')
     const rewriter = createServerSideFallbackStreamRewriter({
       requestedModel: 'claude-fable-5',
-      onRefusalAfterToolUse: () => {
-        handled++
-        return true
-      },
+      serverSideFallbackSent: true,
     })
 
     const output = rewriter.push(stream) + rewriter.flush()
 
-    expect(handled).toBe(0)
     expect(output).toContain('"stop_reason":"refusal"')
     expect(output).not.toContain('"stop_reason":"tool_use"')
   })
 
   test('preserves a completed tool call when its fallback turn later refuses', () => {
-    let handled = 0
     const outcomes: ServerSideFallbackOutcome[] = []
     const stream = [
       sse('message_start', {
@@ -720,7 +716,7 @@ describe('createServerSideFallbackStreamRewriter', () => {
       sse('content_block_stop', { type: 'content_block_stop', index: 0 }),
       sse('message_delta', {
         type: 'message_delta',
-        delta: { stop_reason: 'refusal' },
+        delta: { stop_reason: 'refusal', stop_details: { category: 'test' } },
         usage: {
           output_tokens: 1,
           iterations: [{ type: 'fallback_message', model: 'claude-opus-4-8' }],
@@ -730,18 +726,15 @@ describe('createServerSideFallbackStreamRewriter', () => {
     ].join('')
     const rewriter = createServerSideFallbackStreamRewriter({
       requestedModel: 'claude-fable-5',
+      serverSideFallbackSent: true,
       onOutcome: (outcome) => outcomes.push(outcome),
-      onRefusalAfterToolUse: () => {
-        handled++
-        return true
-      },
     })
 
     const output = rewriter.push(stream) + rewriter.flush()
 
-    expect(handled).toBe(1)
     expect(output).toContain('"stop_reason":"tool_use"')
     expect(output).not.toContain('"stop_reason":"refusal"')
+    expect(output).not.toContain('"stop_details"')
     expect(outcomes).toEqual([
       expect.objectContaining({
         fallback: true,
@@ -749,15 +742,61 @@ describe('createServerSideFallbackStreamRewriter', () => {
         stopReason: 'refusal',
       }),
     ])
+
+    const withoutOptIn = createServerSideFallbackStreamRewriter({
+      requestedModel: 'claude-fable-5',
+    })
+    expect(withoutOptIn.push(stream) + withoutOptIn.flush()).toBe(stream)
+  })
+
+  test('streams CR-only keep-alives and rewrites each handoff before EOF', () => {
+    const rewriter = createServerSideFallbackStreamRewriter({
+      requestedModel: 'claude-fable-5',
+      serverSideFallbackSent: true,
+    })
+    const heartbeat = ': keep-alive\r\r'
+    const handoff = sse('content_block_start', {
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'fallback',
+        from: { model: 'claude-fable-5' },
+        to: { model: 'claude-opus-4-8' },
+      },
+    }).replaceAll('\n', '\r')
+
+    expect(rewriter.push(heartbeat)).toBe(heartbeat)
+    const output = rewriter.push(handoff)
+    expect(output).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
+    expect(output).not.toContain(handoff)
+    expect(rewriter.flush()).toBe('')
+  })
+
+  test('keeps ordinary mixed SSE endings byte-for-byte across split CRLF', () => {
+    const rewriter = createServerSideFallbackStreamRewriter({
+      requestedModel: 'claude-fable-5',
+    })
+    const chunks = [
+      'event: ping\r',
+      '\ndata: {"type":"ping"}\r',
+      '\n',
+      '\n: keep-alive\r',
+      '\r',
+      '\n',
+    ]
+    let output = ''
+    for (const chunk of chunks) output += rewriter.push(chunk)
+    expect(output).toBe(chunks.join(''))
+    expect(rewriter.flush()).toBe('')
   })
 
   test.each([
     ['LF', '\n\n', 1],
     ['CRLF', '\r\n\r\n', 2],
+    ['CR', '\r\r', 1],
   ])(
     'resyncs after an oversized frame ending in a split %s boundary',
     (_name, delimiter, splitAt) => {
-      let handled = 0
       const skipped = `data: ${'x'.repeat(256)}`
       const later = [
         sse('content_block_start', {
@@ -787,11 +826,8 @@ describe('createServerSideFallbackStreamRewriter', () => {
       ].join('')
       const rewriter = createServerSideFallbackStreamRewriter({
         requestedModel: 'claude-fable-5',
+        serverSideFallbackSent: true,
         maxPendingBytes: 64,
-        onRefusalAfterToolUse: () => {
-          handled++
-          return true
-        },
       })
 
       const output =
@@ -805,7 +841,6 @@ describe('createServerSideFallbackStreamRewriter', () => {
       expect(output).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
       expect(output).toContain('"stop_reason":"tool_use"')
       expect(output).not.toContain('"stop_reason":"refusal"')
-      expect(handled).toBe(1)
     },
   )
 })

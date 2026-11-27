@@ -15,7 +15,6 @@ import {
   createNativePoolStore,
   custodyTombstoneOAuth,
   isCustodyTombstoneOAuth,
-  primeMarkerNamespaceDir,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { nativeQuotaCodec } from '../../../../core/src/native-quota-codec.ts'
@@ -246,32 +245,6 @@ export async function useTempAccountFile(
   for (const [key, value] of Object.entries(fixture.env))
     process.env[key] = value
   delete process.env.OPENCODE_AUTH_CONTENT
-}
-
-/**
- * Remove the Prime start markers owned by the current fixture's account file.
- *
- * PrimeManager records "this account's five-hour window was already started"
- * as marker files under a temp root shared by every test in the process, in a
- * subdirectory named after a hash of the account storage path. Clearing only
- * that subdirectory keeps a stale marker from suppressing this test's request
- * without deleting markers that another test's plugin is still using. Call it
- * after useTempAccountFile and before creating a plugin: the account file must
- * exist so the hash matches the one the plugin computes. The same directory is
- * removed again once the test's plugins are disposed.
- */
-export async function ownPrimeMarkerNamespace(
-  ctx: Opencode1TestContext,
-): Promise<void> {
-  const storagePath = ctx.migratedPool?.env.OPENCODE_ANTHROPIC_AUTH_FILE
-  if (!storagePath) throw new Error('Prime markers need a migrated pool first')
-  // Core's default marker root; the plugin does not pass its own markerDir.
-  const markerRoot = join(tmpdir(), 'opencode-anthropic-auth', 'prime')
-  const namespace = primeMarkerNamespaceDir(markerRoot, storagePath)
-  await rm(namespace, { recursive: true, force: true })
-  getBodyLifetime(ctx).deferCleanup(() =>
-    rm(namespace, { recursive: true, force: true }),
-  )
 }
 
 export function registerPoolLogins(

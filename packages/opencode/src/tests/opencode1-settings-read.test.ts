@@ -7,6 +7,7 @@ import { applyEdits, modify, parse } from 'jsonc-parser'
 import { nativeAccountSettings } from '../../../core/src/native-account-view'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
+import { settingsTestPaths } from '../../../core/src/tests/settings-record-paths-fixture.ts'
 import { settingsReaderOutputs } from './opencode2-settings-readers'
 import { getPluginTestHandles } from './plugin-test-handles'
 import { snapshotSettings } from './settings-snapshot-fixture'
@@ -295,7 +296,12 @@ describe('OpenCode 1 settings service reads', () => {
         else process.env[key] = value
     })
     await fs.rm(f.target)
-    await core.writeSettingsMoveMarker(f.target)
+    await core.writeSettingsMoveMarker(
+      await settingsTestPaths(f.target, {
+        home: f.pool.root,
+        env: process.env,
+      }),
+    )
     const instance = await f.launch(f.pool.root)
     const result = await instance.runtime.updateSettings((settings) => ({
       ...settings,
@@ -579,7 +585,12 @@ describe('OpenCode 1 settings service reads', () => {
       expect(f.starts[0]?.mode).toBe('legacy')
       expect(ticks).toHaveLength(1)
       await f.put({ claude_fast_enabled: true, quota_enabled: 'off' })
-      await core.writeSettingsMoveMarker(f.target)
+      await core.writeSettingsMoveMarker(
+        await settingsTestPaths(f.target, {
+          home: f.pool.root,
+          env: process.env,
+        }),
+      )
       const before = f.io()
       expect(
         (await instance.runtime.read()).policyStorage.claudeFast?.enabled,
@@ -596,6 +607,19 @@ describe('OpenCode 1 settings service reads', () => {
       expect(f.starts).toHaveLength(1)
     })
   }
+
+  test('client mode keeps the fallback beta in the OpenCode 1 request and explicit warm snapshots', async () => {
+    const observed = await observeSettings(snapshotSettings(false), 1)
+    expect(observed.warms).toHaveLength(1)
+    expect(
+      [observed.request, observed.warms[0]!].map(({ headers }) =>
+        new Headers(headers)
+          .get('anthropic-beta')
+          ?.split(',')
+          .includes(core.SERVER_SIDE_FALLBACK_BETA),
+      ),
+    ).toEqual([true, true])
+  })
 
   for (const custody of ['local', 'claustrum'] as const) {
     test(`a ${custody} user-file projection never reaches a legacy write, including account-order writes`, async () => {

@@ -863,13 +863,13 @@ for (const operation of ['validation', 'failure'] as const) {
   })
 }
 
-async function invalidGrantScenario(module: ServiceModule) {
+async function invalidGrantScenario(
+  module: ServiceModule,
+  body = `{"error":"invalid_grant","detail":"${providerBody}"}`,
+) {
   const f = await fixture()
   f.exchange = async () => {
-    throw new ClaudeOAuthRefreshError(
-      400,
-      `{"error":"invalid_grant","detail":"${providerBody}"}`,
-    )
+    throw new ClaudeOAuthRefreshError(400, body)
   }
   f.policy = () => ({ checkedAt: f.time })
   const s = service(f, module)
@@ -911,16 +911,41 @@ async function invalidGrantScenario(module: ServiceModule) {
   leaksNoSecret([result, next, await f.entry()])
 }
 
-test('provider 400 invalid_grant is recorded as permanent and blocks the next exchange', async () => {
-  await invalidGrantScenario(production)
-})
-
-for (const [status, body, classification] of [
-  [400, `{"error":"invalid_request","detail":"${providerBody}"}`, 'permanent'],
-  [403, `{"error":"invalid_grant","detail":"${providerBody}"}`, 'permanent'],
-  [429, providerBody, 'transient'],
+for (const [format, body] of [
+  ['OAuth JSON', `{"error":"invalid_grant","detail":"${providerBody}"}`],
+  [
+    'API envelope',
+    `{"error":{"type":"invalid_grant","message":"${providerBody}"}}`,
+  ],
+  ['plain text', `invalid_grant: ${providerBody}`],
 ] as const) {
-  test(`provider ${status} ${classification} failure is recorded as retryable, never invalid grant`, async () => {
+  test(`provider 400 invalid_grant in ${format} is recorded as permanent and blocks the next exchange`, async () => {
+    await invalidGrantScenario(production, body)
+  })
+}
+
+for (const [label, status, body, classification] of [
+  [
+    'invalid_request',
+    400,
+    `{"error":"invalid_request","detail":"${providerBody}"}`,
+    'permanent',
+  ],
+  [
+    'unrelated JSON mentioning invalid_grant',
+    400,
+    `{"error":"invalid_request","detail":"${providerBody}: not invalid_grant"}`,
+    'permanent',
+  ],
+  [
+    'non-400 invalid_grant',
+    403,
+    `{"error":"invalid_grant","detail":"${providerBody}"}`,
+    'permanent',
+  ],
+  ['rate limit', 429, providerBody, 'transient'],
+] as const) {
+  test(`provider ${label} failure is recorded as retryable, never invalid grant`, async () => {
     const f = await fixture()
     f.exchange = async () => {
       throw new ClaudeOAuthRefreshError(status, body)

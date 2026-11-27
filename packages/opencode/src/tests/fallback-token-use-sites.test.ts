@@ -62,7 +62,6 @@ const fixtureEnvKeys = [
   'CLAUDE_CONFIG_DIR',
   'OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION',
   'OPENCODE_AUTH_CONTENT',
-  'OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE',
 ] as const
 
 class CensusTeardownTrace {
@@ -432,7 +431,6 @@ async function createFixture(
     /** The vault default's state as the plugin lists it after migration. */
     mainState?: 'active' | 'needs_reauth'
     fallbackEnabled?: boolean
-    fallbackMode?: 'server' | 'legacy'
     recoveryToolUse?: boolean
   } = {},
 ) {
@@ -893,8 +891,6 @@ async function createFixture(
   // but do not spend real time spacing calls to the in-memory usage endpoint.
   const quotaCallPause = mock((_ms: number) => Promise.resolve())
   scope.assertOpen()
-  if (options.fallbackMode)
-    process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = options.fallbackMode
   mainRowState = options.mainState ?? 'active'
   const plugin = (await (
     AnthropicAuthPlugin as unknown as (
@@ -1219,140 +1215,6 @@ describe('vault-served fallback outbound token census', () => {
       )
     },
   )
-
-  for (const fallbackMode of ['server', 'legacy'] as const)
-    for (const cleanReset of [false, true])
-      test.serial(
-        `recovery ${cleanReset ? 'clean-source reset' : 'backoff and model reset'} counts tool responses and warms the source only near expiry (${fallbackMode})`,
-        async () => {
-          const now = Date.now()
-          const fixture = await createFixture('recovery', {
-            now,
-            quotaEnabled: true,
-            quotaSnapshot: quota(now, 98),
-            recovery: true,
-            refuseFirst: false,
-            fallbackMode,
-            recoveryToolUse: true,
-            captureIntervals: true,
-          })
-          fixture.records.length = 0
-          const request = {
-            method: 'POST',
-            headers: { 'x-session-affinity': 'recovery-census' },
-            body: JSON.stringify({
-              model: 'claude-opus-5-5',
-              max_tokens: 128_000,
-              stream: true,
-              system: [{ type: 'text', text: 'stable system' }],
-              messages: [{ role: 'user', content: 'hello' }],
-            }),
-          }
-          const manager = getPluginTestHandles(fixture.plugin).cacheKeepManager
-          const immediateWarm = mock(manager.prewarmNow.bind(manager))
-          manager.prewarmNow = immediateWarm
-          const messages = () =>
-            fixture.records
-              .filter((record) => record.url.includes('/v1/messages'))
-              .map((record) => JSON.parse(record.body))
-          const send = async (model: string, refusal = false) => {
-            if (refusal) fixture.refuseNext()
-            const response = await fixture.result.fetch(MESSAGES_URL, request)
-            if (refusal) await expect(response.text()).rejects.toThrow()
-            else expect(await response.text()).toContain('tool_use')
-            expect(
-              messages()
-                .filter((body) => body.max_tokens !== 0)
-                .at(-1)?.model,
-            ).toBe(model)
-            expect(immediateWarm).not.toHaveBeenCalled()
-            // Warms go to the live Opus 4.8 prefix, or to the source model's
-            // kept prefix near its expiry. A source warm never carries the
-            // server-side fallback opt-in.
-            expect(
-              messages()
-                .filter((body) => body.max_tokens === 0)
-                .every(
-                  (body) =>
-                    body.model === 'claude-opus-4-8' ||
-                    (body.model === 'claude-opus-5-5' &&
-                      body.fallbacks === undefined),
-                ),
-            ).toBe(true)
-          }
-          // Recovery keeps a source prefix only after a completed request has
-          // reported cache usage, before the refused request starts the round.
-          await send('claude-opus-5-5')
-          for (const responses of [10]) {
-            await send('claude-opus-5-5', true)
-            for (let index = 0; index < responses; index++) {
-              await send('claude-opus-4-8')
-              if (responses === 10 && index === 0) {
-                expect(
-                  messages().filter((body) => body.max_tokens === 0),
-                ).toHaveLength(0)
-                ;(
-                  fixture.intervals as IntervalRecord[] & {
-                    clock: (now: number) => void
-                  }
-                ).clock(now + 55 * 60_000)
-                await manager.tick()
-                // Both caches are near expiry: the live Opus 4.8 prefix and
-                // the source model's prefix kept when the round started.
-                expect(
-                  messages()
-                    .filter((body) => body.max_tokens === 0)
-                    .map((body) => body.model)
-                    .sort(),
-                ).toEqual(['claude-opus-4-8', 'claude-opus-5-5'])
-              }
-            }
-            await send('claude-opus-5-5')
-            await send('claude-opus-5-5')
-          }
-          // Two source tool responses have completed; eight more clear the backoff.
-          if (cleanReset)
-            for (let index = 0; index < 8; index++)
-              await send('claude-opus-5-5')
-          await send('claude-opus-5-5', true)
-          await drainSidebarWrites()
-          expect(
-            (await getSidebarState()).fableRecoveries?.find(
-              (recovery) => recovery.sessionId === 'recovery-census',
-            )?.remaining,
-          ).toBe(cleanReset ? 10 : 20)
-          await send('claude-opus-4-8')
-          if (!cleanReset) {
-            const changedModel = {
-              ...request,
-              body: JSON.stringify({
-                ...JSON.parse(request.body),
-                model: 'claude-sonnet-4-6',
-              }),
-            }
-            await (
-              await fixture.result.fetch(MESSAGES_URL, changedModel)
-            ).text()
-            await send('claude-opus-5-5')
-            await send('claude-opus-5-5', true)
-            await drainSidebarWrites()
-            expect(
-              (await getSidebarState()).fableRecoveries?.find(
-                (recovery) => recovery.sessionId === 'recovery-census',
-              )?.remaining,
-            ).toBe(10)
-            await send('claude-opus-4-8')
-            await fixture.plugin.event({
-              event: {
-                type: 'session.deleted',
-                properties: { sessionID: 'recovery-census' },
-              },
-            })
-            await send('claude-opus-5-5')
-          }
-          expect(fixture.quotaCallPause).toHaveBeenCalledWith(1_000)
-        },
-      )
 
   test.serial('profile hydration', async () => {
     const fixture = await createFixture('profile', { profile: true })

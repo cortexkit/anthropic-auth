@@ -107,6 +107,9 @@
         }
       ]
     },
+    "refusal_fallback": {
+      "enum": ["client", "server", "off"]
+    },
     "fallback_on": {
       "anyOf": [
         {

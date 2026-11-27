@@ -44,11 +44,21 @@ OpenCode 1, OpenCode 2 and Pi report `cache_touch` after each accepted ordinary 
 
 `cache_warm_stopped` contains `{kind:'cache_warm_stopped', at, reason}` and is emitted only for a session that actually warmed. Reasons are exactly `cost-cap`, `count-cap`, `outside-hours`, `session-ended`, `unsupported`, `evicted`, `stopped`, `account-changed`, `expired` and `idle`. `count-cap`, not `idle`, describes the 24-attempt stop. `idle` is reserved for legacy/unpriced-auto idle limits. A policy refusal is `unsupported`; a disappeared/invalid previously applied runner plan is `session-ended`.
 
-When content-filter recovery switches a session to Opus 4.8 temporarily, the original model's saved prefix can be warmed separately so it remains available when the session switches back. These source warms remain separate cache targets, with their own 24-attempt bound where applicable. Explicit `off` and `none` stop them too. Source warms do not move the active session's cache clock or emit its touch/stop reports: the shared report has no target/model attribution, so a source warm cannot establish the active model's cache lifetime. Prime remains separate and has no session cache reports.
+During a [client fallback round](refusal-fallback.md#returning-to-the-requested-model), keep-warm still targets only the requested model's saved prefix. Those warms report touches and stops under the ordinary rules. Accepted round steps reset the warm budget without replacing the saved prefix. Prime remains separate and has no session cache reports.
 
 ## Prime and lane start
 
 Prime is opt-in quota-window priming. The **Extras** group in OpenCode and Pi can enable or disable it and shows each account's next due time and last result. In OpenCode 1 and 2, Prime runs without waiting for a chat request and picks up changes to `prime_enabled` in the shared settings file without a restart. After a confirmed five-hour reset, Prime checks fresh quota and limits, then approximately one minute after reset can send a minimal `claude-haiku-4-5` request. Cross-process claims prevent duplicate priming for the same verified Claude account/reset, even when OpenCode and Pi (or two OpenCode installs) use separate account files. Accounts without a verified identity are deduplicated only within the same account storage. This is a real request, not a quota API trick or a guarantee of free usage. Prime does not create a message thread or register a cache for keepalive. It stops when the host shuts down.
+
+While enabled, Prime stores and cleans up its own claim markers in the private `<data>/cortexkit/anthropic-auth/prime/` folder. It uses the [same data home as CacheKeep](cachekeep-registry.md#location-and-permissions), including `XDG_DATA_HOME` when set.
+
+| OS | Default Prime marker root |
+| --- | --- |
+| Linux | `~/.local/share/cortexkit/anthropic-auth/prime/` |
+| macOS | `~/.local/share/cortexkit/anthropic-auth/prime/` |
+| Windows | `%USERPROFILE%\.local\share\cortexkit\anthropic-auth\prime\` |
+
+The folder is owner-only (`0700` on Unix, owner-only ACLs on Windows). If the folder cannot be used safely or a sign-in replaces the checked account before dispatch, Prime skips the request and checks again on a later tick. A token refresh for the same account does not stop a scheduled request. Older temp-folder markers are left untouched, so an old and a new plugin running side by side can each send one Prime request for the same account in a window.
 
 In OpenCode and Pi, **Fire lane start** is an explicit one-shot action. It inserts a visible synthetic lane-start marker in the conversation and runs a one-token request through normal routing, custody, limits, cache shaping and transport. This warms the session's prompt cache for the next turn and counts as billed usage. It neither enables Prime nor installs an automatic schedule.
 

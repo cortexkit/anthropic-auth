@@ -123,8 +123,8 @@ export interface NativeVaultRuntimeOptions {
   now?: () => number
   onLockEvent?: (event: NativeLockEvent) => void
   /**
-   * Timer functions for custody probes, watch retries and Insula's minute
-   * watchdog. Defaults to the global ones; tests pass their own.
+   * Timer functions for custody probes, watch retries, Insula's minute
+   * watchdog and the roster shutdown grace. Defaults to the global ones.
    */
   setTimeout?: typeof globalThis.setTimeout
   clearTimeout?: typeof globalThis.clearTimeout
@@ -377,6 +377,7 @@ export async function publishNativeVaultRuntimeSeed(
 }
 
 const NATIVE_VAULT_CONNECT_TIMEOUT_MS = 2_000
+const ROSTER_SHUTDOWN_GRACE_MS = 1_000
 
 /**
  * The vault list timer's period. Without an open vault watch it is the
@@ -1492,11 +1493,32 @@ export function createNativeVaultRuntime(
         closeCustody()
         return store.close()
       }
+      const drainRoster = async () => {
+        if (!refreshing) return
+        // Abort releases the refresh's callers, not its roster or settings
+        // lock wait. Give the refresh a chance to finish without holding up close.
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+          await Promise.race([
+            Promise.allSettled([refreshing]),
+            new Promise<void>((resolve) => {
+              timer = (options.setTimeout ?? setTimeout)(
+                resolve,
+                ROSTER_SHUTDOWN_GRACE_MS,
+              )
+            }),
+          ])
+        } finally {
+          ;(options.clearTimeout ?? clearTimeout)(timer)
+        }
+      }
       // Metadata writes recheck active custody before renaming. Leave custody
       // active until those writes finish, but close idle custody synchronously.
-      closing = quotaObservations.hasPendingPublications()
-        ? quotaObservations.close().finally(finish)
-        : Promise.resolve(finish())
+      closing = (
+        quotaObservations.hasPendingPublications()
+          ? quotaObservations.close().finally(finish)
+          : Promise.resolve(finish())
+      ).finally(drainRoster)
       return closing
     },
   }

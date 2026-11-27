@@ -374,6 +374,12 @@ export class PiNativeRuntime {
     return this.closed ? undefined : this.publishedRuntime?.getClaudeGateway?.()
   }
 
+  refusalFallbackMode() {
+    return this.closed
+      ? undefined
+      : this.publishedRuntime?.getRefusalFallbackMode?.()
+  }
+
   async routingPath(): Promise<string> {
     return (await this.routingStorage()).path
   }

@@ -106,6 +106,7 @@ function restore(shared: Shared): Promise<void> {
         if (!lease.allowUrl(entry.url)) return 'invalid'
         const account = accounts.get(entry.oauthAccountIdentity)
         if (!account) return 'account-gone'
+        // Older round records contain only the serving model's prefix.
         if (
           entry.isSubagent &&
           !entry.policyState?.planned &&
@@ -126,7 +127,9 @@ function restore(shared: Shared): Promise<void> {
           cacheMode: 'hybrid',
           oauthAccountId: account.id,
           oauthAccountIdentity: account.accountIdentity,
-          hostMetadata: { restartCredential: entry.oauthAccountIdentity },
+          hostMetadata: {
+            restartCredential: entry.oauthAccountIdentity,
+          },
           isSubagent: entry.isSubagent,
           acceptedAt,
           retained: {
@@ -189,14 +192,14 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
   const active = () => shared.leases.has(lease)
   const persisted = (target: Readonly<CacheKeepTarget>) => {
     const credential = target.hostMetadata?.restartCredential
-    return !target.sourceWarm && typeof credential === 'string'
+    return typeof credential === 'string'
       ? { ...target, oauthAccountIdentity: credential }
       : undefined
   }
   const reserve = (target: Readonly<CacheKeepTarget>) => {
     const entry = persisted(target)
     if (!entry) return Promise.resolve(true)
-    if (!active() || shared.owners.get(sessionHash(target.id)) !== lease)
+    if (!active() || shared.owners.get(sessionHash(entry.id)) !== lease)
       return Promise.resolve(false)
     return shared.store.reserveWarm(entry)
   }
@@ -207,12 +210,12 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
     changed(target: Readonly<CacheKeepTarget>) {
       const entry = persisted(target)
       if (!entry || !active()) return
-      const hash = sessionHash(target.id)
+      const hash = sessionHash(entry.id)
       const previous = shared.owners.get(hash)
       if (previous !== lease) {
         shared.owners.set(hash, lease)
         shared.restored.delete(hash)
-        previous?.manager.releaseTarget(target.id)
+        previous?.manager.releaseTarget(entry.id)
       }
       shared.store.changed(entry, !lease.manager.isRestoredTarget(target))
     },
