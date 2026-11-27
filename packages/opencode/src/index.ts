@@ -10202,6 +10202,7 @@ const anthropicAuthPlugin = async (
                     warmCredentialId: routingWarmCredential(
                       snapshot.accounts,
                       assignment,
+                      routingSessionId,
                     ),
                   },
                 )
@@ -10395,6 +10396,8 @@ const anthropicAuthPlugin = async (
                       inputBytes: 1,
                       preserveOnNoCandidate: true,
                       routingAccountId: account.id,
+                      preferWarmRetryAccount:
+                        lastRefuser !== undefined && !advice.hold,
                       accountIdentities: routing.accountIdentities,
                     })
                     if (!selected) {
@@ -10756,7 +10759,7 @@ const anthropicAuthPlugin = async (
                           ? Buffer.byteLength(init.body)
                           : 1,
                       preferredAccountId,
-                      preferWarmRetryAccount: !!excludeAccountIds && !advised,
+                      preferWarmRetryAccount: !!excludeAccountIds,
                       excludeAccountIds,
                       ...(advised && {
                         preserveOnNoCandidate: true,

@@ -8,6 +8,7 @@ import {
   RoutingRefusalError,
   routingWarmCredential,
 } from '../routing-relay.ts'
+import { sessionCacheActivity } from '../session-cache-activity.ts'
 import { StickySessionRouter } from '../sticky-routing.ts'
 
 const key = Symbol.for('cortexkit.routing')
@@ -59,6 +60,50 @@ test('warm credential hints require the pinned account to remain servable and id
     expect(
       routingWarmCredential([{ ...account, ...change }], pin),
     ).toBeUndefined()
+})
+
+test('warm credential hints prefer live cache activity and fall back to the pin', () => {
+  const sessionId = 'warm-hint-activity'
+  const pinned: NativeAccountView = {
+    id: 'main',
+    type: 'oauth',
+    source: 'vault',
+    enabled: true,
+    state: 'active',
+    accountIdentity: 'pinned-account',
+    credentialId: 'pinned-credential',
+  }
+  const warm = {
+    ...pinned,
+    id: 'warm',
+    accountIdentity: 'warm-account',
+    credentialId: 'warm-credential',
+  }
+  const pin = { accountId: pinned.id, accountIdentity: pinned.accountIdentity }
+  try {
+    sessionCacheActivity.record(sessionId, warm.id, 300_000)
+    expect(routingWarmCredential([pinned, warm], pin, sessionId)).toBe(
+      warm.credentialId,
+    )
+    expect(routingWarmCredential([pinned, warm], undefined, sessionId)).toBe(
+      warm.credentialId,
+    )
+    for (const change of [
+      { enabled: false },
+      { credentialId: undefined },
+      { source: 'local' as const },
+    ]) {
+      expect(
+        routingWarmCredential([pinned, { ...warm, ...change }], pin, sessionId),
+      ).toBe(pinned.credentialId)
+    }
+    sessionCacheActivity.record(sessionId, warm.id, 1, Date.now() - 100)
+    expect(routingWarmCredential([pinned, warm], pin, sessionId)).toBe(
+      pinned.credentialId,
+    )
+  } finally {
+    sessionCacheActivity.forget(sessionId)
+  }
 })
 
 test('warm hints add only the matching candidate credential to the routing request', async () => {

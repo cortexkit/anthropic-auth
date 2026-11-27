@@ -4677,9 +4677,11 @@ async function vaultWarmHintFixture() {
     if (previous === undefined) delete globals[key]
     else globals[key] = previous
   })
+  const sessionId = 'pi-warm-hint'
+  deferCleanup(() => sessionCacheActivity.forget(sessionId))
   const send = () =>
     streamCortexKitAnthropic(model, context, {
-      sessionId: 'pi-warm-hint',
+      sessionId,
     }).result()
   return {
     ...f,
@@ -4687,6 +4689,7 @@ async function vaultWarmHintFixture() {
     bodies,
     requests,
     send,
+    sessionId,
     noAdvice: () => {
       answer = null
     },
@@ -4733,6 +4736,22 @@ test('Pi sends its pinned vault warm credential on every model request without c
   expect(f.bodies).toHaveLength(3)
   expect(f.bodies[1]).toBe(f.bodies[0])
   expect(f.bodies[2]).toBe(f.bodies[0])
+})
+
+test('Pi hints the account with live cache activity instead of the pin', async () => {
+  const f = await vaultWarmHintFixture()
+  expect((await f.send()).stopReason).toBe('stop')
+  const warm = (await f.runtime.read()).accounts.find(
+    (account) => account.credentialId === 'oauth:anthropic:work',
+  )
+  if (!warm) throw new Error('Missing fixture fallback')
+  sessionCacheActivity.record(f.sessionId, warm.id, 300_000)
+  expect((await f.send()).stopReason).toBe('stop')
+  const plain = expectedVaultRoutingAsk(true)
+  expect(f.requests).toEqual([
+    plain,
+    { ...plain, warm_credential: warm.credentialId },
+  ])
 })
 
 for (const condition of ['disabled', 'signed out', 'unservable']) {

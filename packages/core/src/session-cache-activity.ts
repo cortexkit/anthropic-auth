@@ -67,12 +67,17 @@ export class SessionCacheActivity {
     accountId: (candidate: T) => string,
     now = Date.now(),
   ): T | undefined {
-    if (!sessionId) return undefined
-    const activity = this.entries.get(sessionId)
+    const activity = this.lastAcceptedAccount(sessionId)
     if (!activity || activity.expiresAt <= now) return undefined
     return candidates.find(
       (candidate) => accountId(candidate) === activity.accountId,
     )
+  }
+
+  lastAcceptedAccount(
+    sessionId: string | null | undefined,
+  ): Readonly<Pick<Activity, 'accountId' | 'expiresAt'>> | undefined {
+    return sessionId ? this.entries.get(sessionId) : undefined
   }
 
   /** Restore only an unexpired cache for a session without newer in-process evidence. */
