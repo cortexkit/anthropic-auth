@@ -5,12 +5,16 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync, gzipSync } from 'node:zlib'
 import {
+  CACHE_KEEP_PREWARM_LEAD_MS,
+  CACHE_KEEP_TTL_MS,
   CacheKeepClaim,
   type CacheKeepManager,
   cacheKeepStoreDirectory,
   createEmptyStorage,
   type HolderLiveness,
   type NativeAccountSnapshot,
+  StickySessionRouter,
+  sessionCacheActivity,
 } from '@cortexkit/anthropic-auth-core'
 import { PiCacheKeep } from '../cachekeep.ts'
 
@@ -163,6 +167,72 @@ async function restoredPlannedFixture(adopt = true) {
   if (adopt) await active.process.startSession('pi-storage', 'session-S')
   return { ...f, active, reports }
 }
+
+test.each(['warm', 'prewarmed', 'expired', 'live response'] as const)(
+  'Pi first retry after restore uses %s cache evidence',
+  async (evidence) => {
+    const f = await fixture()
+    const sessionId = 'pi-cachekeep-retry'
+    const realAcceptedAt = f.now()
+    const router = new StickySessionRouter({
+      path: join(f.root, 'sticky.json'),
+      now: f.now,
+    })
+    cleanups.push(() => router.drain())
+    cleanups.push(() => sessionCacheActivity.forget(sessionId))
+    const initial = f.create()
+    await initial.process.startSession('pi-storage', sessionId)
+    expect(
+      await initial.process.trackAccepted(f.input(sessionId), f.snapshot),
+    ).toEqual({ tracked: true })
+    let lastAcceptedAt = realAcceptedAt
+    if (evidence === 'prewarmed') {
+      f.advance(CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS + 1)
+      await initial.tick()
+      expect(f.sends).toHaveLength(1)
+      lastAcceptedAt = f.now()
+      f.advance(CACHE_KEEP_PREWARM_LEAD_MS)
+    }
+    await initial.process.stop()
+    sessionCacheActivity.forget(sessionId)
+    f.advance(evidence === 'expired' ? CACHE_KEEP_TTL_MS : 60_000)
+
+    const restored = f.create()
+    const starting = restored.process.startSession('pi-storage', sessionId)
+    if (evidence === 'live response')
+      sessionCacheActivity.record(sessionId, 'cold', 300_000, f.now())
+    await starting
+    expect(restored.process.manager.trackedCount()).toBe(
+      evidence === 'expired' ? 0 : 1,
+    )
+    expect(f.sends).toHaveLength(evidence === 'prewarmed' ? 1 : 0)
+
+    const candidates = ['refused', 'cold', 'oauth'].map((accountId, order) => ({
+      accountId,
+      order,
+      quota: { kind: 'unknown' } as const,
+    }))
+    const retry = await router.resolve({
+      sessionId,
+      family: 'general',
+      candidates,
+      retainAccountIds: new Set(candidates.map(({ accountId }) => accountId)),
+      excludeAccountIds: new Set(['refused']),
+      preferWarmRetryAccount: true,
+      storage: null,
+      inputBytes: 1024,
+    })
+    const warm = evidence === 'warm' || evidence === 'prewarmed'
+    expect(retry?.accountId).toBe(warm ? 'oauth' : 'cold')
+    expect(
+      sessionCacheActivity.holdUntil(sessionId, 'oauth', f.now(), 'max'),
+    ).toBe(warm ? lastAcceptedAt + CACHE_KEEP_TTL_MS : undefined)
+    if (evidence === 'live response')
+      expect(
+        sessionCacheActivity.holdUntil(sessionId, 'cold', f.now(), 'max'),
+      ).toBe(f.now() + 300_000)
+  },
+)
 
 test('a first Pi track saves its accepted target identity on the first change', async () => {
   const f = await fixture()
@@ -809,47 +879,55 @@ test('a Pi real turn on an ineligible account ends its restored planned prefix',
   expect(f.sends).toHaveLength(0)
 })
 
-test('Pi restores a 2.6 record without policyState and durably caps its new count', async () => {
-  const f = await fixture()
-  const first = f.create()
-  await first.process.trackAccepted(f.input('legacy-pi'), f.snapshot)
-  await first.process.stop()
-  const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
-  const [name] = (await readdir(directory)).filter((name) =>
-    name.endsWith('.gz'),
-  )
-  const path = join(directory, name!)
-  const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
-  expect(saved.policyState).toBeDefined()
-  saved.pluginVersion = '2.6.0'
-  delete saved.policyState
-  await writeFile(path, gzipSync(JSON.stringify(saved)))
-  f.advance(60_000)
-  const reserved: number[] = []
-  const resumed = f.create(undefined, async () => {
-    const persisted = JSON.parse(gunzipSync(await readFile(path)).toString())
-    reserved.push(persisted.policyState.warmsSinceLastRealRequest)
-    return Response.json({})
-  })
-  await resumed.process.startSession('pi-storage', 'legacy-pi')
-  expect(resumed.process.manager.trackedPolicyState('legacy-pi')).toMatchObject(
-    {
+test.each([true, false])(
+  'Pi restores a 2.6 record without policyState and durably caps its new count (saved touch=%s)',
+  async (savedTouch) => {
+    const f = await fixture()
+    cleanups.push(() => sessionCacheActivity.forget('legacy-pi'))
+    const first = f.create()
+    await first.process.trackAccepted(f.input('legacy-pi'), f.snapshot)
+    await first.process.stop()
+    const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
+    const [name] = (await readdir(directory)).filter((name) =>
+      name.endsWith('.gz'),
+    )
+    const path = join(directory, name!)
+    const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+    expect(saved.policyState).toBeDefined()
+    saved.pluginVersion = '2.6.0'
+    delete saved.policyState
+    if (!savedTouch) delete saved.lastTouchAt
+    await writeFile(path, gzipSync(JSON.stringify(saved)))
+    f.advance(60_000)
+    const reserved: number[] = []
+    const resumed = f.create(undefined, async () => {
+      const persisted = JSON.parse(gunzipSync(await readFile(path)).toString())
+      reserved.push(persisted.policyState.warmsSinceLastRealRequest)
+      return Response.json({})
+    })
+    await resumed.process.startSession('pi-storage', 'legacy-pi')
+    expect(
+      resumed.process.manager.trackedPolicyState('legacy-pi'),
+    ).toMatchObject({
       planned: false,
-      lastRealRequestAt: saved.lastTouchAt,
+      lastRealRequestAt: savedTouch ? saved.lastTouchAt : f.now(),
       warmsSinceLastRealRequest: 0,
       warmCostSoFar: 0,
       hasWarmed: false,
-    },
-  )
-  for (let count = 1; count <= 25; count++) {
-    f.advance(55 * 60_000)
-    await resumed.tick()
-    expect(f.sends).toHaveLength(Math.min(count, 24))
-  }
-  expect(reserved).toEqual(Array.from({ length: 24 }, (_, i) => i + 1))
-  expect(f.sends[0]?.body.system).toEqual(JSON.parse(saved.bodyText).system)
-  expect(resumed.process.manager.trackedCount()).toBe(0)
-})
+    })
+    expect(
+      sessionCacheActivity.holdUntil('legacy-pi', 'oauth', f.now(), 'max'),
+    ).toBe(savedTouch ? saved.cacheExpiresAt : undefined)
+    for (let count = 1; count <= 25; count++) {
+      f.advance(55 * 60_000)
+      await resumed.tick()
+      expect(f.sends).toHaveLength(Math.min(count, 24))
+    }
+    expect(reserved).toEqual(Array.from({ length: 24 }, (_, i) => i + 1))
+    expect(f.sends[0]?.body.system).toEqual(JSON.parse(saved.bodyText).system)
+    expect(resumed.process.manager.trackedCount()).toBe(0)
+  },
+)
 
 test('Pi still drops a restart record requiring a real request', async () => {
   const f = await fixture()
@@ -945,6 +1023,8 @@ test.each([
   'expired',
 ] as const)('Pi drops %s restart records', async (reason) => {
   const f = await fixture()
+  sessionCacheActivity.forget('session-S')
+  cleanups.push(() => sessionCacheActivity.forget('session-S'))
   const seed = f.create()
   await seed.process.trackAccepted(f.input('session-S'), f.snapshot)
   await seed.process.stop()
@@ -960,6 +1040,9 @@ test.each([
   const next = f.create()
   await next.process.startSession('pi-storage', 'session-S')
   expect(next.process.manager.trackedCount()).toBe(0)
+  expect(
+    sessionCacheActivity.holdUntil('session-S', 'oauth', f.now(), 'max'),
+  ).toBeUndefined()
   const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
   expect(
     (await readdir(directory)).filter((name) => name.endsWith('.gz')),

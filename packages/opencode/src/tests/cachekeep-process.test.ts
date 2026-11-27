@@ -5,10 +5,13 @@ import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import {
   CACHE_KEEP_PREWARM_LEAD_MS,
+  CACHE_KEEP_TTL_MS,
   CacheKeepStore,
   cacheKeepStoreDirectory,
+  StickySessionRouter,
+  sessionCacheActivity,
 } from '@cortexkit/anthropic-auth-core'
-import { type Host, openKeeper } from './fixtures/cachekeep-process.ts'
+import { type Host, openKeeper, SESSION } from './fixtures/cachekeep-process.ts'
 
 function spawnKeeper(
   host: Host,
@@ -50,6 +53,83 @@ function spawnKeeper(
     },
   }
 }
+
+const retryCases = (['opencode1', 'opencode2'] as const).flatMap((host) =>
+  (['warm', 'expired', 'live response'] as const).map(
+    (evidence) => [host, evidence] as const,
+  ),
+)
+
+test.each(retryCases)(
+  '%s first retry after restore uses %s cache evidence',
+  async (host, evidence) => {
+    const root = await mkdtemp(join(tmpdir(), 'cachekeep-retry-'))
+    const dataHome = process.env.XDG_DATA_HOME
+    process.env.XDG_DATA_HOME = root
+    const storageId = join(root, 'accounts.json')
+    const disposals: Array<() => Promise<void>> = []
+    const acceptedAt = Date.now()
+    let now = acceptedAt
+    const start = async () => {
+      const keeper = await openKeeper(host, storageId, root, () => now)
+      disposals.push(keeper.dispose)
+      return keeper
+    }
+    const router = new StickySessionRouter({
+      path: join(root, 'sticky.json'),
+      now: () => now,
+    })
+    try {
+      const initial = await start()
+      expect(await initial.prepare()).toEqual({ tracked: true })
+      await initial.dispose()
+      sessionCacheActivity.forget(SESSION)
+      now += evidence === 'expired' ? CACHE_KEEP_TTL_MS : 60_000
+
+      const starting = start()
+      if (evidence === 'live response')
+        sessionCacheActivity.record(SESSION, 'cold', 300_000, now)
+      const restored = await starting
+      expect(restored.manager.trackedCount()).toBe(
+        evidence === 'expired' ? 0 : 1,
+      )
+      expect(restored.sent()).toBe(0)
+
+      const candidates = ['refused', 'cold', 'main'].map(
+        (accountId, order) => ({
+          accountId,
+          order,
+          quota: { kind: 'unknown' } as const,
+        }),
+      )
+      const retry = await router.resolve({
+        sessionId: SESSION,
+        family: 'general',
+        candidates,
+        retainAccountIds: new Set(candidates.map(({ accountId }) => accountId)),
+        excludeAccountIds: new Set(['refused']),
+        preferWarmRetryAccount: true,
+        storage: null,
+        inputBytes: 1024,
+      })
+      expect(retry?.accountId).toBe(evidence === 'warm' ? 'main' : 'cold')
+      expect(sessionCacheActivity.holdUntil(SESSION, 'main', now, 'max')).toBe(
+        evidence === 'warm' ? acceptedAt + CACHE_KEEP_TTL_MS : undefined,
+      )
+      if (evidence === 'live response')
+        expect(
+          sessionCacheActivity.holdUntil(SESSION, 'cold', now, 'max'),
+        ).toBe(now + 300_000)
+    } finally {
+      sessionCacheActivity.forget(SESSION)
+      await router.drain()
+      for (const dispose of disposals.reverse()) await dispose()
+      if (dataHome === undefined) delete process.env.XDG_DATA_HOME
+      else process.env.XDG_DATA_HOME = dataHome
+      await rm(root, { recursive: true, force: true })
+    }
+  },
+)
 
 test.each(['opencode1', 'opencode2'] as const)(
   '%s restores and warms a shared session only in the owning process',

@@ -43,6 +43,7 @@ import {
 } from './provider-error.ts'
 import { sanitizeClaudeCodeRequestBody } from './server-fallback.ts'
 import { stripServerFallbackUsageMarkers } from './server-fallback-usage.ts'
+import { sessionCacheActivity } from './session-cache-activity.ts'
 import {
   isSessionCacheWarmStopReason,
   readSessionCachePolicy,
@@ -2065,6 +2066,27 @@ export class CacheKeepManager {
         return { tracked: false, reason: decision.reason }
       }
       if (decision?.action === 'wait') target.nextPrewarmAt = decision.until
+    }
+    if (input.retained && target.oauthAccountId) {
+      // A prewarm can renew the cache without accepting a new request body.
+      // Use saved touches only: the restore clock is not cache evidence.
+      const lastAcceptedAt = Math.max(
+        ...[
+          input.retained.lastTouchAt,
+          input.retained.policyState?.lastRealRequestAt,
+          input.retained.policyState?.lastWarmAt,
+        ].filter((at): at is number => Number.isFinite(at)),
+      )
+      sessionCacheActivity.seedFromRestore(
+        target.id,
+        target.oauthAccountId,
+        {
+          lastAcceptedAt,
+          ttlMs: target.ttlMs ?? appliedTtlMs,
+          cacheExpiresAt: target.cacheExpiresAt,
+        },
+        now,
+      )
     }
     this.options.onTargetChanged?.(target)
     this.start()
