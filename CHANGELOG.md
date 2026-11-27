@@ -20,7 +20,6 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Billing reports a streamed reply as completed only when it ends normally; a reply cut off after its usage update is reported as cut, with its usage kept.
 - Claude sign-in stops after 60 seconds if the code exchange stalls, instead of hanging until the runtime's own timeout. A refresh error is treated as a dead login only when Anthropic's reply says `invalid_grant` as its error, not whenever the text appears.
 - When a thread continuation is refused and its error body stalls, recovery gives up after 5 seconds and returns the original error, without resending.
-- A new account's first full quota poll is no longer skipped when a response's quota headers are still waiting to be saved. If newer headers are already saved, the poll's per-model limits and credits still wait for the next poll, as before: within a minute on OpenCode 2, and after about five minutes on OpenCode 1 and Pi.
 - The routing assignment file is pruned again when it is saved: expired assignments and the oldest ones over the 4,096 limit are removed, so the file no longer grows without end. An assignment is kept on disk for two hours past the 7-day limit, so one that a session is using at that moment isn't lost.
 - OpenCode 2's session listeners subscribe only to the events they handle, so the host no longer encodes every streamed event for them.
 - OpenCode 2 parses a large request body fewer times while preparing it; the bytes sent to Anthropic don't change.
