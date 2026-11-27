@@ -474,7 +474,6 @@ export const nativeQuotaCodec: QuotaCodec = {
       incoming.source === 'poll' &&
       incoming.checkedAt !== undefined &&
       previous.source === 'headers' &&
-      previousPollAt > 0 &&
       previousTime > incomingTime
     )
       // A header can arrive after the poll completed but before it was stored.

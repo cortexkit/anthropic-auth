@@ -16,6 +16,7 @@ import {
   nativeQuotaModelScope,
   toNativeQuotaMap,
 } from '../native-quota-codec.ts'
+import { NativeQuotaObservations } from '../native-quota-observations.ts'
 import { normalizeQuotaHeaders } from '../quota-headers.ts'
 
 // Different timestamps expose accidental timestamp reuse between quota windows.
@@ -604,8 +605,78 @@ test('new native header merges retain the poll clock even though legacy data cou
   expect(afterSecond.checkedAt).toBe(laterPollAt)
   expect(afterSecond.scoped).toEqual([])
   expect(afterSecond.extraUsage).toBeUndefined()
-  expect(nativeQuotaCodec.merge(legacy(first), latePoll)).toEqual(legacy(first))
+  // A legacy header snapshot with no recoverable poll clock cannot establish
+  // that the incoming poll is older. Keep the headers and use the poll data.
+  expect(
+    fromNativeQuotaMap(nativeQuotaCodec.merge(legacy(first), latePoll)),
+  ).toEqual(afterFirst)
 })
+
+test('a newer header-only snapshot keeps its standard windows and gains the first poll’s scoped limits and credits', () => {
+  const headers: OAuthQuotaSnapshot = {
+    accountIdentity: full.accountIdentity,
+    source: 'headers',
+    checkedAt: 2000,
+    five_hour: { usedPercent: 12, remainingPercent: 88, checkedAt: 2000 },
+    seven_day: { usedPercent: 21, remainingPercent: 79, checkedAt: 2000 },
+  }
+  const poll: OAuthQuotaSnapshot = {
+    accountIdentity: full.accountIdentity,
+    source: 'poll',
+    checkedAt: full.checkedAt,
+    five_hour: full.five_hour,
+    seven_day: full.seven_day,
+    scoped: full.scoped,
+    extraUsage: full.extraUsage,
+  }
+  expect(quotaPollCheckedAt(headers)).toBe(0)
+  const merged = fromNativeQuotaMap(
+    nativeQuotaCodec.merge(toNativeQuotaMap(headers), toNativeQuotaMap(poll)),
+  )
+  expect(merged.five_hour).toEqual(headers.five_hour)
+  expect(merged.seven_day).toEqual(headers.seven_day)
+  expect(merged.scoped).toEqual(poll.scoped)
+  expect(merged.extraUsage).toEqual(poll.extraUsage)
+  expect(quotaPollCheckedAt(merged)).toBe(poll.checkedAt!)
+})
+
+test.each([
+  ['headers', 1],
+  ['poll', 0],
+] as const)(
+  'newer held %s affects a pending quota poll write by source',
+  async (source, expectedWrites) => {
+    const observations = new NativeQuotaObservations()
+    const reading = (source: 'headers' | 'poll', checkedAt: number) => ({
+      lineage: 'same-credential',
+      accountUuid: 'same-account',
+      generalExhausted: false,
+      entry: {
+        quota: { source, checkedAt },
+        checkedAt,
+        refreshAfter: checkedAt,
+      },
+    })
+    let writes = 0
+    try {
+      const published = observations.publish(
+        'main',
+        reading('poll', 1000),
+        async () => {
+          writes++
+          return true
+        },
+      )
+      const latest = reading(source, 2000)
+      expect(observations.hold('main', latest)).toBe(true)
+      await published
+      expect(writes).toBe(expectedWrites)
+      expect(observations.get('main')).toBe(latest)
+    } finally {
+      await observations.close()
+    }
+  },
+)
 
 test('a newer complete poll replaces the whole snapshot and clears older scoped limits and extra usage', () => {
   const stored = toNativeQuotaMap({ ...full, source: 'poll' })
