@@ -16,7 +16,6 @@ import {
   type PrimeUsageCounters,
   quotaSnapshotOmitsFiveHour,
 } from './accounts.ts'
-import { ensureHolderDirectory } from './holder-registry.ts'
 import { getHostDataHome } from './host-paths.ts'
 import { logger } from './logger.ts'
 import {
@@ -25,7 +24,10 @@ import {
 } from './models.ts'
 import type { NativeAccountRuntime } from './native-account-runtime.ts'
 import { nativeAccountCanServe } from './native-account-view.ts'
-import { ensureWindowsOwnerOnlyDirectory } from './owner-only.ts'
+import {
+  ensureHolderDirectory,
+  ensureWindowsOwnerOnlyDirectory,
+} from './owner-only.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
 // Re-export pricing for downstream packages that import it through core's

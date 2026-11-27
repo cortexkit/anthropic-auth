@@ -12,12 +12,12 @@ import { dirname, join, resolve } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
 import { fallbackCreditRequestDumpView } from './fallback-credit.ts'
 import { isClaudeGatewaySecretHeader } from './gateway.ts'
-import { ensureHolderDirectory } from './holder-registry.ts'
 import { getHostDataHome } from './host-paths.ts'
 import { parseJsonRedacted } from './json.ts'
 import { isSecretKey, logger, relayLog } from './logger.ts'
 import {
   createWindowsOwnerOnly,
+  ensureHolderDirectory,
   ensureWindowsOwnerOnlyDirectory,
 } from './owner-only.ts'
 import type { ProviderErrorSummary } from './provider-error.ts'

@@ -1,4 +1,4 @@
-import { lstat } from 'node:fs/promises'
+import { lstat, mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { types as utilTypes } from 'node:util'
 import type * as PrivateFiles from '@cortexkit/private-files'
@@ -193,4 +193,27 @@ export async function ensureWindowsOwnerOnlyDirectory(
   if (await exists(path)) await privateDirectory(path)
   else await create(path)
   return true
+}
+
+/**
+ * Create missing per-user storage directories with mode 0700 on POSIX or a
+ * protected owner-only access control list on Windows. Leave existing directories
+ * alone: the user may have shared them intentionally. If a Windows creation
+ * races another process, adopt the winning directory only if it is owner-only.
+ */
+export async function ensureHolderDirectory(
+  dir: string,
+  ownerOnly: OwnerOnlyOptions = {},
+): Promise<void> {
+  if ((ownerOnly.platform ?? process.platform) !== 'win32') {
+    await mkdir(dir, { recursive: true, mode: 0o700 })
+    return
+  }
+  try {
+    await lstat(dir)
+    return
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+  }
+  await ensureWindowsOwnerOnlyDirectory(dir, ownerOnly)
 }
