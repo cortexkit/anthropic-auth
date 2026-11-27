@@ -3517,6 +3517,11 @@ async function executeWithFallback(options: {
             capacityWait: 'wait',
             signal,
             onCapacityWait: options.onCapacityWait,
+            warmCredentialId: routingWarmCredential(
+              snapshot.accounts,
+              undefined,
+              routingSessionId,
+            ),
           },
         )),
     )
@@ -3619,6 +3624,7 @@ async function executeWithFallback(options: {
           warmCredentialId: routingWarmCredential(
             snapshot.accounts,
             assignment,
+            routingSessionId,
           ),
         },
       )

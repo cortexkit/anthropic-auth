@@ -27,8 +27,9 @@ import {
   quotaRefusalTiming,
   quotaSnapshotOmitsFiveHour,
   quotaSnapshotPassesModelScope,
+  quotaSnapshotPassesPolicy,
 } from './accounts.ts'
-import { logger } from './logger.ts'
+import { logger, shouldEmit } from './logger.ts'
 import { isClaudeFableOrMythos5Model } from './models.ts'
 import type { NativeQuotaPolicyLimit } from './native-account-runtime.ts'
 import {
@@ -849,6 +850,108 @@ const warnedInvalidStates = new Set<string>()
 
 class InvalidStateRepairError extends Error {}
 
+export type WarmRetryRejection =
+  | NativeQuotaPolicyLimit
+  | 'excluded'
+  | 'missing-identity'
+  | 'credential-unavailable'
+  | 'not-candidate'
+  | 'quota-exhausted'
+  | 'quota-unknown'
+  | 'quota-stale'
+  | 'quota-invalid'
+
+export type RetryAccountCandidate = {
+  candidate: StickyRouteCandidate
+  ineligibleReason?: WarmRetryRejection
+  /** Null means the host checked for a blocker and found none. */
+  hostBlocker?: StickyQuotaBlocker['reason'] | null
+  policyLimits?: readonly NativeQuotaPolicyLimit[]
+}
+
+export function logRetryAccountChoice(input: {
+  sessionId: string
+  accountId: string
+  modelId?: string
+  family: StickyRouteFamily
+  storage: AccountStorage | null
+  routingUsable: boolean
+  routingAccountId?: string
+  pinnedAccountId?: string
+  preferredAccountId?: string
+  candidates: () => readonly RetryAccountCandidate[]
+  warmRejection?: WarmRetryRejection
+  now?: number
+}) {
+  if (!shouldEmit('debug')) return
+  const now = input.now ?? Date.now()
+  const activity = sessionCacheActivity.lastAcceptedAccount(input.sessionId)
+  const candidates = input.candidates()
+  const warmReason = !activity
+    ? 'cache-missing'
+    : activity.expiresAt <= now
+      ? 'cache-expired'
+      : activity.accountId === input.accountId
+        ? 'warm-selected'
+        : input.routingUsable
+          ? 'routed'
+          : (input.warmRejection ??
+            candidates.find(
+              (entry) => entry.candidate.accountId === activity.accountId,
+            )?.ineligibleReason ??
+            'not-candidate')
+  logger.debug('sticky-routing', 'retry account choice', {
+    sessionId: input.sessionId,
+    accountId: input.accountId,
+    modelId: input.modelId,
+    routingUsable: input.routingUsable,
+    routingAccountId: input.routingAccountId ?? null,
+    pinnedAccountId: input.pinnedAccountId ?? null,
+    preferredAccountId: input.preferredAccountId ?? null,
+    warmAccountId: activity?.accountId ?? null,
+    warmExpiresAt: activity?.expiresAt ?? null,
+    warmReason,
+    candidates: candidates.map(
+      ({ candidate, ineligibleReason, hostBlocker, policyLimits }) => {
+        const quota = knownQuota(candidate.quota)
+        const weightLimits = new Set<NativeQuotaPolicyLimit>()
+        const weight = stickyRouteCandidateWeight({
+          candidate,
+          family: input.family,
+          modelId: input.modelId,
+          storage: input.storage,
+          now,
+          onPolicyBlock: (limit) => weightLimits.add(limit),
+        })
+        return {
+          accountId: candidate.accountId,
+          order: candidate.order,
+          ineligibleReason: ineligibleReason ?? null,
+          quotaState: !quota
+            ? 'unknown'
+            : stickyQuotaSnapshotIsFresh(
+                  quota,
+                  input.storage,
+                  now,
+                  input.modelId,
+                )
+              ? 'fresh'
+              : 'stale',
+          floorPassed: quotaSnapshotPassesPolicy(quota, input.storage),
+          policyLimits: policyLimits ?? [],
+          weight,
+          weightLimits: [...weightLimits],
+          blocker:
+            stickyQuotaBlockerInForce({ quota, modelId: input.modelId, now })
+              ?.reason ?? null,
+          hostBlockerChecked: hostBlocker !== undefined,
+          hostBlocker: hostBlocker ?? null,
+        }
+      },
+    ),
+  })
+}
+
 export class StickySessionRouter {
   private loaded = false
   private state: StickyRouteState
@@ -1410,6 +1513,10 @@ export class StickySessionRouter {
     preferredAccountId?: string
     /** Prefer live cache activity over the sticky assignment when choosing our own retry. */
     preferWarmRetryAccount?: boolean
+    /** Include the host's retry filters in diagnostics, even for accounts not passed to the resolver. */
+    retryPool?: () => readonly RetryAccountCandidate[]
+    /** Account ID from routing advice the host could not admit. */
+    rejectedRoutingAccountId?: string
     excludeAccountIds?: ReadonlySet<string>
     /** Leave the current pin intact when selection cannot offer an account. */
     preserveOnNoCandidate?: boolean
@@ -1445,43 +1552,115 @@ export class StickySessionRouter {
       !input.excludeAccountIds?.has(candidate.accountId) &&
       (!input.accountIdentities ||
         identityForAccount(candidate.accountId) !== undefined)
-    const warm =
-      input.preferWarmRetryAccount && !input.routingAccountId
-        ? sessionCacheActivity.warmRetryAccount(
-            input.sessionId,
-            input.candidates.filter(canSelect),
-            (candidate) => candidate.accountId,
-            this.now(),
-          )
-        : undefined
-    const warmRetry =
-      warm &&
-      !stickyQuotaBlockerInForce({
-        quota: warm.quota,
-        modelId: input.modelId,
-        now: this.now(),
-      }) &&
-      (stickyRouteCandidateWeight({
-        candidate: warm,
-        family: input.family,
-        modelId: input.modelId,
-        storage: input.storage,
-        now: this.now(),
-      }) > 0 ||
-        (!knownQuota(warm.quota) &&
-          input.candidates.every(
-            (candidate) =>
-              !canSelect(candidate) || !knownQuota(candidate.quota),
-          )))
-        ? warm
-        : undefined
+    const candidates = input.candidates.filter(canSelect)
+    const routed = input.routingAccountId
+      ? candidates.find(
+          (candidate) => candidate.accountId === input.routingAccountId,
+        )
+      : undefined
+    const retryNow = this.now()
+    let warmRejection: WarmRetryRejection | undefined
+    const warmRetry = (() => {
+      if (!input.preferWarmRetryAccount || routed) return undefined
+      const warm = sessionCacheActivity.warmRetryAccount(
+        input.sessionId,
+        input.candidates,
+        (candidate) => candidate.accountId,
+        retryNow,
+      )
+      if (!warm) return undefined
+      if (!canSelect(warm)) {
+        warmRejection = input.excludeAccountIds?.has(warm.accountId)
+          ? 'excluded'
+          : 'missing-identity'
+        return undefined
+      }
+      if (
+        stickyQuotaBlockerInForce({
+          quota: warm.quota,
+          modelId: input.modelId,
+          now: retryNow,
+        })
+      ) {
+        warmRejection = 'quota-exhausted'
+        return undefined
+      }
+      const quota = knownQuota(warm.quota)
+      if (!quota) {
+        if (candidates.every((candidate) => !knownQuota(candidate.quota)))
+          return warm
+        warmRejection = 'quota-unknown'
+        return undefined
+      }
+      if (
+        stickyRouteCandidateWeight({
+          candidate: warm,
+          family: input.family,
+          modelId: input.modelId,
+          storage: input.storage,
+          now: retryNow,
+          onPolicyBlock: (limit) => {
+            warmRejection ??= limit
+          },
+        }) > 0
+      )
+        return warm
+      warmRejection ??= stickyQuotaSnapshotIsFresh(
+        quota,
+        input.storage,
+        retryNow,
+        input.modelId,
+      )
+        ? 'quota-invalid'
+        : 'quota-stale'
+      return undefined
+    })()
+    const retryPick =
+      (input.preferWarmRetryAccount ? routed : undefined) ?? warmRetry
     const cached = this.state.assignments[key]
+    const logChoice = (accountId: string) => {
+      if (!input.preferWarmRetryAccount) return
+      logRetryAccountChoice({
+        sessionId: input.sessionId,
+        accountId,
+        modelId: input.modelId,
+        family: input.family,
+        storage: input.storage,
+        routingUsable: routed !== undefined,
+        routingAccountId:
+          input.routingAccountId ?? input.rejectedRoutingAccountId,
+        pinnedAccountId: cached && this.logicalAccountId(cached),
+        preferredAccountId: input.preferredAccountId,
+        now: retryNow,
+        warmRejection,
+        candidates: () => {
+          const entries = new Map(
+            input
+              .retryPool?.()
+              .map((entry) => [entry.candidate.accountId, entry]),
+          )
+          for (const candidate of input.candidates) {
+            const previous = entries.get(candidate.accountId)
+            entries.set(candidate.accountId, {
+              ...previous,
+              candidate,
+              ineligibleReason: !canSelect(candidate)
+                ? input.excludeAccountIds?.has(candidate.accountId)
+                  ? 'excluded'
+                  : 'missing-identity'
+                : undefined,
+            })
+          }
+          return [...entries.values()]
+        },
+      })
+    }
     if (
       cached &&
       this.assignmentIsActive(cached) &&
       matchesAffinity(cached) &&
       matchesAccountIdentity(cached) &&
-      (!warmRetry || this.logicalAccountId(cached) === warmRetry.accountId) &&
+      (!retryPick || this.logicalAccountId(cached) === retryPick.accountId) &&
       input.retainAccountIds.has(this.logicalAccountId(cached)) &&
       !input.excludeAccountIds?.has(this.logicalAccountId(cached))
     ) {
@@ -1492,6 +1671,7 @@ export class StickySessionRouter {
         })
       }
       commitRequestChange(() => this.retryChange(key))
+      logChoice(this.logicalAccountId(cached))
       return {
         accountId: this.logicalAccountId(cached),
         assignment: { ...cached },
@@ -1513,12 +1693,13 @@ export class StickySessionRouter {
       current &&
       matchesAffinity(current) &&
       matchesAccountIdentity(current) &&
-      (!warmRetry || this.logicalAccountId(current) === warmRetry.accountId) &&
+      (!retryPick || this.logicalAccountId(current) === retryPick.accountId) &&
       input.retainAccountIds.has(this.logicalAccountId(current)) &&
       !input.excludeAccountIds?.has(this.logicalAccountId(current))
     ) {
       current.lastSeenAt = this.now()
       save('touch')
+      logChoice(this.logicalAccountId(current))
       return {
         accountId: this.logicalAccountId(current),
         assignment: { ...current },
@@ -1531,7 +1712,6 @@ export class StickySessionRouter {
     if (affinityChanged || identityChanged) {
       delete state.assignments[key]
     }
-    const candidates = input.candidates.filter(canSelect)
     const preferred =
       !affinityChanged && !identityChanged && input.preferredAccountId
         ? candidates.find(
@@ -1546,11 +1726,12 @@ export class StickySessionRouter {
               }) > 0,
           )
         : undefined
-    const selected = input.routingAccountId
-      ? candidates.find((row) => row.accountId === input.routingAccountId)
-      : (warmRetry ??
-        preferred ??
-        this.selectCandidate({ ...input, candidates, state }))
+    const selected =
+      input.routingAccountId && !input.preferWarmRetryAccount
+        ? routed
+        : (retryPick ??
+          preferred ??
+          this.selectCandidate({ ...input, candidates, state }))
     if (!selected) {
       if (current && !input.preserveOnNoCandidate) {
         delete state.assignments[key]
@@ -1574,6 +1755,7 @@ export class StickySessionRouter {
     }
     state.assignments[key] = assignment
     save('assign')
+    logChoice(selected.accountId)
     return {
       accountId: selected.accountId,
       assignment: { ...assignment },

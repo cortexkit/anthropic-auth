@@ -349,13 +349,15 @@ afterEach(async () => {
   sessionCacheActivity.forget(scope.sessionID)
 })
 
-function waitRecorder(accountFor: () => unknown = () => null) {
+function waitRecorder(
+  accountFor: (request: Record<string, unknown>) => unknown = () => null,
+) {
   const globals = globalThis as Record<symbol, unknown>
   const key = Symbol.for('cortexkit.routing')
   const prior = globals[key]
   const reports: Record<string, unknown>[] = []
   globals[key] = () => ({
-    accountFor: async () => accountFor(),
+    accountFor: async (request: Record<string, unknown>) => accountFor(request),
     report: (report: Record<string, unknown>) => {
       if (report.kind === 'wait') reports.push(report)
     },
@@ -3926,7 +3928,13 @@ describe('OC2 installed quota reroutes', () => {
     },
   )
 
-  test.each(['warm', 'exhausted', 'disabled', 'already refused'] as const)(
+  test.each([
+    'warm',
+    'exhausted',
+    'disabled',
+    'already refused',
+    'quota floor',
+  ] as const)(
     'vault: scoped Fable 429 and repeated routing advice respect the %s cache account',
     async (condition) => {
       const fixture = await vaultRetryPool('sticky-balanced', 20)
@@ -3935,22 +3943,38 @@ describe('OC2 installed quota reroutes', () => {
       const warm = { account_id: changedIdentity, credential_id: spare }
       const refused = { account_id: identity, credential_id: main }
       let advice = warm
-      waitRecorder(() => advice)
+      const asks: Record<string, unknown>[] = []
+      waitRecorder((request) => {
+        asks.push(request)
+        return advice
+      })
       const previous = await host.send(fable)
       expect(previous.headers.get('authorization')).toBe(vaultBearer(spare))
       await host.response(previous, 200, fable)
+      const snapshot = await fixture.runtime.read()
+      const warmRoute = snapshot.accounts.find(
+        (account) => account.credentialId === spare,
+      )
+      const coldRoute = snapshot.accounts.find(
+        (account) => account.credentialId === work,
+      )
+      if (!warmRoute || !coldRoute)
+        throw new Error('Missing retry fixture accounts')
 
-      if (condition === 'exhausted' || condition === 'disabled') {
-        const row = (await fixture.runtime.read()).accounts.find(
-          (account) => account.credentialId === spare,
-        )
-        if (!row) throw new Error('Missing warm account')
+      if (condition === 'quota floor') {
+        await fixture.runtime.updateSettings((settings) => {
+          settings.quota = {
+            enabled: true,
+            minimumRemaining: { five_hour: 20, seven_day: 20 },
+          }
+        })
+      } else if (condition === 'exhausted' || condition === 'disabled') {
         if (condition === 'disabled') {
-          await fixture.runtime.setEnabled(row.id, false)
+          await fixture.runtime.setEnabled(warmRoute.id, false)
         } else {
           const now = Date.now()
           await fixture.runtime.vault.publish(
-            await fixture.runtime.authorizeVault(row.id),
+            await fixture.runtime.authorizeVault(warmRoute.id),
             {
               quota: {
                 accountIdentity: changedIdentity,
@@ -3996,6 +4020,7 @@ describe('OC2 installed quota reroutes', () => {
 
       const request = await host.send(fable)
       expect(request.headers.get('authorization')).toBe(vaultBearer(main))
+      if (condition === 'warm') expect(asks.at(-1)?.warm_credential).toBe(spare)
       await host.response(request, 429, fable, {
         'anthropic-ratelimit-unified-7d-utilization': '0.64',
         'anthropic-ratelimit-unified-7d_fable-utilization': '1',
@@ -4003,6 +4028,17 @@ describe('OC2 installed quota reroutes', () => {
         'anthropic-ratelimit-unified-7d_fable-reset': String(
           Math.floor(Date.now() / 1000) + 86_400,
         ),
+      })
+      const previousAskCount = asks.length
+      const records: LogTestRecord[] = []
+      const previousLogLevel = getLogLevel()
+      setLogLevel('debug')
+      __setLogTestSink((record) => {
+        if (record.message === 'retry account choice') records.push(record)
+      })
+      cleanups.push(() => {
+        __setLogTestSink(null)
+        setLogLevel(previousLogLevel)
       })
       expect(
         await host.retry(
@@ -4017,6 +4053,70 @@ describe('OC2 installed quota reroutes', () => {
       expect(retry.headers.get('authorization')).toBe(
         vaultBearer(condition === 'warm' ? spare : work),
       )
+      if (condition === 'warm') {
+        expect(asks.length).toBeGreaterThan(previousAskCount)
+        for (const ask of asks.slice(previousAskCount))
+          expect(ask.warm_credential).toBe(spare)
+      }
+      expect(records).toHaveLength(1)
+      expect(records[0]).toMatchObject({
+        level: 'debug',
+        payload: {
+          sessionId: fable.sessionID,
+          accountId: condition === 'warm' ? warmRoute.id : coldRoute.id,
+          routingUsable: false,
+          routingAccountId: 'main',
+          pinnedAccountId: 'main',
+          warmAccountId: warmRoute.id,
+          warmExpiresAt: expect.any(Number),
+          warmReason: {
+            warm: 'warm-selected',
+            exhausted: 'model-scoped',
+            disabled: 'credential-unavailable',
+            'already refused': 'excluded',
+            'quota floor': 'quota-floor',
+          }[condition],
+          candidates: expect.arrayContaining([
+            expect.objectContaining({
+              accountId: 'main',
+              ineligibleReason: 'excluded',
+            }),
+            expect.objectContaining({
+              accountId: coldRoute.id,
+              ineligibleReason: null,
+              blocker: null,
+              hostBlockerChecked: true,
+              hostBlocker: null,
+            }),
+            expect.objectContaining({
+              accountId: warmRoute.id,
+              ...{
+                warm: {
+                  weight: 20,
+                  floorPassed: true,
+                  blocker: null,
+                  ineligibleReason: null,
+                },
+                exhausted: {
+                  weight: 0,
+                  blocker: 'model-scoped',
+                  ineligibleReason: 'model-scoped',
+                },
+                disabled: { ineligibleReason: 'credential-unavailable' },
+                'already refused': { ineligibleReason: 'excluded' },
+                'quota floor': {
+                  weight: 0,
+                  floorPassed: true,
+                  weightLimits: ['quota-floor'],
+                  hostBlockerChecked: true,
+                  hostBlocker: null,
+                  ineligibleReason: null,
+                },
+              }[condition],
+            }),
+          ]),
+        },
+      })
       await host.response(retry, 200, fable)
     },
   )

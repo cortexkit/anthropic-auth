@@ -15,6 +15,7 @@ import {
   nativeAccountCanServe,
 } from './native-account-view.ts'
 import { reportRoutingResponse } from './routing-reports.ts'
+import { sessionCacheActivity } from './session-cache-activity.ts'
 
 export const ROUTING_HOLD_LIMIT_MS = MAX_HOST_RETRY_MS
 const ROUTING_ASK_DEADLINE_MS = 2_000
@@ -41,16 +42,25 @@ export function routingCandidates(accounts: readonly NativeAccountView[]) {
   )
 }
 
-/** Hint only the still-servable vault credential behind the session's own pin. */
+/** Hint the credential that served the session, falling back to its pin. */
 export function routingWarmCredential(
   accounts: readonly NativeAccountView[],
   assignment: { accountId: string; accountIdentity?: string } | undefined,
+  sessionId?: string,
 ): string | undefined {
+  const vault = routingCandidates(accounts).filter(
+    (account) => account.source === 'vault' && account.credentialId,
+  )
+  const warm = sessionCacheActivity.warmRetryAccount(
+    sessionId,
+    vault,
+    (account) => account.id,
+  )
+  if (warm) return warm.credentialId
   if (!assignment) return undefined
-  return routingCandidates(accounts).find(
+  return vault.find(
     (account) =>
       account.id === assignment.accountId &&
-      account.source === 'vault' &&
       (!assignment.accountIdentity ||
         account.accountIdentity === assignment.accountIdentity),
   )?.credentialId

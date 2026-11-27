@@ -22,6 +22,7 @@ import {
   isQuotaBearingHeaderFrame,
   localMessageThreadCredential,
   logger,
+  logRetryAccountChoice,
   MAX_HOST_RETRY_MS,
   mergeHeaderQuotaForPersistence,
   type NativeAccountPolicy,
@@ -54,6 +55,7 @@ import {
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
   RELAY_PROXY_REFUSAL,
+  type RetryAccountCandidate,
   type RoutingWaitClock,
   readNativeAccountsForRequest,
   readSessionCachePolicy,
@@ -76,6 +78,7 @@ import {
   stickyRetainRetryHeaders,
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
+  type WarmRetryRejection,
   warnClaudeGatewayRelayIgnored,
   warnRelayProxyRefused,
 } from '@cortexkit/anthropic-auth-core'
@@ -1244,6 +1247,7 @@ export function createNativeAnthropicSource(
           warmCredentialId: routingWarmCredential(
             snapshot.accounts,
             assignment,
+            input.sessionID,
           ),
         },
       )
@@ -1263,14 +1267,61 @@ export function createNativeAnthropicSource(
       const excluded = input.phase === 'retry' ? input.excluded : undefined
       const previouslyRefused = (account: NativeAccountView) =>
         excluded?.includes(account.id)
-      const blockerFor = (account: NativeAccountView) =>
-        exhaustionInForce(
+      const checkedHostBlockers = new Map<
+        string,
+        NonNullable<RetryAccountCandidate['hostBlocker']> | null
+      >()
+      const blockerFor = (account: NativeAccountView) => {
+        const blocker = exhaustionInForce(
           input,
           account,
           snapshot,
           modelID,
           input.phase === 'retry',
         )
+        if (input.phase === 'retry')
+          checkedHostBlockers.set(account.id, blocker?.reason ?? null)
+        return blocker
+      }
+      const overriddenPolicies = new Map<string, NativeAccountPolicy>()
+      const retryPool = (routes: readonly NativeAccountView[]) => () => {
+        const eligibleIds = new Set(routes.map((account) => account.id))
+        const oauthIds = new Set(oauth.map((account) => account.id))
+        return snapshot.accounts
+          .filter((account) => account.type === 'oauth')
+          .map((account, order): RetryAccountCandidate => {
+            const id = account.id
+            const policy = overriddenPolicies.get(id) ?? policies.get(id)
+            const limits = policy?.quotaPolicyLimits
+            const blocker = checkedHostBlockers.get(id)
+            const ineligibleReason: WarmRetryRejection | undefined =
+              eligibleIds.has(id)
+                ? undefined
+                : id === lastRefuser
+                  ? 'excluded'
+                  : (limits?.[0] ??
+                    (blocker
+                      ? 'quota-exhausted'
+                      : !oauthIds.has(id)
+                        ? 'credential-unavailable'
+                        : excluded?.includes(id)
+                          ? 'excluded'
+                          : 'not-candidate'))
+            return {
+              candidate: {
+                accountId: id,
+                order,
+                quota: account.quota ?? { kind: 'unknown' },
+              },
+              hostBlocker: blocker,
+              policyLimits: limits,
+              ineligibleReason,
+            }
+          })
+      }
+      const advisedAccountId =
+        advice &&
+        snapshot.accounts.find((row) => routingChoiceMatches(advice, row))?.id
       if (advice) {
         const account = oauth.find((row) => routingChoiceMatches(advice, row))
         const candidates = oauth.map((row, order) => ({
@@ -1318,6 +1369,8 @@ export function createNativeAnthropicSource(
             inputBytes: 1,
             preserveOnNoCandidate: true,
             routingAccountId: account.id,
+            preferWarmRetryAccount: input.phase === 'retry' && !advice.hold,
+            retryPool: retryPool([account]),
           })
           active.signal.throwIfAborted()
           if (selected?.migrated) stickyQuotaRetries.clear(input.sessionID)
@@ -1345,11 +1398,16 @@ export function createNativeAnthropicSource(
         oauth.splice(
           0,
           oauth.length,
-          ...oauth.filter(
-            (account) =>
-              routingRelay.policy(input.sessionID, account, snapshot, modelID)
-                .status === 'allowed',
-          ),
+          ...oauth.filter((account) => {
+            const policy = routingRelay.policy(
+              input.sessionID,
+              account,
+              snapshot,
+              modelID,
+            )
+            overriddenPolicies.set(account.id, policy)
+            return policy.status === 'allowed'
+          }),
         )
       }
       // A refusal from a held account ends its hold unless this probe grants
@@ -1410,6 +1468,21 @@ export function createNativeAnthropicSource(
         ? usable.filter((row) => !previouslyRefused(row))
         : usable
       const routes = untried.length ? untried : usable
+      const logLocalRetryChoice = (accountId: string) => {
+        if (input.phase === 'retry')
+          logRetryAccountChoice({
+            sessionId: input.sessionID,
+            accountId,
+            family: stickyRouteFamilyForModel(modelID),
+            modelId: modelID,
+            storage: snapshot.policyStorage,
+            routingUsable: false,
+            routingAccountId: advisedAccountId,
+            pinnedAccountId: assignment?.accountId,
+            preferredAccountId: input.previousAccountId,
+            candidates: retryPool(routes),
+          })
+      }
       // As in the vault refusal, a sign-in failure takes precedence over quota.
       const quotaExplainsRefusal =
         exhausted.length > 0 &&
@@ -1489,6 +1562,8 @@ export function createNativeAnthropicSource(
           inputBytes: 1,
           preferredAccountId: input.previousAccountId,
           preferWarmRetryAccount: input.phase === 'retry',
+          retryPool: retryPool(routes),
+          rejectedRoutingAccountId: advisedAccountId,
           // A refusal leaves the host in charge; it must not clear its route.
           preserveOnNoCandidate: true,
         })
@@ -1522,7 +1597,11 @@ export function createNativeAnthropicSource(
                 (account) => account.id,
               )
             : undefined
-        if (warm || ordered[0]) return (warm ?? ordered[0])?.id
+        const selected = warm ?? ordered[0]
+        if (selected) {
+          logLocalRetryChoice(selected.id)
+          return selected.id
+        }
       }
       if (snapshot.mode === 'claustrum') {
         const holdForPool = poolHold()
@@ -1551,7 +1630,10 @@ export function createNativeAnthropicSource(
       }
       if (!advice) {
         const api = await paidFallback(input, snapshot, active)
-        if (api) return api
+        if (api) {
+          logLocalRetryChoice(api)
+          return api
+        }
         const holdForPool = poolHold()
         if (holdForPool) return holdForPool
         // Local mode explains a pool that is out of quota as the vault does.
@@ -2023,6 +2105,7 @@ export function createNativeAnthropicSource(
           warmCredentialId: routingWarmCredential(
             snapshot.accounts,
             assignment,
+            input.sessionID,
           ),
         },
       )
