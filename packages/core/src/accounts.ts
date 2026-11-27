@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-import { parseRetryAfterHeader } from './auth.ts'
+import { isInvalidGrantResponse, parseRetryAfterHeader } from './auth.ts'
 import type { ProviderAccountUuid } from './claude-code.ts'
 import { assertNotCustodyTombstone } from './claustrum.ts'
 import {
@@ -1162,14 +1162,10 @@ export function buildRefreshOperationError(input: {
   // re-login does NOT fix — those must stay permanent=false so they are not
   // falsely flagged "needs re-login". Network failures use a fixed five-minute
   // retry interval so connectivity recovery cannot inherit an hour-long backoff.
-  // ClaudeOAuthRefreshError carries the raw
-  // OAuth body, and its message embeds it (`...: 400 — <body>`), so check both.
   const body =
     typeof (input.error as { body?: unknown }).body === 'string'
       ? (input.error as { body: string }).body
       : ''
-  const isInvalidGrant =
-    body.includes('invalid_grant') || message.includes('invalid_grant')
   return {
     message,
     checkedAt: input.now,
@@ -1178,7 +1174,7 @@ export function buildRefreshOperationError(input: {
     accountIdentity: input.accountIdentity,
     refreshTokenFingerprint: input.refreshTokenFingerprint,
     status,
-    permanent: status === 400 && isInvalidGrant,
+    permanent: isInvalidGrantResponse(status, body),
   }
 }
 

@@ -598,6 +598,31 @@ describe('buildRefreshOperationError', () => {
     expect(dead.permanent).toBe(true)
     expect(isPermanentRefreshError(dead)).toBe(true)
   })
+
+  test.each([
+    ['API envelope', '{"error":{"type":"invalid_grant"}}', true],
+    [
+      'OAuth description',
+      '{"error":"invalid_request","error_description":"not invalid_grant"}',
+      false,
+    ],
+    [
+      'API message',
+      '{"error":{"type":"invalid_request_error","message":"not invalid_grant"}}',
+      false,
+    ],
+    ['JSON string', '"invalid_grant"', false],
+  ] as const)(
+    'classifies a 400 invalid_grant by the error field, not the %s',
+    (_format, body, permanent) => {
+      const result = buildRefreshOperationError({
+        error: new ClaudeOAuthRefreshError(400, body),
+        now: 1000000,
+        accountIdentity: 'test-account',
+      })
+      expect(result.permanent).toBe(permanent)
+    },
+  )
 })
 
 describe('getFallbackReauthLabels', () => {
