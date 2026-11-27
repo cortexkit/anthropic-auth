@@ -3770,6 +3770,189 @@ describe('OC2 installed quota reroutes', () => {
     return fixture
   }
 
+  async function publishFablePool(
+    fixture: Awaited<ReturnType<typeof vaultRetryPool>>,
+    checkedAt: number,
+    scopedReset: number,
+    fiveHourReset?: number,
+  ) {
+    for (const account of (await fixture.runtime.read()).accounts) {
+      const quota = account.quota
+      if (!quota?.five_hour || !quota.seven_day)
+        throw new Error('Missing quota fixture')
+      const providerOnly =
+        account.credentialId === spare && fiveHourReset !== undefined
+      await fixture.runtime.vault.publish(
+        await fixture.runtime.authorizeVault(account.id),
+        {
+          quota: {
+            ...quota,
+            source: 'poll',
+            checkedAt,
+            five_hour: providerOnly
+              ? {
+                  usedPercent: 100,
+                  remainingPercent: 0,
+                  checkedAt,
+                  resetsAt: new Date(fiveHourReset).toISOString(),
+                }
+              : { ...quota.five_hour, checkedAt },
+            seven_day:
+              fiveHourReset !== undefined && account.credentialId === main
+                ? {
+                    usedPercent: 100,
+                    remainingPercent: 0,
+                    checkedAt,
+                    resetsAt: new Date(checkedAt + 86_400_000).toISOString(),
+                  }
+                : { ...quota.seven_day, checkedAt },
+            scoped: providerOnly
+              ? []
+              : [
+                  {
+                    id: 'fable-weekly',
+                    title: 'Fable weekly',
+                    modelName: 'Fable',
+                    usedPercent: 100,
+                    remainingPercent: 0,
+                    checkedAt,
+                    resetsAt: new Date(scopedReset).toISOString(),
+                  },
+                ],
+          },
+        },
+      )
+    }
+  }
+
+  test.each(['cached', 'failed'] as const)(
+    'expired Fable admission refreshes and treats a %s vault reading as unknown',
+    async (refresh) => {
+      const fixture = await vaultRetryPool(
+        refresh === 'cached' ? 'sticky-balanced' : 'fallback-first',
+      )
+      const checkedAt = Date.now()
+      await publishFablePool(fixture, checkedAt, checkedAt + 60_000)
+      await fixture.runtime.updateSettings((settings) => {
+        settings.quota = { enabled: true, failClosedOnUnknownQuota: false }
+      })
+      const fetchQuota = spyOn(
+        fixture.runtime,
+        'fetchQuota',
+      ).mockImplementation(async (id) => {
+        if (refresh === 'failed') throw new Error('Usage endpoint unavailable')
+        const quota = (await fixture.runtime.read()).accounts.find(
+          (account) => account.id === id,
+        )?.quota
+        if (!quota) throw new Error('Missing cached vault reading')
+        return quota
+      })
+      try {
+        const host = await retryHost(source(fixture.runtime, fixture.paths))
+        const fable = { ...scope, modelID: 'claude-fable-5-2' }
+        await expect(
+          host.send({ ...fable, sessionID: 'live-fable' }),
+        ).rejects.toThrow('Fable scoped limit')
+        expect(fetchQuota).not.toHaveBeenCalled()
+        await atTime(checkedAt + 120_000, async () => {
+          const request = await host.send({
+            ...fable,
+            sessionID: 'expired-fable',
+          })
+          expect([main, work, spare].map(vaultBearer)).toContain(
+            request.headers.get('authorization') ?? '',
+          )
+          expect(fetchQuota).toHaveBeenCalledTimes(3)
+          expect(fetchQuota.mock.calls.map((call) => call[4])).toEqual([
+            'admission',
+            'admission',
+            'admission',
+          ])
+          await fixture.runtime.updateSettings((settings) => {
+            settings.quota = { enabled: true, failClosedOnUnknownQuota: true }
+          })
+          await expect(
+            host.send({ ...fable, sessionID: 'expired-fable-fail-closed' }),
+          ).rejects.toBeInstanceOf(NativeVaultQuotaPolicyError)
+          const account = (await fixture.runtime.read()).accounts[0]!
+          const quota = account.quota!
+          await fixture.runtime.vault.publish(
+            await fixture.runtime.authorizeVault(account.id),
+            {
+              quota: {
+                ...quota,
+                scoped: [
+                  {
+                    ...quota.scoped![0]!,
+                    checkedAt: Date.now(),
+                    remainingPercent: 90,
+                    usedPercent: 10,
+                    resetsAt: new Date(Date.now() + 86_400_000).toISOString(),
+                  },
+                ],
+              },
+            },
+          )
+          const recovered = await host.send({
+            ...fable,
+            sessionID: 'refreshed-fable',
+          })
+          expect(recovered.headers.get('authorization')).toBe(
+            vaultBearer(account.credentialId!),
+          )
+        })
+      } finally {
+        fetchQuota.mockRestore()
+      }
+    },
+  )
+
+  test.each([false, true])(
+    'mixed vault refusal names the provider limit once (provider resets first: %s)',
+    async (providerFirst) => {
+      const fixture = await vaultRetryPool('fallback-first')
+      const now = Date.now()
+      await publishFablePool(
+        fixture,
+        now,
+        now + 180_000,
+        now + (providerFirst ? 60_000 : 7_200_000),
+      )
+      const host = await retryHost(source(fixture.runtime, fixture.paths))
+      const fable = { ...scope, modelID: 'claude-fable-5-2' }
+      await atTime(now, async () => {
+        const refusal = await host.send(fable).catch((error: unknown) => error)
+        expect(refusal).toBeInstanceOf(NativeVaultQuotaPolicyError)
+        if (!(refusal instanceof NativeVaultQuotaPolicyError))
+          throw new Error('Expected a quota refusal')
+        expect(refusal.message).toContain('Fable scoped limit')
+        expect(refusal.message).toContain(
+          'Provider limits on other accounts (quota settings cannot raise these): 5-hour.',
+        )
+        expect(refusal.message.match(/5-hour/g)).toHaveLength(1)
+        expect(refusal.message).toContain(
+          providerFirst ? '(in 1 min)' : '(in 3 min)',
+        )
+        expect(refusal.message).toContain('Send the message again after')
+        for (const account of (await fixture.runtime.read()).accounts) {
+          if (account.credentialId !== spare)
+            await fixture.runtime.setEnabled(account.id, false)
+        }
+        const providerOnly = await host
+          .send({ ...fable, sessionID: 'provider-only' })
+          .catch((error: unknown) => error)
+        expect(providerOnly).toBeInstanceOf(NativeVaultQuotaPolicyError)
+        if (!(providerOnly instanceof NativeVaultQuotaPolicyError))
+          throw new Error('Expected a provider-only refusal')
+        expect(providerOnly.message).toContain('5-hour')
+        expect(providerOnly.message).not.toContain(
+          'quota settings cannot raise',
+        )
+        expect(providerOnly.message).not.toContain('Fable scoped limit')
+      })
+    },
+  )
+
   test.each([undefined, 'Fable', 'Claude-Fable-Pool', 'stored-only'] as const)(
     'installed scoped Fable 429 reports exhaustion and the failed physical attempt (stored pool %s)',
     async (storedPool) => {

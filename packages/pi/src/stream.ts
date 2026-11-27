@@ -111,6 +111,7 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  quotaWindowHasReset,
   RecoveryThinkingStore,
   type RefusalFallbackDispatchOptions,
   type RefusalFallbackMode,
@@ -144,6 +145,7 @@ import {
   shouldFallbackStatus,
   signRequestBody,
   startRoutingWait,
+  stickyQuotaAdmissionIsFresh,
   stickyQuotaBlockerInForce,
   stickyQuotaSnapshotIsFresh,
   stickyRetainRetryHeaders,
@@ -528,7 +530,10 @@ function getPiRoutingServices(
       const needsProbe =
         view.source !== 'vault' ||
         Boolean(current.quota?.minimumRemaining) ||
-        isKillswitchEnabled(current)
+        isKillswitchEnabled(current) ||
+        quotaWindowHasReset(
+          getScopedQuotaWindowForModel(view.quota, options.modelId),
+        )
       if (
         needsProbe &&
         quotas.isFallbackStale(
@@ -554,7 +559,7 @@ function getPiRoutingServices(
         quotas.getFallback(account.id, account)?.quota ?? account.quota
       if (
         (!needsProbe || quotaSnapshotPassesPolicy(quota, current)) &&
-        quotaSnapshotPassesModelScope(quota, options.modelId)
+        quotaSnapshotPassesModelScope(quota, options.modelId, current)
       )
         usable.push({ ...account, quota })
     }
@@ -1818,7 +1823,7 @@ async function sendAnthropicRequestAttempt(
         options.routingChoice &&
         routingChoiceMatches(options.routingChoice, account)) ||
         quotaSnapshotPassesPolicy(account.quota, policyStorage)) &&
-      quotaSnapshotPassesModelScope(account.quota, model)
+      quotaSnapshotPassesModelScope(account.quota, model, policyStorage)
     )
   }
   const currentPrimary = (payer: ReturnType<typeof piBillingPayer>) =>
@@ -3213,7 +3218,7 @@ async function executeWithFallback(options: {
     let mainQuota = mainEntry?.quota
     if (
       primaryAvailable() &&
-      !stickyQuotaSnapshotIsFresh(
+      !stickyQuotaAdmissionIsFresh(
         mainEntry?.quota,
         storage,
         Date.now(),
@@ -3251,7 +3256,7 @@ async function executeWithFallback(options: {
       let accountQuota =
         quotaManager.getFallback(account.id, account)?.quota ?? account.quota
       if (
-        !stickyQuotaSnapshotIsFresh(accountQuota, storage, Date.now(), modelId)
+        !stickyQuotaAdmissionIsFresh(accountQuota, storage, Date.now(), modelId)
       ) {
         try {
           accountQuota = await quotaManager.refreshFallback(
@@ -3277,7 +3282,7 @@ async function executeWithFallback(options: {
             : route.account?.lastRefreshError
         if (isPermanentRefreshError(refreshError)) return []
         if (
-          stickyQuotaSnapshotIsFresh(
+          stickyQuotaAdmissionIsFresh(
             route.quota,
             storage,
             Date.now(),
@@ -3297,6 +3302,13 @@ async function executeWithFallback(options: {
         ) {
           return []
         }
+        if (
+          quotaWindowHasReset(
+            getScopedQuotaWindowForModel(route.quota, modelId),
+          ) &&
+          !quotaSnapshotPassesModelScope(route.quota, modelId, storage)
+        )
+          return []
         if (
           isKillswitchEnabled(storage) &&
           !killswitchPassesPolicy(
@@ -3333,7 +3345,7 @@ async function executeWithFallback(options: {
         passesKillswitch &&
         (quotaState.kind === 'unknown' ||
           (quotaSnapshotPassesPolicy(quotaState.quota, storage) &&
-            quotaSnapshotPassesModelScope(quotaState.quota, modelId) &&
+            quotaSnapshotPassesModelScope(quotaState.quota, modelId, storage) &&
             (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
               usableIds.has(route.id))))
       return passes
@@ -3791,7 +3803,7 @@ async function executeWithFallback(options: {
         )
       const proactiveQuotaDecision =
         !advisedAccountId &&
-        stickyQuotaSnapshotIsFresh(
+        stickyQuotaAdmissionIsFresh(
           route.quota,
           storage,
           Date.now(),
@@ -3991,10 +4003,26 @@ async function executeWithFallback(options: {
   if (fallbackFirst) {
     const fallback = await tryFallbackAccounts()
     if (fallback) return fallback
-  } else if (
-    primaryFreshModelScopeExhausted() ||
-    (primaryCachedModelScopeExhausted() &&
-      (await primaryQuotaRefreshConfirmsModelScopeExhausted()))
+  }
+  const expiredPrimaryScope =
+    primaryAvailable() &&
+    quotaWindowHasReset(
+      getScopedQuotaWindowForModel(
+        quotaManager.getMain(mainAccountId)?.quota,
+        options.model.id,
+      ),
+    )
+  if (expiredPrimaryScope) {
+    try {
+      await quotaManager.refreshMain(mainAccountId, '', undefined, 'admission')
+    } catch {}
+  }
+  if (
+    !fallbackFirst &&
+    (primaryFreshModelScopeExhausted() ||
+      (!expiredPrimaryScope &&
+        primaryCachedModelScopeExhausted() &&
+        (await primaryQuotaRefreshConfirmsModelScopeExhausted())))
   ) {
     const fallback = await tryFallbackAccounts()
     if (fallback) return fallback
@@ -4036,7 +4064,10 @@ async function executeWithFallback(options: {
 
   if (isKillswitchEnabled(storage)) {
     let mainQuota = quotaManager.getMain(mainAccountId)?.quota
-    if (!mainQuota || quotaManager.isMainStale(options.model.id)) {
+    if (
+      !expiredPrimaryScope &&
+      (!mainQuota || quotaManager.isMainStale(options.model.id))
+    ) {
       try {
         mainQuota = await quotaManager.refreshMain(
           mainAccountId,

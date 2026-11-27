@@ -53,6 +53,7 @@ import {
   quotaRefusalTiming,
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
+  quotaWindowHasReset,
   RELAY_PROXY_REFUSAL,
   type RoutingWaitClock,
   readNativeAccountsForRequest,
@@ -71,6 +72,7 @@ import {
   shouldFallbackStatus,
   signRequestBody,
   startRoutingWait,
+  stickyQuotaAdmissionIsFresh,
   stickyQuotaBlockerInForce,
   stickyQuotaSnapshotIsFresh,
   stickyRetainRetryHeaders,
@@ -1184,15 +1186,20 @@ export function createNativeAnthropicSource(
         for (const account of snapshot.accounts) {
           if (!nativeAccountCanServe(account) || account.type !== 'oauth')
             continue
+          const now = Date.now()
           const fresh = quotaSnapshotHasStandardWindows(account.quota)
-            ? stickyQuotaSnapshotIsFresh(
+            ? stickyQuotaAdmissionIsFresh(
                 account.quota,
                 snapshot.policyStorage,
-                Date.now(),
+                now,
                 modelID,
               )
-            : Date.now() - quotaSnapshotCheckedAt(account.quota) <
-              getQuotaCheckIntervalMs(snapshot.policyStorage)
+            : !quotaWindowHasReset(
+                getScopedQuotaWindowForModel(account.quota, modelID),
+                now,
+              ) &&
+              now - quotaSnapshotCheckedAt(account.quota) <
+                getQuotaCheckIntervalMs(snapshot.policyStorage)
           if (fresh) continue
           try {
             // Admission: for a vault account the runtime may answer from its
@@ -1432,7 +1439,7 @@ export function createNativeAnthropicSource(
             details.reason,
             details.timing,
             Date.now(),
-            { retry: 'manual' },
+            { retry: 'manual', providerLimitNames: details.providerLimitNames },
           )
         return await NativeVaultQuotaPolicyError.fromResponse(response)
       }
@@ -1534,6 +1541,7 @@ export function createNativeAnthropicSource(
             sessionId: input.sessionID,
             modelId: modelID,
             policies,
+            providerBlockers: exhausted,
             sticky:
               getRoutingMode(snapshot.policyStorage) === 'sticky-balanced',
           })

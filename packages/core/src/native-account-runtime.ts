@@ -490,10 +490,18 @@ export function nativeAccountPolicy(
 ): NativeAccountPolicy {
   if (!nativeAccountCanServe(account))
     return { status: 'blocked', reason: 'account-disabled' }
+  const now = Date.now()
   const quotaPolicyLimits: NativeQuotaPolicyLimit[] = []
   if (!quotaSnapshotPassesPolicy(account.quota, snapshot.policyStorage))
     quotaPolicyLimits.push('quota-floor')
-  if (!quotaSnapshotPassesModelScope(account.quota, modelId))
+  if (
+    !quotaSnapshotPassesModelScope(
+      account.quota,
+      modelId,
+      snapshot.policyStorage,
+      now,
+    )
+  )
     quotaPolicyLimits.push('model-scoped')
   if (
     !killswitchPassesPolicy(
@@ -501,6 +509,7 @@ export function nativeAccountPolicy(
       snapshot.policyStorage,
       account.id === 'main' ? undefined : account.id,
       modelId,
+      now,
     )
   )
     quotaPolicyLimits.push('killswitch')

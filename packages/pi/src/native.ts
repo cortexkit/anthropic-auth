@@ -37,6 +37,7 @@ import {
   nativeValidationRetryAt,
   normalizeQuotaHeaders,
   quotaSnapshotHasStandardWindows,
+  quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
   type RoutingChoice,
@@ -111,9 +112,11 @@ function requestPolicy(
           modelId,
         )) ||
       (routeId !== 'main' &&
-        ((needsQuotaPolicy &&
-          !quotaSnapshotPassesPolicy(account.quota, storage)) ||
-          !quotaSnapshotPassesModelScope(account.quota, modelId)))
+        needsQuotaPolicy &&
+        !quotaSnapshotPassesPolicy(account.quota, storage)) ||
+      ((routeId !== 'main' ||
+        !quotaSnapshotModelScopeIsExhausted(account.quota, modelId)) &&
+        !quotaSnapshotPassesModelScope(account.quota, modelId, storage))
     return blocked
       ? { status: 'blocked', reason: 'quota-ineligible' }
       : { status: 'allowed' }

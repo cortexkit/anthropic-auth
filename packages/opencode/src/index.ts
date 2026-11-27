@@ -215,6 +215,7 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  quotaWindowHasReset,
   RecoveryThinkingStore,
   type RefusalFallbackDispatchOptions,
   type RefusalFallbackMode,
@@ -258,6 +259,7 @@ import {
   startRoutingWait,
   startSettings,
   stateRefusalPublicMessage,
+  stickyQuotaAdmissionIsFresh,
   stickyQuotaBlockerInForce,
   stickyQuotaSnapshotIsFresh,
   stickyRouteCandidateWeight,
@@ -1962,6 +1964,7 @@ const anthropicAuthPlugin = async (
       )
         return
       const quota = routingAccountQuota(view, storage, receipt)
+      const now = runtimeNow()
       // Ordered routing can try main after eligible fallbacks are exhausted.
       // A cached scoped limit must not remove that final provider attempt;
       // explicit killswitch limits still block it before dispatch.
@@ -1977,8 +1980,11 @@ const anthropicAuthPlugin = async (
             storage,
             routeId === 'main' ? undefined : routeId,
             modelId,
+            now,
           )) ||
-          (!lastMainAttempt && !quotaSnapshotPassesModelScope(quota, modelId)))
+          ((!lastMainAttempt ||
+            !quotaSnapshotModelScopeIsExhausted(quota, modelId, now)) &&
+            !quotaSnapshotPassesModelScope(quota, modelId, storage, now)))
       )
         throw intent === 'cachekeep'
           ? new NativeAccountRefusal('account-policy')
@@ -3185,7 +3191,7 @@ const anthropicAuthPlugin = async (
           quotaSnapshotCheckedAt(account.quota),
         ) > Date.now() &&
         (!modelId ||
-          stickyQuotaSnapshotIsFresh(
+          stickyQuotaAdmissionIsFresh(
             account.quota,
             snapshot.policyStorage,
             Date.now(),
@@ -3295,7 +3301,7 @@ const anthropicAuthPlugin = async (
             : committedQuota
         if (
           !quotaSnapshotPassesPolicy(quota, storage) ||
-          !quotaSnapshotPassesModelScope(quota, options?.modelId) ||
+          !quotaSnapshotPassesModelScope(quota, options?.modelId, storage) ||
           (isKillswitchEnabled(storage) &&
             !killswitchPassesPolicy(
               quota,
@@ -6679,6 +6685,7 @@ const anthropicAuthPlugin = async (
           let denied: NativeAccountView | undefined
           let unavailable: NativeAccountView | undefined
           let credentialFailure: NativeCredentialUnavailableError | undefined
+          let triedExpiredScopeRefresh = false
           try {
             credential = await authorizeOAuth(
               'main',
@@ -6702,18 +6709,30 @@ const anthropicAuthPlugin = async (
                 denied.quota,
                 modelId,
               )
+              const scopedExpired = quotaWindowHasReset(
+                scopedWindow,
+                runtimeNow(),
+              )
               const scopedStale =
                 scopedWindow !== undefined &&
                 (!Number.isFinite(scopedWindow.checkedAt) ||
                   (scopedWindow.checkedAt ?? 0) + error.checkIntervalMs <=
                     Date.now())
               if (
+                scopedExpired ||
                 scopedStale ||
                 (!quotaSnapshotHasStandardWindows(denied.quota) &&
                   !quotaSnapshotModelScopeIsExhausted(denied.quota, modelId))
               ) {
                 try {
-                  await nativeAccounts.fetchQuota('main', undefined, signal)
+                  triedExpiredScopeRefresh = scopedExpired
+                  await nativeAccounts.fetchQuota(
+                    'main',
+                    undefined,
+                    signal,
+                    undefined,
+                    scopedExpired ? 'admission' : undefined,
+                  )
                   credential = await authorizeOAuth(
                     'main',
                     signal,
@@ -6758,6 +6777,7 @@ const anthropicAuthPlugin = async (
               denied?.accountIdentity ??
               unavailable?.accountIdentity,
             modelDenied: Boolean(denied),
+            triedExpiredScopeRefresh,
             credentialUnavailable: Boolean(unavailable),
             credentialFailure,
             deferred: false,
@@ -7834,7 +7854,7 @@ const anthropicAuthPlugin = async (
               storage: AccountStorage,
               model: string,
             ) =>
-              quotaSnapshotPassesModelScope(quota, model) &&
+              quotaSnapshotPassesModelScope(quota, model, storage) &&
               (!isKillswitchEnabled(storage) ||
                 killswitchPassesPolicy(
                   quota,
@@ -9159,7 +9179,7 @@ const anthropicAuthPlugin = async (
             )
             let mainQuota = mainEntry?.quota
             if (
-              !stickyQuotaSnapshotIsFresh(
+              !stickyQuotaAdmissionIsFresh(
                 mainEntry?.quota,
                 input.storage,
                 runtimeNow(),
@@ -9232,7 +9252,7 @@ const anthropicAuthPlugin = async (
                 if (stored.claustrumScopedCredentialId) {
                   let accountQuota = getFallbackQuota(stored)
                   if (
-                    !stickyQuotaSnapshotIsFresh(
+                    !stickyQuotaAdmissionIsFresh(
                       accountQuota,
                       latestStorage,
                       runtimeNow(),
@@ -9275,7 +9295,7 @@ const anthropicAuthPlugin = async (
                 if (isPermanentRefreshError(account.lastRefreshError)) continue
                 let accountQuota = getFallbackQuota(account)
                 if (
-                  !stickyQuotaSnapshotIsFresh(
+                  !stickyQuotaAdmissionIsFresh(
                     accountQuota,
                     latestStorage,
                     Date.now(),
@@ -9339,7 +9359,7 @@ const anthropicAuthPlugin = async (
                 )
                   return []
                 if (
-                  stickyQuotaSnapshotIsFresh(
+                  stickyQuotaAdmissionIsFresh(
                     route.quota,
                     latestStorage,
                     Date.now(),
@@ -9359,6 +9379,20 @@ const anthropicAuthPlugin = async (
                 ) {
                   return []
                 }
+                if (
+                  quotaWindowHasReset(
+                    getScopedQuotaWindowForModel(
+                      route.quota,
+                      input.requestedModelId,
+                    ),
+                  ) &&
+                  !quotaSnapshotPassesModelScope(
+                    route.quota,
+                    input.requestedModelId,
+                    latestStorage,
+                  )
+                )
+                  return []
                 if (
                   isKillswitchEnabled(latestStorage) &&
                   !killswitchPassesPolicy(
@@ -9435,6 +9469,7 @@ const anthropicAuthPlugin = async (
                     (quotaSnapshotPassesModelScope(
                       quotaState.quota,
                       input.requestedModelId,
+                      latestStorage,
                     ) &&
                       (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
                         usableIds.has(route.id) ||
@@ -10999,7 +11034,7 @@ const anthropicAuthPlugin = async (
 
                     const proactiveQuotaDecision =
                       !advisedAccountId &&
-                      stickyQuotaSnapshotIsFresh(
+                      stickyQuotaAdmissionIsFresh(
                         route.quota,
                         stickyRoutes.storage,
                         Date.now(),
@@ -11641,6 +11676,8 @@ const anthropicAuthPlugin = async (
                 showQuotaToast(mainEntry.quota, fallbacks, activeId)
               }
 
+              let triedExpiredScopeRefresh =
+                auth.triedExpiredScopeRefresh ?? false
               if (replayableRequest && mainQuotaRoutingEnabled(storage)) {
                 try {
                   const quotaStart = nowMs()
@@ -11651,7 +11688,7 @@ const anthropicAuthPlugin = async (
                     storage,
                   )
                   let routingQuota = routingQuotaEntry?.quota
-                  if (!routingQuota) {
+                  if (!routingQuota && !triedExpiredScopeRefresh) {
                     routingQuota = await quotaManager.refreshMain(
                       requestMainQuotaIdentity?.quotaKey,
                       auth.access,
@@ -11664,12 +11701,22 @@ const anthropicAuthPlugin = async (
                     )
                     showQuotaToastFromCache()
                   } else if (
+                    routingQuota &&
+                    !triedExpiredScopeRefresh &&
                     quotaManager.needsRefresh(
                       sessionRequestCount,
                       requestModelId,
                     )
                   ) {
+                    const expiredScope = quotaWindowHasReset(
+                      getScopedQuotaWindowForModel(
+                        routingQuota,
+                        requestModelId,
+                      ),
+                      runtimeNow(),
+                    )
                     if (
+                      expiredScope ||
                       quotaSnapshotIsExhausted(routingQuota) ||
                       quotaSnapshotModelScopeIsExhausted(
                         routingQuota,
@@ -11682,10 +11729,12 @@ const anthropicAuthPlugin = async (
                       // is backed off and only stale data is returned, the route gate
                       // below still refuses API-key routes because the entry is not
                       // fresh.
+                      triedExpiredScopeRefresh = expiredScope
                       routingQuota = await quotaManager.refreshMain(
                         requestMainQuotaIdentity?.quotaKey,
                         auth.access,
                         requestMainQuotaIdentity?.generation,
+                        expiredScope ? 'admission' : undefined,
                       )
                       routingQuotaEntry = routingMainQuotaEntry(
                         requestMainQuotaIdentity,
@@ -11713,7 +11762,12 @@ const anthropicAuthPlugin = async (
                   writeCurrentSidebarState('main', 'main', false)
                   const routingQuotaPasses =
                     quotaSnapshotPassesPolicy(routingQuota, storage) &&
-                    quotaSnapshotPassesModelScope(routingQuota, requestModelId)
+                    quotaSnapshotPassesModelScope(
+                      routingQuota,
+                      requestModelId,
+                      storage,
+                      runtimeNow(),
+                    )
                   trace.mark('main_quota_for_routing', {
                     ms: roundMs(nowMs() - quotaStart),
                     passes: routingQuotaPasses,
@@ -11838,13 +11892,22 @@ const anthropicAuthPlugin = async (
                   sessionRequestCount,
                   requestModelId,
                 )
-                if (needsRefresh) {
+                if (needsRefresh && !triedExpiredScopeRefresh) {
                   try {
                     await Promise.all([
                       quotaManager.refreshMain(
                         requestMainQuotaIdentity?.quotaKey,
                         auth.access,
                         requestMainQuotaIdentity?.generation,
+                        quotaWindowHasReset(
+                          getScopedQuotaWindowForModel(
+                            mainQuota,
+                            requestModelId,
+                          ),
+                          runtimeNow(),
+                        )
+                          ? 'admission'
+                          : undefined,
                       ),
                       // Fallback-first may have just polled these accounts.
                       // Keep those fresh readings rather than polling twice.

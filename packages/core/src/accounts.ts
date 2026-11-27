@@ -1401,20 +1401,39 @@ export function getScopedQuotaWindowForModel(
 export function quotaSnapshotModelScopeIsExhausted(
   quota: OAuthQuotaSnapshot | undefined,
   model: unknown,
+  now = Date.now(),
 ) {
   const window = getScopedQuotaWindowForModel(quota, model)
   return Boolean(
     window &&
+      !quotaWindowHasReset(window, now) &&
       Number.isFinite(window.remainingPercent) &&
       window.remainingPercent <= 0,
   )
 }
 
+export function quotaWindowHasReset(
+  window: AccountQuotaWindow | undefined,
+  now = Date.now(),
+) {
+  return Date.parse(window?.resetsAt ?? '') <= now
+}
+
 export function quotaSnapshotPassesModelScope(
   quota: OAuthQuotaSnapshot | undefined,
   model: unknown,
+  storage: AccountSettingsReaderInput | null = null,
+  now = Date.now(),
 ) {
-  return !quotaSnapshotModelScopeIsExhausted(quota, model)
+  const window = getScopedQuotaWindowForModel(quota, model)
+  // A missing model-scoped quota window is not an unknown reading. A recorded
+  // window that has reset still applies to the model, but its quota is unknown.
+  if (!window) return true
+  if (quotaWindowHasReset(window, now))
+    return !quotaEnabled(storage) || !failClosedOnUnknownQuota(storage)
+  return (
+    !Number.isFinite(window.remainingPercent) || window.remainingPercent > 0
+  )
 }
 
 export function quotaSnapshotPassesPolicy(
@@ -1528,6 +1547,7 @@ export function killswitchPassesPolicy(
   storage: AccountSettingsReaderInput | null,
   accountId?: string,
   modelId?: string,
+  now = Date.now(),
 ) {
   if (!isKillswitchEnabled(storage)) return true
   const thresholds = getKillswitchThresholdsForAccount(storage, accountId)
@@ -1546,26 +1566,25 @@ export function killswitchPassesPolicy(
     }
     if (window.remainingPercent < thresholds[key]) return false
   }
-  // Scoped check is additive to the 5h/7d evaluation above and is an
-  // INDEPENDENT block reason — it must run before the unknown-window
-  // fail-closed decision, so an exhausted scoped window blocks even when
-  // 5h/7d is missing/non-finite (the latter only changes the fall-through
-  // for accounts that did not already block on scoped). A missing scoped
-  // window (no carve-out for this model) is not "unknown quota" — only a
-  // PRESENT window at/below threshold blocks. The comparison is inclusive
-  // (`<=`) so the default 0 fires at exhaustion.
+  // Like the standard windows, a recorded scoped window needs current quota
+  // to prove it meets a configured floor. The scoped comparison is inclusive
+  // so the default zero floor still blocks a live exhausted window.
   if (modelId) {
     // An explicit empty scope list proves there is no model carve-out;
     // absent scope metadata cannot prove a configured model floor is met.
     if (thresholds.scoped > 0 && quota?.scoped === undefined) return false
     const scopedWindow = getScopedQuotaWindowForModel(quota, modelId)
-    if (
-      scopedWindow &&
-      ((!Number.isFinite(scopedWindow.remainingPercent) &&
-        thresholds.scoped > 0) ||
-        scopedWindow.remainingPercent <= thresholds.scoped)
-    ) {
-      return false
+    if (scopedWindow) {
+      if (quotaWindowHasReset(scopedWindow, now)) {
+        if (thresholds.scoped > 0) return false
+        sawUnknownWindow = true
+      } else if (
+        (!Number.isFinite(scopedWindow.remainingPercent) &&
+          thresholds.scoped > 0) ||
+        scopedWindow.remainingPercent <= thresholds.scoped
+      ) {
+        return false
+      }
     }
   }
   if (sawUnknownWindow) return !failClosedOnUnknownQuota(storage)

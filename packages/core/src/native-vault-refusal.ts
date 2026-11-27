@@ -10,6 +10,7 @@ import {
 import { NativeVaultNoAccountError } from './native-vault-admission.ts'
 import {
   createStickyNoRouteResponse,
+  type StickyQuotaBlocker,
   stickyRouteCandidateWeight,
   stickyRouteFamilyForModel,
 } from './sticky-routing.ts'
@@ -19,6 +20,7 @@ export function createNativeVaultNoRouteResponse(input: {
   snapshot: NativeAccountSnapshot
   modelId?: string
   policies?: ReadonlyMap<string, NativeAccountPolicy>
+  providerBlockers?: readonly StickyQuotaBlocker[]
   sticky?: boolean
   sessionId?: string | null
   waitForReset?: boolean
@@ -72,6 +74,9 @@ export function createNativeVaultNoRouteResponse(input: {
     storage: snapshot.policyStorage,
     sessionId: input.sessionId,
     vaultPolicyLimits: [...limits],
+    providerLimitNames: input.providerBlockers?.map(
+      (blocker) => blocker.limitName,
+    ),
     waitForReset:
       input.waitForReset && active.every((account) => account.quota),
   })
