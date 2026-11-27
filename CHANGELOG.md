@@ -18,6 +18,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - OpenCode: saving the sidebar's collapsed state no longer overwrites preference changes saved in the meantime, and leaves the preferences file untouched when it can't be read (#902).
 - Legacy import from 1.x: when the configuration and state files hold different logins for a fallback account and both record a refresh time, the more recently refreshed login is kept (#903).
 - Billing reports a streamed reply as completed only when it ends normally; a reply cut off after its usage update is reported as cut, with its usage kept (#901).
+- Claude sign-in stops after 60 seconds if the code exchange stalls, instead of hanging until the runtime's own timeout. A refresh error is treated as a dead login only when Anthropic's reply says `invalid_grant` as its error, not whenever the text appears (#908).
+- When a thread continuation is refused and its error body stalls, recovery gives up after 5 seconds and returns the original error, without resending (#909).
+- A new account's per-model limits and credits are no longer dropped when a response's quota headers are saved just before its first full quota poll (#910).
+- The routing assignment file is pruned again when it is saved: expired assignments and the oldest ones over the 4,096 limit are removed, so the file no longer grows without end (#911).
 - OpenCode 2's session listeners subscribe only to the events they handle, so the host no longer encodes every streamed event for them (#912).
 - OpenCode 2 parses a large request body fewer times while preparing it; the bytes sent to Anthropic don't change (#913).
 - After OpenCode or Pi restarts, the plugin's own retry again prefers the Claude login that holds the session's warm cache. That memory used to live only in the running process, so the first retry after a restart could pick a cold login and rewrite the whole conversation. It is now restored from the saved keep-warm records.
