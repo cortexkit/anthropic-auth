@@ -605,14 +605,48 @@ test('new native header merges retain the poll clock even though legacy data cou
   expect(afterSecond.checkedAt).toBe(laterPollAt)
   expect(afterSecond.scoped).toEqual([])
   expect(afterSecond.extraUsage).toBeUndefined()
-  // A legacy header snapshot with no recoverable poll clock cannot establish
-  // that the incoming poll is older. Keep the headers and use the poll data.
-  expect(
-    fromNativeQuotaMap(nativeQuotaCodec.merge(legacy(first), latePoll)),
-  ).toEqual(afterFirst)
+  // A legacy snapshot without a recoverable poll clock may already have seen
+  // a later poll. Leave it alone until a poll newer than the headers arrives.
+  expect(nativeQuotaCodec.merge(legacy(first), latePoll)).toEqual(legacy(first))
 })
 
-test('a newer header-only snapshot keeps its standard windows and gains the first poll’s scoped limits and credits', () => {
+test('an older poll cannot replace a poll already covered by newer headers', () => {
+  const poll = (checkedAt: number, withDetails: boolean) =>
+    toNativeQuotaMap({
+      accountIdentity: full.accountIdentity,
+      source: 'poll',
+      checkedAt,
+      five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt },
+      seven_day: { usedPercent: 20, remainingPercent: 80, checkedAt },
+      ...(withDetails && {
+        scoped: full.scoped?.map((window) => ({ ...window, checkedAt })),
+        extraUsage: full.extraUsage,
+      }),
+    })
+  const headers = toNativeQuotaMap({
+    ...normalizeQuotaHeaders(
+      new Headers({
+        'anthropic-ratelimit-unified-5h-utilization': '0.12',
+        'anthropic-ratelimit-unified-7d-utilization': '0.21',
+      }),
+      300,
+    ),
+    accountIdentity: full.accountIdentity,
+  })
+  const stored = nativeQuotaCodec.merge(poll(200, false), headers)
+  expect(fromNativeQuotaMap(stored)).toMatchObject({
+    source: 'headers',
+    checkedAt: 200,
+    five_hour: { checkedAt: 300 },
+    seven_day: { checkedAt: 300 },
+  })
+  expect(nativeQuotaCodec.merge(stored, poll(100, true))).toEqual(stored)
+
+  const newer = poll(400, true)
+  expect(nativeQuotaCodec.merge(stored, newer)).toEqual(newer)
+})
+
+test('a header-only snapshot waits for a newer poll if the first poll is older than its headers', () => {
   const headers: OAuthQuotaSnapshot = {
     accountIdentity: full.accountIdentity,
     source: 'headers',
@@ -630,14 +664,8 @@ test('a newer header-only snapshot keeps its standard windows and gains the firs
     extraUsage: full.extraUsage,
   }
   expect(quotaPollCheckedAt(headers)).toBe(0)
-  const merged = fromNativeQuotaMap(
-    nativeQuotaCodec.merge(toNativeQuotaMap(headers), toNativeQuotaMap(poll)),
-  )
-  expect(merged.five_hour).toEqual(headers.five_hour)
-  expect(merged.seven_day).toEqual(headers.seven_day)
-  expect(merged.scoped).toEqual(poll.scoped)
-  expect(merged.extraUsage).toEqual(poll.extraUsage)
-  expect(quotaPollCheckedAt(merged)).toBe(poll.checkedAt!)
+  const stored = toNativeQuotaMap(headers)
+  expect(nativeQuotaCodec.merge(stored, toNativeQuotaMap(poll))).toEqual(stored)
 })
 
 test.each([

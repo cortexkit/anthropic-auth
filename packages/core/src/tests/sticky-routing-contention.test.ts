@@ -21,7 +21,10 @@ import {
 } from '../logger.ts'
 import type { NativeLockEvent } from '../native-lock-observer.ts'
 import { runWithRequestSignal } from '../request-abort.ts'
-import { StickySessionRouter } from '../sticky-routing.ts'
+import {
+  STICKY_ROUTING_ASSIGNMENT_TTL_MS,
+  StickySessionRouter,
+} from '../sticky-routing.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
 const lifetimes = createTestLifetimeSuite()
@@ -36,7 +39,7 @@ const input = (sessionId: string, accountId = 'main') => ({
   storage: null,
   inputBytes: 1,
 })
-async function fixture() {
+async function fixture(now?: () => number) {
   const directory = await mkdtemp(join(tmpdir(), 'sticky-held-lock-'))
   const path = join(directory, 'routing.json')
   const routers: StickySessionRouter[] = []
@@ -54,6 +57,7 @@ async function fixture() {
   ) => {
     const value = new StickySessionRouter({
       path,
+      now,
       onLockEvent,
       localRecoveryPath,
     })
@@ -72,6 +76,22 @@ async function fixture() {
     return lease
   }
   return { directory, path, router, hold }
+}
+
+function delayNextWriter(router: StickySessionRouter) {
+  const waiting = lifetimes.gate()
+  const resume = lifetimes.gate()
+  const seam = router as unknown as {
+    acquireLock(wait?: boolean, detached?: boolean): Promise<unknown>
+  }
+  const acquire = seam.acquireLock
+  seam.acquireLock = async (...args) => {
+    seam.acquireLock = acquire
+    waiting.open()
+    await resume.wait
+    return acquire.apply(router, args)
+  }
+  return { waiting: waiting.wait, resume: resume.open }
 }
 
 function stickyWarnings() {
@@ -190,6 +210,83 @@ lifetimes.test(
   },
   10_000,
 )
+
+lifetimes.test(
+  'a sticky pin touched before expiry survives a peer write after expiry',
+  async () => {
+    const assignedAt = Date.now()
+    let now = assignedAt
+    const f = await fixture(() => now)
+    const a = f.router()
+    const b = f.router()
+    const session = 'live-pin'
+    await a.resolve(input(session))
+    await a.drain()
+
+    now = assignedAt + STICKY_ROUTING_ASSIGNMENT_TTL_MS - 1
+    const touchedAt = now
+    const touch = delayNextWriter(a)
+    try {
+      expect(await a.resolve(input(session, 'other'))).toMatchObject({
+        accountId: 'main',
+        created: false,
+        assignment: { lastSeenAt: touchedAt },
+      })
+      await touch.waiting
+      now += 2
+      expect(await b.readAssignment(session)).toBeUndefined()
+      await b.resolve(input('unrelated', 'other'))
+      await b.drain()
+      expect(await b.readAssignment(session)).toBeUndefined()
+    } finally {
+      touch.resume()
+    }
+    await a.drain()
+    expect(await b.readAssignment(session)).toMatchObject({
+      accountId: 'main',
+      lastSeenAt: touchedAt,
+    })
+  },
+)
+
+for (const change of ['cleared', 'reassigned'] as const) {
+  lifetimes.test(
+    `a delayed touch does not restore a peer's ${change} pin`,
+    async () => {
+      let now = Date.now()
+      const f = await fixture(() => now)
+      const a = f.router()
+      const b = f.router()
+      const session = 'changed-pin'
+      await a.resolve(input(session))
+      await a.drain()
+
+      now += 24 * 60 * 60_000
+      const touch = delayNextWriter(a)
+      try {
+        expect((await a.resolve(input(session, 'other')))?.accountId).toBe(
+          'main',
+        )
+        await touch.waiting
+        if (change === 'cleared') await b.clear(session)
+        else
+          expect(
+            await b.resolve({
+              ...input(session, 'other'),
+              excludeAccountIds: new Set(['main']),
+            }),
+          ).toMatchObject({ accountId: 'other', migrated: true })
+        await b.drain()
+      } finally {
+        touch.resume()
+      }
+      await a.drain()
+      const saved = JSON.parse(await readFile(f.path, 'utf8')).assignments
+      if (change === 'cleared') expect(saved[key(session)]).toBeUndefined()
+      else expect(saved[key(session)].accountId).toBe('other')
+    },
+  )
+}
 
 lifetimes.test(
   'sticky routing assignment prunes the locked state without losing a live peer pin',

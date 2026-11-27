@@ -50,6 +50,8 @@ export const STICKY_ROUTING_MAIN_ACCOUNT_ID = 'main'
 export const STICKY_ROUTING_ASSIGNMENT_TTL_MS = 7 * 24 * 60 * 60_000
 
 const STICKY_ROUTING_TOUCH_INTERVAL_MS = 60 * 60_000
+// Leave a touch interval plus an hour for queued touches to reach disk.
+const STICKY_ROUTING_PRUNE_GRACE_MS = 2 * STICKY_ROUTING_TOUCH_INTERVAL_MS
 const STICKY_ROUTING_LOCK_TTL_MS = 10_000
 const STICKY_ROUTING_LOCK_WAIT_MS = 5_000
 const STICKY_ROUTING_LOCK_POLL_MS = 10
@@ -1061,10 +1063,11 @@ export class StickySessionRouter {
     )
   }
 
-  private prune(state: StickyRouteState) {
+  private prune(state: StickyRouteState, graceMs = 0) {
     const cutoff =
       this.now() -
-      (this.options.assignmentTtlMs ?? STICKY_ROUTING_ASSIGNMENT_TTL_MS)
+      (this.options.assignmentTtlMs ?? STICKY_ROUTING_ASSIGNMENT_TTL_MS) -
+      graceMs
     for (const [key, assignment] of Object.entries(state.assignments)) {
       if (assignment.lastSeenAt < cutoff) delete state.assignments[key]
     }
@@ -1083,7 +1086,7 @@ export class StickySessionRouter {
     beforeRename: () => Promise<void>,
   ) {
     await this.options.relocationGuard?.assertNotRelocated()
-    this.prune(state)
+    this.prune(state, STICKY_ROUTING_PRUNE_GRACE_MS)
     state.updatedAt = this.now()
     const tempPath = `${this.options.path}.${randomUUID()}.tmp`
     try {

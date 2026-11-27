@@ -474,10 +474,11 @@ export const nativeQuotaCodec: QuotaCodec = {
       incoming.source === 'poll' &&
       incoming.checkedAt !== undefined &&
       previous.source === 'headers' &&
+      previousPollAt > 0 &&
       previousTime > incomingTime
     )
-      // A header can arrive after the poll completed but before it was stored.
-      // Preserve the newer standard readings without copying old poll fields.
+      // Keep newer header windows only when the stored poll clock proves the
+      // incoming poll is not older. Headers can cover all evidence of a poll.
       return toNativeQuotaMap(
         mergeHeaderQuotaForPersistence(incoming, {
           ...previous,
