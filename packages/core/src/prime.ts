@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import * as fs from 'node:fs'
-import { lstat, open, readdir, rm } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { chmod, lstat, mkdir, open, readdir, rm } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 import { canonicalFilePathSync } from '@cortexkit/common-auth/fs'
 
 import {
@@ -16,6 +16,7 @@ import {
   type PrimeUsageCounters,
   quotaSnapshotOmitsFiveHour,
 } from './accounts.ts'
+import { ensureHolderDirectory } from './holder-registry.ts'
 import { getHostDataHome } from './host-paths.ts'
 import { logger } from './logger.ts'
 import {
@@ -24,7 +25,7 @@ import {
 } from './models.ts'
 import type { NativeAccountRuntime } from './native-account-runtime.ts'
 import { nativeAccountCanServe } from './native-account-view.ts'
-import { ensurePrivateDirectory } from './owner-only.ts'
+import { ensureWindowsOwnerOnlyDirectory } from './owner-only.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
 // Re-export pricing for downstream packages that import it through core's
@@ -428,6 +429,8 @@ function defaultMarkerDir(): string {
   return join(getHostDataHome(), 'cortexkit', 'anthropic-auth', 'prime')
 }
 
+const warnedMarkerDirectories = new Set<string>()
+
 export function primeStorageFingerprint(storagePath: string): string {
   const absolutePath = resolve(storagePath)
   let canonicalPath: string
@@ -736,15 +739,7 @@ export class PrimeManager {
       logger.trace('prime', 'tick: feature disabled, skipping')
       return
     }
-    if (
-      !(await ensurePrivateDirectory(this.markerRoot(), {
-        base:
-          this.options.markerDir === undefined ? getHostDataHome() : undefined,
-        createBase: this.options.markerDir === undefined,
-        area: 'prime',
-      })) ||
-      this.stopped
-    )
+    if (!(await this.privateMarkerDirectory(this.markerRoot())) || this.stopped)
       return
     await this.sweepMarkers(now)
     for (const [path, { file }] of this.retainedClaims) {
@@ -1340,15 +1335,58 @@ export class PrimeManager {
     return this.options.markerDir ?? defaultMarkerDir()
   }
 
-  private privateMarkerDirectory(
+  private async privateMarkerDirectory(
     path: string,
     create = true,
   ): Promise<boolean> {
-    return ensurePrivateDirectory(path, {
-      base: this.markerRoot(),
-      create,
-      area: 'prime',
-    })
+    const directory = resolve(path)
+    const root = resolve(this.markerRoot())
+    const parent = dirname(directory)
+    if (directory !== root && parent !== root) {
+      // Check the storage namespace before touching its account directory.
+      if (
+        dirname(parent) !== root ||
+        !(await this.privateMarkerDirectory(parent, create))
+      )
+        return false
+    }
+    const explicit = this.options.markerDir !== undefined
+    try {
+      let stat = await lstat(directory).catch(
+        (error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return undefined
+          throw error
+        },
+      )
+      if (!stat) {
+        if (!create) return false
+        if (explicit && process.platform !== 'win32') {
+          // An explicit path retains its non-recursive creation policy.
+          await mkdir(directory, { mode: 0o700 }).catch(
+            (error: NodeJS.ErrnoException) => {
+              if (error.code !== 'EEXIST') throw error
+            },
+          )
+        } else {
+          await ensureHolderDirectory(directory)
+        }
+        stat = await lstat(directory)
+      }
+      if (!stat.isDirectory()) throw new Error('Not a directory')
+      if (await ensureWindowsOwnerOnlyDirectory(directory, undefined, false))
+        return true
+      if (stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0)
+        throw new Error('Unsafe directory')
+      if (explicit && (stat.mode & 0o7777) !== 0o700)
+        await chmod(directory, 0o700)
+      return true
+    } catch {
+      if (!warnedMarkerDirectories.has(directory)) {
+        warnedMarkerDirectories.add(directory)
+        logger.warn('prime', 'private directory refused', { directory })
+      }
+      return false
+    }
   }
 
   private storageMarkerDir(): string {

@@ -137,7 +137,7 @@ test.skipIf(process.platform === 'win32')(
       expect(await readFile(oldDump, 'utf8')).toBe('untouched')
       await chmod(dumpDir, 0o755)
       expect(await dump()).not.toBeNull()
-      expect((await lstat(dumpDir)).mode & 0o777).toBe(0o700)
+      expect((await lstat(dumpDir)).mode & 0o777).toBe(0o755)
 
       await rm(dumpDir, { recursive: true })
       const target = join(base, 'target')
@@ -154,6 +154,41 @@ test.skipIf(process.platform === 'win32')(
     }
   },
 )
+
+for (const mode of [0o775, 0o755]) {
+  test.skipIf(process.platform === 'win32')(
+    `default dumps write without changing a CortexKit parent at ${mode.toString(8)}`,
+    async () => {
+      const data = await mkdtemp(join(tmpdir(), 'shared-parent-dumps-'))
+      dumpDirs.push(data)
+      const shared = join(data, 'cortexkit')
+      await mkdir(shared)
+      await chmod(shared, mode)
+      const oldData = process.env.XDG_DATA_HOME
+      process.env.XDG_DATA_HOME = data
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      setDumpEnabled(true)
+      try {
+        const handle = await dumpDirectRequest({
+          affinity: 'ses-shared-parent',
+          bodyText: '{}',
+          route: 'oauth',
+        })
+        expect(handle).not.toBeNull()
+        const dumpDir = join(shared, 'anthropic-auth', 'dumps')
+        const bodyName = basename(handle!.responsePath).replace(
+          /\.response\.json$/,
+          '.body.json',
+        )
+        expect(await readFile(join(dumpDir, bodyName), 'utf8')).toBe('{}')
+        expect((await lstat(shared)).mode & 0o777).toBe(mode)
+      } finally {
+        if (oldData === undefined) delete process.env.XDG_DATA_HOME
+        else process.env.XDG_DATA_HOME = oldData
+      }
+    },
+  )
+}
 
 test('credited request dumps replace the token in bytes, relay envelopes, and failure text', async () => {
   const dumpDir = await mkdtemp(join(tmpdir(), 'credited-request-dump-'))

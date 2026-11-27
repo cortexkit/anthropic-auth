@@ -180,6 +180,41 @@ describe('PrimeManager storage namespaces', () => {
     },
   )
 
+  for (const mode of [0o775, 0o755]) {
+    test.skipIf(process.platform === 'win32')(
+      `Prime writes without changing a CortexKit parent at ${mode.toString(8)}`,
+      async () => {
+        const root = await tempMarkerRoot()
+        const shared = join(root, 'cortexkit')
+        await mkdir(shared)
+        await chmod(shared, mode)
+        const storagePath = join(root, 'accounts.json')
+        const oldData = process.env.XDG_DATA_HOME
+        process.env.XDG_DATA_HOME = root
+        try {
+          const prime = manager({
+            storagePath,
+            now: Date.now,
+            loadStorage: async () => storage(),
+            refreshQuota: async () => ({}),
+            sendPrime: async () => {},
+          })
+          await prime.tick()
+          const accountDir = primeAccountMarkerDir(
+            join(shared, 'anthropic-auth', 'prime'),
+            storagePath,
+            tokenFingerprint(TEST_LINEAGE),
+          )
+          expect(await readdir(accountDir)).toEqual(['main-bootstrap'])
+          expect((await lstat(shared)).mode & 0o777).toBe(mode)
+        } finally {
+          if (oldData === undefined) delete process.env.XDG_DATA_HOME
+          else process.env.XDG_DATA_HOME = oldData
+        }
+      },
+    )
+  }
+
   test('Ultra skips priming a stored or newly polled account with no five-hour limit', async () => {
     const now = Date.now()
     const quota: OAuthQuotaSnapshot = {

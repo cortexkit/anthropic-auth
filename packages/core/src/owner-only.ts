@@ -1,8 +1,7 @@
-import { chmod, lstat, mkdir } from 'node:fs/promises'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { lstat } from 'node:fs/promises'
+import { dirname } from 'node:path'
 import { types as utilTypes } from 'node:util'
 import type * as PrivateFiles from '@cortexkit/private-files'
-import { logger } from './logger.ts'
 
 /** Per-operation injection keeps simulated Windows policy out of process globals. */
 export interface OwnerOnlyOptions {
@@ -194,65 +193,4 @@ export async function ensureWindowsOwnerOnlyDirectory(
   if (await exists(path)) await privateDirectory(path)
   else await create(path)
   return true
-}
-
-const warnedPrivateDirectories = new Set<string>()
-
-/** Check each plugin-owned component below a trusted base before using its children. */
-export async function ensurePrivateDirectory(
-  path: string,
-  options: {
-    base?: string
-    createBase?: boolean
-    create?: boolean
-    area: string
-  },
-): Promise<boolean> {
-  const absolute = resolve(path)
-  const base = resolve(options.base ?? dirname(absolute))
-  const parts = relative(base, absolute).split(sep)
-  const create = options.create !== false
-  let directory = base
-  try {
-    if (!parts[0] || parts[0] === '..' || isAbsolute(parts.join(sep)))
-      throw new Error('Private folder is outside its base')
-    // The configured data home can be absent on a fresh install. Windows
-    // creates missing ancestors through the native ACL backend below.
-    if (create && options.createBase && process.platform !== 'win32')
-      await mkdir(base, { recursive: true, mode: 0o700 })
-    for (const part of parts) {
-      directory = join(directory, part)
-      let metadata = await lstat(directory).catch((error) => {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-        return undefined
-      })
-      if (!metadata && !create) return false
-      if (metadata && !metadata.isDirectory())
-        throw new Error('Not a directory')
-      if (await ensureWindowsOwnerOnlyDirectory(directory, undefined, create))
-        continue
-      if (!metadata) {
-        try {
-          await mkdir(directory, { mode: 0o700 })
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-        }
-        metadata = await lstat(directory)
-      }
-      if (
-        !metadata.isDirectory() ||
-        metadata.uid !== process.getuid?.() ||
-        (metadata.mode & 0o022) !== 0
-      )
-        throw new Error('Unsafe directory')
-      if ((metadata.mode & 0o7777) !== 0o700) await chmod(directory, 0o700)
-    }
-    return true
-  } catch {
-    if (!warnedPrivateDirectories.has(directory)) {
-      warnedPrivateDirectories.add(directory)
-      logger.warn(options.area, 'private directory refused', { directory })
-    }
-    return false
-  }
 }

@@ -12,10 +12,14 @@ import { dirname, join, resolve } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
 import { fallbackCreditRequestDumpView } from './fallback-credit.ts'
 import { isClaudeGatewaySecretHeader } from './gateway.ts'
+import { ensureHolderDirectory } from './holder-registry.ts'
 import { getHostDataHome } from './host-paths.ts'
 import { parseJsonRedacted } from './json.ts'
 import { isSecretKey, logger, relayLog } from './logger.ts'
-import { createWindowsOwnerOnly, ensurePrivateDirectory } from './owner-only.ts'
+import {
+  createWindowsOwnerOnly,
+  ensureWindowsOwnerOnlyDirectory,
+} from './owner-only.ts'
 import type { ProviderErrorSummary } from './provider-error.ts'
 import {
   type IncompleteStreamDiagnostics,
@@ -161,13 +165,29 @@ export async function writeDumpFile(path: string, contents: string) {
   return false
 }
 
-function ensureDefaultDumpDirectory(directory: string, create: boolean) {
-  return ensurePrivateDirectory(directory, {
-    base: getHostDataHome(),
-    createBase: true,
-    create,
-    area: 'dump',
-  })
+const warnedDumpDirectories = new Set<string>()
+
+async function ensureDefaultDumpDirectory(path: string, create: boolean) {
+  const directory = resolve(path)
+  try {
+    if (create) await ensureHolderDirectory(directory)
+    const stat = await lstat(directory)
+    if (!stat.isDirectory()) throw new Error('Not a directory')
+    if (await ensureWindowsOwnerOnlyDirectory(directory, undefined, false))
+      return true
+    if (stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0)
+      throw new Error('Unsafe directory')
+    return true
+  } catch (error) {
+    if (
+      (create || (error as NodeJS.ErrnoException).code !== 'ENOENT') &&
+      !warnedDumpDirectories.has(directory)
+    ) {
+      warnedDumpDirectories.add(directory)
+      logger.warn('dump', 'private directory refused', { directory })
+    }
+    return false
+  }
 }
 
 /**
