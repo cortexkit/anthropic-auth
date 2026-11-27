@@ -18,6 +18,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - OpenCode: saving the sidebar's collapsed state no longer overwrites preference changes saved in the meantime, and leaves the preferences file untouched when it can't be read (#902).
 - Legacy import from 1.x: when the configuration and state files hold different logins for a fallback account and both record a refresh time, the more recently refreshed login is kept (#903).
 - Billing reports a streamed reply as completed only when it ends normally; a reply cut off after its usage update is reported as cut, with its usage kept (#901).
+- After OpenCode or Pi restarts, the plugin's own retry again prefers the Claude login that holds the session's warm cache. That memory used to live only in the running process, so the first retry after a restart could pick a cold login and rewrite the whole conversation. It is now restored from the saved keep-warm records.
 - Shared routing now hears when a Claude login has used up its Fable weekly limit even though Anthropic names that window `7d_oi`, so a Fable session moves off that login instead of hitting the limit again on every step. For other models, an unrecognised limit window is logged by name but not reported to routing as a limit.
 
 ## 2.17.1
