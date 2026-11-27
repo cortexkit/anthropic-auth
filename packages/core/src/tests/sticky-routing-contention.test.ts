@@ -12,6 +12,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { projectVaultRoster } from '@cortexkit/common-auth/claustrum'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import {
   __setLogTestSink,
@@ -22,6 +23,7 @@ import {
 import type { NativeLockEvent } from '../native-lock-observer.ts'
 import { runWithRequestSignal } from '../request-abort.ts'
 import {
+  getStickyRoutingStatePath,
   STICKY_ROUTING_ASSIGNMENT_TTL_MS,
   StickySessionRouter,
 } from '../sticky-routing.ts'
@@ -289,6 +291,48 @@ for (const change of ['cleared', 'reassigned'] as const) {
 }
 
 lifetimes.test(
+  'local recovery during prune grace cannot revive a cleared sticky pin through a delayed touch',
+  async () => {
+    const assignedAt = Date.now()
+    let now = assignedAt
+    const f = await fixture(() => now)
+    const toucher = f.router()
+    const peer = f.router()
+    const session = 'cleared-pin'
+    const legacy = join(f.directory, 'legacy-routing.json')
+    await toucher.resolve(input(session))
+    await toucher.drain()
+    await writeFile(legacy, await readFile(f.path), { mode: 0o600 })
+
+    now = assignedAt + STICKY_ROUTING_ASSIGNMENT_TTL_MS - 1
+    const touch = delayNextWriter(toucher)
+    try {
+      expect(await toucher.resolve(input(session, 'other'))).toMatchObject({
+        accountId: 'main',
+        created: false,
+        assignment: { lastSeenAt: now },
+      })
+      await touch.waiting
+      await peer.clear(session)
+      await peer.drain()
+      expect(JSON.parse(await readFile(f.path, 'utf8')).assignments).toEqual({})
+
+      now += 2
+      const recovering = f.router(undefined, legacy)
+      await recovering.resolve(input('unrelated', 'other'))
+      await recovering.drain()
+    } finally {
+      touch.resume()
+    }
+    await toucher.drain()
+    expect(await f.router().readAssignment(session)).toBeUndefined()
+    const saved = JSON.parse(await readFile(f.path, 'utf8')).assignments
+    expect(saved[key(session)]).toBeUndefined()
+    expect(saved[key('unrelated')].accountId).toBe('other')
+  },
+)
+
+lifetimes.test(
   'sticky routing assignment prunes the locked state without losing a live peer pin',
   async () => {
     const f = await fixture()
@@ -361,9 +405,9 @@ lifetimes.test(
 lifetimes.test(
   'sticky routing local recovery prunes expired imports and keeps live pins',
   async () => {
-    const f = await fixture()
-    const legacy = join(f.directory, 'legacy-routing.json')
     const now = Date.now()
+    const f = await fixture(() => now)
+    const legacy = join(f.directory, 'legacy-routing.json')
     const live = {
       accountId: 'main',
       family: 'general',
@@ -374,6 +418,23 @@ lifetimes.test(
       quotaCheckedAt: 0,
     }
     const expired = now - 8 * 24 * 60 * 60_000
+    const graceKept = now - STICKY_ROUTING_ASSIGNMENT_TTL_MS - 1
+    await writeFile(
+      f.path,
+      JSON.stringify({
+        version: 1,
+        updatedAt: now,
+        assignments: {
+          [key('replace-expired')]: {
+            ...live,
+            accountId: 'other',
+            assignedAt: graceKept,
+            lastSeenAt: graceKept,
+          },
+        },
+      }),
+      { mode: 0o600 },
+    )
     await writeFile(
       legacy,
       JSON.stringify({
@@ -381,6 +442,7 @@ lifetimes.test(
         updatedAt: now,
         assignments: {
           [key('live')]: live,
+          [key('replace-expired')]: live,
           [key('expired')]: {
             ...live,
             assignedAt: expired,
@@ -397,7 +459,107 @@ lifetimes.test(
     await router.drain()
     expect(JSON.parse(await readFile(f.path, 'utf8')).assignments).toEqual({
       [key('live')]: live,
+      [key('replace-expired')]: live,
     })
+  },
+)
+
+lifetimes.test(
+  'vault seeding imports a live legacy pin over a grace-kept expired pin',
+  async () => {
+    const assignedAt = Date.now()
+    let now = assignedAt
+    const f = await fixture(() => now)
+    const peer = f.router()
+    const session = 'legacy-pin'
+    const expiredSession = 'expired-source'
+    const legacyConfig = join(f.directory, 'legacy.json')
+    const accountIdentity = '11111111-2222-4333-8444-555555555555'
+    const roster = projectVaultRoster(
+      undefined,
+      {
+        view: 'verified',
+        credentials: [
+          {
+            credentialId: 'oauth:anthropic',
+            credentialType: 'oauth',
+            accountIdentity,
+            state: 'active',
+          },
+        ],
+        skipped: [],
+      },
+      { now },
+    )
+    const routeId = roster.rows[0]?.routeId
+    if (!routeId) throw new Error('Fixture roster has no route')
+    await writeFile(
+      legacyConfig,
+      JSON.stringify({ mainAccountId: accountIdentity }),
+      {
+        mode: 0o600,
+      },
+    )
+    const oldPin = {
+      accountId: 'other',
+      affinityModelId: 'claude-sonnet-5',
+      family: 'general' as const,
+      assignedAt,
+      lastSeenAt: assignedAt,
+      initialInputBytes: 1,
+      quotaCheckedAt: 0,
+    }
+    const legacyPin = {
+      ...oldPin,
+      accountId: 'main',
+      lastSeenAt: assignedAt + 6 * 24 * 60 * 60_000,
+    }
+    await writeFile(
+      getStickyRoutingStatePath(legacyConfig),
+      JSON.stringify({
+        version: 1,
+        updatedAt: legacyPin.lastSeenAt,
+        assignments: {
+          [key(session)]: legacyPin,
+          [key(expiredSession)]: { ...oldPin, accountId: 'main' },
+        },
+      }),
+      { mode: 0o600 },
+    )
+    await writeFile(
+      f.path,
+      JSON.stringify({
+        version: 1,
+        updatedAt: assignedAt,
+        assignments: { [key(session)]: oldPin },
+        vaultLegacySeed: 'pending',
+      }),
+      { mode: 0o600 },
+    )
+
+    now = assignedAt + STICKY_ROUTING_ASSIGNMENT_TTL_MS + 1
+    await peer.resolve(input('unrelated'))
+    await peer.drain()
+    expect(await peer.readAssignment(session)).toBeUndefined()
+    const before = JSON.parse(await readFile(f.path, 'utf8'))
+    expect(before.vaultLegacySeed).toBe('pending')
+    expect(before.assignments[key(session)]).toEqual(oldPin)
+
+    const seeder = f.router()
+    seeder.setVaultSeed({
+      legacyConfig,
+      roster: join(f.directory, 'roster.json'),
+    })
+    await seeder.prepareLegacySeed(roster)
+    await seeder.drain()
+    const saved = JSON.parse(await readFile(f.path, 'utf8'))
+    expect(saved.vaultLegacySeed).toBe('complete')
+    expect(await seeder.readAssignment(session)).toEqual({
+      ...legacyPin,
+      accountId: routeId,
+      accountIdentity,
+    })
+    expect(saved.assignments[key(expiredSession)]).toBeUndefined()
   },
 )
 

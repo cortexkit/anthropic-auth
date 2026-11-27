@@ -668,12 +668,9 @@ test('a header-only snapshot waits for a newer poll if the first poll is older t
   expect(nativeQuotaCodec.merge(stored, toNativeQuotaMap(poll))).toEqual(stored)
 })
 
-test.each([
-  ['headers', 1],
-  ['poll', 0],
-] as const)(
-  'newer held %s affects a pending quota poll write by source',
-  async (source, expectedWrites) => {
+test.each(['headers', 'poll'] as const)(
+  'newer held %s supersedes a pending quota poll write',
+  async (source) => {
     const observations = new NativeQuotaObservations()
     const reading = (source: 'headers' | 'poll', checkedAt: number) => ({
       lineage: 'same-credential',
@@ -698,7 +695,7 @@ test.each([
       const latest = reading(source, 2000)
       expect(observations.hold('main', latest)).toBe(true)
       await published
-      expect(writes).toBe(expectedWrites)
+      expect(writes).toBe(0)
       expect(observations.get('main')).toBe(latest)
     } finally {
       await observations.close()

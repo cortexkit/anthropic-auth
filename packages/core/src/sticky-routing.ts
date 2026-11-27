@@ -1042,13 +1042,14 @@ export class StickySessionRouter {
       for (const [key, assignment] of Object.entries(legacy.assignments)) {
         if (
           !/^[0-9a-f]{64}$/.test(key) ||
-          Object.hasOwn(state.assignments, key)
+          !this.assignmentIsActive(assignment) ||
+          this.hasActiveAssignment(state, key)
         )
           continue
         state.assignments[key] = assignment
         changed = true
       }
-      // Imported pins fill missing entries and share the destination's limits.
+      // Recovery must not restore expired pins kept on disk for delayed touches.
       if (changed) await this.writeState(state, () => lock.assertOwned())
     } finally {
       await lock.release()
@@ -1061,6 +1062,11 @@ export class StickySessionRouter {
       this.now() -
         (this.options.assignmentTtlMs ?? STICKY_ROUTING_ASSIGNMENT_TTL_MS)
     )
+  }
+
+  private hasActiveAssignment(state: StickyRouteState, key: string) {
+    const assignment = state.assignments[key]
+    return assignment !== undefined && this.assignmentIsActive(assignment)
   }
 
   private prune(state: StickyRouteState, graceMs = 0) {
@@ -1158,12 +1164,13 @@ export class StickySessionRouter {
           for (const [key, raw] of Object.entries(legacy.assignments)) {
             if (
               !/^[0-9a-f]{64}$/.test(key) ||
-              Object.hasOwn(state.assignments, key)
+              this.hasActiveAssignment(state, key)
             )
               continue
             const assignment = normalizeAssignment(raw)
-            const target = assignment && routes.get(assignment.accountId)
-            if (assignment && target)
+            if (!assignment || !this.assignmentIsActive(assignment)) continue
+            const target = routes.get(assignment.accountId)
+            if (target)
               state.assignments[key] = {
                 ...assignment,
                 accountId: target.routeId,

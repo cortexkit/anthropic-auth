@@ -135,11 +135,9 @@ export class NativeQuotaObservations extends Map<
         let cancelled = false
         try {
           const current = this.get(accountId)
-          // Headers can update standard windows, but cannot replace poll-only data.
           if (
             current &&
             current.lineage === observation.lineage &&
-            current.entry.quota.source === 'poll' &&
             quotaSnapshotCheckedAt(current.entry.quota) >
               quotaSnapshotCheckedAt(observation.entry.quota)
           )

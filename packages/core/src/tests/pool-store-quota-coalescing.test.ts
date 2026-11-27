@@ -167,7 +167,7 @@ function lockHolder(paths: NativePoolStorePaths, lane: Lane) {
 const epoch1 = (identity: string) => ({ credentialEpoch: 1, identity })
 
 coalescing(
-  'holding newer headers does not discard the first poll before it can reach disk',
+  'a first poll older than held headers waits for the next poll',
   async () => {
     const paths = await fixture()
     const account = 'acct-a'
@@ -190,8 +190,7 @@ coalescing(
     })
     const observations = new NativeQuotaObservations()
     try {
-      // The header is already visible to the publisher, but its separate save
-      // has not reached the store. The poll must still get a chance to write.
+      // The header save has not reached the store; the held reading alone supersedes the poll.
       expect(observations.hold('a', observation(headers, 2_000))).toBe(true)
       await observations.publish('a', observation(poll, 1_000), async () => {
         await store.recordQuota('a', epoch1(account), nativeLane.observe(poll))
@@ -202,7 +201,31 @@ coalescing(
       expect(await onDisk(paths, nativeLane, 'a')).toEqual({
         five_hour: { usedPercent: 12, checkedAt: 2_000 },
         seven_day: { usedPercent: 41, checkedAt: 2_000 },
-        fable: { usedPercent: 51, checkedAt: 1_000 },
+      })
+
+      const next = coalesced(paths, nativeLane)
+      const newerPoll = pollSnapshot(account, 3_000, {
+        five_hour: 75,
+        seven_day: 43,
+        fable: 56,
+      })
+      await observations.publish(
+        'a',
+        observation(newerPoll, 3_000),
+        async () => {
+          await next.recordQuota(
+            'a',
+            epoch1(account),
+            nativeLane.observe(newerPoll),
+          )
+          return true
+        },
+      )
+      await closeStore(next)
+      expect(await onDisk(paths, nativeLane, 'a')).toEqual({
+        five_hour: { usedPercent: 75, checkedAt: 3_000 },
+        seven_day: { usedPercent: 43, checkedAt: 3_000 },
+        fable: { usedPercent: 56, checkedAt: 3_000 },
         extraUsagePercent: 19.225,
       })
     } finally {
