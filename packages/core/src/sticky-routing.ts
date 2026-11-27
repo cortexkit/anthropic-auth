@@ -50,8 +50,7 @@ export const STICKY_ROUTING_MAIN_ACCOUNT_ID = 'main'
 export const STICKY_ROUTING_ASSIGNMENT_TTL_MS = 7 * 24 * 60 * 60_000
 
 const STICKY_ROUTING_TOUCH_INTERVAL_MS = 60 * 60_000
-// Leave a touch interval plus an hour for queued touches to reach disk.
-const STICKY_ROUTING_PRUNE_GRACE_MS = 2 * STICKY_ROUTING_TOUCH_INTERVAL_MS
+const STICKY_ROUTING_DISK_PRUNE_MARGIN_MS = 30 * 24 * 60 * 60_000
 const STICKY_ROUTING_LOCK_TTL_MS = 10_000
 const STICKY_ROUTING_LOCK_WAIT_MS = 5_000
 const STICKY_ROUTING_LOCK_POLL_MS = 10
@@ -1042,14 +1041,14 @@ export class StickySessionRouter {
       for (const [key, assignment] of Object.entries(legacy.assignments)) {
         if (
           !/^[0-9a-f]{64}$/.test(key) ||
-          !this.assignmentIsActive(assignment) ||
-          this.hasActiveAssignment(state, key)
+          Object.hasOwn(state.assignments, key)
         )
           continue
         state.assignments[key] = assignment
         changed = true
       }
-      // Recovery must not restore expired pins kept on disk for delayed touches.
+      // Imported pins must not replace newer destination choices. Ordinary
+      // routing handles expired pins and accounts that no longer exist.
       if (changed) await this.writeState(state, () => lock.assertOwned())
     } finally {
       await lock.release()
@@ -1064,16 +1063,10 @@ export class StickySessionRouter {
     )
   }
 
-  private hasActiveAssignment(state: StickyRouteState, key: string) {
-    const assignment = state.assignments[key]
-    return assignment !== undefined && this.assignmentIsActive(assignment)
-  }
-
-  private prune(state: StickyRouteState, graceMs = 0) {
+  private prune(state: StickyRouteState) {
     const cutoff =
       this.now() -
-      (this.options.assignmentTtlMs ?? STICKY_ROUTING_ASSIGNMENT_TTL_MS) -
-      graceMs
+      (this.options.assignmentTtlMs ?? STICKY_ROUTING_ASSIGNMENT_TTL_MS)
     for (const [key, assignment] of Object.entries(state.assignments)) {
       if (assignment.lastSeenAt < cutoff) delete state.assignments[key]
     }
@@ -1092,7 +1085,15 @@ export class StickySessionRouter {
     beforeRename: () => Promise<void>,
   ) {
     await this.options.relocationGuard?.assertNotRelocated()
-    this.prune(state, STICKY_ROUTING_PRUNE_GRACE_MS)
+    // Keep pins well past read expiry so delayed touches and imports can finish.
+    // Bound disk retention by age only; a count cap could evict live pins.
+    const cutoff =
+      this.now() -
+      (this.options.assignmentTtlMs ?? STICKY_ROUTING_ASSIGNMENT_TTL_MS) -
+      STICKY_ROUTING_DISK_PRUNE_MARGIN_MS
+    for (const [key, assignment] of Object.entries(state.assignments)) {
+      if (assignment.lastSeenAt < cutoff) delete state.assignments[key]
+    }
     state.updatedAt = this.now()
     const tempPath = `${this.options.path}.${randomUUID()}.tmp`
     try {
@@ -1164,13 +1165,12 @@ export class StickySessionRouter {
           for (const [key, raw] of Object.entries(legacy.assignments)) {
             if (
               !/^[0-9a-f]{64}$/.test(key) ||
-              this.hasActiveAssignment(state, key)
+              Object.hasOwn(state.assignments, key)
             )
               continue
             const assignment = normalizeAssignment(raw)
-            if (!assignment || !this.assignmentIsActive(assignment)) continue
-            const target = routes.get(assignment.accountId)
-            if (target)
+            const target = assignment && routes.get(assignment.accountId)
+            if (assignment && target)
               state.assignments[key] = {
                 ...assignment,
                 accountId: target.routeId,
@@ -1179,7 +1179,8 @@ export class StickySessionRouter {
           }
         }
         state.vaultLegacySeed = 'complete'
-        // Publish the import marker and the pruned assignments together.
+        // Imported pins fill only missing assignments, leaving existing ones
+        // unchanged. Publish the marker and additions in one owned rename.
         await this.writeState(state, () => lock.assertOwned())
         this.seedFinalized = true
       } finally {
