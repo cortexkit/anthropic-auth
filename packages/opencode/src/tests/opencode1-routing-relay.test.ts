@@ -52,6 +52,10 @@ describe('OC1 shared routing relay', () => {
       | 'fallback-first' = 'sticky-balanced',
     relay = false,
     sessionId = 'ses_relay_oc1',
+    orderedQuota?: {
+      evidence: 'poll' | 'rounded headers' | 'past reset' | 'stale poll'
+      second?: 'healthy' | 'blocked'
+    },
   ) {
     const now = Date.now()
     const paidBackup = mode.startsWith('paid backup')
@@ -92,6 +96,28 @@ describe('OC1 shared routing relay', () => {
               },
             ],
     })
+    const orderedFallbackQuota = () => {
+      const checkedAt =
+        orderedQuota?.evidence === 'stale poll' ? now - 3600_000 : now
+      return {
+        ...quota(0),
+        source:
+          orderedQuota?.evidence === 'rounded headers'
+            ? ('headers' as const)
+            : ('poll' as const),
+        checkedAt,
+        five_hour: {
+          ...quota(0).five_hour,
+          checkedAt,
+          resetsAt: new Date(
+            now +
+              (orderedQuota?.evidence === 'past reset' ? -60_000 : 3600_000),
+          ).toISOString(),
+        },
+        seven_day: { ...quota(0).seven_day, checkedAt },
+        scoped: [],
+      }
+    }
     await useTempAccountFile(
       ctx,
       bindPoolAccounts(
@@ -115,7 +141,7 @@ describe('OC1 shared routing relay', () => {
             enabled: true,
             checkIntervalMinutes: 5,
             minimumRemaining: {
-              five_hour: mode === 'refusal floor' ? 20 : 1,
+              five_hour: orderedQuota ? 0 : mode === 'refusal floor' ? 20 : 1,
               seven_day: 1,
             },
             failClosedOnUnknownQuota: true,
@@ -143,7 +169,18 @@ describe('OC1 shared routing relay', () => {
             ...(mode === 'refresh cadence' && { refreshEveryNRequests: 1 }),
           },
           ...(mode === 'floor' || mainKilled
-            ? { killswitch: { enabled: true, main: { five_hour: 20 } } }
+            ? {
+                killswitch: {
+                  enabled: true,
+                  main: { five_hour: 20 },
+                  ...(orderedQuota && {
+                    accounts: {
+                      'fallback-1': { five_hour: 0 },
+                      'fallback-2': { five_hour: 0 },
+                    },
+                  }),
+                },
+              }
             : {}),
           accounts:
             paidBackup && !mode.includes('OAuth')
@@ -156,8 +193,9 @@ describe('OC1 shared routing relay', () => {
                     access: 'sk-ant-oat01-fallback-access',
                     refresh: 'fallback-refresh',
                     expires: now + 3600_000,
-                    quota:
-                      mode === 'unknown quota'
+                    quota: orderedQuota
+                      ? orderedFallbackQuota()
+                      : mode === 'unknown quota'
                         ? undefined
                         : quota(
                             ['floor', 'blocked', 'refusal floor'].includes(mode)
@@ -174,7 +212,7 @@ describe('OC1 shared routing relay', () => {
                         }
                       : {}),
                   },
-                  ...(mode.startsWith('three accounts')
+                  ...(mode.startsWith('three accounts') || orderedQuota?.second
                     ? [
                         {
                           id: 'fallback-2',
@@ -182,9 +220,14 @@ describe('OC1 shared routing relay', () => {
                           access: 'sk-ant-oat01-third-access',
                           refresh: 'third-refresh',
                           expires: now + 3600_000,
-                          quota: quota(
-                            mode === 'three accounts for warm retry' ? 50 : 80,
-                          ),
+                          quota:
+                            orderedQuota?.second === 'blocked'
+                              ? orderedFallbackQuota()
+                              : quota(
+                                  mode === 'three accounts for warm retry'
+                                    ? 50
+                                    : 80,
+                                ),
                         },
                       ]
                     : []),
@@ -207,6 +250,12 @@ describe('OC1 shared routing relay', () => {
           )
           if (responseFor) return Promise.resolve(responseFor())
         }
+        if (
+          orderedQuota &&
+          extractUrl(input).includes('/api/oauth/usage') &&
+          !new Headers(init?.headers).get('authorization')?.includes('main')
+        )
+          return Promise.resolve(new Response('{}', { status: 503 }))
         if (extractUrl(input).includes('/api/oauth/usage'))
           return Promise.resolve(
             new Response(
@@ -282,6 +331,102 @@ describe('OC1 shared routing relay', () => {
       ...getPluginTestHandles(plugin),
     }
   }
+
+  const mainBearer = 'Bearer sk-ant-oat01-main-access'
+  const fallbackBearer = 'Bearer sk-ant-oat01-fallback-access'
+  const healthyFallbackBearer = 'Bearer sk-ant-oat01-third-access'
+
+  for (const mode of ['main-first', 'fallback-first'] as const) {
+    test.each(['poll', 'rounded headers', 'past reset', 'stale poll'] as const)(
+      `OC1 ${mode} ordered fallback uses confirmed provider quota only (%s)`,
+      async (evidence) => {
+        let sends = 0
+        const f = await fixture(
+          'normal',
+          () =>
+            mode === 'main-first' && sends++ === 0
+              ? new Response('main refused', { status: 403 })
+              : new Response('served'),
+          undefined,
+          mode,
+          false,
+          `ses_oc1_ordered_${mode}_${evidence.replaceAll(' ', '-')}`,
+          { evidence, second: 'healthy' },
+        )
+        expect(await (await f.send()).text()).toBe('served')
+        expect(f.sends).toEqual([
+          ...(mode === 'main-first' ? [mainBearer] : []),
+          evidence === 'poll' ? healthyFallbackBearer : fallbackBearer,
+        ])
+      },
+    )
+  }
+
+  test('OC1 ordered quota stop names the provider limit once without sending', async () => {
+    const f = await fixture(
+      'blocked',
+      undefined,
+      undefined,
+      'main-first',
+      false,
+      undefined,
+      { evidence: 'poll', second: 'blocked' },
+    )
+    const response = await f.send()
+    expect(f.sends).toEqual([])
+    const { error } = (await response.json()) as { error: { message: string } }
+    expect(error.message).toContain('Killswitch')
+    expect(error.message).toContain(
+      'Provider limits on other accounts (quota settings cannot raise these): 5-hour.',
+    )
+  })
+
+  test('OC1 ordered routing keeps the upstream main refusal when the fallbacks are provider-blocked', async () => {
+    const f = await fixture(
+      'normal',
+      () =>
+        new Response('upstream main refusal', {
+          status: 429,
+          headers: { 'retry-after': '17' },
+        }),
+      undefined,
+      'main-first',
+      false,
+      undefined,
+      { evidence: 'poll', second: 'blocked' },
+    )
+    const response = await f.send()
+    expect(response.status).toBe(429)
+    expect(response.headers.get('retry-after')).toBe('17')
+    expect(await response.text()).toBe('upstream main refusal')
+    expect(f.sends).toEqual([mainBearer])
+  })
+
+  test('OC1 ordered fallback uses raw quota refusal headers on a revisit', async () => {
+    let sends = 0
+    const f = await fixture(
+      'normal',
+      () =>
+        sends++ === 0
+          ? new Response('fallback refused', {
+              status: 429,
+              headers: {
+                'anthropic-ratelimit-unified-5h-status': 'rejected',
+                'anthropic-ratelimit-unified-5h-reset': String(
+                  Math.ceil(Date.now() / 1000) + 3600,
+                ),
+              },
+            })
+          : new Response('upstream main refusal', { status: 403 }),
+      undefined,
+      'fallback-first',
+      false,
+      undefined,
+      { evidence: 'rounded headers' },
+    )
+    expect(await (await f.send()).text()).toBe('upstream main refusal')
+    expect(f.sends).toEqual([fallbackBearer, mainBearer])
+  })
 
   test.each(['sticky-balanced', 'main-first'] as const)(
     'OC1 %s scoped Fable retry prefers the last accepted cache account',

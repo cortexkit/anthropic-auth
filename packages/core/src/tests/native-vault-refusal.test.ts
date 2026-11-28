@@ -86,6 +86,44 @@ test('vault disabled and declined accounts do not hide an active account quota r
   })
 })
 
+test('vault provider-only stop lists exhausted windows without hiding sign-in problems', async () => {
+  const view = snapshot()
+  view.policyStorage.quota = {
+    minimumRemaining: { five_hour: 0, seven_day: 0 },
+  }
+  const resetAt = Date.now() + 120_000
+  const input = {
+    snapshot: view,
+    providerBlockers: [
+      { limitName: '5-hour', reason: 'five-hour' as const, resetAt },
+      {
+        limitName: 'weekly',
+        reason: 'seven-day' as const,
+        resetAt: resetAt + 1000,
+      },
+      { limitName: '5-hour', reason: 'five-hour' as const, resetAt },
+    ],
+    fallbackToProviderExhaustion: true,
+  }
+  const response = createNativeVaultNoRouteResponse(input)
+  expect(response.status).toBe(429)
+  const body = (await response.json()) as { error: { message: string } }
+  expect(body.error.message).toContain('Claude reports every account')
+  expect(body.error.message).toContain(
+    'Provider limits on other accounts (quota settings cannot raise these): 5-hour, weekly.',
+  )
+  expect(body.error.message).not.toContain('your quota floor')
+  expect(() =>
+    createNativeVaultNoRouteResponse({
+      ...input,
+      snapshot: {
+        ...view,
+        accounts: [...view.accounts, account('signed-out', 'needs_reauth')],
+      },
+    }),
+  ).toThrow(NativeVaultNoAccountError)
+})
+
 test('vault model-scoped refusal names the model limit and uses its reset retry hint', async () => {
   const view = snapshot()
   const checkedAt = Date.now()

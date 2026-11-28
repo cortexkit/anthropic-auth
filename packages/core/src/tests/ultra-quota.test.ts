@@ -232,6 +232,61 @@ test('Ultra sticky weight is nonzero, while weekly and scoped exhaustion have no
   ).toBe(false)
 })
 
+test('expired Fable evidence is only usable under unknown-quota policy', async () => {
+  const now = Date.now()
+  const policy = storage()
+  policy.quota!.failClosedOnUnknownQuota = false
+  const reading = await poll(0, now - 120_000)
+  const scope = {
+    ...reading.scoped![0]!,
+    remainingPercent: 0,
+    usedPercent: 100,
+  }
+  const quota = (resetAt?: number, remainingPercent = 0) => ({
+    ...reading,
+    scoped: [
+      {
+        ...scope,
+        remainingPercent,
+        resetsAt:
+          resetAt === undefined ? undefined : new Date(resetAt).toISOString(),
+      },
+    ],
+  })
+  const weight = (q: OAuthQuotaSnapshot) =>
+    stickyRouteCandidateWeight({
+      candidate: { accountId: 'main', order: 0, quota: q },
+      family: 'fable',
+      modelId: model,
+      storage: policy,
+      now,
+    })
+  const expired = quota(now - 60_000)
+  expect(quotaSnapshotPassesModelScope(expired, model, policy, now)).toBe(true)
+  expect(weight(expired)).toBe(weight({ ...reading, scoped: [] }))
+  expect(weight(expired)).toBeGreaterThan(0)
+  for (const liveOrUndated of [quota(now + 60_000), quota()]) {
+    expect(
+      quotaSnapshotPassesModelScope(liveOrUndated, model, policy, now),
+    ).toBe(false)
+    expect(weight(liveOrUndated)).toBe(0)
+  }
+  policy.quota!.failClosedOnUnknownQuota = true
+  expect(quotaSnapshotPassesModelScope(expired, model, policy, now)).toBe(false)
+  expect(weight(expired)).toBe(0)
+  policy.quota!.failClosedOnUnknownQuota = false
+  policy.killswitch = {
+    enabled: true,
+    main: { five_hour: 0, seven_day: 0, scoped: 10 },
+  }
+  const expiredWithHeadroom = quota(now - 60_000, 90)
+  expect(
+    killswitchPassesPolicy(expiredWithHeadroom, policy, undefined, model, now),
+  ).toBe(false)
+  expect(weight(expiredWithHeadroom)).toBe(0)
+  expect(weight(quota(now + 120_000, 90))).toBeGreaterThan(0)
+})
+
 test('Ultra weekly killswitch floor and retry hint still apply without a session limit', async () => {
   const policy = storage()
   policy.killswitch = { enabled: true, main: { five_hour: 99, seven_day: 20 } }

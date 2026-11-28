@@ -25,7 +25,10 @@ import {
   PiNativeRuntime,
 } from '../native.ts'
 import { createPiNativeCommands } from '../native-commands.ts'
-import { streamCortexKitAnthropic } from '../stream.ts'
+import {
+  __executePiWithFallbackForTest,
+  streamCortexKitAnthropic,
+} from '../stream.ts'
 import {
   fixtureAccountIdentity,
   saveNativePiFixture,
@@ -694,6 +697,201 @@ test.each([
       })(),
     ),
 )
+
+async function orderedProviderFixture(input: {
+  mode: 'main-first' | 'fallback-first'
+  evidence: 'poll' | 'rounded headers' | 'past reset' | 'stale poll'
+  blockSecond?: boolean
+  killMain?: boolean
+  mainRefusal?: boolean
+  rawFirstRefusal?: boolean
+}) {
+  const now = Date.now()
+  const quota = (remaining: number, blocked: boolean) => {
+    const checkedAt =
+      blocked && input.evidence === 'stale poll' ? now - 3600_000 : now
+    return {
+      source:
+        blocked && input.evidence === 'rounded headers'
+          ? ('headers' as const)
+          : ('poll' as const),
+      checkedAt,
+      five_hour: {
+        usedPercent: 100 - remaining,
+        remainingPercent: remaining,
+        checkedAt,
+        resetsAt: new Date(
+          now +
+            (blocked && input.evidence === 'past reset' ? -60_000 : 3600_000),
+        ).toISOString(),
+      },
+      seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt },
+      scoped: [],
+    }
+  }
+  await saveNativePiFixture(
+    {
+      version: 1,
+      routing: { mode: input.mode },
+      quota: {
+        enabled: true,
+        checkIntervalMinutes: 5,
+        minimumRemaining: { five_hour: 0, seven_day: 0 },
+        mainQuota: quota(input.killMain ? 10 : 100, false),
+      },
+      ...(input.killMain && {
+        killswitch: {
+          enabled: true,
+          main: { five_hour: 20 },
+          accounts: { first: { five_hour: 0 }, second: { five_hour: 0 } },
+        },
+      }),
+      accounts: [
+        ...['first', 'second'].map((id) => {
+          const blocked = id === 'first' || Boolean(input.blockSecond)
+          return {
+            id,
+            type: 'oauth' as const,
+            access: `sk-ant-oat01-${id}-ordered-fallback`,
+            refresh: `${id}-refresh`,
+            expires: now + 3600_000,
+            quota: quota(blocked ? 0 : 80, blocked),
+          }
+        }),
+        ...(input.rawFirstRefusal
+          ? [
+              {
+                id: 'paid',
+                type: 'api' as const,
+                apiKey: 'ordered-paid',
+                baseURL: 'https://paid.invalid',
+              },
+            ]
+          : []),
+      ],
+    },
+    storagePath,
+  )
+  const sends: string[] = []
+  globalThis.fetch = Object.assign(
+    async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const auth = new Headers(init?.headers).get('authorization') ?? ''
+      if (!String(url).includes('/v1/messages')) {
+        if (
+          input.rawFirstRefusal &&
+          String(url).includes('/api/oauth/usage') &&
+          auth === 'Bearer sk-ant-oat01-main-access' &&
+          sends.includes(auth)
+        )
+          return Response.json({
+            five_hour: { utilization: 100 },
+            seven_day: { utilization: 0 },
+          })
+        return new Response('{}', { status: 503 })
+      }
+      sends.push(auth)
+      if (input.rawFirstRefusal && auth.includes('-ordered-fallback'))
+        return new Response('fallback refused', {
+          status: 429,
+          headers: {
+            'anthropic-ratelimit-unified-5h-status': 'rejected',
+            'anthropic-ratelimit-unified-5h-reset': String(
+              Math.ceil(Date.now() / 1000) + 3600,
+            ),
+          },
+        })
+      return input.mainRefusal && auth === 'Bearer sk-ant-oat01-main-access'
+        ? Response.json(
+            {
+              type: 'error',
+              error: {
+                type: 'rate_limit_error',
+                message: 'upstream main refusal',
+              },
+            },
+            { status: 429, headers: { 'retry-after': '17' } },
+          )
+        : success()
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  return {
+    sends,
+    send: () => __executePiWithFallbackForTest({ model, context, storagePath }),
+  }
+}
+
+for (const mode of ['main-first', 'fallback-first'] as const) {
+  test.each(['poll', 'rounded headers', 'past reset', 'stale poll'] as const)(
+    `Pi ${mode} ordered fallback uses confirmed provider quota only (%s)`,
+    async (evidence) => {
+      const f = await orderedProviderFixture({
+        mode,
+        evidence,
+        mainRefusal: mode === 'main-first',
+      })
+      const response = await f.send()
+      expect(response.status).toBe(200)
+      await response.text()
+      expect(f.sends).toEqual([
+        ...(mode === 'main-first' ? ['Bearer sk-ant-oat01-main-access'] : []),
+        `Bearer sk-ant-oat01-${evidence === 'poll' ? 'second' : 'first'}-ordered-fallback`,
+      ])
+    },
+  )
+}
+
+test('Pi ordered quota stop names the provider limit once without sending', async () => {
+  const f = await orderedProviderFixture({
+    mode: 'fallback-first',
+    evidence: 'poll',
+    blockSecond: true,
+    killMain: true,
+  })
+  const response = await f.send()
+  expect(f.sends).toEqual([])
+  const { error } = (await response.json()) as { error: { message: string } }
+  expect(error.message).toContain('Killswitch')
+  expect(error.message).toContain(
+    'Provider limits on other accounts (quota settings cannot raise these): 5-hour.',
+  )
+})
+
+test('Pi ordered routing keeps the upstream main refusal when the fallbacks are provider-blocked', async () => {
+  const f = await orderedProviderFixture({
+    mode: 'main-first',
+    evidence: 'poll',
+    blockSecond: true,
+    mainRefusal: true,
+  })
+  const response = await f.send()
+  expect(response.status).toBe(429)
+  expect(response.headers.get('retry-after')).toBe('17')
+  expect(await response.json()).toEqual({
+    type: 'error',
+    error: { type: 'rate_limit_error', message: 'upstream main refusal' },
+  })
+  expect(f.sends).toEqual(['Bearer sk-ant-oat01-main-access'])
+})
+
+test('Pi ordered fallback uses raw quota refusal headers on a revisit', async () => {
+  const f = await orderedProviderFixture({
+    mode: 'fallback-first',
+    evidence: 'rounded headers',
+    blockSecond: true,
+    mainRefusal: true,
+    rawFirstRefusal: true,
+  })
+  const response = await f.send()
+  expect(response.status).toBe(200)
+  await response.text()
+  expect(f.sends).toEqual([
+    'Bearer sk-ant-oat01-first-ordered-fallback',
+    'Bearer sk-ant-oat01-second-ordered-fallback',
+    'Bearer sk-ant-oat01-main-access',
+    'Bearer ordered-paid',
+  ])
+})
 
 test('offline controller imports synthetic Pi host OAuth with consent before native serving', () =>
   trackPiTestBody(

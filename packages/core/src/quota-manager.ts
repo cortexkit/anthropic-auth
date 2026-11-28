@@ -26,6 +26,7 @@ import {
   quotaBackoffActive,
   quotaSnapshotCheckedAt,
   quotaSnapshotOmitsFiveHour,
+  quotaWindowHasReset,
 } from './accounts.ts'
 import { logger } from './logger.ts'
 import { nativeAccountCanServe } from './native-account-view.ts'
@@ -600,9 +601,11 @@ export class QuotaManager {
 
   private scopedWindowIsStale(entry: QuotaEntry, modelId?: string) {
     const scoped = getScopedQuotaWindowForModel(entry.quota, modelId)
+    const now = this.now()
     return Boolean(
       scoped &&
-        this.now() - scoped.checkedAt >= getQuotaCheckIntervalMs(this.storage),
+        (quotaWindowHasReset(scoped, now) ||
+          now - scoped.checkedAt >= getQuotaCheckIntervalMs(this.storage)),
     )
   }
 

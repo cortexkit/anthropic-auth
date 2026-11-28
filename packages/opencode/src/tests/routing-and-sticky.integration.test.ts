@@ -1350,6 +1350,94 @@ describe('auth.loader', () => {
     expect(calls).toBe(1)
   })
 
+  test('OC1 local sticky admission refreshes an expired Fable scope before using it as unknown', async () => {
+    const checkedAt = Date.now()
+    let now = checkedAt
+    Date.now = mock(() => now)
+    const quota = {
+      checkedAt,
+      five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt },
+      seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt },
+      scoped: [
+        {
+          id: 'fable-weekly',
+          title: 'Fable weekly',
+          modelName: 'Fable',
+          usedPercent: 100,
+          remainingPercent: 0,
+          checkedAt,
+          resetsAt: new Date(checkedAt + 60_000).toISOString(),
+        },
+      ],
+    }
+    const main = {
+      type: 'oauth' as const,
+      access: 'sk-ant-oat01-main-access',
+      refresh: 'main-refresh',
+      expires: checkedAt + 3600_000,
+    }
+    await useTempAccountFile(
+      bindPoolAccounts(
+        createFallbackStorage({
+          routing: { mode: 'sticky-balanced' },
+          quota: {
+            enabled: true,
+            failClosedOnUnknownQuota: false,
+            mainQuota: quota,
+            mainQuotaCheckedAt: checkedAt,
+            mainQuotaToken: tokenFingerprint(main.access),
+          },
+          accounts: [
+            {
+              ...main,
+              id: 'work',
+              access: 'sk-ant-oat01-work-access',
+              refresh: 'work-refresh',
+              quota,
+            },
+          ],
+        }),
+      ),
+      main,
+    )
+    let probes = 0
+    let sent = 0
+    globalThis.fetch = mock(
+      withNativeAdmission((input: Parameters<typeof fetch>[0]) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/oauth/usage')) {
+          probes++
+          return new Response('quota service unavailable', { status: 503 })
+        }
+        if (!url.includes('/v1/messages')) return Response.json({})
+        sent++
+        return new Response('ok\n\ndata: {"type":"message_stop"}\n\n')
+      }),
+    ) as unknown as typeof fetch
+    const loader = await (await getPlugin()).auth.loader(async () => main, {
+      models: {},
+    })
+    const send = (sessionId: string) =>
+      loader.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': sessionId },
+        body: JSON.stringify({
+          model: 'claude-fable-5',
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+    const live = await send('local-live-fable')
+    expect(live.ok).toBe(false)
+    expect(sent).toBe(0)
+    expect(probes).toBe(0)
+    now += 120_000
+    const recovered = await send('local-expired-fable')
+    expect(recovered.status).toBe(200)
+    expect(sent).toBe(1)
+    expect(probes).toBeGreaterThan(0)
+  })
+
   test('sticky-balanced assigns cold Fable to abundant quota and routes direct Opus independently', async () => {
     const checkedAt = Date.now()
     const quota = (fableRemaining: number) => ({

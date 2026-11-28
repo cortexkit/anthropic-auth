@@ -3,7 +3,11 @@ import { clampHostRetryMs, markResetWaitResponse } from './host-retry.ts'
 
 const details = new WeakMap<
   Response,
-  { reason: string; timing: ReturnType<typeof quotaRefusalTiming> }
+  {
+    reason: string
+    timing: ReturnType<typeof quotaRefusalTiming>
+    providerLimitNames?: readonly string[]
+  }
 >()
 
 export const quotaRefusalDetails = (response: Response) => details.get(response)
@@ -18,7 +22,10 @@ export function createQuotaRefusalResponse(
   reason: string,
   timing: ReturnType<typeof quotaRefusalTiming>,
   now = Date.now(),
-  options: { retry?: 'automatic' | 'manual' } = {},
+  options: {
+    retry?: 'automatic' | 'manual'
+    providerLimitNames?: readonly string[]
+  } = {},
 ): Response {
   const resetWaitMs =
     options.retry !== 'manual' ? timing.resetWaitMs : undefined
@@ -62,8 +69,11 @@ export function createQuotaRefusalResponse(
     remaining >= 3_600_000
       ? `${Math.ceil(remaining / 3_600_000)} h`
       : `${Math.ceil(remaining / 60_000)} min`
+  const providerLimits = [...new Set(options.providerLimitNames)]
   const room = timing.limitName
-    ? `No Claude account has room for this request (${timing.limitName} limit or your quota floor). `
+    ? providerLimits.includes(timing.limitName)
+      ? 'No Claude account has room for this request. '
+      : `No Claude account has room for this request (${timing.limitName} limit or your quota floor). `
     : ''
   const manualAction = resetTime
     ? `The earliest reset is ${resetTime} UTC (in ${duration}). Send the message again after ${resetTime} UTC.`
@@ -76,6 +86,9 @@ export function createQuotaRefusalResponse(
         : timing.limitName && resetTime
           ? `${room}The earliest reset is ${resetTime} UTC (in ${duration}). Retrying every ${retryMinutes(seconds)}. ${reason}`
           : `${reason}${retry} ${reset}`
+  const providerNote = providerLimits.length
+    ? ` Provider limits on other accounts (quota settings cannot raise these): ${providerLimits.join(', ')}.`
+    : ''
   const response = new Response(
     JSON.stringify({
       type: 'error',
@@ -84,7 +97,7 @@ export function createQuotaRefusalResponse(
           timing.retryAfterSeconds === undefined
             ? 'FAILED_PRECONDITION'
             : 'rate_limit_error',
-        message,
+        message: message + providerNote,
       },
     }),
     {
@@ -97,7 +110,11 @@ export function createQuotaRefusalResponse(
       },
     },
   )
-  details.set(response, { reason, timing })
+  details.set(response, {
+    reason,
+    timing,
+    providerLimitNames: options.providerLimitNames,
+  })
   return resetWaitMs === undefined
     ? response
     : markResetWaitResponse(response, resetWaitMs)

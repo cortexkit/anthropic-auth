@@ -2579,6 +2579,84 @@ test('fallback-first adopts a newly published account on the next turn and honor
   })
 })
 
+test('Pi fallback-first refreshes an expired Fable scope and can send after that probe fails', async () => {
+  const f = await fixture('fallback-first')
+  const credentialId = 'oauth:anthropic:work'
+  f.rows.push(row(credentialId, fixtureAccountIdentity('work')))
+  const runtime = await f.native.service()
+  await runtime.vault.refresh()
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    quota: { enabled: true, failClosedOnUnknownQuota: false },
+  }))
+  const fallback = (await f.native.view()).accounts.find(
+    (account) => account.credentialId === credentialId,
+  )
+  if (!fallback) throw new Error('Missing vault fallback')
+  const receipt = await runtime.authorizeVault(fallback.id)
+  const checkedAt = Date.now() - 120_000
+  const publish = (at: number, resetAt: number) =>
+    runtime.vault.publish(receipt, {
+      quota: {
+        accountIdentity: fixtureAccountIdentity('work'),
+        checkedAt: at,
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: at },
+        seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt: at },
+        scoped: [
+          {
+            id: 'fable-weekly',
+            title: 'Fable weekly',
+            modelName: 'Fable',
+            usedPercent: 100,
+            remainingPercent: 0,
+            checkedAt: at,
+            resetsAt: new Date(resetAt).toISOString(),
+          },
+        ],
+      },
+    })
+  let probes = 0
+  const sent: string[] = []
+  globalThis.fetch = Object.assign(
+    async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (String(input).includes('/api/oauth/usage')) {
+        probes++
+        return new Response('quota service unavailable', { status: 503 })
+      }
+      const index =
+        Number(
+          /vault-test-access-(\d+)$/.exec(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )?.[1],
+        ) - 1
+      sent.push(f.gets[index]?.credentialId ?? 'missing receipt')
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  const fable = { ...model, id: 'claude-fable-5-1', name: 'Fable' }
+  expect(await publish(checkedAt, Date.now() + 60_000)).toBe(true)
+  expect(
+    (
+      await streamCortexKitAnthropic(fable, context, {
+        sessionId: 'live-fable',
+      }).result()
+    ).stopReason,
+  ).toBe('stop')
+  expect(sent).toEqual(['oauth:anthropic'])
+  expect(probes).toBe(0)
+  expect(await publish(checkedAt + 1, Date.now() - 60_000)).toBe(true)
+  expect(
+    (
+      await streamCortexKitAnthropic(fable, context, {
+        sessionId: 'expired-fable',
+      }).result()
+    ).stopReason,
+  ).toBe('stop')
+  expect(sent).toEqual(['oauth:anthropic', credentialId])
+  expect(probes).toBe(1)
+})
+
 for (const mode of [
   'main-first',
   'fallback-first',

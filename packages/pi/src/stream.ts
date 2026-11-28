@@ -111,6 +111,7 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  quotaWindowHasReset,
   RecoveryThinkingStore,
   type RefusalFallbackDispatchOptions,
   type RefusalFallbackMode,
@@ -133,6 +134,7 @@ import {
   runWithRequestSignal,
   SERVER_SIDE_FALLBACK_BETA,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
+  type StickyQuotaBlocker,
   StickyQuotaRetryCounter,
   type StickyRouteCandidate,
   StickySessionRouter,
@@ -144,6 +146,7 @@ import {
   shouldFallbackStatus,
   signRequestBody,
   startRoutingWait,
+  stickyQuotaAdmissionIsFresh,
   stickyQuotaBlockerInForce,
   stickyQuotaSnapshotIsFresh,
   stickyRetainRetryHeaders,
@@ -528,7 +531,10 @@ function getPiRoutingServices(
       const needsProbe =
         view.source !== 'vault' ||
         Boolean(current.quota?.minimumRemaining) ||
-        isKillswitchEnabled(current)
+        isKillswitchEnabled(current) ||
+        quotaWindowHasReset(
+          getScopedQuotaWindowForModel(view.quota, options.modelId),
+        )
       if (
         needsProbe &&
         quotas.isFallbackStale(
@@ -554,7 +560,7 @@ function getPiRoutingServices(
         quotas.getFallback(account.id, account)?.quota ?? account.quota
       if (
         (!needsProbe || quotaSnapshotPassesPolicy(quota, current)) &&
-        quotaSnapshotPassesModelScope(quota, options.modelId)
+        quotaSnapshotPassesModelScope(quota, options.modelId, current)
       )
         usable.push({ ...account, quota })
     }
@@ -1818,7 +1824,7 @@ async function sendAnthropicRequestAttempt(
         options.routingChoice &&
         routingChoiceMatches(options.routingChoice, account)) ||
         quotaSnapshotPassesPolicy(account.quota, policyStorage)) &&
-      quotaSnapshotPassesModelScope(account.quota, model)
+      quotaSnapshotPassesModelScope(account.quota, model, policyStorage)
     )
   }
   const currentPrimary = (payer: ReturnType<typeof piBillingPayer>) =>
@@ -3213,7 +3219,7 @@ async function executeWithFallback(options: {
     let mainQuota = mainEntry?.quota
     if (
       primaryAvailable() &&
-      !stickyQuotaSnapshotIsFresh(
+      !stickyQuotaAdmissionIsFresh(
         mainEntry?.quota,
         storage,
         Date.now(),
@@ -3251,7 +3257,7 @@ async function executeWithFallback(options: {
       let accountQuota =
         quotaManager.getFallback(account.id, account)?.quota ?? account.quota
       if (
-        !stickyQuotaSnapshotIsFresh(accountQuota, storage, Date.now(), modelId)
+        !stickyQuotaAdmissionIsFresh(accountQuota, storage, Date.now(), modelId)
       ) {
         try {
           accountQuota = await quotaManager.refreshFallback(
@@ -3277,7 +3283,7 @@ async function executeWithFallback(options: {
             : route.account?.lastRefreshError
         if (isPermanentRefreshError(refreshError)) return []
         if (
-          stickyQuotaSnapshotIsFresh(
+          stickyQuotaAdmissionIsFresh(
             route.quota,
             storage,
             Date.now(),
@@ -3297,6 +3303,13 @@ async function executeWithFallback(options: {
         ) {
           return []
         }
+        if (
+          quotaWindowHasReset(
+            getScopedQuotaWindowForModel(route.quota, modelId),
+          ) &&
+          !quotaSnapshotPassesModelScope(route.quota, modelId, storage)
+        )
+          return []
         if (
           isKillswitchEnabled(storage) &&
           !killswitchPassesPolicy(
@@ -3333,7 +3346,7 @@ async function executeWithFallback(options: {
         passesKillswitch &&
         (quotaState.kind === 'unknown' ||
           (quotaSnapshotPassesPolicy(quotaState.quota, storage) &&
-            quotaSnapshotPassesModelScope(quotaState.quota, modelId) &&
+            quotaSnapshotPassesModelScope(quotaState.quota, modelId, storage) &&
             (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
               usableIds.has(route.id))))
       return passes
@@ -3401,6 +3414,38 @@ async function executeWithFallback(options: {
   }
 
   const refusedOAuth = new Set<string>()
+  const fallbackRefusalHeaders = new Map<
+    string,
+    { identity: string | undefined; headers: Headers }
+  >()
+  const providerBlockers = new Map<string, StickyQuotaBlocker>()
+  const routingMode = getRoutingMode(storage)
+  const fallbackQuota = (account: OAuthAccount) =>
+    quotaManager.getFallback(account.id, account)?.quota ?? account.quota
+  function fallbackProviderBlocked(
+    account: OAuthAccount,
+    quota = fallbackQuota(account),
+  ) {
+    if (routingMode === 'sticky-balanced') return false
+    const now = Date.now()
+    const modelId = options.model.id
+    const refusal = fallbackRefusalHeaders.get(account.id)
+    const blocker = stickyQuotaBlockerInForce({
+      quota: stickyQuotaSnapshotIsFresh(quota, storage, now, modelId)
+        ? quota
+        : undefined,
+      responseHeaders:
+        refusal?.identity ===
+        (account.anthropicAccountUuid ?? account.authLineageId)
+          ? refusal?.headers
+          : undefined,
+      modelId,
+      now,
+    })
+    if (blocker) providerBlockers.set(account.id, blocker)
+    else providerBlockers.delete(account.id)
+    return Boolean(blocker)
+  }
   async function tryFallbackAccounts(
     routeOptions: { includeApiRoutes?: boolean; apiOnly?: boolean } = {},
   ) {
@@ -3410,13 +3455,12 @@ async function executeWithFallback(options: {
     const usableOAuthById = new Map(
       usableOAuth.map((account) => [account.id, account]),
     )
-    const fallbackQuota = (account: OAuthAccount) =>
-      quotaManager.getFallback(account.id, account)?.quota ?? account.quota
     const oauthRoute = (configured: OAuthAccount) => {
       if (routeOptions.apiOnly || !nativeReady(configured.id)) return undefined
       const account = usableOAuthById.get(configured.id) ?? configured
       const quota = fallbackQuota(account)
       if (
+        fallbackProviderBlocked(account, quota) ||
         (!usableOAuthById.has(account.id) &&
           quotaSnapshotHasStandardWindows(quota)) ||
         (isKillswitchEnabled(storage) &&
@@ -3437,7 +3481,7 @@ async function executeWithFallback(options: {
     for (const configured of storage.accounts) {
       if (!nativeAccountCanServe(configured)) continue
       let response: Response | undefined
-      let accountSent: string | undefined
+      let accountSent: OAuthAccount | undefined
       if (isOAuthAccount(configured)) {
         if (!oauthSlots.has(configured.id)) continue
         const warm = refusedOAuth.size
@@ -3459,7 +3503,7 @@ async function executeWithFallback(options: {
           1,
         )
         if (!account) continue
-        accountSent = account.id
+        accountSent = account
         response = await sendAnthropicRequest({
           ...options,
           oauthAccountId: account.id,
@@ -3491,13 +3535,25 @@ async function executeWithFallback(options: {
         !shouldFallbackStatus(preflight.status, storage)
       )
         return preflight
-      if (accountSent) refusedOAuth.add(accountSent)
+      if (accountSent) {
+        refusedOAuth.add(accountSent.id)
+        if (
+          routingMode !== 'sticky-balanced' &&
+          (preflight === 'rate_limit_error' || preflight.status === 429)
+        ) {
+          fallbackRefusalHeaders.set(accountSent.id, {
+            identity:
+              accountSent.anthropicAccountUuid ?? accountSent.authLineageId,
+            headers: inspected.response.headers,
+          })
+          fallbackProviderBlocked(accountSent)
+        }
+      }
       await inspected.response.body?.cancel().catch(() => {})
     }
     return sawPaidLaneRoute ? skippedPaidLaneStart : null
   }
 
-  const routingMode = getRoutingMode(storage)
   const routingRelay = routingState.relay
   const routingSessionId = options.streamOptions?.sessionId
   if (piForkHeadSession(options.streamOptions) && routingSessionId) {
@@ -3791,7 +3847,7 @@ async function executeWithFallback(options: {
         )
       const proactiveQuotaDecision =
         !advisedAccountId &&
-        stickyQuotaSnapshotIsFresh(
+        stickyQuotaAdmissionIsFresh(
           route.quota,
           storage,
           Date.now(),
@@ -3991,10 +4047,26 @@ async function executeWithFallback(options: {
   if (fallbackFirst) {
     const fallback = await tryFallbackAccounts()
     if (fallback) return fallback
-  } else if (
-    primaryFreshModelScopeExhausted() ||
-    (primaryCachedModelScopeExhausted() &&
-      (await primaryQuotaRefreshConfirmsModelScopeExhausted()))
+  }
+  const expiredPrimaryScope =
+    primaryAvailable() &&
+    quotaWindowHasReset(
+      getScopedQuotaWindowForModel(
+        quotaManager.getMain(mainAccountId)?.quota,
+        options.model.id,
+      ),
+    )
+  if (expiredPrimaryScope) {
+    try {
+      await quotaManager.refreshMain(mainAccountId, '', undefined, 'admission')
+    } catch {}
+  }
+  if (
+    !fallbackFirst &&
+    (primaryFreshModelScopeExhausted() ||
+      (!expiredPrimaryScope &&
+        primaryCachedModelScopeExhausted() &&
+        (await primaryQuotaRefreshConfirmsModelScopeExhausted())))
   ) {
     const fallback = await tryFallbackAccounts()
     if (fallback) return fallback
@@ -4013,6 +4085,8 @@ async function executeWithFallback(options: {
         ),
         modelId: options.model.id,
         sessionId: options.streamOptions?.sessionId,
+        providerBlockers: [...providerBlockers.values()],
+        fallbackToProviderExhaustion: true,
         waitForReset: getWaitForReset(storage) && !advice,
       })
     return createStickyNoRouteResponse({
@@ -4030,13 +4104,20 @@ async function executeWithFallback(options: {
       storage,
       sessionId: options.streamOptions?.sessionId,
       modelId: options.model.id,
+      providerLimitNames: Array.from(
+        providerBlockers.values(),
+        (blocker) => blocker.limitName,
+      ),
       waitForReset: getWaitForReset(storage) && !advice,
     })
   }
 
   if (isKillswitchEnabled(storage)) {
     let mainQuota = quotaManager.getMain(mainAccountId)?.quota
-    if (!mainQuota || quotaManager.isMainStale(options.model.id)) {
+    if (
+      !expiredPrimaryScope &&
+      (!mainQuota || quotaManager.isMainStale(options.model.id))
+    ) {
       try {
         mainQuota = await quotaManager.refreshMain(
           mainAccountId,
@@ -4078,6 +4159,13 @@ async function executeWithFallback(options: {
             options.streamOptions?.sessionId,
           ),
         }),
+        Date.now(),
+        {
+          providerLimitNames: Array.from(
+            providerBlockers.values(),
+            (blocker) => blocker.limitName,
+          ),
+        },
       )
     }
   }

@@ -15,6 +15,7 @@ import {
   type AccountOperationError,
   type AccountStorage,
   acquireRefreshFileLock,
+  failClosedOnUnknownQuota,
   getKillswitchThresholdsForAccount,
   getQuotaCheckIntervalMs,
   getQuotaMinimumRemainingThresholds,
@@ -25,8 +26,10 @@ import {
   quotaFieldSource,
   quotaRefusalRetryAfterSeconds,
   quotaRefusalTiming,
+  quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotOmitsFiveHour,
   quotaSnapshotPassesModelScope,
+  quotaWindowHasReset,
 } from './accounts.ts'
 import { logger } from './logger.ts'
 import { isClaudeFableOrMythos5Model } from './models.ts'
@@ -168,6 +171,7 @@ export function createStickyNoRouteResponse(input: {
   storage?: AccountStorage | null
   sessionId?: string | null
   vaultPolicyLimits?: readonly NativeQuotaPolicyLimit[]
+  providerLimitNames?: readonly string[]
   waitForReset?: boolean
   modelId?: string
   now?: number
@@ -204,14 +208,14 @@ export function createStickyNoRouteResponse(input: {
     )
   }
 
+  const now = input.now ?? Date.now()
   const scopedBlocked = Boolean(
     modelId &&
       input.routeQuotas.length > 0 &&
-      input.routeQuotas.every(
-        (quota) => !quotaSnapshotPassesModelScope(quota, modelId),
+      input.routeQuotas.every((quota) =>
+        quotaSnapshotModelScopeIsExhausted(quota, modelId, now),
       ),
   )
-  const now = input.now ?? Date.now()
   const timing = quotaRefusalTiming({
     readings: input.routeQuotas.map((quota, index) => ({
       quota,
@@ -233,11 +237,13 @@ export function createStickyNoRouteResponse(input: {
         : 'quota floor',
   )
   const reason = limitNames
-    ? `No vault account currently satisfies quota policy: ${limitNames.join(', ')}. Open /claude → Killswitch / Quota to change these limits.`
+    ? `${input.providerLimitNames?.length ? 'Quota policy blocks some vault accounts' : 'No vault account currently satisfies quota policy'}: ${limitNames.join(', ')}. Open /claude → Killswitch / Quota to change these limits.`
     : scopedBlocked && modelName
       ? `${modelName} weekly limit reached, no routable OAuth accounts.`
       : 'No OAuth account currently satisfies sticky-balanced quota policy.'
-  return createQuotaRefusalResponse(reason, timing, now)
+  return createQuotaRefusalResponse(reason, timing, now, {
+    providerLimitNames: input.providerLimitNames,
+  })
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -419,6 +425,33 @@ export function stickyQuotaSnapshotIsFresh(
   now = Date.now(),
   modelId?: string,
 ) {
+  return stickyQuotaWindowsAreFresh(
+    quota,
+    storage,
+    now,
+    getScopedQuotaWindowForModel(quota, modelId),
+  )
+}
+
+export function stickyQuotaAdmissionIsFresh(
+  quota: OAuthQuotaSnapshot | undefined,
+  storage: AccountStorage | null,
+  now = Date.now(),
+  modelId?: string,
+) {
+  const scoped = getScopedQuotaWindowForModel(quota, modelId)
+  return (
+    stickyQuotaWindowsAreFresh(quota, storage, now, scoped) &&
+    !quotaWindowHasReset(scoped, now)
+  )
+}
+
+function stickyQuotaWindowsAreFresh(
+  quota: OAuthQuotaSnapshot | undefined,
+  storage: AccountStorage | null,
+  now: number,
+  scoped: ReturnType<typeof getScopedQuotaWindowForModel>,
+) {
   const maxAge = getQuotaCheckIntervalMs(storage)
   const standardFresh = (['five_hour', 'seven_day'] as const).every((key) => {
     if (key === 'five_hour' && quotaSnapshotOmitsFiveHour(quota)) return true
@@ -426,7 +459,6 @@ export function stickyQuotaSnapshotIsFresh(
     return Boolean(window && now - window.checkedAt < maxAge)
   })
   if (!standardFresh) return false
-  const scoped = getScopedQuotaWindowForModel(quota, modelId)
   return !scoped || now - scoped.checkedAt < maxAge
 }
 
@@ -501,7 +533,27 @@ export function stickyRouteCandidateWeight(input: {
   const { candidate, storage } = input
   const quota = knownQuota(candidate.quota)
   if (!quota) return 0
-  if (!stickyQuotaSnapshotIsFresh(quota, storage, now, input.modelId)) {
+  const scoped = getScopedQuotaWindowForModel(quota, input.modelId)
+  const scopedExpired = quotaWindowHasReset(scoped, now)
+  // Expiry makes a scope due for polling, but a failed poll must not make the
+  // router use the expired percentage or discard otherwise usable evidence.
+  if (
+    !stickyQuotaWindowsAreFresh(
+      quota,
+      storage,
+      now,
+      scopedExpired ? undefined : scoped,
+    )
+  ) {
+    return 0
+  }
+  if (
+    scopedExpired &&
+    (!quotaSnapshotPassesModelScope(quota, input.modelId, storage, now) ||
+      remainingThreshold(storage, candidate.accountId, 'scoped') > 0 ||
+      (isKillswitchEnabled(storage) && failClosedOnUnknownQuota(storage)))
+  ) {
+    input.onPolicyBlock?.('model-scoped')
     return 0
   }
   const weights: number[] = []
@@ -527,8 +579,8 @@ export function stickyRouteCandidateWeight(input: {
       ),
     )
   }
-  if (input.family === 'fable') {
-    const window = getScopedQuotaWindowForModel(quota, input.modelId)
+  if (input.family === 'fable' && !scopedExpired) {
+    const window = scoped
     if (window && Number.isFinite(window.remainingPercent)) {
       if (
         window.remainingPercent <=
@@ -554,12 +606,9 @@ export function stickyRouteKnownFableExhausted(
   now = Date.now(),
 ) {
   const quota = knownQuota(candidate.quota)
-  const window = getScopedQuotaWindowForModel(quota, 'claude-fable-5')
-  return Boolean(
-    window &&
-      stickyQuotaSnapshotIsFresh(quota, storage, now, 'claude-fable-5') &&
-      Number.isFinite(window.remainingPercent) &&
-      window.remainingPercent <= 0,
+  return (
+    stickyQuotaSnapshotIsFresh(quota, storage, now, 'claude-fable-5') &&
+    quotaSnapshotModelScopeIsExhausted(quota, 'claude-fable-5', now)
   )
 }
 
@@ -767,6 +816,7 @@ function quotaBlockerInForce(
  */
 export function createExhaustedNoRouteResponse(input: {
   exhausted: readonly StickyQuotaBlocker[]
+  providerLimitNames?: readonly string[]
   storage?: AccountStorage | null
   sessionId?: string | null
   now?: number
@@ -788,6 +838,7 @@ export function createExhaustedNoRouteResponse(input: {
       }),
     },
     now,
+    { providerLimitNames: input.providerLimitNames },
   )
 }
 
