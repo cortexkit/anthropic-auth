@@ -134,6 +134,7 @@ import {
   runWithRequestSignal,
   SERVER_SIDE_FALLBACK_BETA,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
+  type StickyQuotaBlocker,
   StickyQuotaRetryCounter,
   type StickyRouteCandidate,
   StickySessionRouter,
@@ -3413,6 +3414,38 @@ async function executeWithFallback(options: {
   }
 
   const refusedOAuth = new Set<string>()
+  const fallbackRefusalHeaders = new Map<
+    string,
+    { identity: string | undefined; headers: Headers }
+  >()
+  const providerBlockers = new Map<string, StickyQuotaBlocker>()
+  const routingMode = getRoutingMode(storage)
+  const fallbackQuota = (account: OAuthAccount) =>
+    quotaManager.getFallback(account.id, account)?.quota ?? account.quota
+  function fallbackProviderBlocked(
+    account: OAuthAccount,
+    quota = fallbackQuota(account),
+  ) {
+    if (routingMode === 'sticky-balanced') return false
+    const now = Date.now()
+    const modelId = options.model.id
+    const refusal = fallbackRefusalHeaders.get(account.id)
+    const blocker = stickyQuotaBlockerInForce({
+      quota: stickyQuotaSnapshotIsFresh(quota, storage, now, modelId)
+        ? quota
+        : undefined,
+      responseHeaders:
+        refusal?.identity ===
+        (account.anthropicAccountUuid ?? account.authLineageId)
+          ? refusal?.headers
+          : undefined,
+      modelId,
+      now,
+    })
+    if (blocker) providerBlockers.set(account.id, blocker)
+    else providerBlockers.delete(account.id)
+    return Boolean(blocker)
+  }
   async function tryFallbackAccounts(
     routeOptions: { includeApiRoutes?: boolean; apiOnly?: boolean } = {},
   ) {
@@ -3422,13 +3455,12 @@ async function executeWithFallback(options: {
     const usableOAuthById = new Map(
       usableOAuth.map((account) => [account.id, account]),
     )
-    const fallbackQuota = (account: OAuthAccount) =>
-      quotaManager.getFallback(account.id, account)?.quota ?? account.quota
     const oauthRoute = (configured: OAuthAccount) => {
       if (routeOptions.apiOnly || !nativeReady(configured.id)) return undefined
       const account = usableOAuthById.get(configured.id) ?? configured
       const quota = fallbackQuota(account)
       if (
+        fallbackProviderBlocked(account, quota) ||
         (!usableOAuthById.has(account.id) &&
           quotaSnapshotHasStandardWindows(quota)) ||
         (isKillswitchEnabled(storage) &&
@@ -3449,7 +3481,7 @@ async function executeWithFallback(options: {
     for (const configured of storage.accounts) {
       if (!nativeAccountCanServe(configured)) continue
       let response: Response | undefined
-      let accountSent: string | undefined
+      let accountSent: OAuthAccount | undefined
       if (isOAuthAccount(configured)) {
         if (!oauthSlots.has(configured.id)) continue
         const warm = refusedOAuth.size
@@ -3471,7 +3503,7 @@ async function executeWithFallback(options: {
           1,
         )
         if (!account) continue
-        accountSent = account.id
+        accountSent = account
         response = await sendAnthropicRequest({
           ...options,
           oauthAccountId: account.id,
@@ -3503,13 +3535,25 @@ async function executeWithFallback(options: {
         !shouldFallbackStatus(preflight.status, storage)
       )
         return preflight
-      if (accountSent) refusedOAuth.add(accountSent)
+      if (accountSent) {
+        refusedOAuth.add(accountSent.id)
+        if (
+          routingMode !== 'sticky-balanced' &&
+          (preflight === 'rate_limit_error' || preflight.status === 429)
+        ) {
+          fallbackRefusalHeaders.set(accountSent.id, {
+            identity:
+              accountSent.anthropicAccountUuid ?? accountSent.authLineageId,
+            headers: inspected.response.headers,
+          })
+          fallbackProviderBlocked(accountSent)
+        }
+      }
       await inspected.response.body?.cancel().catch(() => {})
     }
     return sawPaidLaneRoute ? skippedPaidLaneStart : null
   }
 
-  const routingMode = getRoutingMode(storage)
   const routingRelay = routingState.relay
   const routingSessionId = options.streamOptions?.sessionId
   if (piForkHeadSession(options.streamOptions) && routingSessionId) {
@@ -4041,6 +4085,8 @@ async function executeWithFallback(options: {
         ),
         modelId: options.model.id,
         sessionId: options.streamOptions?.sessionId,
+        providerBlockers: [...providerBlockers.values()],
+        fallbackToProviderExhaustion: true,
         waitForReset: getWaitForReset(storage) && !advice,
       })
     return createStickyNoRouteResponse({
@@ -4058,6 +4104,10 @@ async function executeWithFallback(options: {
       storage,
       sessionId: options.streamOptions?.sessionId,
       modelId: options.model.id,
+      providerLimitNames: Array.from(
+        providerBlockers.values(),
+        (blocker) => blocker.limitName,
+      ),
       waitForReset: getWaitForReset(storage) && !advice,
     })
   }
@@ -4109,6 +4159,13 @@ async function executeWithFallback(options: {
             options.streamOptions?.sessionId,
           ),
         }),
+        Date.now(),
+        {
+          providerLimitNames: Array.from(
+            providerBlockers.values(),
+            (blocker) => blocker.limitName,
+          ),
+        },
       )
     }
   }

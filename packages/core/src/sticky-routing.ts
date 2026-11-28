@@ -816,6 +816,7 @@ function quotaBlockerInForce(
  */
 export function createExhaustedNoRouteResponse(input: {
   exhausted: readonly StickyQuotaBlocker[]
+  providerLimitNames?: readonly string[]
   storage?: AccountStorage | null
   sessionId?: string | null
   now?: number
@@ -837,6 +838,7 @@ export function createExhaustedNoRouteResponse(input: {
       }),
     },
     now,
+    { providerLimitNames: input.providerLimitNames },
   )
 }
 

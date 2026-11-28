@@ -9,6 +9,7 @@ import {
 } from './native-account-view.ts'
 import { NativeVaultNoAccountError } from './native-vault-admission.ts'
 import {
+  createExhaustedNoRouteResponse,
   createStickyNoRouteResponse,
   type StickyQuotaBlocker,
   stickyRouteCandidateWeight,
@@ -21,6 +22,8 @@ export function createNativeVaultNoRouteResponse(input: {
   modelId?: string
   policies?: ReadonlyMap<string, NativeAccountPolicy>
   providerBlockers?: readonly StickyQuotaBlocker[]
+  /** Use the provider-exhaustion response when the caller has ruled out every route. */
+  fallbackToProviderExhaustion?: boolean
   sticky?: boolean
   sessionId?: string | null
   waitForReset?: boolean
@@ -59,7 +62,19 @@ export function createNativeVaultNoRouteResponse(input: {
       })
     }
   }
-  if (!limits.size) throw new NativeVaultNoAccountError()
+  const providerLimitNames = input.providerBlockers?.map(
+    (blocker) => blocker.limitName,
+  )
+  if (!limits.size) {
+    if (input.fallbackToProviderExhaustion && input.providerBlockers?.length)
+      return createExhaustedNoRouteResponse({
+        exhausted: input.providerBlockers,
+        providerLimitNames,
+        storage: snapshot.policyStorage,
+        sessionId: input.sessionId,
+      })
+    throw new NativeVaultNoAccountError()
+  }
   return createStickyNoRouteResponse({
     routeQuotas: active.flatMap((account) =>
       account.quota ? [account.quota] : [],
@@ -74,9 +89,7 @@ export function createNativeVaultNoRouteResponse(input: {
     storage: snapshot.policyStorage,
     sessionId: input.sessionId,
     vaultPolicyLimits: [...limits],
-    providerLimitNames: input.providerBlockers?.map(
-      (blocker) => blocker.limitName,
-    ),
+    providerLimitNames,
     waitForReset:
       input.waitForReset && active.every((account) => account.quota),
   })

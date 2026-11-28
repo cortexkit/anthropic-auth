@@ -243,6 +243,7 @@ import {
   resolveNativePoolPaths,
   rewriteApiKeyRequestBody,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
+  type StickyQuotaBlocker,
   StickyQuotaRetryCounter,
   type StickyRouteCandidate,
   StickySessionRouter,
@@ -3267,7 +3268,14 @@ const anthropicAuthPlugin = async (
     },
     getUsableFallbackAccounts: async (
       storage: AccountStorage | null | undefined,
-      options?: { modelId?: string; credentialUnavailable?: Set<string> },
+      options?: {
+        modelId?: string
+        credentialUnavailable?: Set<string>
+        skipProviderBlocked?: (
+          account: OAuthAccount,
+          quota: OAuthQuotaSnapshot | undefined,
+        ) => boolean
+      },
     ) => {
       storage = storage ?? null
       const usable: OAuthAccount[] = []
@@ -3300,6 +3308,7 @@ const anthropicAuthPlugin = async (
               )
             : committedQuota
         if (
+          options?.skipProviderBlocked?.(account, quota) ||
           !quotaSnapshotPassesPolicy(quota, storage) ||
           !quotaSnapshotPassesModelScope(quota, options?.modelId, storage) ||
           (isKillswitchEnabled(storage) &&
@@ -9068,7 +9077,11 @@ const anthropicAuthPlugin = async (
           // usable accounts; softer quota routing cannot bypass a killswitch.
           async function getRoutableFallbackAccounts(
             storageArg: Awaited<ReturnType<typeof loadAccounts>>,
-            options: { includeApiRoutes?: boolean; modelId?: string } = {},
+            options: {
+              includeApiRoutes?: boolean
+              modelId?: string
+              routing?: RequestRouting
+            } = {},
           ): Promise<Array<OAuthAccount | ApiKeyAccount>> {
             // Ordered eligibility needs current quota even when hard-limit
             // enforcement (the killswitch) is off. The serialized sweep reuses
@@ -9099,9 +9112,28 @@ const anthropicAuthPlugin = async (
                   ),
                 }
             }
+            const providerSkipped = new Set<string>()
+            const { routing } = options
             const usableOAuth = await fallbackManager.getUsableFallbackAccounts(
               storageArg,
-              { modelId: options.modelId },
+              {
+                modelId: options.modelId,
+                skipProviderBlocked: routing
+                  ? (account, quota) => {
+                      if (
+                        !fallbackProviderBlocked(
+                          account,
+                          storageArg,
+                          routing,
+                          quota,
+                        )
+                      )
+                        return false
+                      providerSkipped.add(account.id)
+                      return true
+                    }
+                  : undefined,
+              },
             )
             const usableOAuthById = new Map(
               usableOAuth.map((account) => [account.id, account]),
@@ -9110,6 +9142,7 @@ const anthropicAuthPlugin = async (
             const paid: ApiKeyAccount[] = []
             for (const account of storageArg?.accounts ?? []) {
               if (storageArg && isOAuthAccount(account)) {
+                if (providerSkipped.has(account.id)) continue
                 if (isScopedCustodyActive(storageArg)) {
                   const usableAccount = usableOAuthById.get(account.id)
                   if (usableAccount) usable.push(usableAccount)
@@ -9575,6 +9608,11 @@ const anthropicAuthPlugin = async (
             refusal: ReturnType<typeof createRefusalOwner>
             attemptedPaid: Set<string>
             refusedOAuth: Set<string>
+            fallbackRefusalHeaders: Map<
+              string,
+              { identity: string | undefined; headers: Headers }
+            >
+            providerBlockers: Map<string, StickyQuotaBlocker>
             sessionId: string | null
             modelId: string | undefined
             shared?: {
@@ -9585,6 +9623,33 @@ const anthropicAuthPlugin = async (
               skipLocal: (id: string) => boolean
               allowPaidFallback: () => boolean
             }
+          }
+
+          function fallbackProviderBlocked(
+            account: OAuthAccount,
+            storage: AccountStorage | null,
+            routing: RequestRouting,
+            quota = getFallbackQuota(account),
+          ): boolean {
+            if (getRoutingMode(storage) === 'sticky-balanced') return false
+            const now = Date.now()
+            const modelId = routing.modelId
+            const refusal = routing.fallbackRefusalHeaders.get(account.id)
+            const blocker = stickyQuotaBlockerInForce({
+              quota: stickyQuotaSnapshotIsFresh(quota, storage, now, modelId)
+                ? quota
+                : undefined,
+              responseHeaders:
+                refusal?.identity ===
+                (account.anthropicAccountUuid ?? account.authLineageId)
+                  ? refusal?.headers
+                  : undefined,
+              modelId,
+              now,
+            })
+            if (blocker) routing.providerBlockers.set(account.id, blocker)
+            else routing.providerBlockers.delete(account.id)
+            return Boolean(blocker)
           }
 
           async function tryUsableFallbackAccounts(
@@ -9636,6 +9701,11 @@ const anthropicAuthPlugin = async (
               const account = ordered[index]
               if (!account) break
               if (shared?.skipLocal(account.id)) continue
+              if (
+                isOAuthAccount(account) &&
+                fallbackProviderBlocked(account, storage, routing)
+              )
+                continue
               let response: Response
               if (isApiKeyAccount(account)) {
                 if (shared && !shared.allowPaidFallback()) continue
@@ -9702,6 +9772,7 @@ const anthropicAuthPlugin = async (
                   options?.laneStartRequest,
                 )
               } else continue
+              let rateLimited = response.status === 429
               let fallbackAgain = shouldFallbackResponse(response, storage)
               if (!fallbackAgain) {
                 const inspected = await inspectStreamingRateLimit(
@@ -9709,7 +9780,7 @@ const anthropicAuthPlugin = async (
                   trace,
                 )
                 response = inspected.response
-                fallbackAgain = inspected.rateLimited
+                fallbackAgain = rateLimited = inspected.rateLimited
               }
               if (!fallbackAgain) {
                 responseRouteKinds.set(
@@ -9724,7 +9795,18 @@ const anthropicAuthPlugin = async (
               }
               attempted = true
               refusal.keep(response)
-              if (isOAuthAccount(account)) refusedOAuth.add(account.id)
+              if (isOAuthAccount(account)) {
+                refusedOAuth.add(account.id)
+                if (
+                  rateLimited &&
+                  getRoutingMode(storage) !== 'sticky-balanced'
+                )
+                  routing.fallbackRefusalHeaders.set(account.id, {
+                    identity:
+                      account.anthropicAccountUuid ?? account.authLineageId,
+                    headers: response.headers,
+                  })
+              }
               if (shared && isOAuthAccount(account)) {
                 const replacement = await shared.afterRefusal(
                   account.id,
@@ -9845,6 +9927,7 @@ const anthropicAuthPlugin = async (
               accounts = await getRoutableFallbackAccounts(storage, {
                 includeApiRoutes,
                 modelId,
+                routing,
               })
               trace?.mark('fallback_get_accounts', {
                 ms: roundMs(nowMs() - accountsStart),
@@ -9924,6 +10007,8 @@ const anthropicAuthPlugin = async (
                 refusal,
                 attemptedPaid: new Set(),
                 refusedOAuth: new Set(),
+                fallbackRefusalHeaders: new Map(),
+                providerBlockers: new Map(),
                 sessionId,
                 // The requested model: a refusal round's serving model is
                 // chosen later, per send, and checks its own quota there.
@@ -10574,6 +10659,7 @@ const anthropicAuthPlugin = async (
                           requestMainQuotaIdentity,
                         ),
                       modelId: requestModelId,
+                      routing: requestRouting,
                     })
                   : []
                 const response = await tryUsableFallbackAccounts(
@@ -10649,6 +10735,13 @@ const anthropicAuthPlugin = async (
                         getWaitForReset(current.policyStorage) &&
                         !sharedRoutingDecision,
                     }),
+                    Date.now(),
+                    {
+                      providerLimitNames: Array.from(
+                        requestRouting.providerBlockers.values(),
+                        (blocker) => blocker.limitName,
+                      ),
+                    },
                   ),
                   'account_free',
                 )
@@ -10660,6 +10753,10 @@ const anthropicAuthPlugin = async (
                       snapshot: await nativeAccounts.read(),
                       modelId: credentialModelId,
                       sticky: getRoutingMode(storage) === 'sticky-balanced',
+                      providerBlockers: [
+                        ...requestRouting.providerBlockers.values(),
+                      ],
+                      fallbackToProviderExhaustion: true,
                       sessionId,
                       waitForReset:
                         getWaitForReset(storage) && !sharedRoutingDecision,
@@ -11404,6 +11501,7 @@ const anthropicAuthPlugin = async (
                           requestMainQuotaIdentity,
                         ),
                       modelId: requestModelId,
+                      routing: requestRouting,
                     })
                   trace.mark('fallback_first_get_accounts', {
                     ms: roundMs(nowMs() - fallbackStart),
@@ -11457,6 +11555,7 @@ const anthropicAuthPlugin = async (
                   getRoutingMode(storage) !== 'fallback-first'
                     ? await getRoutableFallbackAccounts(storage, {
                         modelId: requestModelId,
+                        routing: requestRouting,
                       })
                     : []
                 const response = await tryUsableFallbackAccounts(
@@ -11550,6 +11649,7 @@ const anthropicAuthPlugin = async (
                     const fallbackAccounts = replayableRequest
                       ? await getRoutableFallbackAccounts(storage, {
                           modelId: requestModelId,
+                          routing: requestRouting,
                         })
                       : []
                     const fallbackResponse = await tryUsableFallbackAccounts(
@@ -11789,6 +11889,7 @@ const anthropicAuthPlugin = async (
                               quotaSnapshotIsExhausted(routingQuotaEntry.quota),
                           ),
                         modelId: requestModelId,
+                        routing: requestRouting,
                       })
                     trace.mark('preselect_fallback_accounts', {
                       ms: roundMs(nowMs() - fallbackStart),
@@ -11969,6 +12070,7 @@ const anthropicAuthPlugin = async (
                         !sharedRoutingDecision &&
                         mainQuotaEntryIsFreshExhausted(auth.access),
                       modelId: requestModelId,
+                      routing: requestRouting,
                     })
                   : []
 
@@ -12032,6 +12134,7 @@ const anthropicAuthPlugin = async (
                 const fallbackAccounts = replayableRequest
                   ? await getRoutableFallbackAccounts(storage, {
                       modelId: credentialModelId,
+                      routing: requestRouting,
                     })
                   : []
                 const response = await tryUsableFallbackAccounts(
