@@ -70,6 +70,11 @@ import { readNativeRuntime } from '../../../core/src/native-runtime'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
 import { nativePoolStoreLocks } from '../../../core/src/pool-store'
 import {
+  localAuthFixtureQuota,
+  localAuthRefusalScenarios,
+  seedLocalAuthRefusal,
+} from '../../../core/src/tests/local-auth-refusal-fixture.ts'
+import {
   holdRefreshJoin,
   observeRefreshJoin,
   refreshedJoinAccess,
@@ -2886,6 +2891,83 @@ async function retryHost(native: ReturnType<typeof source>) {
       return draft.decision
     },
   }
+}
+
+for (const mode of ['main-first', 'sticky-balanced'] as const) {
+  test.each(localAuthRefusalScenarios)(
+    `#916 OpenCode 2 ${mode}: %s`,
+    async (scenario) => {
+      const { paths, store, runtime } = await local()
+      const alternateIdentity = '00000000-0000-4000-8000-000000000916'
+      const alternateAccess = 'sk-ant-oat01-oc2-refusal-alternate'
+      const alternate =
+        scenario === 'live alternate' || scenario === 'quota-blocked alternate'
+      await store.updateSettings((settings) => ({
+        ...settings,
+        routing: { mode },
+        quota: {
+          enabled: alternate,
+          failClosedOnUnknownQuota: false,
+          minimumRemaining: { five_hour: 10, seven_day: 10 },
+        },
+      }))
+      if (alternate) {
+        await store.add({
+          id: 'alternate',
+          identity: alternateIdentity,
+          credential: {
+            type: 'oauth',
+            access: alternateAccess,
+            refresh: 'oc2-alternate-refresh',
+            expires: Date.now() + 3_600_000,
+          },
+        })
+        const subject = await seedLocalAuthRefusal(paths, 'proven', 'alternate')
+        await runtime.publishLocal(subject, {
+          quota: {
+            ...localAuthFixtureQuota(scenario === 'live alternate' ? 70 : 5),
+            accountIdentity: alternateIdentity,
+          },
+        })
+      }
+      const waiting =
+        scenario === 'validation wait' || scenario === 'stale record'
+      await seedLocalAuthRefusal(
+        paths,
+        waiting
+          ? scenario === 'stale record'
+            ? 'stale'
+            : 'validation'
+          : 'dead',
+      )
+      const outbound = spyOn(globalThis, 'fetch').mockRejectedValue(
+        new Error('Unexpected outbound request'),
+      )
+      cleanups.push(() => outbound.mockRestore())
+      const host = await retryHost(source(runtime, paths))
+      if (scenario === 'live alternate') {
+        expect((await host.send()).headers.get('authorization')).toBe(
+          `Bearer ${alternateAccess}`,
+        )
+      } else if (waiting) {
+        await expect(host.send()).rejects.toThrow(
+          "Claude couldn't confirm which account this login belongs to",
+        )
+      } else {
+        const error = await host.send().catch((error: unknown) => error)
+        expect(error).toMatchObject({
+          name: 'NativeLocalReauthError',
+          status: 401,
+        })
+        if (!(error instanceof Error)) throw new Error('Missing login refusal')
+        expect(error.message).toStartWith(
+          'Main Claude OAuth account requires re-login',
+        )
+        if (alternate) expect(error.message).toContain('quota floor')
+      }
+      expect(outbound).not.toHaveBeenCalled()
+    },
+  )
 }
 
 test.each(['scheduled check', 'reset account backoff'])(

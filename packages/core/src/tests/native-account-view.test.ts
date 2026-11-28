@@ -280,6 +280,9 @@ for (const lineage of ['current', 'previous', 'unbound'] as const) {
     if (lineage === 'previous')
       expect(snapshot.accounts[0]?.lastRefreshError).toBeUndefined()
     else expect(snapshot.accounts[0]?.lastRefreshError?.permanent).toBe(true)
+    expect(snapshot.accounts[0]?.localAuthDecline).toBe(
+      lineage === 'current' ? 'invalid-grant' : undefined,
+    )
     expect(JSON.stringify(snapshot)).not.toContain(currentFingerprint)
   })
 }

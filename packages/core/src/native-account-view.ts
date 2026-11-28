@@ -11,6 +11,7 @@ import {
   type PrimeUsageCounters,
   type ProviderAccountUuid,
 } from './accounts.ts'
+import { nativeLocalRefreshRestriction } from './native-local-runtime-readers.ts'
 import {
   fromNativeQuotaMap,
   nativeQuotaCodec,
@@ -49,6 +50,8 @@ export interface NativeAccountView {
   lastUsed?: number
   lastRefreshedAt?: number
   lastRefreshError?: AccountOperationError
+  /** The current local login can no longer be refreshed. */
+  localAuthDecline?: 'invalid-grant'
   lastQuotaRefreshError?: AccountOperationError
   quotaErrorClearedAt?: number
   quotaErrorGeneration?: number
@@ -658,15 +661,21 @@ export function projectNativeAccountViews(input: {
         ? observedQuota
         : undefined
     const localMetadata = metadata(entry)
+    const recordedFingerprint = entry?.lastRefreshError?.credentialFingerprint
+    const credentialFingerprint =
+      recordedFingerprint && row.credential && fingerprintOf(row.credential)
     // A refresh-token rotation can keep the account and epoch unchanged.
     // An error from the previous token must not exclude the new credential.
-    if (
-      entry?.lastRefreshError?.credentialFingerprint &&
-      (!row.credential ||
-        entry.lastRefreshError.credentialFingerprint !==
-          fingerprintOf(row.credential))
-    )
+    if (recordedFingerprint && recordedFingerprint !== credentialFingerprint)
       delete localMetadata.lastRefreshError
+    const restriction =
+      binding && row.credential?.type === 'oauth' && credentialFingerprint
+        ? nativeLocalRefreshRestriction(
+            entry,
+            { binding, credentialFingerprint },
+            Date.now(),
+          )
+        : undefined
     accounts.push({
       id,
       type: row.type,
@@ -691,6 +700,10 @@ export function projectNativeAccountViews(input: {
       accountIdentity: row.identity,
       binding,
       ...localMetadata,
+      ...(restriction?.status === 'blocked' &&
+      restriction.reason === 'invalid-grant'
+        ? { localAuthDecline: restriction.reason }
+        : {}),
       ...(quota ? { quota } : {}),
       ...(row.credential?.type === 'api'
         ? {

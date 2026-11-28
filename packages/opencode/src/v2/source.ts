@@ -3,6 +3,7 @@ import {
   type ClaudeGateway,
   claudeGatewayModelUrl,
   createExhaustedNoRouteResponse,
+  createNativeLocalNoRouteError,
   createNativeUsagePublisher,
   createNativeVaultNoRouteResponse,
   createQuotaRefusalResponse,
@@ -741,6 +742,7 @@ export function createNativeAnthropicSource(
     const policies = new Map<string, NativeAccountPolicy>()
     const validationWaits: { account: NativeAccountView; retryAt: number }[] =
       []
+    const declines: NativeAccountView[] = []
     for (const account of snapshot.accounts) {
       if (account.type !== 'oauth') continue
       const policy = routingRelay.policy(
@@ -760,6 +762,11 @@ export function createNativeAnthropicSource(
         })
         active.signal.throwIfAborted()
         if (admission.status !== 'usable') {
+          if (
+            admission.status === 'refused' &&
+            admission.reason === 'invalid-grant'
+          )
+            declines.push(account)
           const retryAt = nativeValidationRetryAt(admission)
           if (retryAt !== undefined) validationWaits.push({ account, retryAt })
           continue
@@ -767,7 +774,7 @@ export function createNativeAnthropicSource(
       }
       oauth.push(account)
     }
-    return { oauth, policies, validationWaits }
+    return { oauth, policies, validationWaits, declines }
   }
   const paidFallback = async (
     input: ChooseAccountInput,
@@ -1253,7 +1260,7 @@ export function createNativeAnthropicSource(
         active.signal.throwIfAborted()
         assertTransport(snapshot, gateway())
       }
-      const { oauth, policies, validationWaits } = await oauthPool(
+      const { oauth, policies, validationWaits, declines } = await oauthPool(
         input,
         snapshot,
         modelID,
@@ -1554,8 +1561,6 @@ export function createNativeAnthropicSource(
         if (api) return api
         const holdForPool = poolHold()
         if (holdForPool) return holdForPool
-        // Local mode explains a pool that is out of quota as the vault does.
-        if (quotaExplainsRefusal) throw await refusal(exhaustedRefusal())
       }
       // Explain the earliest check only for a login that could otherwise serve.
       let earliestCheck = Infinity
@@ -1567,10 +1572,37 @@ export function createNativeAnthropicSource(
             .status === 'allowed'
         )
           earliestCheck = Math.min(earliestCheck, retryAt)
-      if (Number.isFinite(earliestCheck))
-        throw new Error(
-          formatNativeValidationBackoffMessage(formatPrimeTime(earliestCheck)),
-        )
+      const validationMessage = Number.isFinite(earliestCheck)
+        ? formatNativeValidationBackoffMessage(formatPrimeTime(earliestCheck))
+        : undefined
+      if (declines.length) {
+        const quotaReason =
+          !advice && quotaExplainsRefusal
+            ? quotaRefusalDetails(exhaustedRefusal())?.reason
+            : undefined
+        const reauth = createNativeLocalNoRouteError({
+          snapshot,
+          modelId: modelID,
+          declinedIds: declines
+            .filter(
+              (account) =>
+                routingRelay.policy(input.sessionID, account, snapshot, modelID)
+                  .status === 'allowed',
+            )
+            .map((account) => account.id),
+          policies,
+          sticky: getRoutingMode(snapshot.policyStorage) === 'sticky-balanced',
+          otherReasons: [quotaReason, validationMessage].filter(
+            (reason) => reason !== undefined,
+          ),
+        })
+        if (reauth) throw reauth
+      }
+      // With no routing advice, a local pool that is out of quota stops with a
+      // quota refusal that names the limit and its reset time.
+      if (!advice && quotaExplainsRefusal)
+        throw await refusal(exhaustedRefusal())
+      if (validationMessage) throw new Error(validationMessage)
       return undefined
     },
     dropChoice() {

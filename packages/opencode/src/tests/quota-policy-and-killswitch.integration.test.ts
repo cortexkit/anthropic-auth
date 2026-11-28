@@ -1100,18 +1100,26 @@ describe('main account quota and identity', () => {
         }),
       { models: {} },
     )
-    await expect(
-      result.fetch(MESSAGES_URL, {
-        ...EMPTY_POST,
-        body: JSON.stringify({
-          model: 'claude-sonnet-5',
-          max_tokens: 1,
-          messages: [
-            { role: 'user', content: 'synthetic permanent-failure control' },
-          ],
-        }),
+    const response = await result.fetch(MESSAGES_URL, {
+      ...EMPTY_POST,
+      body: JSON.stringify({
+        model: 'claude-sonnet-5',
+        max_tokens: 1,
+        messages: [
+          { role: 'user', content: 'synthetic permanent-failure control' },
+        ],
       }),
-    ).rejects.toThrow('Claude OAuth refresh is backed off')
+    })
+    expect(response.status).toBe(401)
+    expect(response.headers.get('retry-after')).toBeNull()
+    expect(await response.json()).toEqual({
+      type: 'error',
+      error: {
+        type: 'authentication_error',
+        message:
+          'Main Claude OAuth account requires re-login, and no fallback OAuth account is currently routable.',
+      },
+    })
     expect(calls).toBe(0)
     expect(
       (await readAccountStorage())?.refresh?.mainLastRefreshError?.permanent,

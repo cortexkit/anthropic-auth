@@ -14,6 +14,11 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
+import {
+  localAuthFixtureQuota,
+  localAuthRefusalScenarios,
+  seedLocalAuthRefusal,
+} from '../../../core/src/tests/local-auth-refusal-fixture.ts'
 import type { TestLifetime } from '../../../core/src/tests/test-lifetime.ts'
 import {
   applyMenuAction as applyMenuActionWithCtx,
@@ -161,6 +166,171 @@ function applyMenuAction(
   request: Omit<CommandApplyRequest, 'command' | 'sessionId'>,
 ): Promise<CommandApplyResult> {
   return applyMenuActionWithCtx(testContext, plugin, sessionId, request)
+}
+
+for (const mode of ['main-first', 'sticky-balanced'] as const) {
+  const scenarios =
+    mode === 'main-first'
+      ? ([
+          ...localAuthRefusalScenarios,
+          'dead alternate',
+          'replaced main credential',
+        ] as const)
+      : localAuthRefusalScenarios
+  for (const scenario of scenarios) {
+    test(`#916 OpenCode 1 ${mode}: ${scenario}`, async () => {
+      const deadAlternate = scenario === 'dead alternate'
+      const quotaBlocked = scenario === 'quota-blocked alternate'
+      const replaced = scenario === 'replaced main credential'
+      const alternate =
+        scenario === 'live alternate' ||
+        quotaBlocked ||
+        deadAlternate ||
+        replaced
+      const main = syntheticMainHostAuth()
+      const alternateAccess = 'sk-ant-oat01-oc1-refusal-alternate'
+      await useTempAccountFile(
+        bindPoolAccounts(
+          createFallbackStorage({
+            routing: { mode },
+            quota: {
+              enabled: alternate,
+              minimumRemaining: { five_hour: 10, seven_day: 10 },
+            },
+            accounts: alternate
+              ? [
+                  {
+                    type: 'oauth',
+                    id: 'alternate',
+                    access: alternateAccess,
+                    refresh: 'oc1-alternate-refresh',
+                    expires: Date.now() + 3_600_000,
+                    quota: localAuthFixtureQuota(quotaBlocked ? 5 : 70),
+                  },
+                ]
+              : [],
+          }),
+          main.access,
+        ),
+        main,
+      )
+      const pool = testContext.migratedPool
+      if (!pool) throw new Error('Missing migrated fixture')
+      const waiting =
+        scenario === 'validation wait' || scenario === 'stale record'
+      await seedLocalAuthRefusal(
+        pool.paths,
+        scenario === 'stale record'
+          ? 'stale'
+          : scenario === 'validation wait'
+            ? 'validation'
+            : replaced
+              ? 'replaced'
+              : 'dead',
+      )
+      if (alternate)
+        await seedLocalAuthRefusal(
+          pool.paths,
+          deadAlternate ? 'dead' : 'proven',
+          'alternate',
+        )
+      const outbound: [string, string | null][] = []
+      const mainProbes: string[] = []
+      const fetchMock = spyOn(globalThis, 'fetch').mockImplementation((async (
+        input: Parameters<typeof fetch>[0],
+        init?: RequestInit,
+      ) => {
+        const path = new URL(extractUrl(input)).pathname
+        const authorization = new Headers(init?.headers).get('authorization')
+        if (path === '/v1/messages') {
+          outbound.push([path, authorization])
+          return Response.json({ type: 'message' })
+        }
+        if (
+          authorization === `Bearer ${main.access}` ||
+          (path === '/v1/oauth/token' &&
+            typeof init?.body === 'string' &&
+            init.body.includes(main.refresh))
+        )
+          mainProbes.push(path)
+        if (alternate && path === '/api/oauth/profile') return Response.json({})
+        if (
+          alternate &&
+          path === '/v1/oauth/token' &&
+          typeof init?.body === 'string' &&
+          init.body.includes('oc1-alternate-refresh')
+        )
+          return Response.json({
+            access_token: alternateAccess,
+            refresh_token: 'oc1-alternate-refresh',
+            expires_in: 28_800,
+          })
+        if (alternate && path === '/api/oauth/usage')
+          return Response.json({
+            five_hour: { utilization: quotaBlocked ? 95 : 30 },
+            seven_day: { utilization: quotaBlocked ? 95 : 30 },
+          })
+        if (alternate && path === '/api/claude_cli/bootstrap') {
+          const bootstrap = await nativeBootstrapAnswer(input, init)
+          if (bootstrap) return bootstrap
+        }
+        throw new Error(`Unexpected provider request: ${path}`)
+      }) as typeof fetch)
+      try {
+        const plugin = await getPlugin(createMockClient())
+        const loader = await plugin.auth.loader(
+          () => Promise.resolve({ type: 'oauth', ...main }),
+          { models: {} },
+        )
+        const turn = () =>
+          loader.fetch(MESSAGES_URL, {
+            method: 'POST',
+            headers: { 'x-session-affinity': 'oc1-refusal' },
+            body: JSON.stringify({
+              model: 'claude-sonnet-5',
+              messages: [{ role: 'user', content: 'hello' }],
+            }),
+          })
+        if (waiting) {
+          await expect(turn()).rejects.toThrow(
+            "Claude couldn't confirm which account this login belongs to",
+          )
+          expect(outbound).toEqual([])
+        } else if (scenario === 'live alternate' || replaced) {
+          expect((await turn()).ok).toBe(true)
+          expect(outbound).toEqual([
+            [
+              '/v1/messages',
+              `Bearer ${replaced ? main.access : alternateAccess}`,
+            ],
+          ])
+        } else {
+          const response = await turn()
+          expect(response.status).toBe(401)
+          expect(response.headers.get('retry-after')).toBeNull()
+          const body = (await response.json()) as {
+            error: { type: string; message: string }
+          }
+          expect(body.error.type).toBe('authentication_error')
+          expect(body.error.message).toStartWith(
+            'Main Claude OAuth account requires re-login',
+          )
+          if (quotaBlocked)
+            expect(body.error.message).toEndWith(
+              'Other OAuth routes are blocked by quota policy: quota floor.',
+            )
+          if (deadAlternate)
+            expect(body.error.message).toEndWith(
+              'Fallback Claude OAuth account requires re-login: alternate.',
+            )
+          expect(outbound).toEqual([])
+        }
+        if (!waiting && !replaced) expect(mainProbes).toEqual([])
+      } finally {
+        fetchMock.mockRestore()
+      }
+    })
+  }
 }
 
 async function runStickyDnsBackoffScenario(options: {

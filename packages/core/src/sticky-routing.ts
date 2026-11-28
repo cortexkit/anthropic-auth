@@ -12,7 +12,6 @@ import {
 import { basename, dirname, join } from 'node:path'
 import { readVaultRoster } from '@cortexkit/common-auth/claustrum'
 import {
-  type AccountOperationError,
   type AccountStorage,
   acquireRefreshFileLock,
   getKillswitchThresholdsForAccount,
@@ -20,7 +19,6 @@ import {
   getQuotaMinimumRemainingThresholds,
   getScopedQuotaWindowForModel,
   isKillswitchEnabled,
-  isPermanentRefreshError,
   type OAuthQuotaSnapshot,
   quotaFieldSource,
   quotaRefusalRetryAfterSeconds,
@@ -154,13 +152,53 @@ export class StickyQuotaRetryCounter {
   }
 }
 
+/** A terminal local OAuth refusal; account selection cannot always return HTTP. */
+export class NativeLocalReauthError extends Error {
+  readonly kind = 'local-oauth-reauth'
+  readonly status = 401
+
+  response(): Response {
+    return Response.json(
+      {
+        type: 'error',
+        error: { type: 'authentication_error', message: this.message },
+      },
+      { status: this.status },
+    )
+  }
+}
+
+export function createOAuthReauthError(input: {
+  mainRequiresReauth?: boolean
+  fallbackReauthLabels?: readonly string[]
+  modelName?: string
+  quotaReason?: string
+}): NativeLocalReauthError | undefined {
+  const scope = input.modelName ? ` for ${input.modelName}` : ''
+  const labels = input.fallbackReauthLabels ?? []
+  const fallback = `Fallback Claude OAuth ${labels.length === 1 ? 'account requires' : 'accounts require'} re-login: ${labels.join(', ')}.`
+  const authentication = input.mainRequiresReauth
+    ? `Main Claude OAuth account requires re-login, and no fallback OAuth account is currently routable${scope}.${labels.length ? ` ${fallback}` : ''}`
+    : labels.length
+      ? `${fallback} No OAuth account is currently routable${scope}.`
+      : undefined
+  if (!authentication) return undefined
+  const error = new NativeLocalReauthError(
+    input.quotaReason
+      ? `${authentication} ${input.quotaReason}`
+      : authentication,
+  )
+  error.name = 'NativeLocalReauthError'
+  return error
+}
+
 /**
  * Build the terminal response for a complete sticky quota pool that has no
  * eligible route. This prevents callers from silently falling through to the
  * main account after the router deliberately excluded it.
  */
 export function createStickyNoRouteResponse(input: {
-  mainRefreshError?: AccountOperationError
+  mainRequiresReauth?: boolean
   fallbackReauthLabels?: readonly string[]
   routeQuotas: readonly OAuthQuotaSnapshot[]
   routeIdentities?: readonly (string | undefined)[]
@@ -179,30 +217,8 @@ export function createStickyNoRouteResponse(input: {
         .find(Boolean)?.modelName
     : undefined
 
-  let authenticationMessage: string | undefined
-  if (isPermanentRefreshError(input.mainRefreshError)) {
-    authenticationMessage = modelName
-      ? `Main Claude OAuth account requires re-login, and no fallback OAuth account is currently routable for ${modelName}.`
-      : 'Main Claude OAuth account requires re-login, and no fallback OAuth account is currently routable.'
-  } else if (input.fallbackReauthLabels?.length) {
-    const scope = modelName ? ` for ${modelName}` : ''
-    authenticationMessage = `No OAuth account is currently routable${scope}. Fallback Claude OAuth accounts require re-login: ${input.fallbackReauthLabels.join(', ')}.`
-  }
-  if (authenticationMessage) {
-    return new Response(
-      JSON.stringify({
-        type: 'error',
-        error: {
-          type: 'authentication_error',
-          message: authenticationMessage,
-        },
-      }),
-      {
-        status: 401,
-        headers: { 'content-type': 'application/json' },
-      },
-    )
-  }
+  const reauth = createOAuthReauthError({ ...input, modelName })
+  if (reauth) return reauth.response()
 
   const scopedBlocked = Boolean(
     modelId &&

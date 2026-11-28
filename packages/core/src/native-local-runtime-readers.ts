@@ -66,9 +66,9 @@ function sameCredential(
   )
 }
 
-function refreshRestriction(
+export function nativeLocalRefreshRestriction(
   entry: NativeRuntimeEntry | undefined,
-  subject: NativeRefreshSubject,
+  subject: Pick<NativeRefreshSubject, 'binding' | 'credentialFingerprint'>,
   now: number,
 ): NativeRefreshRestriction {
   const error = entry?.lastRefreshError
@@ -154,7 +154,7 @@ export function createNativeLocalRuntimeReaders(
         restriction:
           gate.status === 'blocked'
             ? gate
-            : refreshRestriction(entry, subject, now()),
+            : nativeLocalRefreshRestriction(entry, subject, now()),
         context: {
           subject,
           runtimeBinding:
@@ -170,7 +170,7 @@ export function createNativeLocalRuntimeReaders(
       const gate = policy(subject)
       if (gate.status === 'blocked') return gate
       const time = now()
-      const restriction = refreshRestriction(entry, subject, time)
+      const restriction = nativeLocalRefreshRestriction(entry, subject, time)
       if (restriction.status === 'blocked')
         return { status: 'blocked', reason: restriction.reason }
       if (!isNativeLocalCredentialValidation(subject))

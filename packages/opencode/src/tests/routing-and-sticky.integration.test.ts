@@ -1826,7 +1826,7 @@ describe('auth.loader', () => {
       error: {
         type: 'authentication_error',
         message:
-          'Main Claude OAuth account requires re-login, and no fallback OAuth account is currently routable for Fable.',
+          'Main Claude OAuth account requires re-login, and no fallback OAuth account is currently routable for Fable. Other OAuth routes are blocked by quota policy: Fable scoped limit.',
       },
     })
     expect(messageRequests).toBe(0)
