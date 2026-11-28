@@ -12,6 +12,7 @@ import {
   QUOTA_FIELD_NAMES,
   type QuotaFieldSources,
   type QuotaMoney,
+  quotaFieldSource,
   quotaPollCheckedAt,
   quotaSnapshotCheckedAt,
 } from './accounts.ts'
@@ -474,11 +475,15 @@ export const nativeQuotaCodec: QuotaCodec = {
       incoming.source === 'poll' &&
       incoming.checkedAt !== undefined &&
       previous.source === 'headers' &&
-      previousPollAt > 0 &&
+      (previousPollAt > 0 ||
+        (previous.scoped === undefined &&
+          previous.extraUsage === undefined &&
+          quotaFieldSource(previous, 'five_hour') !== 'poll' &&
+          quotaFieldSource(previous, 'seven_day') !== 'poll')) &&
       previousTime > incomingTime
     )
-      // Keep newer header windows only when the stored poll clock proves the
-      // incoming poll is not older. Headers can cover all evidence of a poll.
+      // Keep the newer header windows when the poll clock is known, or when
+      // the stored headers have no scoped array, credits or poll-owned windows.
       return toNativeQuotaMap(
         mergeHeaderQuotaForPersistence(incoming, {
           ...previous,
