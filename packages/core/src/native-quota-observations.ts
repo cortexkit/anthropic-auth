@@ -14,6 +14,8 @@ import { createNativeUsagePublisher } from './native-usage-publication.ts'
 import type { NativeLocalPoolBinding } from './pool-binding.ts'
 import type { QuotaEntry } from './quota-manager.ts'
 
+const MAX_ACCOUNTS = 1000
+
 export type NativeQuotaObservation = {
   lineage: string
   accountUuid: string
@@ -63,14 +65,27 @@ export class NativeQuotaObservations extends Map<
   NativeQuotaObservation
 > {
   private readonly publications = createNativeUsagePublisher('quota')
+  // A header can replace the held reading without superseding the poll.
+  private readonly polls = new Map<string, NativeQuotaObservation>()
 
   override set(accountId: string, observation: NativeQuotaObservation): this {
+    const poll = this.polls?.get(accountId)
+    if (poll && poll.lineage !== observation.lineage)
+      this.polls.delete(accountId)
     this.delete(accountId)
-    if (this.size >= 1000) {
+    if (this.size >= MAX_ACCOUNTS) {
       const oldest = this.keys().next().value
       if (oldest !== undefined) this.delete(oldest)
     }
     return super.set(accountId, observation)
+  }
+
+  private *routingObservations() {
+    // Apply the poll underneath the held header, if both are still fresh.
+    yield* this.polls.values()
+    for (const [accountId, held] of this) {
+      if (this.polls.get(accountId) !== held) yield held
+    }
   }
 
   quota(
@@ -84,7 +99,7 @@ export class NativeQuotaObservations extends Map<
     let result = committed
     let clearAt: number | undefined
     let matched = false
-    for (const observation of this.values()) {
+    for (const observation of this.routingObservations()) {
       // Headers retain host-owned admission and display rules unless the
       // host asked for them to route before their save lands; otherwise
       // only polls replace the quota exposed by native snapshots before
@@ -129,17 +144,36 @@ export class NativeQuotaObservations extends Map<
         quotaSnapshotCheckedAt(observation.entry.quota)
     )
       this.set(accountId, observation)
+    const isPoll = observation.entry.quota.source === 'poll'
+    const poll = this.polls.get(accountId)
+    if (
+      isPoll &&
+      (!poll ||
+        poll.lineage !== observation.lineage ||
+        poll.entry.checkedAt <= observation.entry.checkedAt)
+    ) {
+      this.polls.delete(accountId)
+      if (this.polls.size >= MAX_ACCOUNTS) {
+        const oldest = this.polls.keys().next().value
+        if (oldest !== undefined) this.polls.delete(oldest)
+      }
+      this.polls.set(accountId, observation)
+    }
     return this.publications.observe(
       Promise.resolve().then(async () => {
         let kept = false
         let cancelled = false
         try {
-          const current = this.get(accountId)
+          const current = isPoll
+            ? this.polls.get(accountId)
+            : this.get(accountId)
           if (
             current &&
             current.lineage === observation.lineage &&
-            quotaSnapshotCheckedAt(current.entry.quota) >
-              quotaSnapshotCheckedAt(observation.entry.quota)
+            (isPoll
+              ? current.entry.checkedAt > observation.entry.checkedAt
+              : quotaSnapshotCheckedAt(current.entry.quota) >
+                quotaSnapshotCheckedAt(observation.entry.quota))
           )
             return
           kept = await write(this.publications.signal)
@@ -155,6 +189,8 @@ export class NativeQuotaObservations extends Map<
         } finally {
           if (!kept) {
             if (this.get(accountId) === observation) this.delete(accountId)
+            if (this.polls.get(accountId) === observation)
+              this.polls.delete(accountId)
             if (!cancelled) logger.warn('quota', 'Quota publication discarded')
           }
         }

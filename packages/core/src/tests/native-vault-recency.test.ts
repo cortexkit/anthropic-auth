@@ -8,6 +8,7 @@ import {
   readVaultRoster,
 } from '@cortexkit/common-auth/claustrum'
 import { acquireRefreshFileLock, lockPathFor } from '@cortexkit/common-auth/fs'
+import type { OAuthQuotaSnapshot } from '../accounts.ts'
 import {
   acquireNativeAccountRuntime,
   createNativeAccountRuntime,
@@ -17,6 +18,7 @@ import type {
   NativeCustodyReceipt,
 } from '../native-custody.ts'
 import { fromNativeQuotaMap, nativeQuotaCodec } from '../native-quota-codec.ts'
+import type { NativeQuotaObservation } from '../native-quota-observations.ts'
 import {
   isNativeRuntimeStagingName,
   NativeRuntimeError,
@@ -34,6 +36,10 @@ import {
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
+import {
+  headerSnapshot,
+  pollSnapshot,
+} from './pool-store-coalescing-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
 const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
@@ -146,6 +152,99 @@ async function fixture() {
 }
 
 type Fixture = Awaited<ReturnType<typeof fixture>>
+
+async function vaultQuotaRace(delayedOlderPoll: boolean) {
+  const f = await fixture()
+  const receipt = await f.runtime.authorize('main')
+  const account = receipt.assertedAccountIdentity!
+  const older = pollSnapshot(account, now, {
+    five_hour: 70,
+    seven_day: 40,
+    fable: 100,
+  })
+  const newer: OAuthQuotaSnapshot = {
+    accountIdentity: account,
+    source: 'poll',
+    checkedAt: now + 1,
+    five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: now + 1 },
+    seven_day: { usedPercent: 20, remainingPercent: 80, checkedAt: now + 1 },
+    scoped: [],
+  }
+  const headers = headerSnapshot(account, now + 2, {
+    five_hour: 12,
+    seven_day: 41,
+  })
+  const reading = (quota: OAuthQuotaSnapshot): NativeQuotaObservation => ({
+    lineage: 'same-vault-receipt',
+    accountUuid: account,
+    generalExhausted: false,
+    entry: {
+      quota,
+      checkedAt: quota.checkedAt!,
+      refreshAfter: quota.checkedAt!,
+    },
+  })
+  const observations = f.runtime.quotaObservations
+  let olderStarted = false
+  let newerKept = false
+  const publishOlder = () =>
+    observations.publish('main', reading(older), async (signal) => {
+      olderStarted = true
+      await f.runtime.publish(receipt, { quota: older }, signal)
+      // If the older write runs, the header can land before the newer poll.
+      // The vault then refuses that poll because the header has a later timestamp.
+      await f.runtime.publish(receipt, { quota: headers }, signal)
+      return true
+    })
+  const publishNewer = (beforeWrite: () => Promise<void>) =>
+    observations.publish('main', reading(newer), async (signal) => {
+      await beforeWrite()
+      newerKept = await f.runtime.publish(receipt, { quota: newer }, signal)
+      return newerKept
+    })
+  const holdHeader = () =>
+    expect(observations.hold('main', reading(headers))).toBe(true)
+  if (delayedOlderPoll) {
+    const entered = gate()
+    const release = gate()
+    const newerPublication = publishNewer(async () => {
+      entered.open()
+      await release.wait
+    })
+    trackDetached(newerPublication)
+    try {
+      await entered.wait
+      holdHeader()
+      await publishOlder()
+    } finally {
+      release.open()
+      await newerPublication
+    }
+  } else {
+    const olderPublication = publishOlder()
+    const settled = Promise.all([
+      olderPublication,
+      publishNewer(() => olderPublication),
+    ])
+    trackDetached(settled)
+    holdHeader()
+    await settled
+  }
+  expect(olderStarted).toBe(false)
+  expect(newerKept).toBe(true)
+  const stored = fromNativeQuotaMap((await runtimeEntry(f))?.quota)
+  expect(stored.checkedAt).toBe(now + 1)
+  expect(stored.five_hour).toEqual(newer.five_hour)
+  expect(stored.seven_day).toEqual(newer.seven_day)
+  expect(stored.scoped).toEqual([])
+  expect(stored.extraUsage).toBeUndefined()
+}
+
+test('a held header does not cancel the newest queued vault poll', () =>
+  vaultQuotaRace(false))
+
+test('a held header does not let a delayed older poll overtake a vault poll already writing', () =>
+  vaultQuotaRace(true))
 
 for (const lastLease of [false, true]) {
   test(`shared bookkeeping ${lastLease ? 'aborts only at final lease close' : 'survives another lease disposal'}`, async () => {

@@ -618,10 +618,10 @@ test('an older poll cannot replace a poll already covered by newer headers', () 
       checkedAt,
       five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt },
       seven_day: { usedPercent: 20, remainingPercent: 80, checkedAt },
-      ...(withDetails && {
-        scoped: full.scoped?.map((window) => ({ ...window, checkedAt })),
-        extraUsage: full.extraUsage,
-      }),
+      scoped: withDetails
+        ? full.scoped?.map((window) => ({ ...window, checkedAt }))
+        : [],
+      ...(withDetails && { extraUsage: full.extraUsage }),
     })
   const headers = toNativeQuotaMap({
     ...normalizeQuotaHeaders(
@@ -639,14 +639,16 @@ test('an older poll cannot replace a poll already covered by newer headers', () 
     checkedAt: 200,
     five_hour: { checkedAt: 300 },
     seven_day: { checkedAt: 300 },
+    scoped: [],
   })
+  expect(quotaPollCheckedAt(fromNativeQuotaMap(stored))).toBe(200)
   expect(nativeQuotaCodec.merge(stored, poll(100, true))).toEqual(stored)
 
   const newer = poll(400, true)
   expect(nativeQuotaCodec.merge(stored, newer)).toEqual(newer)
 })
 
-test('a header-only snapshot waits for a newer poll if the first poll is older than its headers', () => {
+test('an older first poll fills model limits and credits beneath stored headers', () => {
   const headers: OAuthQuotaSnapshot = {
     accountIdentity: full.accountIdentity,
     source: 'headers',
@@ -665,43 +667,50 @@ test('a header-only snapshot waits for a newer poll if the first poll is older t
   }
   expect(quotaPollCheckedAt(headers)).toBe(0)
   const stored = toNativeQuotaMap(headers)
-  expect(nativeQuotaCodec.merge(stored, toNativeQuotaMap(poll))).toEqual(stored)
+  const merged = fromNativeQuotaMap(
+    nativeQuotaCodec.merge(stored, toNativeQuotaMap(poll)),
+  )
+  expect(merged.five_hour).toEqual(headers.five_hour)
+  expect(merged.seven_day).toEqual(headers.seven_day)
+  expect(merged.scoped).toEqual(poll.scoped)
+  expect(merged.extraUsage).toEqual(poll.extraUsage)
 })
 
-test.each(['headers', 'poll'] as const)(
-  'newer held %s supersedes a pending quota poll write',
-  async (source) => {
-    const observations = new NativeQuotaObservations()
-    const reading = (source: 'headers' | 'poll', checkedAt: number) => ({
-      lineage: 'same-credential',
-      accountUuid: 'same-account',
-      generalExhausted: false,
-      entry: {
-        quota: { source, checkedAt },
-        checkedAt,
-        refreshAfter: checkedAt,
+test('a newer published poll supersedes a pending quota poll write', async () => {
+  const observations = new NativeQuotaObservations()
+  const reading = (source: 'headers' | 'poll', checkedAt: number) => ({
+    lineage: 'same-credential',
+    accountUuid: 'same-account',
+    generalExhausted: false,
+    entry: {
+      quota: { source, checkedAt },
+      checkedAt,
+      refreshAfter: checkedAt,
+    },
+  })
+  let writes = 0
+  try {
+    const published = observations.publish(
+      'main',
+      reading('poll', 1000),
+      async () => {
+        writes++
+        return true
       },
-    })
-    let writes = 0
-    try {
-      const published = observations.publish(
-        'main',
-        reading('poll', 1000),
-        async () => {
-          writes++
-          return true
-        },
-      )
-      const latest = reading(source, 2000)
-      expect(observations.hold('main', latest)).toBe(true)
-      await published
-      expect(writes).toBe(0)
-      expect(observations.get('main')).toBe(latest)
-    } finally {
-      await observations.close()
-    }
-  },
-)
+    )
+    const latest = reading('poll', 2000)
+    const latestPublication = observations.publish(
+      'main',
+      latest,
+      async () => true,
+    )
+    await Promise.all([published, latestPublication])
+    expect(writes).toBe(0)
+    expect(observations.get('main')).toBe(latest)
+  } finally {
+    await observations.close()
+  }
+})
 
 test('a newer complete poll replaces the whole snapshot and clears older scoped limits and extra usage', () => {
   const stored = toNativeQuotaMap({ ...full, source: 'poll' })

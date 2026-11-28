@@ -4,8 +4,6 @@
 // The shared rules run twice: with `nativeQuotaCodec`, which production uses, and
 // with common-auth's own `quotaCodec` as a control, to tell a failure of the
 // coalescer apart from a mismatch between the coalescer and Core's codec.
-// Native snapshots keep legacy whole-snapshot precedence. A late older poll
-// may therefore lose poll-only fields; the library codec is a per-field control.
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
   mkdir,
@@ -167,7 +165,7 @@ function lockHolder(paths: NativePoolStorePaths, lane: Lane) {
 const epoch1 = (identity: string) => ({ credentialEpoch: 1, identity })
 
 coalescing(
-  'a first poll older than held headers waits for the next poll',
+  'a first poll writes its model limits and credits while newer headers are held',
   async () => {
     const paths = await fixture()
     const account = 'acct-a'
@@ -190,17 +188,22 @@ coalescing(
     })
     const observations = new NativeQuotaObservations()
     try {
-      // The header save has not reached the store; the held reading alone supersedes the poll.
+      // The header save has not reached the store when the poll writes.
       expect(observations.hold('a', observation(headers, 2_000))).toBe(true)
+      let pollWrote = false
       await observations.publish('a', observation(poll, 1_000), async () => {
         await store.recordQuota('a', epoch1(account), nativeLane.observe(poll))
+        pollWrote = true
         return true
       })
+      expect(pollWrote).toBe(true)
       await store.recordQuota('a', epoch1(account), nativeLane.observe(headers))
       await closeStore(store)
       expect(await onDisk(paths, nativeLane, 'a')).toEqual({
         five_hour: { usedPercent: 12, checkedAt: 2_000 },
         seven_day: { usedPercent: 41, checkedAt: 2_000 },
+        fable: { usedPercent: 51, checkedAt: 1_000 },
+        extraUsagePercent: 19.225,
       })
 
       const next = coalesced(paths, nativeLane)
@@ -241,7 +244,7 @@ for (const lane of lanes) {
       'newer header, then older poll',
     ] as const) {
       coalescing(
-        `quota observations preserve newer windows using each codec's precedence (${order})`,
+        `the first poll and newer headers keep their own fields (${order})`,
         async () => {
           const paths = await fixture()
           await seed(paths, lane, [['a', 'acct-a']])
@@ -263,11 +266,8 @@ for (const lane of lanes) {
           const expected: Facts = {
             five_hour: { usedPercent: 12, checkedAt: 2_000 },
             seven_day: { usedPercent: 41, checkedAt: 2_000 },
-            ...((lane.name === 'library' ||
-              order === 'poll, then newer header') && {
-              fable: { usedPercent: 51, checkedAt: 1_000 },
-              extraUsagePercent: 19.225,
-            }),
+            fable: { usedPercent: 51, checkedAt: 1_000 },
+            extraUsagePercent: 19.225,
           }
           expect(await facts(store, lane, 'a')).toEqual(expected)
           await closeStore(store)
@@ -277,7 +277,7 @@ for (const lane of lanes) {
     }
 
     coalescing(
-      'a first poll older than persisted headers follows codec precedence until the next poll',
+      'a first poll adds model limits and credits to newer persisted headers',
       async () => {
         const paths = await fixture()
         await seed(paths, lane, [['a', 'acct-a']])
@@ -309,14 +309,11 @@ for (const lane of lanes) {
             }),
           ),
         )
-        const expected: Facts =
-          lane.name === 'native'
-            ? windows
-            : {
-                ...windows,
-                fable: { usedPercent: 51, checkedAt: 1_000 },
-                extraUsagePercent: 19.225,
-              }
+        const expected: Facts = {
+          ...windows,
+          fable: { usedPercent: 51, checkedAt: 1_000 },
+          extraUsagePercent: 19.225,
+        }
         expect(await facts(store, lane, 'a')).toEqual(expected)
         await closeStore(store)
         expect(await onDisk(paths, lane, 'a')).toEqual(expected)
