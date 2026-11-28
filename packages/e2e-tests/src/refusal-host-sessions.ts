@@ -282,8 +282,10 @@ ${newer?.source ?? ''}
   try {
     // The first healthy answer can come before OpenCode 2 has finished
     // starting: the login command's own health check then still gets a 503
-    // for a moment. Wait until health has stayed up for a second, as the main
-    // e2e runner does, and retry the login only for that 503.
+    // for a moment, or the fixture plugin hasn't registered its sign-in method
+    // yet, because OpenCode 2 answers health before plugins finish loading.
+    // Wait until health has stayed up for a second, as the main e2e runner
+    // does, then retry the login for those two start-up answers only.
     const deadline = Date.now() + 10_000
     let healthySince = 0
     while (true) {
@@ -313,15 +315,18 @@ ${newer?.source ?? ''}
       '--server',
       hostUrl,
     ]
-    for (let attempt = 1; ; attempt++) {
+    const loginDeadline = Date.now() + 15_000
+    while (true) {
       try {
         await mustRun(login, project, env, 12_000)
         break
       } catch (error) {
-        const starting = String(error).includes(
-          'did not provide a compatible V2 health response: UnexpectedStatus: 503',
-        )
-        if (!starting || attempt >= 3) throw error
+        const text = String(error)
+        const starting =
+          text.includes(
+            'did not provide a compatible V2 health response: UnexpectedStatus: 503',
+          ) || text.includes(`Authentication method not found: ${methodID}`)
+        if (!starting || Date.now() >= loginDeadline) throw error
         await Bun.sleep(500)
       }
     }
