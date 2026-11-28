@@ -16,7 +16,7 @@ export const localAuthRefusalScenarios = [
 
 export async function seedLocalAuthRefusal(
   paths: NativePoolPaths,
-  state: 'dead' | 'validation' | 'stale' | 'proven',
+  state: 'dead' | 'validation' | 'stale' | 'proven' | 'replaced',
   id = 'main',
 ) {
   const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
@@ -50,11 +50,13 @@ export async function seedLocalAuthRefusal(
   const now = Date.now()
   const entry = {
     binding,
-    ...(state === 'proven' && { credentialValidation: subject }),
+    ...((state === 'proven' || state === 'replaced') && {
+      credentialValidation: subject,
+    }),
     ...((state === 'validation' || state === 'stale') && {
       validationRetry: { subject, checkedAt: now, nextRetryAt: now + 300_000 },
     }),
-    ...((state === 'dead' || state === 'stale') && {
+    ...((state === 'dead' || state === 'stale' || state === 'replaced') && {
       lastRefreshError: {
         credentialFingerprint:
           state === 'dead'

@@ -11579,6 +11579,34 @@ const anthropicAuthPlugin = async (
                   }
                 }
                 if (auth.credentialFailure?.localAuthDecline) {
+                  if (
+                    replayableRequest &&
+                    getRoutingMode(storage) === 'main-first'
+                  ) {
+                    // A dead main login rules out main, so try the other
+                    // Claude subscription logins. Paid API-key routes open only
+                    // once the subscriptions are out of quota, which a dead
+                    // login doesn't show, so they stay closed here.
+                    const fallbackAccounts = await getRoutableFallbackAccounts(
+                      storage,
+                      { modelId: requestModelId },
+                    )
+                    const response = await tryUsableFallbackAccounts(
+                      input,
+                      init,
+                      fallbackAccounts,
+                      storage,
+                      undefined,
+                      requestRouting,
+                      {
+                        returnLastOnExhausted: false,
+                        onSuccess: (account) =>
+                          writeCurrentSidebarState(account.id, 'fallback'),
+                        laneStartRequest,
+                      },
+                    )
+                    if (response) return wrapResponse(response)
+                  }
                   const reauth = createNativeLocalNoRouteError({
                     snapshot: await nativeAccounts.read(credentialModelId),
                     modelId: credentialModelId,

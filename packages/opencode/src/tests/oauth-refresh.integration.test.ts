@@ -169,12 +169,24 @@ function applyMenuAction(
 }
 
 for (const mode of ['main-first', 'sticky-balanced'] as const) {
-  for (const scenario of localAuthRefusalScenarios) {
-    test(`#916 OpenCode 1 ${mode}: ${scenario === 'live alternate' && mode === 'main-first' ? 'main-first still stops before trying a live fallback when main is dead (fallback-first serves it)' : scenario}`, async () => {
+  const scenarios =
+    mode === 'main-first'
+      ? ([
+          ...localAuthRefusalScenarios,
+          'dead alternate',
+          'replaced main credential',
+        ] as const)
+      : localAuthRefusalScenarios
+  for (const scenario of scenarios) {
+    test(`#916 OpenCode 1 ${mode}: ${scenario}`, async () => {
+      const deadAlternate = scenario === 'dead alternate'
+      const quotaBlocked = scenario === 'quota-blocked alternate'
+      const replaced = scenario === 'replaced main credential'
       const alternate =
-        scenario === 'live alternate' || scenario === 'quota-blocked alternate'
-      const live = scenario === 'live alternate'
-      const orderedLive = live && mode === 'main-first'
+        scenario === 'live alternate' ||
+        quotaBlocked ||
+        deadAlternate ||
+        replaced
       const main = syntheticMainHostAuth()
       const alternateAccess = 'sk-ant-oat01-oc1-refusal-alternate'
       await useTempAccountFile(
@@ -193,7 +205,7 @@ for (const mode of ['main-first', 'sticky-balanced'] as const) {
                     access: alternateAccess,
                     refresh: 'oc1-alternate-refresh',
                     expires: Date.now() + 3_600_000,
-                    quota: localAuthFixtureQuota(live ? 70 : 5),
+                    quota: localAuthFixtureQuota(quotaBlocked ? 5 : 70),
                   },
                 ]
               : [],
@@ -208,24 +220,39 @@ for (const mode of ['main-first', 'sticky-balanced'] as const) {
         scenario === 'validation wait' || scenario === 'stale record'
       await seedLocalAuthRefusal(
         pool.paths,
-        waiting
-          ? scenario === 'stale record'
-            ? 'stale'
-            : 'validation'
-          : 'dead',
+        scenario === 'stale record'
+          ? 'stale'
+          : scenario === 'validation wait'
+            ? 'validation'
+            : replaced
+              ? 'replaced'
+              : 'dead',
       )
       if (alternate)
-        await seedLocalAuthRefusal(pool.paths, 'proven', 'alternate')
+        await seedLocalAuthRefusal(
+          pool.paths,
+          deadAlternate ? 'dead' : 'proven',
+          'alternate',
+        )
       const outbound: [string, string | null][] = []
+      const mainProbes: string[] = []
       const fetchMock = spyOn(globalThis, 'fetch').mockImplementation((async (
         input: Parameters<typeof fetch>[0],
         init?: RequestInit,
       ) => {
         const path = new URL(extractUrl(input)).pathname
+        const authorization = new Headers(init?.headers).get('authorization')
         if (path === '/v1/messages') {
-          outbound.push([path, new Headers(init?.headers).get('authorization')])
+          outbound.push([path, authorization])
           return Response.json({ type: 'message' })
         }
+        if (
+          authorization === `Bearer ${main.access}` ||
+          (path === '/v1/oauth/token' &&
+            typeof init?.body === 'string' &&
+            init.body.includes(main.refresh))
+        )
+          mainProbes.push(path)
         if (alternate && path === '/api/oauth/profile') return Response.json({})
         if (
           alternate &&
@@ -240,8 +267,8 @@ for (const mode of ['main-first', 'sticky-balanced'] as const) {
           })
         if (alternate && path === '/api/oauth/usage')
           return Response.json({
-            five_hour: { utilization: live ? 30 : 95 },
-            seven_day: { utilization: live ? 30 : 95 },
+            five_hour: { utilization: quotaBlocked ? 95 : 30 },
+            seven_day: { utilization: quotaBlocked ? 95 : 30 },
           })
         if (alternate && path === '/api/claude_cli/bootstrap') {
           const bootstrap = await nativeBootstrapAnswer(input, init)
@@ -269,10 +296,13 @@ for (const mode of ['main-first', 'sticky-balanced'] as const) {
             "Claude couldn't confirm which account this login belongs to",
           )
           expect(outbound).toEqual([])
-        } else if (live && !orderedLive) {
+        } else if (scenario === 'live alternate' || replaced) {
           expect((await turn()).ok).toBe(true)
           expect(outbound).toEqual([
-            ['/v1/messages', `Bearer ${alternateAccess}`],
+            [
+              '/v1/messages',
+              `Bearer ${replaced ? main.access : alternateAccess}`,
+            ],
           ])
         } else {
           const response = await turn()
@@ -285,20 +315,17 @@ for (const mode of ['main-first', 'sticky-balanced'] as const) {
           expect(body.error.message).toStartWith(
             'Main Claude OAuth account requires re-login',
           )
-          if (scenario === 'quota-blocked alternate')
-            expect(body.error.message).toContain('quota floor')
+          if (quotaBlocked)
+            expect(body.error.message).toEndWith(
+              'Other OAuth routes are blocked by quota policy: quota floor.',
+            )
+          if (deadAlternate)
+            expect(body.error.message).toEndWith(
+              'Fallback Claude OAuth account requires re-login: alternate.',
+            )
           expect(outbound).toEqual([])
-          if (orderedLive) {
-            await updatePoolSettings((settings) => ({
-              ...settings,
-              routing: { mode: 'fallback-first' },
-            }))
-            expect((await turn()).ok).toBe(true)
-            expect(outbound).toEqual([
-              ['/v1/messages', `Bearer ${alternateAccess}`],
-            ])
-          }
         }
+        if (!waiting && !replaced) expect(mainProbes).toEqual([])
       } finally {
         fetchMock.mockRestore()
       }
